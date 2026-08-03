@@ -1,0 +1,22 @@
+skillId: fact-memory
+version: 1.0.0
+executionPoints:
+  - chapter.fact-extraction
+  - character.enrichment
+roles:
+  - fact-extractor
+  - character-enricher
+capabilities:
+  - memory
+dependsOn: []
+conflicts: []
+requiredMemoryKinds: []
+qualityGates:
+  - provenance
+  - deduplication
+priority: required
+promptSections:
+  chapter.fact-extraction: |
+    只沉淀会影响后续因果、人物知识、持续状态、关系、伏笔或承诺的内容。每条事实都要有正文逐字证据、来源段落和 novelty 判断。
+  character.enrichment: |
+    只提取本章实际呈现的角色增量；区分观察、听闻、推测和客观事实，避免把叙述者总结或读者推断写入角色知识。

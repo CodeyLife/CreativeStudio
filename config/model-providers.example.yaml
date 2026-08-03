@@ -1,0 +1,121 @@
+version: 1
+profiles:
+  - id: web-chat
+    label: Stateless Web Chat
+    protocol: chat-completions
+    baseUrl: https://chat.example.com/v1
+    model: web-chat-model
+    responseMode: sse
+    capabilities: [text, structured, stream]
+    secret:
+      source: env
+      name: WEB_CHAT_API_KEY
+    enabled: true
+    timeoutMs: 180000
+  - id: responses-primary
+    label: Responses API
+    protocol: responses
+    baseUrl: https://api.example.com/v1
+    model: responses-model
+    responseMode: json
+    capabilities: [text, structured, responses-continuation]
+    secret:
+      source: env
+      name: RESPONSES_API_KEY
+    enabled: true
+    timeoutMs: 180000
+  - id: siliconflow-embedding
+    label: SiliconFlow BGE-M3 Embedding
+    protocol: chat-completions
+    baseUrl: https://api.siliconflow.cn/v1
+    model: BAAI/bge-m3
+    responseMode: json
+    capabilities: [embedding]
+    secret:
+      source: env
+      name: SILICONFLOW_API_KEY
+    enabled: true
+    timeoutMs: 120000
+  - id: siliconflow-rerank
+    label: SiliconFlow BGE Reranker
+    protocol: chat-completions
+    baseUrl: https://api.siliconflow.cn/v1
+    model: BAAI/bge-reranker-v2-m3
+    responseMode: json
+    capabilities: [rerank]
+    secret:
+      source: env
+      name: SILICONFLOW_API_KEY
+    enabled: true
+    timeoutMs: 120000
+routes:
+  "planning.foundation":
+    conversationPolicy: stateless
+    candidates:
+      - executor: api
+        profileId: web-chat
+      - executor: api
+        profileId: responses-primary
+      - executor: external-mcp
+  "planning.blueprint":
+    conversationPolicy: stateless
+    candidates:
+      - executor: api
+        profileId: responses-primary
+      - executor: api
+        profileId: web-chat
+      - executor: external-mcp
+  "writing.*":
+    conversationPolicy: task-chain
+    candidates:
+      - executor: api
+        profileId: responses-primary
+      - executor: api
+        profileId: web-chat
+      - executor: external-mcp
+  "review.*":
+    conversationPolicy: stateless
+    candidates:
+      - executor: api
+        profileId: web-chat
+      - executor: external-mcp
+  "review.foundation":
+    conversationPolicy: stateless
+    candidates:
+      - executor: api
+        profileId: web-chat
+      - executor: external-mcp
+  "facts.extract":
+    conversationPolicy: stateless
+    candidates:
+      - executor: api
+        profileId: responses-primary
+      - executor: external-mcp
+  "learning.assess":
+    conversationPolicy: stateless
+    candidates:
+      - executor: api
+        profileId: web-chat
+      - executor: external-mcp
+  "skill.iterate":
+    conversationPolicy: stateless
+    candidates:
+      - executor: api
+        profileId: responses-primary
+      - executor: api
+        profileId: web-chat
+      - executor: external-mcp
+  "memory.embed":
+    conversationPolicy: stateless
+    candidates:
+      - executor: api
+        profileId: siliconflow-embedding
+  "memory.rerank":
+    conversationPolicy: stateless
+    candidates:
+      - executor: api
+        profileId: siliconflow-rerank
+  "*":
+    conversationPolicy: stateless
+    candidates:
+      - executor: external-mcp

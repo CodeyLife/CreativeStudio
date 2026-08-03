@@ -1,0 +1,1595 @@
+import { createServer } from "node:http";
+import { Client, Connection } from "@temporalio/client";
+import { QdrantClient } from "@qdrant/js-client-rest";
+import { createHash, randomUUID } from "node:crypto";
+import { NovelPostgresRepository, type KnowledgeRecordKind, type MutableKnowledgeRecordKind } from "../src/novel-v2/postgres-repository";
+import type { Artifact, AuthorDecision, NovelIntent } from "../src/novel-v2/protocol";
+import { CommitService } from "../src/novel-v2/commit-service";
+import { createRuntimeModelGateway } from "../src/novel-v2/model-runtime";
+import type { ModelRoutingConfig, ModelTaskRecord } from "../src/novel-v2/model-routing";
+import { captureProjectSnapshot, computeProjectHead } from "../src/novel-v2/evaluation/project-snapshot";
+import { createExperimentWorkspace, getExperimentWorkspace, listExperimentWorkspaces } from "../src/novel-v2/evaluation/experiment-workspace";
+import { extractCandidateBundle } from "../src/novel-v2/evaluation/candidate-bundle";
+import { createPromotionService } from "../src/novel-v2/evaluation/promotion";
+import { runClosedLoop } from "../src/novel-v2/evaluation/closed-loop";
+import {
+  createCreativeRun,
+  enqueueCreativeWork,
+  listCreativeRuns,
+  getRunSnapshot,
+  executeCreativeCommand,
+  attachArtifact,
+  submitReview,
+  hasPassedIndependentReviewForArtifact,
+  listReviews,
+} from "../src/novel-v2/creative";
+import type { CreativeCommand, CreativeRunMode, CreativeRunPolicy } from "../src/novel-v2/protocol";
+import { startNovelBootstrap } from "../src/novel-v2/application/bootstrap";
+import { provisionalTitle } from "../src/novel-v2/application/provisional-title";
+import { ContentObjectStore } from "../src/novel-v2/object-store";
+import { bindRuntimeObjectStore } from "../src/novel-v2/runtime-object-store";
+import { PROJECT_PLAN_STAGES, isProjectPlanTaskKey, requiresFoundationAuthorConfirmation } from "../src/novel-v2/application/project-plan";
+import {
+  bookSynopsisSourceFingerprint,
+  bookTitleSourceFingerprint,
+  missingSynopsisPlanStages,
+  parseBookSynopsisMetadata,
+  parseBookTitleCandidatesMetadata,
+} from "../src/novel-v2/application/book-synopsis";
+import { startBookSynopsisGeneration, startBookTitleCandidateGeneration } from "../src/novel-v2/application/book-synopsis-workflow";
+import { startChapterTitleGeneration } from "../src/novel-v2/application/chapter-title-workflow";
+import { parseStoryArcBundle } from "../src/novel-v2/application/story-arc";
+import { startStoryArcBatchPlanning, startStoryArcPlanning, startStoryArcReview } from "../src/novel-v2/application/story-arc-workflow";
+import { QdrantMemoryProvider } from "../src/novel-v2/qdrant-memory";
+import { chapterMemoryAsClaim } from "../src/novel-v2/chapter-memory";
+import { countNovelCharacters } from "../src/novel-v2/word-count";
+import { ChapterStateRebuildConflictError, ChapterStateRebuildService } from "../src/novel-v2/application/chapter-state-rebuild";
+import { inspectManuscript } from "../src/novel-v2/application/manuscript-structure";
+import { parseCreativeBrief } from "../src/novel-v2/application/creative-brief";
+import { createConfiguredSkillProvider } from "../src/novel-v2/skill-runtime";
+
+// 通过 Extract 从 CreativeCommand 联合类型中派生 review.submit 的 review 字段类型，
+// 避免新增 CreativeReviewInput / ReviewIssue 的直接导入。
+type ReviewSubmitCommand = Extract<CreativeCommand, { type: "review.submit" }>;
+type ReviewSubmitInput = ReviewSubmitCommand["review"];
+type ReviewIssueShape = ReviewSubmitInput["issues"][number];
+
+const repository = new NovelPostgresRepository();
+await repository.migrate();
+const skillProvider = createConfiguredSkillProvider({ source: process.env.NOVEL_SKILL_SOURCE, databaseList: (projectId) => repository.listSkills(projectId) });
+const objectStore = new ContentObjectStore();
+await bindRuntimeObjectStore(repository, objectStore, "api");
+const { configStore: modelConfigStore, gateway: model } = await createRuntimeModelGateway(repository, objectStore);
+const qdrant = new QdrantClient({ url: process.env.QDRANT_URL ?? "http://127.0.0.1:6333" });
+const qdrantMemory = new QdrantMemoryProvider(qdrant, model, process.env.QDRANT_COLLECTION ?? "novel-memory-current", Number(process.env.NOVEL_EMBEDDING_DIM ?? 1024));
+const wordCountBackfill = await repository.backfillMissingContentWordCounts(objectStore);
+if (wordCountBackfill.updated || wordCountBackfill.failed) console.log("[word-count] content blob backfill", wordCountBackfill);
+// API 入口的 commitService 也启用 chapter memory 创建（与 worker 保持一致）
+// 设计依据：AGENTS.md「commit-stage 对新 DocumentRevision 创建 chapter memory」契约
+const commitService = new CommitService(repository, objectStore, { model, memoryIndex: qdrantMemory });
+const chapterStateRebuildService = new ChapterStateRebuildService({ repository, objects: objectStore, model, memoryIndex: qdrantMemory, skillProvider });
+const promotionService = createPromotionService(repository, objectStore);
+const connection = await Connection.connect({ address: process.env.TEMPORAL_ADDRESS ?? "127.0.0.1:7233" });
+const temporal = new Client({ connection, namespace: process.env.TEMPORAL_NAMESPACE ?? "default" });
+const port = Number(process.env.NOVEL_V2_API_PORT ?? 4770);
+const taskQueue = process.env.TEMPORAL_TASK_QUEUE ?? "novel-v2";
+const ACTIVE_CHAPTER_INTENT_STATUSES = new Set(["accepted", "pending", "running", "waiting-external", "manual-review-required"]);
+
+function chapterTargetId(target: unknown): string | undefined {
+  const record = asRecord(target);
+  return record?.kind === "chapter" ? asString(record.id) : undefined;
+}
+
+function modelTaskDiagnosticPrompt(task: ModelTaskRecord): string {
+  if (!task.workPackage.schema) return task.workPackage.instruction;
+  return [
+    task.workPackage.instruction,
+    "## 结构化输出契约",
+    "只输出一个严格符合下列 JSON Schema 的 JSON 值，不使用 Markdown，不在 JSON 前后添加说明。",
+    JSON.stringify(task.workPackage.schema),
+  ].join("\n\n");
+}
+
+function runChapterTargetId(run: { payload: Record<string, unknown> }): string | undefined {
+  const direct = asString(run.payload.documentId);
+  if (direct) return direct;
+  const intent = asRecord(run.payload.intent);
+  return chapterTargetId(intent?.target);
+}
+
+async function runRetentionCleanup() {
+  const result = await repository.cleanupExpiredChapterData();
+  for (const orphan of result.orphanedObjects) await objectStore.delete(orphan.objectKey);
+  const prompts = await repository.cleanupExpiredPromptExecutions();
+  for (const objectKey of prompts.orphanedObjectKeys) await objectStore.delete(objectKey);
+  if (result.runsCompacted || result.orphanedObjects.length || prompts.deleted) console.log("[retention] workflow cleanup", { ...result, prompts });
+  return { ...result, prompts };
+}
+
+async function readJson(request: import("node:http").IncomingMessage) {
+  const chunks: Buffer[] = [];
+  for await (const chunk of request) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}") as Record<string, unknown>;
+}
+
+function send(response: import("node:http").ServerResponse, status: number, value: unknown) {
+  response.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", "access-control-allow-origin": "*", "access-control-allow-methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS", "access-control-allow-headers": "content-type,authorization" });
+  response.end(status === 204 ? undefined : JSON.stringify(value));
+}
+
+function asString(value: unknown) { return typeof value === "string" && value.trim() ? value.trim() : undefined; }
+function asNumber(value: unknown) { return typeof value === "number" && Number.isFinite(value) ? value : undefined; }
+function asRecord(value: unknown) { return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : undefined; }
+function asBoolean(value: unknown): boolean | undefined {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (["1", "true", "yes", "force"].includes(normalized)) return true;
+    if (["0", "false", "no"].includes(normalized)) return false;
+  }
+  return undefined;
+}
+
+// ===== 创意执行路由（Phase B-2）辅助：从 unknown 构造强类型 CreativeCommand =====
+
+function buildCreativePolicy(value: unknown): Partial<CreativeRunPolicy> | undefined {
+  const record = asRecord(value);
+  if (!record) return undefined;
+  const policy: Partial<CreativeRunPolicy> = {};
+  if (typeof record.maxRetries === "number" && Number.isFinite(record.maxRetries)) policy.maxRetries = record.maxRetries;
+  if (record.reviewGate === "manual" || record.reviewGate === "auto" || record.reviewGate === "none") policy.reviewGate = record.reviewGate;
+  if (typeof record.autoAcceptThreshold === "number" && Number.isFinite(record.autoAcceptThreshold)) policy.autoAcceptThreshold = record.autoAcceptThreshold;
+  if (record.progression === "automatic" || record.progression === "user-driven") policy.progression = record.progression;
+  return policy;
+}
+
+async function createEditedPlanArtifact(input: {
+  projectId: string;
+  taskKey: import("../src/novel-v2/application/project-plan").ProjectPlanTaskKey;
+  workItemId: string;
+  runId: string;
+  payload: Record<string, unknown>;
+}): Promise<Artifact> {
+  const text = JSON.stringify(input.payload, null, 2);
+  const object = await objectStore.putText(text);
+  const taskId = `${input.workItemId}:foundation:user-edit`;
+  const artifact: Artifact = {
+    id: randomUUID(),
+    projectId: input.projectId,
+    taskId,
+    attemptId: randomUUID(),
+    kind: "foundation",
+    contentHash: object.hash,
+    objectKey: object.key,
+    baseRevision: 0,
+    fingerprint: createHash("sha256").update(`${object.hash}:${taskId}`).digest("hex"),
+    structuredData: {
+      ...input.payload,
+      taskKey: input.taskKey,
+      workItemId: input.workItemId,
+      runId: input.runId,
+      origin: "web-author-edit",
+    },
+    createdAt: Date.now(),
+  };
+  await repository.recordArtifact(artifact);
+  await attachArtifact(repository, input.workItemId, artifact.id);
+  return artifact;
+}
+
+async function createEditedStoryArcArtifact(input: { projectId: string; arcId: string; payload: Record<string, unknown> }): Promise<Artifact> {
+  const bundle = parseStoryArcBundle(input.payload);
+  const text = JSON.stringify(bundle, null, 2);
+  const object = await objectStore.putText(text);
+  const taskId = `${input.arcId}:story-arc:web-edit`;
+  const artifact: Artifact = {
+    id: randomUUID(), projectId: input.projectId, taskId, attemptId: randomUUID(), kind: "chapter-blueprint",
+    contentHash: object.hash, objectKey: object.key, baseRevision: 0,
+    fingerprint: createHash("sha256").update(`${object.hash}:${taskId}`).digest("hex"),
+    structuredData: { ...bundle, arcId: input.arcId, origin: "web-author-edit" }, createdAt: Date.now(),
+  };
+  await repository.recordArtifact(artifact);
+  return artifact;
+}
+
+function buildCreativeReviewInput(value: unknown): ReviewSubmitInput | undefined {
+  const record = asRecord(value);
+  if (!record) return undefined;
+  const subjectArtifactId = asString(record.subjectArtifactId);
+  if (!subjectArtifactId) return undefined;
+  const reviewer = record.reviewer;
+  if (reviewer !== "internal" && reviewer !== "independent" && reviewer !== "human") return undefined;
+  const verdict = record.verdict;
+  if (verdict !== "passed" && verdict !== "revise" && verdict !== "blocked") return undefined;
+  const summary = asString(record.summary);
+  if (!summary) return undefined;
+  if (!Array.isArray(record.issues)) return undefined;
+  const issues: ReviewIssueShape[] = [];
+  for (const item of record.issues) {
+    const issueRecord = asRecord(item);
+    if (!issueRecord) return undefined;
+    const severity = issueRecord.severity;
+    if (severity !== "blocker" && severity !== "major" && severity !== "warning") return undefined;
+    const title = asString(issueRecord.title);
+    if (!title) return undefined;
+    const evidence = asString(issueRecord.evidence);
+    if (!evidence) return undefined;
+    const issue: ReviewIssueShape = { severity, title, evidence };
+    if (typeof issueRecord.description === "string") issue.description = issueRecord.description;
+    if (typeof issueRecord.excerpt === "string") issue.excerpt = issueRecord.excerpt;
+    if (typeof issueRecord.paragraph === "number") issue.paragraph = issueRecord.paragraph;
+    if (typeof issueRecord.rule === "string") issue.rule = issueRecord.rule;
+    if (typeof issueRecord.sourceId === "string") issue.sourceId = issueRecord.sourceId;
+    if (typeof issueRecord.suggestion === "string") issue.suggestion = issueRecord.suggestion;
+    // TODO P3: revisionRanges 内部结构（{start:number,end:number}）的逐项校验，目前 storage 层负责
+    issues.push(issue);
+  }
+  return { subjectArtifactId, reviewer, verdict, summary, issues };
+}
+
+function buildCreativeCommand(input: Record<string, unknown>): CreativeCommand | undefined {
+  const type = asString(input.type);
+  const idempotencyKey = asString(input.idempotencyKey);
+  if (!type || !idempotencyKey) return undefined;
+  if (type === "run.pause" || type === "run.resume" || type === "run.cancel") {
+    return { type, idempotencyKey };
+  }
+  const workItemId = asString(input.workItemId);
+  if (!workItemId) return undefined;
+  switch (type) {
+    case "work.start":
+      return { type: "work.start", workItemId, idempotencyKey };
+    case "work.revise": {
+      const instruction = asString(input.instruction);
+      return instruction
+        ? { type: "work.revise", workItemId, instruction, idempotencyKey }
+        : { type: "work.revise", workItemId, idempotencyKey };
+    }
+    case "work.retry":
+      return { type: "work.retry", workItemId, idempotencyKey };
+    case "work.recover":
+      return input.force === true
+        ? { type: "work.recover", workItemId, force: true, idempotencyKey }
+        : { type: "work.recover", workItemId, idempotencyKey };
+    case "work.accept":
+      return { type: "work.accept", workItemId, idempotencyKey };
+    case "review.request":
+      return { type: "review.request", workItemId, idempotencyKey };
+    case "review.submit": {
+      const review = buildCreativeReviewInput(input.review);
+      if (!review) return undefined;
+      return { type: "review.submit", workItemId, review, idempotencyKey };
+    }
+    default:
+      return undefined;
+  }
+}
+
+const server = createServer(async (request, response) => {
+  try {
+    if (request.method === "OPTIONS") return send(response, 204, {});
+    if (request.method === "GET" && request.url === "/live") return send(response, 200, { service: "ymcp-novel-v2", status: "alive" });
+    if (request.method === "GET" && (request.url === "/health" || request.url === "/ready")) {
+      const dependencies: Record<string, { ok: boolean; detail?: string }> = {};
+      try { await repository.health(); dependencies.postgres = { ok: true }; } catch (error) { dependencies.postgres = { ok: false, detail: (error as Error).message }; }
+      try { await objectStore.ensureReady(); dependencies.objectStore = { ok: true }; } catch (error) { dependencies.objectStore = { ok: false, detail: (error as Error).message }; }
+      try {
+        const qdrantResponse = await fetch(`${process.env.QDRANT_URL ?? "http://127.0.0.1:6333"}/collections`);
+        dependencies.qdrant = { ok: qdrantResponse.ok, ...(!qdrantResponse.ok ? { detail: `HTTP ${qdrantResponse.status}` } : {}) };
+      } catch (error) { dependencies.qdrant = { ok: false, detail: (error as Error).message }; }
+      const embeddingIndex = await repository.getRuntimeConfiguration<{ status?: string; model?: string; points?: number }>("embedding-index").catch(() => undefined);
+      dependencies.embedding = { ok: embeddingIndex?.status === "ready", detail: embeddingIndex?.status === "ready" ? `${embeddingIndex.model ?? "unknown"}:${embeddingIndex.points ?? 0}` : "索引尚未就绪" };
+      const workerState = await repository.latestRuntimeService("novel-worker").catch(() => undefined);
+      const heartbeatAge = workerState ? Date.now() - Date.parse(workerState.heartbeatAt) : Number.POSITIVE_INFINITY;
+      dependencies.worker = { ok: Boolean(workerState && heartbeatAge < 30_000 && workerState.status === "healthy"), detail: workerState ? `${workerState.status}; heartbeat ${heartbeatAge}ms ago` : "无 worker heartbeat" };
+      try {
+        await connection.workflowService.getSystemInfo({});
+        dependencies.temporal = { ok: true };
+      } catch (error) { dependencies.temporal = { ok: false, detail: (error as Error).message }; }
+      const requiredReady = dependencies.postgres.ok && dependencies.objectStore.ok && dependencies.qdrant.ok && dependencies.temporal.ok;
+      const fullyHealthy = requiredReady && dependencies.embedding.ok && dependencies.worker.ok;
+      const status = fullyHealthy ? "healthy" : requiredReady ? "degraded" : "unready";
+      return send(response, request.url === "/ready" && !fullyHealthy ? 503 : 200, { service: "ymcp-novel-v2", status, dependencies });
+    }
+    if (request.method === "GET" && request.url === "/v2/model-config") return send(response, 200, { config: modelConfigStore.getMaskedConfig() });
+    if (request.method === "PUT" && request.url === "/v2/model-config") {
+      const input = await readJson(request);
+      const candidate = asRecord(input.config) as unknown as ModelRoutingConfig | undefined;
+      if (!candidate) return send(response, 400, { error: "config 必填" });
+      const previous = modelConfigStore.getConfig();
+      const clearSecretIds = new Set(Array.isArray(input.clearSecretProfileIds) ? input.clearSecretProfileIds.filter((value): value is string => typeof value === "string") : []);
+      candidate.profiles = candidate.profiles.map((profile) => {
+        if (clearSecretIds.has(profile.id)) return { ...profile, secret: undefined };
+        if (profile.secret) return profile;
+        const existing = previous.profiles.find((item) => item.id === profile.id);
+        return existing?.secret ? { ...profile, secret: existing.secret } : profile;
+      });
+      try {
+        await modelConfigStore.save(candidate);
+        await repository.projectModelRoutingConfig(candidate, modelConfigStore.getSnapshot());
+      } catch (error) {
+        await modelConfigStore.save(previous).catch(() => undefined);
+        throw error;
+      }
+      return send(response, 200, { config: modelConfigStore.getMaskedConfig() });
+    }
+    const profileProbeMatch = request.url?.match(/^\/v2\/model-config\/profiles\/([^/?]+)\/probe$/);
+    if (request.method === "POST" && profileProbeMatch) {
+      const profileId = decodeURIComponent(profileProbeMatch[1]);
+      const input = await readJson(request);
+      const capability = asString(input.capability);
+      const current = modelConfigStore.getConfig();
+      const profile = current.profiles.find((item) => item.id === profileId);
+      if (!profile) return send(response, 404, { error: "provider profile 不存在" });
+      if (!capability || !["text", "structured", "stream", "responses-continuation", "embedding", "rerank"].includes(capability)) return send(response, 400, { error: "capability 必填且必须是已知模型能力" });
+      if (!profile.capabilities.includes(capability as never)) return send(response, 400, { error: `profile 未声明 ${capability} 能力` });
+      const snapshot = modelConfigStore.getSnapshot();
+      const purpose = capability === "embedding" ? "memory.embed" : capability === "rerank" ? "memory.rerank" : capability === "structured" ? "review.arc" : "writing.draft";
+      const configuredCandidate = snapshot.routes[purpose]?.candidates.find((candidate) => candidate.executor === "api" && candidate.profileId === profileId);
+      const configuredModel = configuredCandidate?.executor === "api" ? configuredCandidate.model : undefined;
+      snapshot.routes = {
+        "*": {
+          candidates: [{ executor: "api", profileId, ...(configuredModel ? { model: configuredModel } : {}) }],
+        },
+      };
+      const started = Date.now();
+      let contract: Record<string, unknown> = {};
+      if (capability === "embedding") {
+        const result = await model.embed({ purpose: "memory.embed", texts: ["中文语义检索健康检查"], routingSnapshot: snapshot });
+        const dimension = result.vectors[0]?.length ?? 0;
+        if (!dimension) throw new Error("embedding 响应没有有效向量");
+        contract = { endpoint: "embeddings", dimension };
+      } else if (capability === "rerank") {
+        const result = await model.rerank({ purpose: "memory.rerank", query: "人物关系", documents: ["人物之间的关系发生变化", "天气晴朗"], routingSnapshot: snapshot });
+        if (result.scores.length !== 2 || result.scores.some((score) => !Number.isFinite(score))) throw new Error("rerank 响应分数契约无效");
+        contract = { endpoint: "rerank", scoreCount: result.scores.length };
+      } else if (capability === "structured") {
+        const result = await model.generateStructured<{ ok: boolean }>({ purpose: "review.arc", prompt: "只返回 ok=true", schema: { type: "object", additionalProperties: false, required: ["ok"], properties: { ok: { const: true } } }, maxTokens: 32, routingSnapshot: snapshot });
+        contract = { endpoint: profile.protocol === "responses" ? "responses" : "chat/completions", schemaValidated: result.value.ok };
+      } else {
+        await model.generateText({ purpose: "writing.draft", prompt: "Reply with exactly: OK", maxTokens: 8, routingSnapshot: snapshot });
+        contract = { endpoint: profile.protocol === "responses" ? "responses" : "chat/completions", responseMode: profile.responseMode ?? "json" };
+      }
+      return send(response, 200, { ok: true, latencyMs: Date.now() - started, profileId, capability, contract });
+    }
+    if (request.method === "POST" && request.url === "/v2/model-config/models") {
+      // 通过标准 OpenAI 兼容 GET {baseUrl}/models 拉取模型列表
+      // 支持两种入参：
+      //   1) profileId：复用已保存 profile 的 baseUrl + secret
+      //   2) baseUrl + secret：用于新增 profile 时表单内即时拉取
+      const input = await readJson(request);
+      let baseUrl = asString(input.baseUrl);
+      let secretValue = "";
+      const profileId = asString(input.profileId);
+      if (profileId) {
+        const profile = modelConfigStore.getProfile(profileId);
+        if (!profile) return send(response, 404, { error: "provider profile 不存在" });
+        baseUrl = profile.baseUrl;
+        secretValue = profile.secret?.source === "inline" ? profile.secret.value : profile.secret?.source === "env" ? (process.env[profile.secret.name] ?? "") : "";
+      } else {
+        const secret = asRecord(input.secret);
+        if (secret) {
+          if (secret.source === "inline" && typeof secret.value === "string") secretValue = secret.value;
+          else if (secret.source === "env" && typeof secret.name === "string") secretValue = process.env[secret.name] ?? "";
+        }
+      }
+      if (!baseUrl) return send(response, 400, { error: "baseUrl 必填" });
+      const url = `${baseUrl.replace(/\/+$/, "")}/models`;
+      const headers: Record<string, string> = { "content-type": "application/json" };
+      if (secretValue) headers.authorization = `Bearer ${secretValue}`;
+      let resp: Response;
+      try {
+        resp = await fetch(url, { method: "GET", headers, signal: AbortSignal.timeout(15_000) });
+      } catch (error) {
+        return send(response, 502, { error: `拉取模型列表失败：${error instanceof Error ? error.message : String(error)}` });
+      }
+      if (!resp.ok) {
+        const text = await resp.text().catch(() => "");
+        return send(response, resp.status, { error: `模型服务 HTTP ${resp.status}${text ? `: ${text.slice(0, 500)}` : ""}` });
+      }
+      const data = await resp.json() as Record<string, unknown>;
+      const rawModels = Array.isArray(data.data) ? data.data : Array.isArray(data.models) ? data.models : [];
+      const models: { id: string; ownedBy?: string }[] = [];
+      for (const item of rawModels) {
+        const record = asRecord(item);
+        if (!record) continue;
+        const id = typeof record.id === "string" ? record.id : undefined;
+        if (!id) continue;
+        const ownedBy = typeof record.owned_by === "string" ? record.owned_by : typeof record.ownedBy === "string" ? record.ownedBy : undefined;
+        models.push({ id, ownedBy });
+      }
+      return send(response, 200, { models });
+    }
+    const taskListMatch = request.url?.match(/^\/v2\/model-tasks(?:\?status=([^&]+))?$/);
+    if (request.method === "GET" && taskListMatch) {
+      const status = decodeURIComponent(taskListMatch[1] ?? "pending") as ModelTaskRecord["status"];
+      return send(response, 200, { tasks: await repository.listModelTasks(status) });
+    }
+    const taskItemMatch = request.url?.match(/^\/v2\/model-tasks\/([^/?]+)$/);
+    if (request.method === "GET" && taskItemMatch) {
+      const task = await repository.getModelTask(decodeURIComponent(taskItemMatch[1]));
+      return task ? send(response, 200, { task }) : send(response, 404, { error: "外部模型任务不存在" });
+    }
+    const taskActionMatch = request.url?.match(/^\/v2\/model-tasks\/([^/?]+)\/(claim|heartbeat|submit|fail)$/);
+    if (request.method === "POST" && taskActionMatch) {
+      const taskId = decodeURIComponent(taskActionMatch[1]);
+      const action = taskActionMatch[2];
+      const input = await readJson(request);
+      const attemptId = asString(input.attemptId);
+      const leaseOwner = asString(input.leaseOwner);
+      if (!attemptId || !leaseOwner) return send(response, 400, { error: "attemptId、leaseOwner 必填" });
+      if (action === "claim") return send(response, 200, { task: await repository.claimModelTask({ taskId, attemptId, leaseOwner, leaseMs: Math.max(30_000, Math.min(asNumber(input.leaseMs) ?? 600_000, 3_600_000)) }) });
+      if (action === "heartbeat") {
+        await repository.heartbeatModelTask({ taskId, attemptId, leaseOwner, leaseMs: Math.max(30_000, Math.min(asNumber(input.leaseMs) ?? 600_000, 3_600_000)) });
+        return send(response, 200, { ok: true });
+      }
+      if (action === "submit") {
+        const inputFingerprint = asString(input.inputFingerprint);
+        const result = asRecord(input.result) as ModelTaskRecord["result"] | undefined;
+        if (!inputFingerprint || !result) return send(response, 400, { error: "inputFingerprint、result 必填" });
+        const previousTask = await repository.getModelTask(taskId);
+        const task = await repository.submitModelTask({ taskId, attemptId, leaseOwner, inputFingerprint, result });
+        if (previousTask?.status !== "submitted") {
+          try {
+            const responseText = typeof task.result?.text === "string" ? task.result.text : JSON.stringify(task.result?.value);
+            const effectivePrompt = modelTaskDiagnosticPrompt(task);
+            await repository.recordPromptExecution({
+              workflowRunId: task.workflowRunId,
+              taskId: task.taskId,
+              purpose: task.purpose,
+              candidateIndex: task.candidateIndex,
+              status: "completed",
+              system: task.workPackage.system,
+              prompt: effectivePrompt,
+              response: responseText,
+              promptFingerprint: createHash("sha256").update(`${task.workPackage.system ?? ""}\n${effectivePrompt}`).digest("hex"),
+              contextManifest: task.workPackage.promptContext,
+            }, objectStore);
+          } catch (diagnosticError) {
+            console.warn(`[prompt-diagnostics] 外部任务 ${task.id} 留痕失败，不阻塞工作流：${diagnosticError instanceof Error ? diagnosticError.message : String(diagnosticError)}`);
+          }
+        }
+        await temporal.workflow.getHandle(task.workflowRunId).signal("artifact", { taskId, modelTaskId: task.id, attemptId, inputFingerprint, result: task.result });
+        return send(response, 200, { task });
+      }
+      const reason = asString(input.reason);
+      if (!reason) return send(response, 400, { error: "reason 必填" });
+      const task = await repository.failModelTask({ taskId, attemptId, leaseOwner, reason });
+      await temporal.workflow.getHandle(task.workflowRunId).signal("fail", { taskId, modelTaskId: task.id, attemptId, reason });
+      return send(response, 200, { task });
+    }
+    if (request.method === "POST" && request.url === "/v2/intents") {
+      const input = await readJson(request);
+      if (typeof input.projectId !== "string" || typeof input.objective !== "string" || typeof input.idempotencyKey !== "string") return send(response, 400, { error: "projectId、objective、idempotencyKey 必填" });
+      if (input.factApprovalMode !== undefined && input.factApprovalMode !== "auto" && input.factApprovalMode !== "manual") return send(response, 400, { error: "factApprovalMode 必须为 auto 或 manual" });
+      const requestedStage = input.requestedStage as NovelIntent["requestedStage"];
+      const target = input.target as NovelIntent["target"];
+      const targetDocumentId = chapterTargetId(target);
+      if (targetDocumentId && (requestedStage === "drafting" || requestedStage === "revision")) {
+        const active = (await repository.listProjectRuns(input.projectId, 50)).find((run) => run.workflowType === "novel-intent"
+          && ACTIVE_CHAPTER_INTENT_STATUSES.has(run.status)
+          && runChapterTargetId(run) === targetDocumentId
+          && ((asRecord(run.payload.intent)?.requestedStage as NovelIntent["requestedStage"] | undefined) ?? requestedStage) === requestedStage);
+        if (active) return send(response, 200, { intent: asRecord(active.payload.intent), workflowId: active.temporalWorkflowId, status: active.status, reused: true });
+      }
+      const intent: NovelIntent = { id: crypto.randomUUID(), projectId: input.projectId, source: input.source === "mcp" ? "mcp" : input.source === "cli" ? "cli" : input.source === "web" ? "web" : "api", objective: input.objective.trim(), target, requestedStage, constraints: Array.isArray(input.constraints) ? input.constraints.filter((value): value is string => typeof value === "string") : undefined, requestedCapabilities: Array.isArray(input.requestedCapabilities) ? input.requestedCapabilities.filter((value): value is string => typeof value === "string") : undefined, factApprovalMode: input.factApprovalMode as NovelIntent["factApprovalMode"], createdAt: Date.now(), idempotencyKey: input.idempotencyKey };
+      await repository.ensureProject(intent.projectId, typeof input.projectTitle === "string" ? input.projectTitle : intent.projectId);
+      const stored = await repository.putIntent(intent);
+      const workflowId = `novel-intent-${stored.id}`;
+      // workflow_runs.id 必须等于 workflowId：novelIntentWorkflow 全程用 workflowId 作 workflowRunId
+      // （updateTaskAttempt / model gateway / externalTask），task_attempts.workflow_run_id 有 FK→workflow_runs.id。
+      // 若 id=stored.id（intent.id）而 workflow 用 workflowId，FK 会失败。
+      // 对齐方式：id=workflowId，与 creativeRunWorkflow（id=runId=workflow 实参）保持同一约定。
+      await repository.putWorkflowRun({ id: workflowId, workflowType: "novel-intent", projectId: stored.projectId, temporalWorkflowId: workflowId, status: "accepted", payload: { intent: stored, intentId: stored.id } });
+      const handle = await temporal.workflow.start("novelIntentWorkflow", { args: [stored, workflowId], taskQueue: process.env.TEMPORAL_TASK_QUEUE ?? "novel-v2", workflowId });
+      return send(response, 202, { intent: stored, workflowId, runId: handle.firstExecutionRunId });
+    }
+    if (request.method === "GET" && request.url === "/v2/projects") return send(response, 200, { projects: await repository.listProjects() });
+    if (request.method === "POST" && request.url === "/v2/projects") {
+      // 一句话创意创建小说项目入口(对齐 v1 bootstrapNovelFromCoreIdea 与 MCP novel_project_create)
+      // premise 必填 → 自动派生 title → 默认 autoBootstrap=true 一站式启动全书规划
+      // 设计依据:用户需求"创建小说入口改为 v1 版本的一句话创意,MCP 与 HTTP 同一入口"
+      const input = await readJson(request);
+      const premise = asString(input.premise);
+      const idempotencyKey = asString(input.idempotencyKey);
+      if (!premise || !idempotencyKey) {
+        return send(response, 400, { error: "premise 与 idempotencyKey 必填且非空" });
+      }
+
+      const title = asString(input.title) || provisionalTitle(premise);
+      const genre = asString(input.genre) || undefined;
+      const autoBootstrap = typeof input.autoBootstrap === "boolean" ? input.autoBootstrap : true;
+      const includeChapterPlan = typeof input.includeChapterPlan === "boolean" ? input.includeChapterPlan : true;
+      const objective = asString(input.objective) || premise;
+      const reviewGate = input.reviewGate === "auto" || input.reviewGate === "manual" || input.reviewGate === "none" ? input.reviewGate : undefined;
+      const progression = input.progression === "automatic" || input.progression === "user-driven" ? input.progression : undefined;
+      let creativeBrief;
+      try {
+        creativeBrief = parseCreativeBrief(input.creativeBrief);
+      } catch (error) {
+        return send(response, 400, { error: error instanceof Error ? error.message : "creativeBrief 格式非法" });
+      }
+
+      // 使用 idempotencyKey 作为 projectId(与 MCP novel_project_create 行为一致)
+      const projectId = idempotencyKey;
+
+      // premise/genre 写入 metadata,与 MCP handler 保持同构
+      const metadata: Record<string, unknown> = { premise };
+      if (genre) metadata.genre = genre;
+      if (creativeBrief) metadata.creativeBrief = creativeBrief;
+      await repository.ensureProject(projectId, title, metadata);
+
+      const project = await repository.getProjectDetail(projectId);
+
+      // 自动启动全书规划:premise 作为 objective,让每个 foundation task 都知道创意核心
+      // includeChapterPlan 仅保留旧客户端兼容；bootstrap 会固定关闭静态章节表。
+      if (autoBootstrap) {
+        const bootstrapRun = await startNovelBootstrap(repository, temporal, {
+          projectId,
+          objective,
+          idempotencyKey,
+          includeChapterPlan,
+          reviewGate,
+          progression,
+          taskQueue,
+        });
+        return send(response, 201, { project, bootstrapRun });
+      }
+
+      return send(response, 201, { project });
+    }
+    const projectMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)$/);
+    if (projectMatch) {
+      const projectId = decodeURIComponent(projectMatch[1]);
+      if (request.method === "GET") return send(response, 200, { project: await repository.getProjectDetail(projectId) });
+      if (request.method === "PATCH") {
+        const input = await readJson(request);
+        const title = input.title === undefined ? undefined : asString(input.title);
+        if (input.title !== undefined && !title) return send(response, 400, { error: "title 不能为空" });
+        return send(response, 200, { project: await repository.updateProject({ projectId, title, metadata: asRecord(input.metadata) }) });
+      }
+      if (request.method === "DELETE") return send(response, 200, await repository.deleteProject(projectId));
+    }
+    const projectRunsMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/runs$/);
+    if (request.method === "GET" && projectRunsMatch) return send(response, 200, { runs: await repository.listProjectRuns(decodeURIComponent(projectRunsMatch[1])) });
+    const documentMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/documents$/);
+    if (request.method === "POST" && documentMatch) {
+      const input = await readJson(request);
+      const projectId = decodeURIComponent(documentMatch[1]);
+      const title = asString(input.title);
+      if (!title) return send(response, 400, { error: "title 必填" });
+      const document = await repository.ensureDocument({ projectId, documentId: asString(input.documentId), title, narrativeOrder: asNumber(input.narrativeOrder), povCharacterId: asString(input.povCharacterId), status: asString(input.status), chapterGoal: asString(input.chapterGoal) });
+      return send(response, 201, { document });
+    }
+    const documentItemMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/documents\/([^/?]+)$/);
+    if (documentItemMatch) {
+      const projectId = decodeURIComponent(documentItemMatch[1]);
+      const documentId = decodeURIComponent(documentItemMatch[2]);
+      if (request.method === "PATCH") {
+        const input = await readJson(request);
+        const title = input.title === undefined ? undefined : asString(input.title);
+        if (input.title !== undefined && !title) return send(response, 400, { error: "title 不能为空" });
+        const clearPov = input.povCharacterId === null;
+        const povCharacterId = clearPov ? null : asString(input.povCharacterId);
+        const document = await repository.updateDocument({ projectId, documentId, title, narrativeOrder: asNumber(input.narrativeOrder), povCharacterId: input.povCharacterId === undefined ? undefined : povCharacterId, status: asString(input.status), chapterGoal: input.chapterGoal === undefined ? undefined : asString(input.chapterGoal) ?? "" });
+        return send(response, 200, { document });
+      }
+      if (request.method === "DELETE") return send(response, 200, await repository.deleteDocument(projectId, documentId));
+    }
+    const chapterTitleGenerationMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/documents\/([^/?]+)\/title\/generate$/);
+    if (request.method === "POST" && chapterTitleGenerationMatch) {
+      const projectId = decodeURIComponent(chapterTitleGenerationMatch[1]);
+      const documentId = decodeURIComponent(chapterTitleGenerationMatch[2]);
+      const result = await startChapterTitleGeneration(repository, temporal, { projectId, documentId, taskQueue });
+      return send(response, result.reused ? 200 : 202, result);
+    }
+    const documentContentMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/documents\/([^/?]+)\/content$/);
+    if (request.method === "GET" && documentContentMatch) {
+      const projectId = decodeURIComponent(documentContentMatch[1]);
+      const documentId = decodeURIComponent(documentContentMatch[2]);
+      const content = await repository.getFinalDocumentContentRef(projectId, documentId);
+      if (!content?.objectKey) return send(response, 404, { error: "章节尚无定稿正文" });
+      try {
+        const plainText = await objectStore.getText(content.objectKey);
+        return send(response, 200, { documentId, title: content.title, status: content.status, revision: content.revision, contentHash: content.contentHash, plainText });
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === "ENOENT" || code === "NoSuchKey") {
+          return send(response, 503, { code: "CONTENT_OBJECT_MISSING", error: "定稿正文对象暂时不可用，请检查 Runtime 对象存储配置" });
+        }
+        throw error;
+      }
+    }
+    if (request.method === "PUT" && documentContentMatch) {
+      const projectId = decodeURIComponent(documentContentMatch[1]);
+      const documentId = decodeURIComponent(documentContentMatch[2]);
+      const input = await readJson(request);
+      const plainText = typeof input.plainText === "string" ? input.plainText : undefined;
+      const expectedContentHash = typeof input.expectedContentHash === "string" ? input.expectedContentHash : undefined;
+      if (plainText === undefined || expectedContentHash === undefined) return send(response, 400, { error: "plainText 与 expectedContentHash 必填" });
+      const stored = await objectStore.putText(plainText);
+      const result = await repository.saveManualRevision({ projectId, documentId, expectedContentHash, text: plainText, contentHash: stored.hash, objectKey: stored.key, label: asString(input.label) });
+      return send(response, 200, { result });
+    }
+    const chapterWorkspaceMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/documents\/([^/?]+)\/workspace$/);
+    if (request.method === "GET" && chapterWorkspaceMatch) {
+      const projectId = decodeURIComponent(chapterWorkspaceMatch[1]);
+      const documentId = decodeURIComponent(chapterWorkspaceMatch[2]);
+      const workspace = await repository.getChapterWorkspace(projectId, documentId);
+      if (!workspace) return send(response, 404, { error: "章节不存在" });
+      let plainText: string | undefined;
+      if (workspace.content?.objectKey) {
+        try { plainText = await objectStore.getText(workspace.content.objectKey); }
+        catch (error) {
+          const code = (error as NodeJS.ErrnoException).code;
+          if (code !== "ENOENT" && code !== "NoSuchKey") throw error;
+        }
+      }
+      return send(response, 200, { workspace: { ...workspace, content: workspace.content ? { ...workspace.content, objectKey: undefined, plainText } : undefined } });
+    }
+    const reviewIssueMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/documents\/([^/?]+)\/review-issues\/([^/?]+)$/);
+    if (request.method === "PATCH" && reviewIssueMatch) {
+      const input = await readJson(request);
+      const status = asString(input.status);
+      if (status !== "pending" && status !== "ignored" && status !== "resolved") return send(response, 400, { error: "status 必须为 pending、ignored 或 resolved" });
+      return send(response, 200, { issue: await repository.updateChapterReviewIssueStatus({ projectId: decodeURIComponent(reviewIssueMatch[1]), documentId: decodeURIComponent(reviewIssueMatch[2]), issueId: decodeURIComponent(reviewIssueMatch[3]), status }) });
+    }
+    const reviewIssuesMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/documents\/([^/?]+)\/review-issues$/);
+    if (request.method === "POST" && reviewIssuesMatch) {
+      const input = await readJson(request);
+      const severity = asString(input.severity);
+      const title = asString(input.title);
+      const paragraph = input.paragraph === undefined || input.paragraph === null || input.paragraph === "" ? undefined : Number(input.paragraph);
+      if (severity !== "blocker" && severity !== "major" && severity !== "warning") return send(response, 400, { error: "severity 必须为 blocker、major 或 warning" });
+      if (!title) return send(response, 400, { error: "审核意见标题不能为空" });
+      if (paragraph !== undefined && (!Number.isInteger(paragraph) || paragraph < 1)) return send(response, 400, { error: "目标段落必须为正整数" });
+      return send(response, 201, { issue: await repository.addChapterReviewIssue({ projectId: decodeURIComponent(reviewIssuesMatch[1]), documentId: decodeURIComponent(reviewIssuesMatch[2]), severity, title, description: asString(input.description), evidenceQuote: asString(input.evidenceQuote), paragraph, suggestion: asString(input.suggestion) }) });
+    }
+    const chapterVersionMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/documents\/([^/?]+)\/versions\/([^/?]+)(?:\/(restore))?$/);
+    if (chapterVersionMatch) {
+      const projectId = decodeURIComponent(chapterVersionMatch[1]);
+      const documentId = decodeURIComponent(chapterVersionMatch[2]);
+      const revisionId = decodeURIComponent(chapterVersionMatch[3]);
+      if (request.method === "POST" && chapterVersionMatch[4] === "restore") return send(response, 200, { result: await repository.restoreManuscriptVersion({ projectId, documentId, revisionId }) });
+      if (request.method === "PATCH" && !chapterVersionMatch[4]) {
+        const input = await readJson(request);
+        const label = asString(input.label);
+        if (!label) return send(response, 400, { error: "版本名称不能为空" });
+        return send(response, 200, { version: await repository.nameManuscriptVersion({ projectId, documentId, revisionId, label }) });
+      }
+    }
+    const bootstrapMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/bootstrap$/);
+    if (request.method === "POST" && bootstrapMatch) {
+      const projectId = decodeURIComponent(bootstrapMatch[1]);
+      const input = await readJson(request);
+      const idempotencyKey = asString(input.idempotencyKey);
+      if (!idempotencyKey) return send(response, 400, { error: "idempotencyKey 必填" });
+      const objective = asString(input.objective) ?? "完成项目基础设定与全书规划";
+      const result = await startNovelBootstrap(repository, temporal, {
+        projectId,
+        objective,
+        idempotencyKey,
+        includeChapterPlan: typeof input.includeChapterPlan === "boolean" ? input.includeChapterPlan : true,
+        taskQueue,
+      });
+      return send(response, result.reused ? 200 : 202, result);
+    }
+    const projectPlanMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/plan$/);
+    if (request.method === "GET" && projectPlanMatch) {
+      const projectId = decodeURIComponent(projectPlanMatch[1]);
+      const [sections, run, project, projectRuns] = await Promise.all([
+        repository.listProjectPlanSections(projectId),
+        repository.getProjectPlanRun(projectId),
+        repository.getProjectDetail(projectId),
+        repository.listProjectRuns(projectId, 20),
+      ]);
+      const synopsis = parseBookSynopsisMetadata(project.metadata);
+      const titleCandidates = parseBookTitleCandidatesMetadata(project.metadata);
+      const missingSynopsisStages = missingSynopsisPlanStages(sections);
+      const currentSynopsisFingerprint = missingSynopsisStages.length ? undefined : bookSynopsisSourceFingerprint({ projectTitle: project.title, sections });
+      const currentTitleFingerprint = missingSynopsisStages.length ? undefined : bookTitleSourceFingerprint(sections);
+      const synopsisGeneration = projectRuns.find((candidate) => candidate.workflowType === "book-synopsis");
+      const titleGeneration = projectRuns.find((candidate) => candidate.workflowType === "book-title-candidates");
+      return send(response, 200, {
+        stages: PROJECT_PLAN_STAGES,
+        sections,
+        run,
+        projectTitle: project.title,
+        synopsis: synopsis ? { ...synopsis, stale: synopsis.sourceFingerprint !== currentSynopsisFingerprint } : undefined,
+        titleCandidates: titleCandidates ? { ...titleCandidates, stale: titleCandidates.sourceFingerprint !== currentTitleFingerprint } : undefined,
+        synopsisReadiness: { ready: missingSynopsisStages.length === 0, missingStages: missingSynopsisStages },
+        synopsisGeneration,
+        titleGeneration,
+        progress: {
+          approved: sections.filter((section) => section.status === "approved").length,
+          total: sections.length || PROJECT_PLAN_STAGES.length,
+        },
+      });
+    }
+    const projectTitleCandidatesMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/plan\/title-candidates$/);
+    if (request.method === "POST" && projectTitleCandidatesMatch) {
+      const projectId = decodeURIComponent(projectTitleCandidatesMatch[1]);
+      try {
+        const result = await startBookTitleCandidateGeneration(repository, temporal, { projectId, taskQueue });
+        return send(response, result.reused ? 200 : 202, result);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        if (reason.startsWith("全书规划尚未全部确认")) return send(response, 409, { error: reason });
+        throw error;
+      }
+    }
+    const projectTitleSelectionMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/plan\/title$/);
+    if (request.method === "POST" && projectTitleSelectionMatch) {
+      const projectId = decodeURIComponent(projectTitleSelectionMatch[1]);
+      const input = await readJson(request);
+      const title = asString(input.title);
+      const sourceFingerprint = asString(input.sourceFingerprint);
+      if (!title || !sourceFingerprint) return send(response, 400, { error: "title 和 sourceFingerprint 必填" });
+      try {
+        return send(response, 200, { project: await repository.selectBookTitleCandidate({ projectId, title, sourceFingerprint }) });
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        if (reason.includes("候选") || reason.includes("规划已变化")) return send(response, 409, { error: reason });
+        throw error;
+      }
+    }
+    const projectSynopsisMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/plan\/synopsis$/);
+    if (request.method === "POST" && projectSynopsisMatch) {
+      const projectId = decodeURIComponent(projectSynopsisMatch[1]);
+      try {
+        const result = await startBookSynopsisGeneration(repository, temporal, { projectId, taskQueue });
+        return send(response, result.reused ? 200 : 202, result);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        if (reason.startsWith("全书规划尚未全部确认")) return send(response, 409, { error: reason });
+        throw error;
+      }
+    }
+    const projectPlanStartMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/plan\/start$/);
+    if (request.method === "POST" && projectPlanStartMatch) {
+      const projectId = decodeURIComponent(projectPlanStartMatch[1]);
+      const input = await readJson(request);
+      const idempotencyKey = asString(input.idempotencyKey);
+      if (!idempotencyKey) return send(response, 400, { error: "idempotencyKey 必填" });
+      const result = await startNovelBootstrap(repository, temporal, {
+        projectId,
+        objective: asString(input.objective) ?? "建立可执行、可审阅的全书规划",
+        idempotencyKey,
+        includeChapterPlan: true,
+        progression: "user-driven",
+        reviewGate: "manual",
+        taskQueue,
+      });
+      return send(response, result.reused ? 200 : 202, result);
+    }
+    const projectPlanSectionMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/plan\/sections\/([^/?]+)$/);
+    if (request.method === "PATCH" && projectPlanSectionMatch) {
+      const projectId = decodeURIComponent(projectPlanSectionMatch[1]);
+      const taskKeyValue = decodeURIComponent(projectPlanSectionMatch[2]);
+      if (!isProjectPlanTaskKey(taskKeyValue)) return send(response, 404, { error: "未知规划阶段" });
+      const current = await repository.getProjectPlanSection(projectId, taskKeyValue);
+      if (!current?.workItemId || !current.sourceArtifactId) return send(response, 409, { error: "该阶段尚无可编辑产物" });
+      const input = await readJson(request);
+      const payload = asRecord(input.payload) ?? input;
+      if (!asString(payload.title) || !asString(payload.summary) || !Array.isArray(payload.sections) || !asRecord(payload.structuredData)) {
+        return send(response, 400, { error: "规划内容必须包含 title、summary、sections 和 structuredData" });
+      }
+      const run = await repository.getProjectPlanRun(projectId);
+      if (!run) return send(response, 409, { error: "项目没有规划运行" });
+      const artifact = await createEditedPlanArtifact({ projectId, taskKey: taskKeyValue, workItemId: current.workItemId, runId: run.runId, payload });
+      const section = await repository.replaceProjectPlanSection({ projectId, taskKey: taskKeyValue, artifact, actor: "web-author" });
+      await repository.ensureFoundationMemoryClaims(projectId);
+      return send(response, 200, { section, artifactId: artifact.id });
+    }
+    const projectPlanGenerateMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/plan\/sections\/([^/?]+)\/generate$/);
+    if (request.method === "POST" && projectPlanGenerateMatch) {
+      const projectId = decodeURIComponent(projectPlanGenerateMatch[1]);
+      const taskKeyValue = decodeURIComponent(projectPlanGenerateMatch[2]);
+      if (!isProjectPlanTaskKey(taskKeyValue)) return send(response, 404, { error: "未知规划阶段" });
+      const section = await repository.getProjectPlanSection(projectId, taskKeyValue);
+      if (!section?.workItemId) return send(response, 409, { error: "请先启动全书规划" });
+      const input = await readJson(request);
+      const instruction = asString(input.instruction);
+      const run = await repository.getProjectPlanRun(projectId);
+      if (!run) return send(response, 409, { error: "规划运行不存在" });
+      const runIsActive = run.status === "pending" || run.status === "running" || run.status === "paused";
+      if (runIsActive && section.status === "awaiting-confirmation" && section.sourceArtifactId) {
+        if (instruction) {
+          await repository.pool.query("UPDATE creative_work_items SET instruction=$2,updated_at=now() WHERE id=$1", [section.workItemId, `${PROJECT_PLAN_STAGES.find((stage) => stage.taskKey === taskKeyValue)?.instruction ?? taskKeyValue}。作者修订意见：${instruction}`]);
+        }
+        await submitReview(repository, section.workItemId, {
+          subjectArtifactId: section.sourceArtifactId,
+          reviewer: "human",
+          verdict: "revise",
+          issues: [],
+          summary: instruction ?? "作者要求重新生成",
+        });
+        await temporal.workflow.getHandle(run.runId).signal("reviewSubmitted", section.workItemId);
+        await temporal.workflow.getHandle(run.runId).signal("generatePlanWork", section.workItemId);
+        return send(response, 202, { section: { ...section, status: "generating" }, regenerating: true });
+      }
+      if (runIsActive && ["ready", "stale", "failed"].includes(section.status)) {
+        const generating = await repository.markProjectPlanGenerating(projectId, taskKeyValue);
+        await temporal.workflow.getHandle(run.runId).signal("generatePlanWork", section.workItemId);
+        return send(response, 202, { section: generating });
+      }
+
+      const stage = PROJECT_PLAN_STAGES.find((candidate) => candidate.taskKey === taskKeyValue)!;
+      const focusedRun = await createCreativeRun(repository, {
+        projectId,
+        mode: "chapter",
+        policy: { reviewGate: "manual", progression: "user-driven" },
+        payload: {
+          objective: `重新生成全书规划阶段：${stage.label}`,
+          bootstrap: true,
+          focusedPlanTaskKey: taskKeyValue,
+        },
+      });
+      const work = await enqueueCreativeWork(repository, focusedRun.id, {
+        kind: "generation",
+        taskKey: taskKeyValue,
+        instruction: `${stage.instruction}${instruction ? `。作者修订意见：${instruction}` : ""}`,
+        parameters: { bootstrap: true, focusedPlanRegeneration: true },
+      });
+      const generating = await repository.prepareProjectPlanRegeneration({
+        projectId,
+        taskKey: taskKeyValue,
+        workItemId: work.id,
+        actor: "web-author",
+      });
+      await repository.putWorkflowRun({
+        id: focusedRun.id,
+        workflowType: "creative-run",
+        projectId,
+        temporalWorkflowId: focusedRun.id,
+        status: "accepted",
+        payload: { runId: focusedRun.id, focusedPlanTaskKey: taskKeyValue },
+      });
+      await temporal.workflow.start("creativeRunWorkflow", { args: [focusedRun.id], taskQueue, workflowId: focusedRun.id });
+      await temporal.workflow.getHandle(focusedRun.id).signal("generatePlanWork", work.id);
+      return send(response, 202, { section: generating, regenerating: true, runId: focusedRun.id });
+    }
+    const projectPlanApproveMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/plan\/sections\/([^/?]+)\/approve$/);
+    if (request.method === "POST" && projectPlanApproveMatch) {
+      const projectId = decodeURIComponent(projectPlanApproveMatch[1]);
+      const taskKeyValue = decodeURIComponent(projectPlanApproveMatch[2]);
+      if (!isProjectPlanTaskKey(taskKeyValue)) return send(response, 404, { error: "未知规划阶段" });
+      const section = await repository.getProjectPlanSection(projectId, taskKeyValue);
+      if (!section?.workItemId || !section.sourceArtifactId || section.status !== "awaiting-confirmation") {
+        return send(response, 409, { error: "该规划阶段当前不可确认" });
+      }
+      if (requiresFoundationAuthorConfirmation(taskKeyValue)) {
+        const reviews = await listReviews(repository, section.workItemId);
+        if (!hasPassedIndependentReviewForArtifact(reviews, section.sourceArtifactId)) {
+          return send(response, 409, { error: "请先完成当前 Foundation artifact 的专属 independent 审核" });
+        }
+      }
+      await submitReview(repository, section.workItemId, {
+        subjectArtifactId: section.sourceArtifactId,
+        reviewer: "human",
+        verdict: "passed",
+        issues: [],
+        summary: "作者已在 Web 全书规划工作台确认当前内容",
+      });
+      const sections = await repository.approveProjectPlanSection(projectId, taskKeyValue, section.sourceArtifactId, "web-author");
+      const run = await repository.getProjectPlanRun(projectId);
+      if (run && (run.status === "pending" || run.status === "running" || run.status === "paused")) {
+        await temporal.workflow.getHandle(run.runId).signal("reviewSubmitted", section.workItemId);
+      }
+      return send(response, 200, { sections });
+    }
+    const applyChapterPlanMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/plan\/apply-chapters$/);
+    if (request.method === "POST" && applyChapterPlanMatch) {
+      const projectId = decodeURIComponent(applyChapterPlanMatch[1]);
+      const input = await readJson(request);
+      if (input.confirm !== true) return send(response, 200, { preview: await repository.previewChapterPlanApplication(projectId) });
+      return send(response, 200, { result: await repository.applyChapterPlan(projectId) });
+    }
+    const requestPath = request.url?.split("?")[0] ?? "/";
+    const requestQuery = new URL(request.url ?? "/", "http://localhost").searchParams;
+    const storyArcListMatch = requestPath.match(/^\/v2\/projects\/([^/?]+)\/story-arcs$/);
+    const memoryRebuildMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/memory\/rebuild$/);
+    if (request.method === "POST" && memoryRebuildMatch) {
+      const projectId = decodeURIComponent(memoryRebuildMatch[1]);
+      await repository.requestMemoryRebuild(projectId);
+      await qdrantMemory.ensureCollection();
+      const claims = await repository.listIndexableMemoryClaims({ projectId, limit: 100_000 });
+      const chapterMemories = await repository.listAllChapterMemories({ projectId, limit: 100_000 });
+      const indexable = [...claims, ...chapterMemories.map(chapterMemoryAsClaim)];
+      const batchSize = 64;
+      for (let offset = 0; offset < indexable.length; offset += batchSize) await qdrantMemory.upsertClaims(projectId, indexable.slice(offset, offset + batchSize));
+      return send(response, 200, await repository.completeMemoryRebuild(projectId, indexable.length));
+    }
+    if (request.method === "GET" && storyArcListMatch) {
+      const projectId = decodeURIComponent(storyArcListMatch[1]);
+      return send(response, 200, { arcs: await repository.listStoryArcs(projectId) });
+    }
+    const storyArcNextMatch = requestPath.match(/^\/v2\/projects\/([^/?]+)\/story-arcs\/next$/);
+    if (request.method === "POST" && storyArcNextMatch) {
+      const projectId = decodeURIComponent(storyArcNextMatch[1]);
+      const input = await readJson(request);
+      const reviewPolicy = input.reviewPolicy === "auto" ? "auto" : "manual";
+      const result = await startStoryArcPlanning(repository, temporal, { projectId, mode: "web", reviewPolicy, authorIntent: asString(input.authorIntent), taskQueue });
+      return send(response, 202, result);
+    }
+    const storyArcItemMatch = requestPath.match(/^\/v2\/projects\/([^/?]+)\/story-arcs\/([^/?]+)$/);
+    if (request.method === "GET" && storyArcItemMatch) {
+      const projectId = decodeURIComponent(storyArcItemMatch[1]);
+      const arcId = decodeURIComponent(storyArcItemMatch[2]);
+      const arc = await repository.getStoryArc(projectId, arcId);
+      return arc ? send(response, 200, { arc }) : send(response, 404, { error: "故事弧不存在" });
+    }
+    const storyArcBatchListMatch = requestPath.match(/^\/v2\/projects\/([^/?]+)\/story-arcs\/([^/?]+)\/batches$/);
+    if (request.method === "GET" && storyArcBatchListMatch) {
+      const projectId = decodeURIComponent(storyArcBatchListMatch[1]);
+      const arcId = decodeURIComponent(storyArcBatchListMatch[2]);
+      const arc = await repository.getStoryArc(projectId, arcId);
+      return arc ? send(response, 200, { batches: arc.batches }) : send(response, 404, { error: "故事弧不存在" });
+    }
+    const storyArcBatchNextMatch = requestPath.match(/^\/v2\/projects\/([^/?]+)\/story-arcs\/([^/?]+)\/batches\/next$/);
+    if (request.method === "POST" && storyArcBatchNextMatch) {
+      const projectId = decodeURIComponent(storyArcBatchNextMatch[1]);
+      const arcId = decodeURIComponent(storyArcBatchNextMatch[2]);
+      const input = await readJson(request);
+      const reviewPolicy = input.reviewPolicy === "auto" ? "auto" : "manual";
+      return send(response, 202, await startStoryArcBatchPlanning(repository, temporal, { projectId, arcId, mode: "web", reviewPolicy, taskQueue }));
+    }
+    if (request.method === "PATCH" && storyArcItemMatch) {
+      const projectId = decodeURIComponent(storyArcItemMatch[1]);
+      const arcId = decodeURIComponent(storyArcItemMatch[2]);
+      const input = await readJson(request);
+      const artifact = await createEditedStoryArcArtifact({ projectId, arcId, payload: asRecord(input.bundle) ?? input });
+      const bundle = parseStoryArcBundle(artifact.structuredData);
+      return send(response, 200, { arc: await repository.projectStoryArcBundle({ projectId, arcId, bundle, artifact, actor: "web-author", edited: true }) });
+    }
+    if (request.method === "DELETE" && storyArcItemMatch) {
+      const projectId = decodeURIComponent(storyArcItemMatch[1]);
+      const arcId = decodeURIComponent(storyArcItemMatch[2]);
+      const input = await readJson(request);
+      const force = asBoolean(input.force) ?? asBoolean(requestQuery.get("force")) ?? asBoolean(request.headers["x-force-delete"]);
+      const result = await repository.deleteStoryArc(projectId, arcId, "web-author", { force: force === true });
+      const warnings: string[] = [];
+      const indexClaimIds = [...result.removedMemoryClaimIds, ...result.removedChapterMemoryIds];
+      if (indexClaimIds.length) {
+        try {
+          await qdrantMemory.deleteClaims(projectId, indexClaimIds);
+        } catch (error) {
+          warnings.push("向量索引清理失败，已标记项目记忆需要重建");
+          await repository.requestMemoryRebuild(projectId).catch(() => undefined);
+          console.warn("[story-arc-delete] qdrant cleanup failed", error);
+        }
+      }
+      for (const workflowId of result.cancelledWorkflowIds) {
+        try {
+          await temporal.workflow.getHandle(workflowId).terminate("story arc force deleted");
+        } catch (error) {
+          warnings.push(`Temporal 工作流 ${workflowId} 终止失败，运行时状态已标记为 cancelled`);
+          console.warn("[story-arc-delete] temporal terminate failed", workflowId, error);
+        }
+      }
+      return send(response, 200, warnings.length ? { ...result, warnings } : result);
+    }
+    const storyArcActionMatch = requestPath.match(/^\/v2\/projects\/([^/?]+)\/story-arcs\/([^/?]+)\/(approve|review|rebase|abandon)$/);
+    if (request.method === "POST" && storyArcActionMatch) {
+      const projectId = decodeURIComponent(storyArcActionMatch[1]);
+      const arcId = decodeURIComponent(storyArcActionMatch[2]);
+      const action = storyArcActionMatch[3];
+      const input = await readJson(request);
+      if (action === "review") {
+        const reviewPolicy = input.reviewPolicy === "manual" ? "manual" : "auto";
+        return send(response, 202, await startStoryArcReview(repository, temporal, { projectId, arcId, mode: "web", reviewPolicy, taskQueue }));
+      }
+      if (action === "rebase") {
+        const reviewPolicy = input.reviewPolicy === "auto" ? "auto" : "manual";
+        return send(response, 202, await startStoryArcPlanning(repository, temporal, { projectId, arcId, mode: "web", reviewPolicy, authorIntent: asString(input.authorIntent), taskQueue }));
+      }
+      if (action === "abandon") {
+        const reason = asString(input.reason);
+        if (!reason) return send(response, 400, { error: "放弃故事弧必须填写原因" });
+        return send(response, 200, { arc: await repository.abandonStoryArc(projectId, arcId, reason, "web-author") });
+      }
+      const preview = await repository.previewStoryArcApproval(projectId, arcId);
+      if (input.confirm !== true) return send(response, 200, { preview });
+      const workflow = await repository.getStoryArcWorkflow(projectId, arcId);
+      const reviewArtifactId = typeof workflow?.payload.reviewArtifactId === "string" ? workflow.payload.reviewArtifactId : undefined;
+      if (!reviewArtifactId) return send(response, 409, { error: "故事弧缺少当前蓝图的审核证据，请先完成审核" });
+      const result = await repository.approveStoryArc(projectId, arcId, preview.artifactId, reviewArtifactId, "web-author");
+      if (workflow && ["accepted", "running", "manual-review-required"].includes(workflow.status)) {
+        await temporal.workflow.getHandle(workflow.temporalWorkflowId).signal("storyArcApproved", { arcId, artifactId: preview.artifactId });
+      }
+      return send(response, 200, result);
+    }
+    const knowledgeMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/knowledge\/(planning|worldview|characters|relations|timeline|facts|skills|foundation|claims|chapter-memories|project-skills)$/);
+    if (knowledgeMatch) {
+      const projectId = decodeURIComponent(knowledgeMatch[1]);
+      const kind = knowledgeMatch[2] as KnowledgeRecordKind;
+      if (request.method === "GET") return send(response, 200, { records: await repository.listKnowledgeRecords(projectId, kind) });
+      if (request.method === "POST") {
+        if (["foundation", "chapter-memories", "project-skills"].includes(kind)) {
+          return send(response, 405, { error: "该资料由正式工作流维护，不支持从资料工作台直接修改" });
+        }
+        const input = await readJson(request);
+        const result = await repository.upsertKnowledgeRecord(projectId, kind as MutableKnowledgeRecordKind, input);
+        if (kind === "claims" && "claim" in result) {
+          try {
+            await qdrantMemory.upsertClaims(projectId, [result.claim]);
+          } catch (error) {
+            console.warn(`[knowledge.claims] Qdrant 更新失败，PostgreSQL 真源已保存：${(error as Error).message}`);
+          }
+        }
+        return send(response, 201, result);
+      }
+    }
+    const knowledgeItemMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/knowledge\/(planning|worldview|characters|relations|timeline|facts|claims|skills)\/([^/?]+)$/);
+    if (knowledgeItemMatch) {
+      const projectId = decodeURIComponent(knowledgeItemMatch[1]);
+      const kind = knowledgeItemMatch[2] as MutableKnowledgeRecordKind;
+      const recordId = decodeURIComponent(knowledgeItemMatch[3]);
+      if (request.method === "PATCH") {
+        const input = await readJson(request);
+        const result = await repository.upsertKnowledgeRecord(projectId, kind, { ...input, id: recordId });
+        if (kind === "claims" && "claim" in result) {
+          try {
+            await qdrantMemory.upsertClaims(projectId, [result.claim]);
+          } catch (error) {
+            console.warn(`[knowledge.claims] Qdrant 更新失败，PostgreSQL 真源已保存：${(error as Error).message}`);
+          }
+        }
+        return send(response, 200, result);
+      }
+      if (request.method === "DELETE") {
+        const result = await repository.deleteKnowledgeRecord(projectId, kind, recordId);
+        if (kind === "claims" && result.deleted) {
+          try {
+            const deletedClaimIds = "deletedClaimIds" in result && Array.isArray(result.deletedClaimIds) ? result.deletedClaimIds : [recordId];
+            await qdrantMemory.deleteClaims(projectId, deletedClaimIds);
+          } catch (error) {
+            console.warn(`[knowledge.claims] Qdrant 删除失败，PostgreSQL 真源已撤回：${(error as Error).message}`);
+          }
+        }
+        return send(response, 200, result);
+      }
+    }
+    const recordMatch = request.url?.match(/^\/v2\/(preflight-plans|memory-bundles|skills|blueprints|artifacts|context-manifests|learning-assessments)\/([^/]+)$/);
+    if (request.method === "GET" && recordMatch) {
+      const table = ({ "preflight-plans": "preflight_plans", "memory-bundles": "memory_bundles", skills: "skill_bundles", blueprints: "execution_blueprints", artifacts: "artifacts", "context-manifests": "context_manifests", "learning-assessments": "learning_assessments" } as const)[recordMatch[1] as "preflight-plans" | "memory-bundles" | "skills" | "blueprints" | "artifacts" | "context-manifests" | "learning-assessments"];
+      return send(response, 200, { record: await repository.getRecord(table, decodeURIComponent(recordMatch[2])) });
+    }
+    const runArtifactsMatch = request.url?.match(/^\/v2\/runs\/([^/?]+)\/artifacts$/);
+    if (request.method === "GET" && runArtifactsMatch) return send(response, 200, { artifacts: await repository.listRunArtifacts(decodeURIComponent(runArtifactsMatch[1])) });
+    const runReviewsMatch = request.url?.match(/^\/v2\/runs\/([^/?]+)\/reviews$/);
+    if (request.method === "GET" && runReviewsMatch) return send(response, 200, { reviews: await repository.listRunReviews(decodeURIComponent(runReviewsMatch[1])) });
+    const promptExecutionsMatch = request.url?.match(/^\/v2\/runs\/([^/?]+)\/prompt-executions$/);
+    if (request.method === "GET" && promptExecutionsMatch) return send(response, 200, { executions: await repository.listPromptExecutions(decodeURIComponent(promptExecutionsMatch[1])) });
+    const promptSnapshotMatch = request.url?.match(/^\/v2\/prompt-executions\/([^/?]+)\/snapshot$/);
+    if (request.method === "GET" && promptSnapshotMatch) {
+      const snapshot = await repository.getPromptExecutionSnapshot(decodeURIComponent(promptSnapshotMatch[1]), objectStore);
+      return snapshot ? send(response, 200, snapshot) : send(response, 404, { error: "提示词快照不存在或已过期" });
+    }
+    // 产物文本内容：从 object store 读取 draft/revision/summary 等产物的实际文本
+    const artifactContentMatch = request.url?.match(/^\/v2\/artifacts\/([^/?]+)\/content$/);
+    if (request.method === "GET" && artifactContentMatch) {
+      const artifactId = decodeURIComponent(artifactContentMatch[1]);
+      const artifact = await repository.getArtifact(artifactId);
+      if (!artifact) return send(response, 404, { error: "产物不存在" });
+      if (!artifact.objectKey) return send(response, 404, { error: "该产物无文本内容" });
+      try {
+        const text = await objectStore.getText(artifact.objectKey);
+        return send(response, 200, { text, kind: artifact.kind, artifactId, wordCount: countNovelCharacters(text) });
+      } catch {
+        return send(response, 404, { error: "产物内容读取失败（object store 中不存在）" });
+      }
+    }
+    const workflowTaskReplacementMatch = request.url?.match(/^\/v2\/workflows\/([^/]+)\/tasks\/([^/]+)\/replacement$/);
+    if (request.method === "POST" && workflowTaskReplacementMatch) {
+      const input = await readJson(request);
+      const workflowId = decodeURIComponent(workflowTaskReplacementMatch[1]);
+      const currentArtifactId = decodeURIComponent(workflowTaskReplacementMatch[2]);
+      const plainText = typeof input.plainText === "string" ? input.plainText : "";
+      const authorId = asString(input.authorId) ?? "web-author";
+      if (!plainText.trim()) return send(response, 400, { error: "保存的候选正文不能为空" });
+
+      const source = await repository.getArtifact(currentArtifactId);
+      if (!source) return send(response, 404, { error: "待替换产物不存在" });
+      if (!source.objectKey) return send(response, 400, { error: "待替换产物没有可读取正文" });
+      try {
+        await objectStore.getText(source.objectKey);
+      } catch {
+        return send(response, 404, { error: "待替换产物内容读取失败（object store 中不存在）" });
+      }
+      if (source.kind !== "draft" && source.kind !== "revision") return send(response, 400, { error: "只有正文候选产物可以编辑替换" });
+
+      const object = await objectStore.putText(plainText);
+      const taskId = `${source.taskId}:author-edit`;
+      const replacement: Artifact = {
+        id: randomUUID(),
+        projectId: source.projectId,
+        taskId,
+        attemptId: randomUUID(),
+        kind: source.kind,
+        contentHash: object.hash,
+        objectKey: object.key,
+        baseRevision: source.baseRevision,
+        fingerprint: createHash("sha256").update(`${object.hash}:${taskId}`).digest("hex"),
+        structuredData: {
+          ...(source.structuredData ?? {}),
+          origin: "author-edit",
+          authorId,
+          workflowId,
+          replacesArtifactId: source.id,
+          sourceArtifactId: source.id,
+          editedAt: new Date().toISOString(),
+        },
+        createdAt: Date.now(),
+      };
+      const replaced = await repository.replacePendingHumanArtifact({ workflowId, currentArtifactId, replacement, authorId });
+      if (!replaced) return send(response, 409, { error: "当前候选稿已变更、已提交审批，或运行已离开待审阶段" });
+      return send(response, 200, { artifact: replacement, run: replaced.run, text: plainText, wordCount: countNovelCharacters(plainText) });
+    }
+    const eventsMatch = request.url?.match(/^\/v2\/runs\/([^/?]+)\/events(?:\?after=(\d+))?$/);
+    if (request.method === "GET" && eventsMatch) {
+      const workflowId = decodeURIComponent(eventsMatch[1]);
+      const events = await repository.listRunOutbox(workflowId, Number(eventsMatch[2] ?? 0));
+      if (request.headers.accept?.includes("text/event-stream")) {
+        response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive", "access-control-allow-origin": "*" });
+        for (const event of events) response.write(`id: ${event.id}\ndata: ${JSON.stringify(event)}\n\n`);
+        const timer = setInterval(() => response.write(`: heartbeat ${Date.now()}\n\n`), 15000);
+        request.on("close", () => clearInterval(timer));
+        return;
+      }
+      return send(response, 200, { events });
+    }
+    if (request.method === "POST" && request.url === "/v2/reviews") { const input = await readJson(request); return send(response, 201, { review: await repository.putReview(input as any) }); }
+    if (request.method === "POST" && request.url === "/v2/commits") {
+      const input = await readJson(request);
+      if (typeof input.projectId !== "string" || typeof input.documentId !== "string" || typeof input.baseRevision !== "number" || typeof input.idempotencyKey !== "string" || !input.artifact) return send(response, 400, { error: "projectId、documentId、baseRevision、artifact、idempotencyKey 必填" });
+      const text = typeof input.text === "string" ? input.text : "";
+      const result = await commitService.commit({ projectId: input.projectId, documentId: input.documentId, artifact: input.artifact as any, reviews: Array.isArray(input.reviews) ? input.reviews as any[] : [], structuralReport: inspectManuscript({ text }), baseRevision: input.baseRevision, idempotencyKey: input.idempotencyKey, text });
+      return send(response, 201, { result });
+    }
+    const humanDecisionMatch = request.url?.match(/^\/v2\/workflows\/([^/]+)\/tasks\/([^/]+)\/human-decision$/);
+    if (request.method === "POST" && humanDecisionMatch) {
+      const input = await readJson(request);
+      const workflowId = decodeURIComponent(humanDecisionMatch[1]);
+      const taskId = decodeURIComponent(humanDecisionMatch[2]);
+      const decision = input.decision === "approve" || input.decision === "reject" || input.decision === "revise" || input.decision === "abandon" ? input.decision : undefined;
+      if (!decision) return send(response, 400, { error: "decision(approve/reject/revise/abandon) 必填" });
+      const revisionBase = input.revisionBase === "previous" ? "previous" : input.revisionBase === "current" ? "current" : undefined;
+      const claimed = await repository.claimApprovalEvidence({ workflowId, artifactId: taskId, decision, actorSource: "interactive-web", actorId: "web-author", feedback: asString(input.feedback), revisionBase });
+      if (!claimed) return send(response, 409, { error: "该候选稿的审批已提交，或运行已离开当前审批阶段" });
+      const signalPayload = { approvalEvidenceId: claimed.evidence.id, taskId };
+      try {
+        await repository.recordTaskSignal({ workflowId, taskId, signal: "humanSignal", payload: signalPayload });
+        await temporal.workflow.getHandle(workflowId).signal("humanSignal", signalPayload);
+        const stage = decision === "approve" ? "fact-extraction" : decision === "revise" ? "revision" : "manuscript-approval";
+        await repository.updateWorkflowRunStatus(workflowId, "running", { stage, decision, pendingHumanDecisionSubmitted: true });
+        return send(response, 202, { accepted: true, workflowId, taskId, approvalEvidenceId: claimed.evidence.id });
+      } catch (error) {
+        await repository.releaseHumanDecisionClaim(workflowId, taskId).catch(() => undefined);
+        throw error;
+      }
+    }
+    const workflowTaskSignalMatch = request.url?.match(/^\/v2\/workflows\/([^/]+)\/tasks\/([^/]+)\/signal$/);
+    if (request.method === "POST" && workflowTaskSignalMatch) {
+      const input = await readJson(request);
+      const workflowId = decodeURIComponent(workflowTaskSignalMatch[1]);
+      const taskId = decodeURIComponent(workflowTaskSignalMatch[2]);
+      const signal = String(input.signal ?? "humanSignal");
+      let payload: Record<string, unknown> = { ...(typeof input.payload === "object" && input.payload ? input.payload as Record<string, unknown> : {}), taskId };
+      let humanDecisionClaimed = false;
+      let humanDecision: "approve" | "reject" | "revise" | "abandon" | undefined;
+      if (signal === "humanSignal") {
+        const decision = payload.decision === "approve" || payload.decision === "reject" || payload.decision === "revise" || payload.decision === "abandon" ? payload.decision : undefined;
+        if (!decision) return send(response, 400, { error: "humanSignal 的 decision(approve/reject/revise/abandon) 必填" });
+        humanDecision = decision;
+        const revisionBase = payload.revisionBase === "previous" ? "previous" : payload.revisionBase === "current" ? "current" : undefined;
+        const claimed = await repository.claimApprovalEvidence({ workflowId, artifactId: taskId, decision, actorSource: "automation", actorId: "automation", feedback: asString(payload.feedback), revisionBase });
+        if (!claimed) return send(response, 409, { error: "该候选稿的审批已提交，或运行已离开当前审批阶段" });
+        payload = { approvalEvidenceId: claimed.evidence.id, taskId };
+        humanDecisionClaimed = true;
+      }
+      try {
+        await repository.recordTaskSignal({ workflowId, taskId, signal, payload });
+        const handle = temporal.workflow.getHandle(workflowId);
+        await handle.signal(signal, payload);
+        if (humanDecisionClaimed) {
+          const stage = humanDecision === "approve" ? "fact-extraction" : humanDecision === "revise" ? "revision" : "manuscript-approval";
+          await repository.updateWorkflowRunStatus(workflowId, "running", { stage, decision: humanDecision, pendingHumanDecisionSubmitted: true });
+        }
+        return send(response, 202, { accepted: true, workflowId, taskId });
+      } catch (error) {
+        if (humanDecisionClaimed) await repository.releaseHumanDecisionClaim(workflowId, taskId).catch(() => undefined);
+        throw error;
+      }
+    }
+    const signalMatch = request.url?.match(/^\/v2\/tasks\/([^/]+)\/signal$/);
+    if (request.method === "POST" && signalMatch) {
+      const input = await readJson(request);
+      const taskId = decodeURIComponent(signalMatch[1]);
+      const workflowId = asString(input.workflowId);
+      if (!workflowId) return send(response, 400, { error: "workflowId 必填；任务信号必须绑定 Temporal workflow，不能把 taskId 当作 workflowId" });
+      const signal = String(input.signal ?? "humanSignal");
+      let payload: Record<string, unknown> = { ...(typeof input.payload === "object" && input.payload ? input.payload as Record<string, unknown> : {}), taskId };
+      if (signal === "humanSignal") {
+        const decision = payload.decision === "approve" || payload.decision === "reject" || payload.decision === "revise" || payload.decision === "abandon" ? payload.decision : undefined;
+        if (!decision) return send(response, 400, { error: "humanSignal 的 decision(approve/reject/revise/abandon) 必填" });
+        const claimed = await repository.claimApprovalEvidence({ workflowId, artifactId: taskId, decision, actorSource: "automation", actorId: "automation", feedback: asString(payload.feedback), revisionBase: payload.revisionBase === "previous" ? "previous" : "current" });
+        if (!claimed) return send(response, 409, { error: "该候选稿的审批已提交，或运行已离开当前审批阶段" });
+        payload = { approvalEvidenceId: claimed.evidence.id, taskId };
+      }
+      try {
+        await repository.recordTaskSignal({ workflowId, taskId, signal, payload });
+        const handle = temporal.workflow.getHandle(workflowId);
+        await handle.signal(signal, payload);
+        return send(response, 202, { accepted: true, workflowId, taskId });
+      } catch (error) {
+        if (signal === "humanSignal") await repository.releaseHumanDecisionClaim(workflowId, taskId).catch(() => undefined);
+        throw error;
+      }
+    }
+    const learningPromoteMatch = request.url?.match(/^\/v2\/learning\/([^/?]+)\/promote$/);
+    if (request.method === "POST" && learningPromoteMatch) return send(response, 202, { promotion: await repository.requestLearningPromotion(decodeURIComponent(learningPromoteMatch[1])) });
+
+    // ===== 评估闭环路由（B-1.5）=====
+    const snapshotsMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/snapshots$/);
+    if (snapshotsMatch) {
+      const projectId = decodeURIComponent(snapshotsMatch[1]);
+      if (request.method === "POST") {
+        const snapshot = await captureProjectSnapshot(repository, projectId);
+        return send(response, 201, { snapshot });
+      }
+      if (request.method === "GET") {
+        return send(response, 200, { snapshots: await repository.listCapturedSnapshots(projectId) });
+      }
+    }
+    const snapshotMatch = request.url?.match(/^\/v2\/snapshots\/([^/?]+)$/);
+    if (request.method === "GET" && snapshotMatch) {
+      const snapshot = await repository.getCapturedSnapshot(decodeURIComponent(snapshotMatch[1]));
+      if (!snapshot) return send(response, 404, { error: "快照不存在" });
+      return send(response, 200, { snapshot });
+    }
+
+    const experimentsMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/experiments$/);
+    if (experimentsMatch) {
+      const projectId = decodeURIComponent(experimentsMatch[1]);
+      if (request.method === "GET") {
+        const experiments = await listExperimentWorkspaces(repository, projectId);
+        return send(response, 200, { experiments });
+      }
+      if (request.method === "POST") {
+        const input = await readJson(request);
+        const snapshotId = asString(input.snapshotId);
+        if (!snapshotId) return send(response, 400, { error: "snapshotId 必填" });
+        const bundle = await repository.getCapturedSnapshot(snapshotId, projectId);
+        if (!bundle) return send(response, 404, { error: "快照不存在或不属于该项目" });
+        const experimentId = asString(input.experimentId);
+        const workspace = await createExperimentWorkspace(repository, bundle, experimentId);
+        return send(response, 201, { experiment: { id: workspace.id, projectId: workspace.projectId, schemaName: workspace.schemaName, baseSnapshotId: workspace.baseSnapshotId, baseSnapshotHash: workspace.baseSnapshotHash, status: workspace.status, createdAt: workspace.createdAt } });
+      }
+    }
+    const projectCandidatesMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/candidates$/);
+    if (request.method === "GET" && projectCandidatesMatch) {
+      const projectId = decodeURIComponent(projectCandidatesMatch[1]);
+      return send(response, 200, { candidates: await repository.listCandidateBundles(projectId) });
+    }
+    const projectReceiptsMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/receipts$/);
+    if (request.method === "GET" && projectReceiptsMatch) {
+      const projectId = decodeURIComponent(projectReceiptsMatch[1]);
+      return send(response, 200, { receipts: await repository.listPromotionReceipts(projectId) });
+    }
+    const experimentCloseMatch = request.url?.match(/^\/v2\/experiments\/([^/?]+)\/close$/);
+    if (request.method === "POST" && experimentCloseMatch) {
+      const experimentId = decodeURIComponent(experimentCloseMatch[1]);
+      const workspace = await getExperimentWorkspace(repository, experimentId);
+      if (!workspace) return send(response, 404, { error: "实验工作区不存在" });
+      await workspace.close();
+      return send(response, 200, { closed: true, experimentId });
+    }
+    const experimentMatch = request.url?.match(/^\/v2\/experiments\/([^/?]+)$/);
+    if (experimentMatch) {
+      const experimentId = decodeURIComponent(experimentMatch[1]);
+      if (request.method === "GET") {
+        const workspace = await getExperimentWorkspace(repository, experimentId);
+        if (!workspace) return send(response, 404, { error: "实验工作区不存在或已删除" });
+        return send(response, 200, { experiment: { id: workspace.id, projectId: workspace.projectId, schemaName: workspace.schemaName, baseSnapshotId: workspace.baseSnapshotId, baseSnapshotHash: workspace.baseSnapshotHash, status: workspace.status, createdAt: workspace.createdAt } });
+      }
+      if (request.method === "DELETE") {
+        const workspace = await getExperimentWorkspace(repository, experimentId);
+        if (!workspace) return send(response, 404, { error: "实验工作区不存在" });
+        await workspace.delete();
+        return send(response, 200, { deleted: true, experimentId });
+      }
+    }
+    const experimentCandidateMatch = request.url?.match(/^\/v2\/experiments\/([^/?]+)\/candidate$/);
+    if (request.method === "POST" && experimentCandidateMatch) {
+      const experimentId = decodeURIComponent(experimentCandidateMatch[1]);
+      const workspace = await getExperimentWorkspace(repository, experimentId);
+      if (!workspace) return send(response, 404, { error: "实验工作区不存在" });
+      const input = await readJson(request);
+      const documentId = asString(input.documentId);
+      if (!documentId) return send(response, 400, { error: "documentId 必填" });
+      // 查询正式库的 document 基线
+      const documentStatus = await repository.getDocumentStatus(workspace.projectId, documentId);
+      if (!documentStatus) return send(response, 404, { error: "文档不存在" });
+      const baseRevisionRow = await repository.getDocumentRevisionBaseline(workspace.projectId, documentId) ?? { revision: 0, contentHash: "" };
+      const dependencyHead = await computeProjectHead(repository, workspace.projectId);
+      const candidate = await extractCandidateBundle(workspace, {
+        sourceProjectId: workspace.projectId,
+        baseSnapshotId: workspace.baseSnapshotId,
+        baseSnapshotHash: workspace.baseSnapshotHash,
+        dependencyHead,
+        documentId,
+        baseRevision: baseRevisionRow.revision,
+        baseContentHash: baseRevisionRow.contentHash,
+        workflowRunId: asString(input.workflowRunId) ?? `api-${Date.now()}`,
+        codeRevision: asString(input.codeRevision),
+      });
+      // 持久化到 candidate_bundles 表
+      await repository.saveCandidateBundle(candidate);
+      return send(response, 201, { candidate });
+    }
+    const candidateMatch = request.url?.match(/^\/v2\/candidates\/([^/?]+)$/);
+    if (request.method === "GET" && candidateMatch) {
+      const candidate = await repository.getCandidateBundle(decodeURIComponent(candidateMatch[1]));
+      if (!candidate) return send(response, 404, { error: "候选包不存在" });
+      return send(response, 200, { candidate });
+    }
+    const promoteMatch = request.url?.match(/^\/v2\/candidates\/([^/?]+)\/promote$/);
+    if (request.method === "POST" && promoteMatch) {
+      const candidateId = decodeURIComponent(promoteMatch[1]);
+      const candidate = await repository.getCandidateBundle(candidateId);
+      if (!candidate) return send(response, 404, { error: "候选包不存在" });
+      const input = await readJson(request);
+      const decision: AuthorDecision = {
+        authorId: asString(input.authorId) ?? "anonymous",
+        decision: input.decision === "reject" ? "reject" : "accept",
+        reason: asString(input.reason),
+        decidedAt: Date.now(),
+      };
+      const receipt = await promotionService.promote(candidate, decision);
+      return send(response, 200, { receipt });
+    }
+    const rollbackMatch = request.url?.match(/^\/v2\/candidates\/([^/?]+)\/rollback$/);
+    if (request.method === "POST" && rollbackMatch) {
+      const candidateId = decodeURIComponent(rollbackMatch[1]);
+      const existingReceipt = await promotionService.getReceipt(candidateId);
+      if (!existingReceipt) return send(response, 404, { error: "候选包未晋升，无法回滚" });
+      await promotionService.rollback(existingReceipt.id);
+      return send(response, 200, { rolledBack: true, candidateId });
+    }
+    const receiptMatch = request.url?.match(/^\/v2\/receipts\/([^/?]+)$/);
+    if (request.method === "GET" && receiptMatch) {
+      const receiptId = decodeURIComponent(receiptMatch[1]);
+      const receipt = await repository.getPromotionReceiptById(receiptId);
+      if (!receipt) return send(response, 404, { error: "收据不存在" });
+      return send(response, 200, { receipt });
+    }
+    const closedLoopMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/closed-loop$/);
+    if (request.method === "POST" && closedLoopMatch) {
+      const projectId = decodeURIComponent(closedLoopMatch[1]);
+      const input = await readJson(request);
+      const documentId = asString(input.documentId);
+      if (!documentId) return send(response, 400, { error: "documentId 必填" });
+      const result = await runClosedLoop({
+        repository,
+        model,
+        projectId,
+        documentId,
+        instruction: asString(input.instruction),
+        experimentId: asString(input.experimentId),
+        codeRevision: asString(input.codeRevision),
+        authorId: asString(input.authorId),
+        dryRun: input.dryRun === true,
+      });
+      return send(response, 200, { result });
+    }
+
+    // ===== 创意执行路由（Phase B-2）=====
+
+    // 1. POST /v2/projects/:projectId/creative-runs —— 创建 CreativeRun
+    //    GET /v2/projects/:projectId/creative-runs —— 列出项目的 CreativeRun
+    const projectCreativeRunsMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/creative-runs$/);
+    if (projectCreativeRunsMatch) {
+      const projectId = decodeURIComponent(projectCreativeRunsMatch[1]);
+      if (request.method === "GET") {
+        const runs = await listCreativeRuns(repository, projectId);
+        return send(response, 200, { runs });
+      }
+      if (request.method === "POST") {
+        const input = await readJson(request);
+        const modeRaw = asString(input.mode);
+        if (modeRaw !== "chapter" && modeRaw !== "segment-auto") return send(response, 400, { error: "mode 必填，且必须为 \"chapter\" 或 \"segment-auto\"" });
+        const mode: CreativeRunMode = modeRaw;
+        const policy = buildCreativePolicy(input.policy);
+        const payload = asRecord(input.payload);
+        try {
+          const run = await createCreativeRun(repository, { projectId, mode, ...(policy ? { policy } : {}), ...(payload ? { payload } : {}) });
+          return send(response, 201, { run });
+        } catch (error) {
+          return send(response, 400, { error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+    }
+
+    // 2. GET /v2/creative-runs/:runId —— 获取 run 详情（含 work items + reviews + events）
+    //    POST /v2/creative-runs/:runId/commands —— 提交命令到 run
+    //    GET /v2/creative-runs/:runId/events?afterSequence=N —— 增量事件流
+    const creativeRunMatch = request.url?.match(/^\/v2\/creative-runs\/([^/?]+)$/);
+    if (request.method === "GET" && creativeRunMatch) {
+      const runId = decodeURIComponent(creativeRunMatch[1]);
+      const snapshot = await getRunSnapshot(repository, runId);
+      if (!snapshot) return send(response, 404, { error: "CreativeRun 不存在" });
+      return send(response, 200, { snapshot });
+    }
+    const creativeRunCommandsMatch = request.url?.match(/^\/v2\/creative-runs\/([^/?]+)\/commands$/);
+    if (request.method === "POST" && creativeRunCommandsMatch) {
+      const runId = decodeURIComponent(creativeRunCommandsMatch[1]);
+      const input = await readJson(request);
+      const command = buildCreativeCommand(input);
+      if (!command) return send(response, 400, { error: "命令构造失败：type/idempotencyKey 必填，work.* / review.* 命令需 workItemId，review.submit 需 review" });
+      try {
+        const result = await executeCreativeCommand(repository, { ...command, runId }, model);
+        return send(response, 202, { result });
+      } catch (error) {
+        // run 不存在 / work item 不存在 / 状态转换非法 等
+        return send(response, 400, { error: error instanceof Error ? error.message : String(error) });
+      }
+    }
+    const creativeRunEventsMatch = request.url?.match(/^\/v2\/creative-runs\/([^/?]+)\/events(?:\?afterSequence=(\d+))?$/);
+    if (request.method === "GET" && creativeRunEventsMatch) {
+      const runId = decodeURIComponent(creativeRunEventsMatch[1]);
+      const afterSequenceRaw = creativeRunEventsMatch[2];
+      const afterSequence = afterSequenceRaw !== undefined ? Number(afterSequenceRaw) : undefined;
+      if (afterSequence !== undefined && (!Number.isFinite(afterSequence) || afterSequence < 0)) return send(response, 400, { error: "afterSequence 必须为非负整数" });
+      const snapshot = await getRunSnapshot(repository, runId, afterSequence);
+      if (!snapshot) return send(response, 404, { error: "CreativeRun 不存在" });
+      // 注意：snapshot.events 已按 id > afterSequence 增量返回
+      return send(response, 200, { events: snapshot.events });
+    }
+
+    // POST /v2/projects/:projectId/documents/:documentId/review —— 章节审校工作流
+    const chapterStateRebuildMatch = request.url?.match(/^\/v2\/projects\/([^/]+)\/documents\/([^/]+)\/state\/rebuild$/);
+    if (request.method === "POST" && chapterStateRebuildMatch) {
+      const projectId = decodeURIComponent(chapterStateRebuildMatch[1]);
+      const documentId = decodeURIComponent(chapterStateRebuildMatch[2]);
+      try {
+        const result = await chapterStateRebuildService.rebuildCommittedChapterState(projectId, documentId, "web-author");
+        return send(response, 200, { result });
+      } catch (error) {
+        if (error instanceof ChapterStateRebuildConflictError) {
+          return send(response, 409, { code: error.code, error: error.message, ...error.details });
+        }
+        throw error;
+      }
+    }
+
+    const chapterReviewMatch = request.url?.match(/^\/v2\/projects\/([^/]+)\/documents\/([^/]+)\/review$/);
+    if (request.method === "POST" && chapterReviewMatch) {
+      try {
+        const projectId = decodeURIComponent(chapterReviewMatch[1]);
+        const documentId = decodeURIComponent(chapterReviewMatch[2]);
+        const input = await readJson(request);
+        const instruction = asString(input.instruction);
+        if (instruction && instruction.length > 4000) return send(response, 400, { error: "补充修改要求不能超过 4000 字" });
+        if (input.mode !== undefined && input.mode !== "full" && input.mode !== "targeted") return send(response, 400, { error: "mode 必须为 full 或 targeted" });
+        const mode = input.mode === "targeted" ? "targeted" : "full";
+        if (input.targetIssueIds !== undefined && (!Array.isArray(input.targetIssueIds) || input.targetIssueIds.some((value) => typeof value !== "string"))) return send(response, 400, { error: "targetIssueIds 必须为字符串数组" });
+        const targetIssueIds = Array.isArray(input.targetIssueIds) ? input.targetIssueIds as string[] : [];
+        const idempotencyKey = asString(input.idempotencyKey) ?? `${projectId}:${documentId}:review:${Date.now()}`;
+
+        // 校验 document 存在 + status="final"（AGENTS.md 契约：仅对已定稿章节开放重审）
+        const preflight = await repository.getChapterReviewPreflight(projectId, documentId);
+        if (!preflight) return send(response, 404, { error: "章节不存在" });
+        if (preflight.status !== "final") return send(response, 400, { error: "章节审校仅对已定稿章节开放" });
+        if (preflight.activeWorkflowId) return send(response, 409, { error: "该章节已有活跃审校工作流", workflowId: preflight.activeWorkflowId });
+        if (!preflight.hasBlueprint) return send(response, 400, { error: "找不到该章节的历史 blueprint artifact，无法启动章节审校" });
+        if (mode === "targeted" && input.proposedText !== undefined) return send(response, 400, { error: "定向修复只能基于当前已保存正文，不能同时提交作者修订稿" });
+        if (mode === "full" && input.targetIssueIds !== undefined) return send(response, 400, { error: "完整重审不接受 targetIssueIds" });
+        const targeted = mode === "targeted"
+          ? await repository.getTargetedChapterReviewIssues({ projectId, documentId, issueIds: targetIssueIds })
+          : undefined;
+
+        const workflowId = `chapter-review-${documentId}-${idempotencyKey.replace(/[^a-zA-Z0-9_-]/g, "-")}`.slice(0, 200);
+        const proposedText = typeof input.proposedText === "string" ? input.proposedText.trim() : undefined;
+        if (input.proposedText !== undefined && !proposedText) return send(response, 400, { error: "作者修订正文不能为空" });
+        let proposedArtifactId: string | undefined;
+        if (proposedText) {
+          const object = await objectStore.putText(proposedText);
+          proposedArtifactId = randomUUID();
+          const proposal: Artifact = { id: proposedArtifactId, projectId, taskId: `${workflowId}:author-proposal`, attemptId: `${workflowId}:author-proposal:1`, kind: "revision", contentHash: object.hash, objectKey: object.key, baseRevision: preflight.baseRevision, fingerprint: object.hash, structuredData: { workflowId, origin: "author-proposal", documentId }, createdAt: Date.now() };
+          await repository.recordArtifact(proposal);
+        }
+        const params = { projectId, documentId, instruction, workflowId, proposedArtifactId, mode, targetIssueIds: targeted ? targetIssueIds : undefined };
+        // workflowId is also the workflow_run primary key: all Temporal
+        // activities use it as workflowRunId and task_attempts reference it.
+        await repository.putWorkflowRun({ id: workflowId, workflowType: "chapter-review", projectId, temporalWorkflowId: workflowId, status: "accepted", payload: { documentId, instruction, idempotencyKey, proposedArtifactId, mode, targetIssueIds: targeted ? targetIssueIds : [], targetIssueFingerprints: targeted?.fingerprints ?? [], targetRevisionRanges: targeted?.issues.flatMap((issue) => issue.revisionRanges ?? []) ?? [] } });
+        const handle = await temporal.workflow.start("chapterReviewWorkflow", { args: [params], taskQueue, workflowId });
+        return send(response, 202, { workflowId, runId: handle.firstExecutionRunId, documentId, instruction, mode, targetIssueCount: targeted?.issues.length ?? 0, status: "accepted" });
+      } catch (error) {
+        return send(response, 400, { error: error instanceof Error ? error.message : String(error) });
+      }
+    }
+
+    const factCandidatesMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/fact-candidates(?:\?(.+))?$/);
+    if (request.method === "GET" && factCandidatesMatch) {
+      const projectId = decodeURIComponent(factCandidatesMatch[1]);
+      const query = new URL(request.url ?? "", `http://${request.headers.host ?? "127.0.0.1"}`).searchParams;
+      const documentId = query.get("documentId")?.trim() || undefined;
+      return send(response, 200, { candidates: await repository.listFactCandidates(projectId, documentId) });
+    }
+
+    const factDecisionMatch = request.url?.match(/^\/v2\/projects\/([^/]+)\/fact-candidates\/([^/]+)\/decision$/);
+    if (request.method === "POST" && factDecisionMatch) {
+      try {
+        const projectId = decodeURIComponent(factDecisionMatch[1]);
+        const claimId = decodeURIComponent(factDecisionMatch[2]);
+        const input = await readJson(request);
+        const decision = input.decision === "approve" || input.decision === "reject" ? input.decision : undefined;
+        const actorId = asString(input.actorId);
+        if (!decision || !actorId) return send(response, 400, { error: "decision(approve/reject) 和 actorId 必填" });
+        const result = await repository.decideFactCandidate({ projectId, claimId, actorId, decision, reason: asString(input.reason) });
+        return send(response, 200, { result });
+      } catch (error) {
+        return send(response, 409, { error: error instanceof Error ? error.message : String(error) });
+      }
+    }
+
+    if (request.method === "GET" && request.url === "/v2/usage") return send(response, 200, { usage: await repository.listModelUsage() });
+    if (request.method === "POST" && request.url === "/v2/maintenance/chapter-retention") return send(response, 200, { result: await runRetentionCleanup() });
+    const runCancelMatch = request.url?.match(/^\/v2\/runs\/([^/]+)\/cancel$/);
+    if (request.method === "POST" && runCancelMatch) {
+      const workflowId = decodeURIComponent(runCancelMatch[1]);
+      const record = await repository.getWorkflowRunByTemporalId(workflowId);
+      if (!record) return send(response, 404, { error: "运行不存在" });
+      if (record.status === "cancelled") {
+        const expiredModelTasks = await repository.expireWorkflowModelTasks(workflowId, "所属运行已取消");
+        if (record.workflowType === "story-arc-planning" && typeof record.payload.arcId === "string") {
+          await repository.recoverStoryArcAfterWorkflowCancellation(record.projectId, record.payload.arcId);
+        }
+        return send(response, 200, { workflowId, status: "cancelled", record, expiredModelTasks });
+      }
+      if (["completed", "abandoned", "failed", "rejected", "terminated"].includes(record.status)) {
+        return send(response, 409, { error: "运行已经结束", status: record.status });
+      }
+      try {
+        await temporal.workflow.getHandle(workflowId).cancel();
+      } catch (error) {
+        return send(response, 503, { error: `无法取消 Runtime 工作流：${error instanceof Error ? error.message : String(error)}` });
+      }
+      const cancelled = await repository.updateWorkflowRunStatus(workflowId, "cancelled", {
+        error: "作者已取消本次运行",
+        reasonCode: "cancelled-by-author",
+        cancelledAt: new Date().toISOString(),
+      });
+      const expiredModelTasks = await repository.expireWorkflowModelTasks(workflowId, "所属运行已取消");
+      if (record.workflowType === "story-arc-planning" && typeof record.payload.arcId === "string") {
+        await repository.recoverStoryArcAfterWorkflowCancellation(record.projectId, record.payload.arcId);
+      }
+      return send(response, 200, { workflowId, status: "cancelled", record: cancelled, expiredModelTasks });
+    }
+
+    const runMatch = request.url?.match(/^\/v2\/runs\/([^/]+)$/);
+    if (request.method === "GET" && runMatch) {
+      const workflowId = decodeURIComponent(runMatch[1]);
+      const record = await repository.getWorkflowRunByTemporalId(workflowId);
+      try {
+        const description = await temporal.workflow.getHandle(workflowId).describe();
+        return send(response, 200, { workflowId, status: record?.status ?? description.status.name, runId: description.runId, record });
+      } catch (error) {
+        if (!record) throw error;
+        return send(response, 200, { workflowId, status: record.status, record, diagnosticsExpired: true });
+      }
+    }
+    return send(response, 404, { error: "NOT_FOUND" });
+  } catch (error) { return send(response, 500, { error: error instanceof Error ? error.message : String(error) }); }
+});
+
+const apiHost = process.env.NOVEL_API_HOST ?? "127.0.0.1";
+server.listen(port, apiHost, () => {
+  console.log(`ymcp novel v2 api listening on http://${apiHost}:${port}`);
+  void runRetentionCleanup().catch((error) => console.warn("[retention] cleanup failed", error));
+});
+const retentionTimer = setInterval(() => void runRetentionCleanup().catch((error) => console.warn("[retention] cleanup failed", error)), 24 * 60 * 60 * 1000);
+retentionTimer.unref();
+process.once("SIGINT", () => { server.close(); void repository.close(); void connection.close(); });
+process.once("SIGTERM", () => { server.close(); void repository.close(); void connection.close(); });

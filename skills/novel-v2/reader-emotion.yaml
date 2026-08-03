@@ -1,0 +1,29 @@
+skillId: reader-emotion
+version: 1.0.0
+executionPoints:
+  - chapter.drafting
+  - chapter.review.reader
+  - chapter.revision
+roles:
+  - writer
+  - reader-reviewer
+  - reviser
+capabilities:
+  - draft
+  - review
+  - revision
+dependsOn:
+  - narrative-continuity
+conflicts: []
+requiredMemoryKinds: []
+qualityGates:
+  - emotional-progression
+  - reader-momentum
+priority: required
+promptSections:
+  chapter.drafting: |
+    情绪和感情线要通过人物当下的感知、行动、物件、边界、误解、回应、选择和余波推进；读者动力来自期待、揭示、回报与新代价，不要为了制造追更感机械添加危险、反转或问句。
+  chapter.review.reader: |
+    判断本章是否让读者获得了清晰且有证据的体验变化：期待、理解、关系靠近或疏离、情绪回报、悬念更新、条件改变或阶段闭合。允许铺陈、相处和余波章以自身功能成立，不要求每章强行推进感情或事件。
+  chapter.revision: |
+    修订感情和读者推进问题时优先加深已有场景中的感知、反应和余波，不凭空新增不属于蓝图的事件。

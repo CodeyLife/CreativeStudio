@@ -1,0 +1,50 @@
+skillId: review-gate
+version: 1.0.0
+executionPoints:
+  - foundation.book-plan
+  - arc.review
+  - chapter.review.structure
+  - chapter.review.style
+  - chapter.review.character
+  - chapter.review.continuity
+  - chapter.review.plot
+  - chapter.review.reader
+  - chapter.review.prose
+roles:
+  - foundation-reviewer
+  - structure-reviewer
+  - prose-reviewer
+  - style-reviewer
+  - character-reviewer
+  - continuity-reviewer
+  - plot-reviewer
+  - reader-reviewer
+capabilities:
+  - review
+dependsOn:
+  - narrative-continuity
+conflicts: []
+requiredMemoryKinds: []
+qualityGates:
+  - evidence-grounding
+  - dimension-coverage
+priority: required
+promptSections:
+  foundation.book-plan: |
+    以项目级架构审核而非正文审美为目标：检查读者承诺、主题问题、人物矛盾、世界压力、层级边界、剧情线和终局边界是否互相支持。每个问题引用 structuredData/sections/summary 的路径或片段，说明问题机制、影响范围和最小修复方向；区分事实缺口、因果缺口、待确认项和个人偏好。
+  arc.review: |
+    每个问题必须指向蓝图中的具体字段、章节或场景证据，并说明问题机制、影响范围和最小修复方向；区分事实/权威错误、因果/结构问题和风格偏好，不把个人偏好伪装成硬约束。
+  chapter.review.style: |
+    以正文证据判断表达质量，覆盖场景具象度、具体性、视角、节奏和幽默，不靠固定句式或关键词判定。
+  chapter.review.character: |
+    以人物独立欲望、目标、行为、选择、语言、知识边界和关系反应为证据，覆盖人物刻画、能动性与群像变化；不要求没有相关内容的章节强行安排关系变化。
+  chapter.review.continuity: |
+    以冻结记忆、规划上下文和正文证据检查世界观、时间线、知识边界和伏笔。
+  chapter.review.plot: |
+    以目标、阻力、选择、代价和结果检查故事性与因果链。
+  chapter.review.reader: |
+    以实际阅读推进、情绪张力、感情线、幽默和章尾动力判断读者体验；安静章节必须按其功能审查。
+  chapter.review.structure: |
+    以冻结事实、规划上下文和正文证据审视结构、因果、章节功能、世界规则、时间线、人物知识边界、承诺证据和选择后果；不以固定章数、钩子或升级密度判定质量。
+  chapter.review.prose: |
+    以正文证据审视场景体验、语言、具体性、叙述距离、节奏、情绪抵达和幽默；检查关键选择/情绪是否被摘要跳过，只报告有正文证据且影响阅读的普遍问题。

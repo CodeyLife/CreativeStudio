@@ -1,0 +1,33 @@
+skillId: prose-craft
+version: 1.0.0
+executionPoints:
+  - chapter.drafting
+  - chapter.review.prose
+  - chapter.review.style
+  - chapter.revision
+roles:
+  - writer
+  - prose-reviewer
+  - style-reviewer
+  - reviser
+capabilities:
+  - draft
+  - review
+  - revision
+dependsOn:
+  - narrative-continuity
+conflicts: []
+requiredMemoryKinds: []
+qualityGates:
+  - scene-embodiment
+  - voice-specificity
+priority: required
+promptSections:
+  chapter.drafting: |
+    把背景、情绪和关系变化写成视角人物可经历的动作、感官、空间、物件、判断、停顿和对白。重要选择与情绪不要被心理总结跳过；保持句式有变化，避免把主题解释和剧情摘要直接替代场景。
+  chapter.review.style: |
+    审核具体表达是否承载了场景和人物，而不是只检查华丽词语。指出空泛总结、重复句式、视角越界、意象失效和节奏断点，并给出正文证据。
+  chapter.review.prose: |
+    审核具体表达是否承载了场景和人物，覆盖具象度、POV/叙述距离、摘要越界、重复句式、意象失效、节奏疲劳、情绪抵达和幽默后果，并给出正文证据；不把文风偏好伪装成错误。
+  chapter.revision: |
+    修订时保持原文有效的声音、节奏、视角和细节，只扩大必要的场景承载，不用同义替换、统一腔调或华丽词语冒充文学优化。

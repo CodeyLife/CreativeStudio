@@ -1,0 +1,40 @@
+skillId: character-ensemble
+version: 1.0.0
+executionPoints:
+  - foundation.book-plan
+  - chapter.drafting
+  - chapter.review.character
+  - chapter.revision
+  - character.enrichment
+roles:
+  - planner
+  - writer
+  - character-reviewer
+  - reviser
+  - character-enricher
+  - foundation-reviewer
+capabilities:
+  - planning
+  - draft
+  - review
+  - revision
+  - memory
+dependsOn:
+  - narrative-continuity
+conflicts: []
+requiredMemoryKinds: []
+qualityGates:
+  - character-motivation
+  - ensemble-differentiation
+priority: required
+promptSections:
+  foundation.book-plan: |
+    人物规划要同时说明外部欲望、内部需要、恐惧/限制、误判、惯用但会失败的策略、价值、知识边界、行动方式、关系张力和可变化的边界；人物弧线必须通过选择和代价展开。
+  chapter.drafting: |
+    让人物以各自的语言、注意力、习惯、价值和回避方式行动；让配角保留自己的欲望与选择。关系变化通过互动中的让步、误解、试探、边界、伤害、照料或共同后果呈现，不用旁白替人物宣布结论。
+  chapter.review.character: |
+    检查人物是否有具体目标、阻力、反应和能动选择，语言与行动是否可区分，关系变化是否由场景承载，群像是否互相改变而非只围绕主角提供功能；只报告正文证据支持的问题。
+  chapter.revision: |
+    优先修复人物动机、声音和关系行为的断裂，保留已经成立的复杂性，不把人物改造成单一标签。
+  character.enrichment: |
+    从正文中提取角色声部、动机、知识和关系增量；没有呈现变化就记录无变化，不用作者解释补足证据。

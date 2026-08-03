@@ -1,0 +1,40 @@
+skillId: plot-causality
+version: 1.0.0
+executionPoints:
+  - foundation.book-plan
+  - arc.plan
+  - arc.review
+  - arc.revision
+  - chapter.blueprint
+  - chapter.review.structure
+  - chapter.review.plot
+  - chapter.revision
+capabilities:
+  - planning
+  - review
+  - revision
+dependsOn:
+  - narrative-continuity
+conflicts: []
+requiredMemoryKinds: []
+qualityGates:
+  - causal-chain
+  - conflict-clarity
+priority: required
+promptSections:
+  foundation.book-plan: |
+    每条主线和重要支线都要有当前欲望、外部压力、选择、代价、可验证的阶段变化和下一次责任。主题必须落到人物如何选择，不要用事件数量代替剧情推进。
+  arc.plan: |
+    每个场景都回答它改变了什么：人物选择、关系状态、信息分布、资源代价、世界条件或未解问题。没有外部变化时必须说明它承担的体验、理解、关系或余波功能，并保留后续空间。
+  arc.review: |
+    检查故事弧是否存在可追踪的欲望/压力→选择→代价→结果链、阶段边界、承诺窗口和退出状态；检查反转是否有前置证据与行动成本，问题必须引用具体章节或场景证据。
+  arc.revision: |
+    按审核证据修复最小的因果断点，优先保留原有有效的人物选择、关系积累、前置证据和合理未知；不要用新增危机掩盖过程缺失。
+  chapter.blueprint: |
+    本章目标、阻力、行动、选择、代价和结果必须相互连接；场景结束时至少明确状态、认知、关系、资源或代价中的一项证据变化，没有变化时说明功能而不是硬造事件。
+  chapter.review.plot: |
+    审查目标与行动是否相连、阻力是否真实、结果是否由前文条件产生，承诺与后续动力是否有证据；不把固定章尾、反转或持续升级当成硬标准。
+  chapter.review.structure: |
+    检查章节结构、功能、因果、世界压力、知识边界和选择后果是否由规划上下文与正文证据支撑，区分可验证问题与审美偏好。
+  chapter.revision: |
+    修订剧情问题时先修复因果和承载，不用额外危机、解释段或固定钩子掩盖过程缺失。

@@ -1,0 +1,22 @@
+skillId: learning-loop
+version: 1.0.0
+executionPoints:
+  - learning.assessment
+  - skill.iteration
+roles:
+  - learning-auditor
+  - skill-iterator
+capabilities:
+  - learning
+dependsOn: []
+conflicts: []
+requiredMemoryKinds: []
+qualityGates:
+  - mechanism-analysis
+  - regression-validation
+priority: required
+promptSections:
+  learning.assessment: |
+    只有在能够说明底层机制、受影响的输入类别、边界和回归风险时，才提出共享规则改进；不要只重复某个章节的表面症状。
+  skill.iteration: |
+    修改 Skill 时输出完整规则文本，说明它覆盖的输入类别和不覆盖的边界；必须结合审核证据和 underlyingMechanism，而不是堆叠精确短语禁令。

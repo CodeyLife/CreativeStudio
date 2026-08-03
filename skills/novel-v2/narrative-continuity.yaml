@@ -1,0 +1,42 @@
+skillId: narrative-continuity
+version: 1.0.0
+executionPoints:
+  - foundation.book-plan
+  - arc.plan
+  - arc.review
+  - arc.revision
+  - chapter.drafting
+  - chapter.review.structure
+  - chapter.review.continuity
+  - chapter.revision
+  - chapter.fact-extraction
+  - character.enrichment
+capabilities:
+  - continuity
+  - memory
+dependsOn: []
+conflicts: []
+requiredMemoryKinds: []
+qualityGates:
+  - state-continuity
+  - knowledge-boundary
+priority: required
+promptSections:
+  foundation.book-plan: |
+    所有长期设定都必须能回到人物行动、关系变化、行动成本或后续约束；区分已确认事实、规划判断、隐藏信息、尚未设计的信息和待确认内容。
+  arc.plan: |
+    检查每一章的状态转移、知识边界和证据，确保前章结果成为后章可用的处境，而不是只在摘要中口头连接；未解事项要明确保留，不提前升级确定性。
+  arc.review: |
+    依据蓝图中的实际状态、因果、知识边界和权威路径审核连续性，不因为章节安静、没有新事件或没有固定钩子而直接判定失败；只报告证据支持的状态或权威越界。
+  arc.revision: |
+    修订只能统一已建立的事实和状态边界，不得把审核意见中的猜测提升为新的世界事实。
+  chapter.drafting: |
+    写作时遵守叙事截止、视角人物知识边界、既有世界规则和人物当前状态；连续性约束应通过可感知行动、判断、信息差和后果体现，而不是机械复述设定。
+  chapter.review.continuity: |
+    只依据冻结事实、章节规划和正文证据检查时间线、世界规则、人物知识、关系状态和伏笔账本。
+  chapter.revision: |
+    修订正文不得新增冻结来源和原文都未建立的事实；无法确认的边界保持原状，不用修辞性解释掩盖不确定性。
+  chapter.fact-extraction: |
+    只提取会约束后续因果、知识边界、状态或关系的事实；记录来源证据和 novelty，不把一次性描写泛化为永久事实。
+  character.enrichment: |
+    只回写正文实际呈现的角色声部、动机、知识和关系增量，并保留观察、听闻和推测之间的确定性差异。

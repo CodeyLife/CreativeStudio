@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["node", "vite/client"],
+    "noEmit": true
+  },
+  "include": ["src/novel-v2/**/*.ts", "scripts/novel-v2-api.ts", "scripts/novel-v2-worker.ts", "scripts/novel-v2-smoke.ts"]
+}

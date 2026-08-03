@@ -1,0 +1,112 @@
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+import path from "node:path";
+import { readFileSync } from "node:fs";
+/**
+ * 排除 onnxruntime-web 的 wasm 资源被打包进 dist。
+ *
+ * onnxruntime-web 在 build 时会被 Vite 检测到 wasm 引用并拷贝到 dist/assets，
+ * 但运行时 superRes.worker.ts 已通过 ort.env.wasm.wasmPaths 指向 CDN，
+ * dist 里的 wasm 文件根本不会被加载。删除可减少 ~24MB 产物体积。
+ */
+function excludeOnnxWasm() {
+    return {
+        name: "exclude-onnx-wasm",
+        enforce: "post",
+        generateBundle(_options, bundle) {
+            for (const key of Object.keys(bundle)) {
+                if (key.endsWith(".wasm"))
+                    delete bundle[key];
+            }
+        },
+    };
+}
+/**
+ * 从 src/config/defaults.ts 解析 DEFAULT_BASE_URL，避免在 vite.config 中重复维护默认值。
+ * vite.config 属于构建期（独立 TS 项目），无法静态 import src/ 下的文件，
+ * 故在配置加载时通过 fs 读取该唯一来源。
+ */
+function readDefaultBaseUrl() {
+    const src = readFileSync(path.resolve(__dirname, "src/config/defaults.ts"), "utf8");
+    const match = src.match(/DEFAULT_BASE_URL\s*=\s*"([^"]+)"/);
+    if (!match)
+        throw new Error("无法从 src/config/defaults.ts 解析 DEFAULT_BASE_URL");
+    return match[1];
+}
+const DEV_PROXY_TARGET = new URL(readDefaultBaseUrl()).origin;
+export default defineConfig({
+    plugins: [react(), excludeOnnxWasm()],
+    resolve: {
+        alias: {
+            "@": path.resolve(__dirname, "./src"),
+        },
+    },
+    optimizeDeps: {
+        exclude: ["onnxruntime-web"],
+    },
+    server: {
+        port: 5173,
+        proxy: {
+            "/api": {
+                target: DEV_PROXY_TARGET,
+                changeOrigin: true,
+                secure: false,
+                timeout: 600000,
+                proxyTimeout: 600000,
+            },
+            "/ai-proxy": {
+                target: DEV_PROXY_TARGET,
+                changeOrigin: true,
+                secure: false,
+                rewrite: (p) => p.replace(/^\/ai-proxy/, "/v1"),
+                timeout: 600000,
+                proxyTimeout: 600000,
+            },
+            "/v2": {
+                target: process.env.NOVEL_V2_API_URL ?? "http://127.0.0.1:4770",
+                changeOrigin: true,
+                secure: false,
+                timeout: 600000,
+                proxyTimeout: 600000,
+            },
+            // hf-mirror.com 不返回 Access-Control-Allow-Origin，浏览器跨域 fetch 会被 CORS 拦截。
+            // 走同源 /hf-mirror/ 路径由 vite 转发，规避 CORS（与 /api、/ai-proxy 同模式）。
+            // 生产部署需在后端反向代理同样路径，或通过 VITE_HF_MIRROR 指向已开启 CORS 的源。
+            "/hf-mirror": {
+                target: "https://hf-mirror.com",
+                changeOrigin: true,
+                secure: false,
+                rewrite: (p) => p.replace(/^\/hf-mirror/, ""),
+                timeout: 600000,
+                proxyTimeout: 600000,
+            },
+        },
+    },
+    build: {
+        target: "esnext",
+        rollupOptions: {
+            output: {
+                manualChunks(id) {
+                    if (!id.includes("node_modules"))
+                        return undefined;
+                    if (/[\\/]node_modules[\\/](\.pnpm[\\/])?(react|react-dom|react-router-dom|scheduler)[\\/]/.test(id)) {
+                        return "vendor-react";
+                    }
+                    if (/[\\/]node_modules[\\/](\.pnpm[\\/])?(antd|@ant-design|rc-[^\\/]+)[\\/]/.test(id)) {
+                        return "vendor-antd";
+                    }
+                    if (id.includes("motion") || id.includes("gsap")) {
+                        return "vendor-motion";
+                    }
+                    if (id.includes("@tanstack")) {
+                        return "vendor-query";
+                    }
+                    if (id.includes("zustand") || id.includes("axios")) {
+                        return "vendor-state";
+                    }
+                    return undefined;
+                },
+            },
+        },
+    },
+});

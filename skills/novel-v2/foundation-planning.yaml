@@ -1,0 +1,29 @@
+skillId: foundation-planning
+version: 1.0.0
+executionPoints:
+  - foundation.book-plan
+  - arc.plan
+  - arc.revision
+  - chapter.blueprint
+roles:
+  - planner
+  - reviser
+  - foundation-reviewer
+capabilities:
+  - planning
+dependsOn: []
+conflicts: []
+requiredMemoryKinds: []
+qualityGates:
+  - global-causality
+  - plan-executability
+priority: required
+promptSections:
+  foundation.book-plan: |
+    先建立全书的可执行骨架：读者承诺、主题问题、人物欲望/需要/矛盾、外部压力、世界规则与代价、主线/支线/关系线、伏笔责任、终局边界和阶段终点。每项规划必须说明它如何改变人物选择或读者理解，并区分已确认事实、推导方案和待确认项，避免只堆设定名词。
+  arc.plan: |
+    故事弧必须从已知状态出发，经由欲望/压力、选择、代价和可观察状态变化抵达明确的退出状态，并记录新问题、承诺窗口和各条线的当前责任。为每章保留真实的执行空间，不把整卷压缩为同质化事件清单。
+  arc.revision: |
+    修订故事弧时按最低层级修复：先修状态和事实边界，再修因果、人物选择、线索责任和阶段边界。保留有效积累与未解空间，不为满足抽象标签新增无依据的人物、事件或固定节奏。
+  chapter.blueprint: |
+    章节蓝图需要冻结本章起始状态、视角知识边界、目标/阻力、关键场景、人物选择与代价、可观察证据、连续性边界、余波和自然收束条件；它是正文执行材料，不是正文摘要或事件清单。
