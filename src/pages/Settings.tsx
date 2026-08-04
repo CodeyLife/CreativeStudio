@@ -49,14 +49,14 @@ export default function Settings() {
   }
 
   return (
-    <div style={{ maxWidth: 1440, margin: "0 auto", padding: "24px 28px 48px" }}>
+    <div className="settings-page">
       <PageHeader
         title="设置"
         description="AI 接口配置与提示词模板。所有设置自动持久化到本地，刷新不丢失。"
         icon={<SettingOutlined />}
       />
 
-      <Card style={{ background: "#18181b", borderColor: "#27272a", maxWidth: 640 }} styles={{ body: { padding: 20 } }}>
+      <Card className="settings-core-card" style={{ background: "#18181b", borderColor: "#27272a" }} styles={{ body: { padding: 20 } }}>
         {!hasOwnKey && usesDefaultBaseUrl && hasDefaultKey && (
           <Alert
             type="info"
@@ -87,30 +87,33 @@ export default function Settings() {
             spritesheet_prompt: spritesheetPrompt,
           }}
           onFinish={onSave}
+          className="settings-core-form"
         >
-          <Form.Item label="API Base URL" name="api_base_url" help="留空使用默认接口地址">
-            <Input placeholder="https://api.openai.com/v1" />
-          </Form.Item>
-          <Form.Item
-            label="API Key"
-            name="api_key"
-            help={apiKey
-              ? "使用自有 Key"
-              : usesDefaultBaseUrl && hasDefaultKey
-                ? "留空使用部署提供的默认 Key（不显示）"
-                : "当前没有可用的默认 Key，请填写"}
-          >
-            <Input.Password placeholder="sk-..." />
-          </Form.Item>
-          <Form.Item label="对话模型" name="chat_model" help="新配置默认 gpt-5-5；仍可选择 auto 由接口自动选择可用模型">
-            <ChatModelSelect style={{ width: "100%" }} />
-          </Form.Item>
-          <Form.Item label="模型上下文硬上限" name="model_context_window" help="留空或 0 时读取 /models 返回的能力字段；自定义接口未返回时可手动填写，例如 128000">
-            <Space.Compact style={{ width: "100%" }}>
-              <InputNumber min={0} step={1000} precision={0} style={{ width: "100%" }} placeholder="自动检测" />
-              <Button disabled style={{ pointerEvents: "none" }}>tokens</Button>
-            </Space.Compact>
-          </Form.Item>
+          <div className="settings-form-grid">
+            <Form.Item label="API Base URL" name="api_base_url" help="留空使用默认接口地址">
+              <Input placeholder="https://api.openai.com/v1" />
+            </Form.Item>
+            <Form.Item
+              label="API Key"
+              name="api_key"
+              help={apiKey
+                ? "使用自有 Key"
+                : usesDefaultBaseUrl && hasDefaultKey
+                  ? "留空使用部署提供的默认 Key（不显示）"
+                  : "当前没有可用的默认 Key，请填写"}
+            >
+              <Input.Password placeholder="sk-..." />
+            </Form.Item>
+            <Form.Item label="对话模型" name="chat_model" help="新配置默认 gpt-5-5；仍可选择 auto 由接口自动选择可用模型">
+              <ChatModelSelect style={{ width: "100%" }} />
+            </Form.Item>
+            <Form.Item label="模型上下文硬上限" name="model_context_window" help="留空或 0 时读取 /models 返回的能力字段；自定义接口未返回时可手动填写，例如 128000">
+              <Space.Compact style={{ width: "100%" }}>
+                <InputNumber min={0} step={1000} precision={0} style={{ width: "100%" }} placeholder="自动检测" />
+                <Button disabled style={{ pointerEvents: "none" }}>tokens</Button>
+              </Space.Compact>
+            </Form.Item>
+          </div>
           <Divider style={{ borderColor: "#27272a" }} />
           <Form.Item
             label="生图调用模式"
@@ -127,9 +130,11 @@ export default function Settings() {
             />
           </Form.Item>
           <Divider style={{ borderColor: "#27272a" }} />
-          <Form.Item label="缩略图尺寸" name="thumb_size" help="素材库和历史记录的缩略图尺寸">
-            <InputNumber min={64} max={512} style={{ width: "100%" }} />
-          </Form.Item>
+          <div className="settings-form-grid settings-form-grid-compact">
+            <Form.Item label="缩略图尺寸" name="thumb_size" help="素材库和历史记录的缩略图尺寸">
+              <InputNumber min={64} max={512} style={{ width: "100%" }} />
+            </Form.Item>
+          </div>
           <Divider style={{ borderColor: "#27272a" }} />
           <Form.Item
             label="绿幕模式提示词"
@@ -153,14 +158,16 @@ export default function Settings() {
               placeholder={DEFAULT_SPRITESHEET_PROMPT}
             />
           </Form.Item>
-          <Button type="primary" htmlType="submit">
-            保存
-          </Button>
-          {hasOwnKey && (
-            <Text style={{ color: "#10b981", fontSize: 12, marginLeft: 12 }}>
-              已配置自有接口
-            </Text>
-          )}
+          <div className="settings-form-actions">
+            <Button type="primary" htmlType="submit">
+              保存
+            </Button>
+            {hasOwnKey && (
+              <Text style={{ color: "#10b981", fontSize: 12 }}>
+                已配置自有接口
+              </Text>
+            )}
+          </div>
         </Form>
       </Card>
       <NovelModelRoutingSettings />
