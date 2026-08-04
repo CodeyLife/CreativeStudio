@@ -12,6 +12,7 @@ import type { NovelPostgresRepository } from "../postgres-repository";
 import type { ModelGateway } from "../model-gateway";
 import type { PromotionReceipt } from "../protocol";
 import type { ModelRoutingSnapshot } from "../model-routing";
+import { canonicalSha256 } from "../canonical-json";
 import { createCraftRulePromotionService } from "./promotion-service";
 import { compileStageContext } from "../stage-context";
 
@@ -28,12 +29,40 @@ export interface CraftRuleScopeAnalysis {
   regressionRisks: string[];
 }
 
+export interface CraftRuleScenarioProfile {
+  narrativeFunction: string | null;
+  povCharacterId: string | null;
+  sceneCountBucket: "none" | "single" | "multiple";
+  participantShape: "none" | "solo" | "dyad" | "ensemble";
+  hasUnresolvedClose: boolean;
+  fingerprint: string;
+}
+
+export function createScenarioProfileFingerprint(profile: Omit<CraftRuleScenarioProfile, "fingerprint">): string {
+  return canonicalSha256(profile).slice(0, 24);
+}
+
+export function areScenarioProfilesMateriallyDifferent(left: CraftRuleScenarioProfile, right: CraftRuleScenarioProfile): boolean {
+  const primaryDifference = left.narrativeFunction !== right.narrativeFunction
+    || left.povCharacterId !== right.povCharacterId
+    || left.hasUnresolvedClose !== right.hasUnresolvedClose;
+  const structuralDifference = left.sceneCountBucket !== right.sceneCountBucket
+    && left.participantShape !== right.participantShape;
+  return primaryDifference || structuralDifference;
+}
+
 export interface CraftRuleEvidenceCase {
   scenarioClass: string;
   scenarioRole: "source-failure" | "cross-scenario";
   baselineWorkItemId: string;
   candidateWorkItemId: string;
   capturedAt: number;
+  /** 章节实验直接复用正式生命周期；foundation 保留旧的基础任务评估路径。 */
+  evidenceKind?: "foundation" | "chapter";
+  experimentId?: string;
+  documentId?: string;
+  regressionPassed?: boolean;
+  regressionError?: string;
   /** LLM 评估分数（0-100），由 evaluateCraftRuleOnFoundation 填充。回归验证时用 candidateScore 作为基线。 */
   baselineScore?: number;
   candidateScore?: number;
@@ -43,6 +72,7 @@ export interface CraftRuleEvidenceCase {
   taskKey?: string;
   /** 评估摘要，由 evaluateCraftRuleOnFoundation 填充。 */
   summary?: string;
+  scenarioProfile?: CraftRuleScenarioProfile;
 }
 
 export interface CraftRuleReview {
@@ -140,6 +170,13 @@ function mapRow(row: CandidateRow): CraftRuleCandidate {
     applicableGenres: Array.isArray(row.applicable_genres) ? row.applicable_genres : [],
     createdAt: iso(row.created_at), updatedAt: iso(row.updated_at),
   };
+}
+
+/** 同一场景重跑时保留全部历史，但状态判定只使用该场景最新一条证据。 */
+function latestEvidenceCases(cases: CraftRuleEvidenceCase[]): CraftRuleEvidenceCase[] {
+  const latest = new Map<string, CraftRuleEvidenceCase>();
+  for (const evidence of cases) latest.set(`${evidence.scenarioRole}:${evidence.scenarioClass}`, evidence);
+  return [...latest.values()];
 }
 
 async function fetchCandidate(
@@ -282,6 +319,79 @@ export async function inspectCraftRuleCandidate(
     [candidateId, projectId],
   );
   return result.rowCount ? mapRow(result.rows[0]) : null;
+}
+
+/** 项目级候选队列查询，供作者看板和 API 复用同一份字段映射。 */
+export async function listCraftRuleCandidates(
+  repository: NovelPostgresRepository,
+  projectId: string,
+  limit = 100,
+): Promise<CraftRuleCandidate[]> {
+  const boundedLimit = Math.max(1, Math.min(Math.floor(limit), 500));
+  const result = await repository.pool.query<CandidateRow>(
+    `SELECT ${CANDIDATE_COLUMNS}
+     FROM craft_rule_candidates
+     WHERE project_id = $1
+     ORDER BY created_at DESC, id DESC
+     LIMIT $2`,
+    [projectId, boundedLimit],
+  );
+  return result.rows.map(mapRow);
+}
+
+/**
+ * 保存章节生命周期实验的完整证据。
+ * 与 recordCraftRuleEvidence 分开，因为实验 work item 属于隔离 schema，
+ * 不应被误当成正式库 creative_work_items，也不应绕过实验结果写入正式候选。
+ */
+export async function recordCraftRuleExperimentEvidence(
+  repository: NovelPostgresRepository,
+  input: {
+    projectId: string;
+    candidateId: string;
+    scenarioClass: string;
+    scenarioRole: "source-failure" | "cross-scenario";
+    baselineWorkItemId: string;
+    candidateWorkItemId: string;
+    experimentId: string;
+    documentId: string;
+    baselineScore?: number;
+    candidateScore?: number;
+    blockerDelta?: number;
+    majorDelta?: number;
+    summary: string;
+    regressionPassed: boolean;
+    regressionError?: string;
+    scenarioProfile: CraftRuleScenarioProfile;
+  },
+): Promise<CraftRuleCandidate> {
+  const candidate = await fetchCandidate(repository, input.projectId, input.candidateId);
+  if (candidate.status !== "proposed" && candidate.status !== "evidencing") {
+    throw new Error(`候选状态必须为 proposed 或 evidencing，当前为 ${candidate.status}`);
+  }
+  const evidence: CraftRuleEvidenceCase = {
+    scenarioClass: input.scenarioClass,
+    scenarioRole: input.scenarioRole,
+    baselineWorkItemId: input.baselineWorkItemId,
+    candidateWorkItemId: input.candidateWorkItemId,
+    capturedAt: Date.now(),
+    evidenceKind: "chapter",
+    experimentId: input.experimentId,
+    documentId: input.documentId,
+    baselineScore: input.baselineScore,
+    candidateScore: input.candidateScore,
+    blockerDelta: input.blockerDelta,
+    majorDelta: input.majorDelta,
+    summary: input.summary,
+    regressionPassed: input.regressionPassed,
+    regressionError: input.regressionError,
+    scenarioProfile: input.scenarioProfile,
+  };
+  await repository.pool.query(
+    "UPDATE craft_rule_candidates SET evidence_cases = evidence_cases || $3::jsonb, status = 'evidencing', updated_at = now() WHERE id = $1 AND project_id = $2",
+    [input.candidateId, input.projectId, JSON.stringify([evidence])],
+  );
+  return fetchCandidate(repository, input.projectId, input.candidateId);
 }
 
 // ===== 3. recordCraftRuleEvidence =====
@@ -481,6 +591,19 @@ export async function submitCraftRuleReview(
   if (candidate.status !== "evidencing" && candidate.status !== "reviewing") {
     throw new Error(`候选状态必须为 evidencing 或 reviewing，当前为 ${candidate.status}`);
   }
+  if (input.verdict === "passed") {
+    const evidenceCases = latestEvidenceCases(candidate.evidenceCases).filter((evidence) =>
+      (evidence.evidenceKind === "chapter" || Boolean(evidence.taskKey)) && typeof evidence.candidateScore === "number",
+    );
+    const roles = new Set(evidenceCases.map((evidence) => evidence.scenarioRole));
+    const scenarioClasses = new Set(evidenceCases.map((evidence) => evidence.scenarioClass));
+    const chapterEvidence = evidenceCases.filter((evidence) => evidence.evidenceKind === "chapter");
+    const profileClasses = new Set(chapterEvidence.flatMap((evidence) => evidence.scenarioProfile ? [evidence.scenarioProfile.fingerprint] : []));
+    const chapterProfilesInvalid = chapterEvidence.length > 0 && (profileClasses.size < 2 || chapterEvidence.some((evidence) => !evidence.scenarioProfile || evidence.regressionPassed !== true));
+    if (!roles.has("source-failure") || !roles.has("cross-scenario") || scenarioClasses.size < 2 || chapterProfilesInvalid) {
+      throw new Error("作者通过审核前必须完成原失败场景和实质异构场景回归，且所有章节证据通过");
+    }
+  }
   const review: CraftRuleReview = {
     role: input.role, reviewerId: input.reviewerId, reviewRunId: input.reviewRunId, model: input.model,
     provider: input.provider, promptFingerprint: input.promptFingerprint, verdict: input.verdict,
@@ -510,7 +633,7 @@ export async function submitCraftRuleReview(
  *
  * @returns passed: 是否通过；reasons: 失败原因列表（passed=false 时非空）
  */
-const REGRESSION_TOLERANCE = 5; // 容忍 5 分以内的回退（LLM 输出有随机性）
+const REGRESSION_TOLERANCE = 5; // TODO: 迁移到项目质量策略；仅用于旧 foundation 评估的模型方差容忍。
 
 async function runRegressionVerification(params: {
   repository: NovelPostgresRepository;
@@ -522,10 +645,25 @@ async function runRegressionVerification(params: {
   const reasons: string[] = [];
   const details: Array<{ scenarioClass: string; candidateScore: number; newScore: number; delta: number }> = [];
 
-  // 只对 evaluateCraftRuleOnFoundation 产生的 evidenceCase（有 taskKey + candidateScore）做回归
-  const regressableCases = candidate.evidenceCases.filter(
-    (c) => c.taskKey && typeof c.candidateScore === "number",
+  // foundation evidence 需要在晋升后重跑；chapter evidence 已在隔离 schema
+  // 中完成正式生命周期回归，这里只检查其持久化的通过结果，避免在正式库再次运行章节。
+  const regressableCases = latestEvidenceCases(candidate.evidenceCases).filter(
+    (c) => c.evidenceKind !== "chapter" && c.taskKey && typeof c.candidateScore === "number",
   );
+
+  const chapterCases = latestEvidenceCases(candidate.evidenceCases).filter((c) => c.evidenceKind === "chapter");
+  for (const evidenceCase of chapterCases) {
+    const candidateScore = evidenceCase.candidateScore ?? 0;
+    details.push({
+      scenarioClass: evidenceCase.scenarioClass,
+      candidateScore,
+      newScore: candidateScore,
+      delta: 0,
+    });
+    if (evidenceCase.regressionPassed !== true) {
+      reasons.push(`scenarioClass=${evidenceCase.scenarioClass} 的隔离章节回归证据未通过：${evidenceCase.regressionError ?? evidenceCase.summary ?? "未记录原因"}`);
+    }
+  }
 
   for (const evidenceCase of regressableCases) {
     const taskKey = evidenceCase.taskKey as "project-positioning" | "architecture" | "characters" | "worldview" | "plot-design";
@@ -556,7 +694,12 @@ async function runRegressionVerification(params: {
 export async function promoteCraftRuleCandidate(
   repository: NovelPostgresRepository,
   model: ModelGateway,
-  input: { projectId: string; candidateId: string },
+  input: {
+    projectId: string;
+    candidateId: string;
+    authorId?: string;
+    chapterRegressionVerifier?: (candidate: CraftRuleCandidate) => Promise<{ passed: boolean; reasons: string[]; details: unknown }>;
+  },
 ): Promise<{ candidate: CraftRuleCandidate; receipt: PromotionReceipt; regressionVerified: boolean; regressionDetails?: unknown }> {
   const candidate = await fetchCandidate(repository, input.projectId, input.candidateId);
   if (candidate.status !== "reviewing") {
@@ -565,11 +708,24 @@ export async function promoteCraftRuleCandidate(
   if (candidate.reviews.filter((r) => r.verdict === "passed").length === 0) {
     throw new Error("晋升需要至少 1 条 verdict=passed 的 review");
   }
-  const regressableCases = candidate.evidenceCases.filter((evidence) => evidence.taskKey && typeof evidence.candidateScore === "number");
+  const regressableCases = latestEvidenceCases(candidate.evidenceCases).filter((evidence) =>
+    (evidence.evidenceKind === "chapter" || Boolean(evidence.taskKey)) && typeof evidence.candidateScore === "number",
+  );
   const roles = new Set(regressableCases.map((evidence) => evidence.scenarioRole));
   const scenarioClasses = new Set(regressableCases.map((evidence) => evidence.scenarioClass));
-  if (!roles.has("source-failure") || !roles.has("cross-scenario") || scenarioClasses.size < 2) {
-    throw new Error("晋升前必须具备原失败场景和至少一个不同 scenarioClass 的异构回归证据");
+  const chapterEvidence = regressableCases.filter((evidence) => evidence.evidenceKind === "chapter");
+  const profileClasses = new Set(chapterEvidence.flatMap((evidence) => evidence.scenarioProfile ? [evidence.scenarioProfile.fingerprint] : []));
+  const chapterProfilesInvalid = chapterEvidence.length > 0 && (profileClasses.size < 2 || chapterEvidence.some((evidence) => !evidence.scenarioProfile));
+  if (!roles.has("source-failure") || !roles.has("cross-scenario") || scenarioClasses.size < 2 || chapterProfilesInvalid) {
+    throw new Error("晋升前必须具备原失败场景和至少一个实质不同的 ScenarioProfile 异构回归证据");
+  }
+  const failedChapterEvidence = latestEvidenceCases(candidate.evidenceCases).filter((evidence) => evidence.evidenceKind === "chapter" && evidence.regressionPassed !== true);
+  if (failedChapterEvidence.length) {
+    throw new Error(`隔离章节回归未全部通过：${failedChapterEvidence.map((evidence) => evidence.scenarioClass).join("、")}`);
+  }
+  const hasChapterEvidence = latestEvidenceCases(candidate.evidenceCases).some((evidence) => evidence.evidenceKind === "chapter");
+  if (hasChapterEvidence && !input.chapterRegressionVerifier) {
+    throw new Error("章节候选晋升必须提供晋升后的隔离回归验证器");
   }
 
   // 1. 调用 CraftRulePromotionService.promote（原子事务：UPDATE skill_definitions + INSERT receipt + UPDATE candidate.status）
@@ -577,7 +733,7 @@ export async function promoteCraftRuleCandidate(
   const promotionService = createCraftRulePromotionService(repository);
   const receipt = await promotionService.promote({
     candidate,
-    authorId: `craft-rule-bot:${candidate.id}`,
+    authorId: input.authorId ?? `craft-rule-bot:${candidate.id}`,
   });
 
   // 2. 检查 receipt 状态：若 promote 失败，直接抛错（不进入回归验证）
@@ -599,11 +755,25 @@ export async function promoteCraftRuleCandidate(
     );
   }
 
+  let postPromotionRegression: { passed: boolean; reasons: string[]; details: unknown } | undefined;
+  if (hasChapterEvidence) {
+    try {
+      postPromotionRegression = await input.chapterRegressionVerifier!(await fetchCandidate(repository, input.projectId, input.candidateId));
+    } catch (error) {
+      await promotionService.rollback(receipt.id);
+      throw new Error(`晋升后章节回归验证异常：${error instanceof Error ? error.message : String(error)}，已自动 rollback（receiptId=${receipt.id}）`);
+    }
+  }
+  if (postPromotionRegression && !postPromotionRegression.passed) {
+    await promotionService.rollback(receipt.id);
+    throw new Error(`晋升后章节回归验证失败：${postPromotionRegression.reasons.join("; ")}，已自动 rollback（receiptId=${receipt.id}）`);
+  }
+
   return {
     candidate: await fetchCandidate(repository, input.projectId, input.candidateId),
     receipt,
     regressionVerified: true,
-    regressionDetails: regressionResult.details,
+    regressionDetails: postPromotionRegression ? { prePromotion: regressionResult.details, postPromotion: postPromotionRegression.details } : regressionResult.details,
   };
 }
 

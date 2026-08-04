@@ -1,6 +1,6 @@
 import type { Artifact, ExecutionBlueprint, MemoryBundle, NovelIntent, SkillBundle, StagePromptPackage } from "../protocol";
 import type { ChapterPlanningContext } from "../application/story-arc";
-import { dedupeNarrativeRhythmMemory, renderChapterExecutionContract, renderExecutionMemoryClaim, renderNarrativeRhythm } from "./chapter-planning-context";
+import { dedupeNarrativeRhythmMemory, memoryClaimPriority, renderChapterExecutionContract, renderExecutionMemoryClaim, renderNarrativeRhythm } from "./chapter-planning-context";
 import { buildBlueprintSummary } from "./chapter-review";
 import { compileStageContext } from "../stage-context";
 import { buildSkillContextSections, skillPromptSection } from "../skill-runtime";
@@ -143,7 +143,7 @@ export function buildChapterDraftPromptPackage(input: DraftPromptInput & { workf
     { id: "draft-contract", kind: "goal" as const, title: "正文写作契约", text: instruction, priority: "critical" as const, provenanceRefs: [input.intent.id] },
     ...(input.planningContext ? [{ id: "execution-contract", kind: "planning" as const, title: "章节执行合同", text: renderChapterExecutionContract(input.planningContext), priority: "required" as const, provenanceRefs: [input.planningContext.fingerprint] }] : []),
     { id: "blueprint", kind: "blueprint" as const, title: "工作流蓝图引用", text: buildBlueprintSummary(input.blueprint, input.planningContext), priority: "normal" as const, provenanceRefs: [input.blueprint.id] },
-    ...memory.claims.map((claim) => ({ id: `memory:${claim.id}`, kind: "fact" as const, title: `冻结事实：${claim.title}`, text: renderExecutionMemoryClaim(claim).text, priority: claim.authority === "approved" || claim.authority === "author" ? "required" as const : "normal" as const, provenanceRefs: [claim.id, ...claim.sourceRevisionIds] })),
+    ...memory.claims.map((claim) => ({ id: `memory:${claim.id}`, kind: "fact" as const, title: `冻结事实：${claim.title}`, text: renderExecutionMemoryClaim(claim).text, priority: memoryClaimPriority(memory, claim), provenanceRefs: [claim.id, ...claim.sourceRevisionIds] })),
     ...(memory.narrativeRhythm ? [{ id: "narrative-rhythm", kind: "planning" as const, title: "连续章节位置", text: renderNarrativeRhythm(memory.narrativeRhythm), priority: "normal" as const, provenanceRefs: [memory.narrativeRhythm.fingerprint] }] : []),
     ...buildSkillContextSections(input.skills, "chapter.drafting", "写作 Skill"),
   ];

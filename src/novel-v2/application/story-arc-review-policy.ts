@@ -70,15 +70,6 @@ export function storyArcAuthorityClaims(chapter: StoryArcBundle["chapters"][numb
   ];
 }
 
-function stablePlannedValue(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(stablePlannedValue);
-  if (!value || typeof value !== "object") return value;
-  return Object.fromEntries(Object.entries(value)
-    .filter(([key, item]) => !(key === "unresolvedAtClose" && Array.isArray(item) && item.length === 0))
-    .sort(([left], [right]) => left.localeCompare(right))
-    .map(([key, item]) => [key, stablePlannedValue(item)]));
-}
-
 function frozenBlueprint(targetChapter: StoryArcRebaseTarget["chapters"][number] | undefined) {
   if (!targetChapter) return undefined;
   return targetChapter.plannedBlueprint && !targetChapter.revisionId && !targetChapter.committedMemory
@@ -86,9 +77,8 @@ function frozenBlueprint(targetChapter: StoryArcRebaseTarget["chapters"][number]
     : targetChapter.committedBlueprint;
 }
 
-function matchesFrozenBlueprint(chapter: StoryArcBundle["chapters"][number], targetChapter: StoryArcRebaseTarget["chapters"][number] | undefined): boolean {
-  const frozen = frozenBlueprint(targetChapter);
-  return Boolean(frozen && JSON.stringify(stablePlannedValue(chapter)) === JSON.stringify(stablePlannedValue(frozen)));
+function isFrozenHistoricalChapter(targetChapter: StoryArcRebaseTarget["chapters"][number] | undefined): boolean {
+  return Boolean(targetChapter?.revisionId || targetChapter?.committedMemory);
 }
 
 function frozenAuthorityEvidence(chapter: StoryArcBundle["chapters"][number], targetChapter: StoryArcRebaseTarget["chapters"][number] | undefined): string[] {
@@ -106,7 +96,7 @@ function issueMentionsChapter(issue: StoryArcReviewOutput["issues"][number], cha
 
 export function normalizeStoryArcReviewAuthority(bundle: StoryArcBundle, review: StoryArcReviewOutput, rebaseTarget?: StoryArcRebaseTarget): StoryArcReviewOutput {
   const frozen = new Set(bundle.chapters
-    .filter((chapter) => matchesFrozenBlueprint(chapter, rebaseTarget?.chapters.find((target) => target.globalOrder === chapter.index)))
+    .filter((chapter) => isFrozenHistoricalChapter(rebaseTarget?.chapters.find((target) => target.globalOrder === chapter.index)))
     .map((chapter) => chapter.index));
   return {
     ...review,

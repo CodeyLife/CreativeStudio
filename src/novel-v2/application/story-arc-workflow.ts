@@ -38,7 +38,10 @@ export async function startStoryArcReview(
   if (!arc?.blueprintArtifactId || arc.planningStatus !== "awaiting-review") throw new Error("故事弧当前没有可审核的蓝图");
   const workflowId = `story-arc-review-${randomUUID()}`;
   const reviewPolicy = input.reviewPolicy ?? (input.mode === "mcp" ? "auto" : "manual");
-  const rebase = arc.executionStatus === "completed";
+  // A review of an active arc can still sit behind committed chapters. Those
+  // chapters remain frozen authority during review even before the whole arc
+  // reaches completed status.
+  const rebase = arc.executionStatus === "completed" || arc.chapters.some((chapter) => Boolean(chapter.documentId));
   await repository.putWorkflowRun({
     id: workflowId,
     workflowType: "story-arc-planning",

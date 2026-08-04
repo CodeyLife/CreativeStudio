@@ -4,7 +4,7 @@
 
 ## 1. 结论
 
-本次重构的根因判断是：正文质量下降主要来自编辑性字段、重复上下文和固定章节合规检查叠加，而不是缺少“每章必须推进”的规则。系统现在把可靠性边界集中在事实、因果、状态、证据和 durable workflow，把文学选择留给全局规划、故事弧和模型。
+本次重构需要区分两类根因：正文质量下降主要来自编辑性字段、重复上下文和固定章节合规检查叠加；全书架构质量不足则来自 Foundation 只保存主题/功能摘要，未形成卷间状态、长线责任、人物能动性、规则代价和跨阶段引用契约。前一类才由正文 workflow 处理，后一类必须在 Foundation/Story Arc 层修复，不能用章节润色掩盖。
 
 当前活动链路：
 
@@ -36,6 +36,21 @@
 - plot-design
 
 旧 relations、plot-threads、foreshadowing、timeline、story-control 已折入核心阶段的可选结构，不再独立生成、审核或计数。所有 Foundation artifact 仍有 source artifact、fingerprint、作者确认、stale 级联和审计记录。
+
+### 2.1.1 当前全书架构审计契约
+
+`GET /v2/projects/:projectId/architecture/health` 现在除基础完整性 `issues` 外，返回独立的 `fullBookArchitecture` 报告。该报告以结构数据为输入，诊断：
+
+- 卷级 entryState、pressures、exitState、promiseWindows 是否完整；
+- 重要人物是否有 fear/限制，以及 `independentAction.desire`、`choice`、`cost`、`knowledgeBoundary`；
+- 每条世界规则是否同时有 statement、cost、boundary；
+- characterDestinations 是否解析到唯一规范人物 ID；
+- 长线是否有负责卷、下一次责任和交汇/退出/转化条件；
+- hidden、notDesigned、open 信息是否被区分。
+
+它不检查正文句式、章节长度、事件数量或文学风格。故事弧蓝图通过 `threadResponsibilities` 承载每条 `plotThreadRefs` 在本弧的责任和下一次可验证推进；这不是逐章兑现清单。架构问题的修复顺序是 Foundation 编辑/作者确认 → 活动 Story Arc rebase → 弧级审核；只有局部正文证据仍失败时，才进入正式 chapterReviewWorkflow。
+
+本次项目运行 `novel-create-wanfa-20260801` 的架构审计结果：6 卷、估计 670 章、6 名核心人物、3 条长线，`passed=true` 且结构问题为空。四个被补强的 Foundation section 已完成独立审核和作者确认；原有 6 个 final 章节未被该修复重写。rebase 已实际完成规划并生成新的弧级 blueprint artifact，随后进入弧级审核；最新尝试因 provider 402/网络超时取消，尚未生成新的 review artifact。
 
 ### 2.2 Story Arc
 
@@ -118,7 +133,11 @@ review/commit 后聚合 issue 模式为 RuntimeLearningAssessment。结论为 pr
 - regressionRisks；
 - candidate scope。
 
-skill iteration 的 prompt 注入机制分析而非只注入症状。promote 后重新运行失败场景，验证候选没有扩大到无关题材、角色、章节号或固定短语。
+成功章节只允许在 commit/enrich 后执行一次持久化 learning；事实审批挂起不得提前创建候选。质量门失败可保存一次原始失败 learning，不能用同一 artifact 的后续 assessment 覆盖候选而不重新生成候选内容。
+
+skill iteration 的 prompt 注入机制分析而非只注入症状。promote 后重新运行失败场景，验证候选没有扩大到无关题材、角色、章节号或固定短语。章节异构回归必须携带历史蓝图派生的 ScenarioProfile，不能仅以不同 documentId 作为跨场景证据；旧 foundation evidence 仍可读，但不能伪装成章节异构证据。
+
+Skill database check 必须报告未知 execution point；运行时不能静默删除失效点。context manifest 必须能审计 Story Arc 的 narrative cutoff、section provenance 和 fingerprint；章节修订的软背景与节奏上下文可被预算淘汰，定稿事实不能静默丢失。
 
 ## 5. 通用性与回归边界
 

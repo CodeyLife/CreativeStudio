@@ -78,6 +78,13 @@ type SkillRow = {
   quality_gates: string[] | null;
   prompt_sections: Record<string, unknown> | null;
   enabled: boolean;
+  execution_points: string[] | null;
+  roles: string[] | null;
+  depends_on: string[] | null;
+  priority: SkillDescriptor["priority"] | null;
+  applicable_genres: string[] | null;
+  content_fingerprint: string | null;
+  source_ref: string | null;
   updated_at: Date | string;
 };
 
@@ -194,6 +201,13 @@ function mapSkillRow(row: SkillRow): SkillDescriptor {
     qualityGates: row.quality_gates ?? [],
     promptSections: (row.prompt_sections ?? {}) as SkillDescriptor["promptSections"],
     enabled: row.enabled,
+    executionPoints: row.execution_points as SkillDescriptor["executionPoints"],
+    roles: row.roles ?? [],
+    dependsOn: row.depends_on ?? [],
+    priority: row.priority ?? undefined,
+    applicableGenres: row.applicable_genres ?? [],
+    contentFingerprint: row.content_fingerprint ?? undefined,
+    sourceRef: row.source_ref ?? undefined,
   };
 }
 
@@ -323,7 +337,7 @@ export async function captureProjectSnapshot(
       [projectId],
     ),
     repository.pool.query<SkillRow>(
-      "SELECT skill_id, version, capabilities, applicable_tasks, required_memory_kinds, conflicts, quality_gates, prompt_sections, enabled, updated_at FROM skill_definitions ORDER BY skill_id",
+      "SELECT skill_id, version, capabilities, applicable_tasks, required_memory_kinds, conflicts, quality_gates, prompt_sections, enabled, execution_points, roles, depends_on, priority, applicable_genres, content_fingerprint, source_ref, updated_at FROM skill_definitions ORDER BY skill_id",
     ),
     repository.pool.query<EntityRow>(
       "SELECT id, kind, name, payload FROM entities WHERE project_id = $1 ORDER BY id",

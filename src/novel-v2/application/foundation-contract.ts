@@ -85,6 +85,41 @@ const objectSchema = (required: string[], properties: Record<string, JsonSchema>
   properties,
 });
 
+const architectureVolumeSchema = objectSchema(
+  ["name", "theme", "function", "entryState", "exitState", "pressures", "promiseWindows"],
+  {
+    name: stringSchema,
+    theme: stringSchema,
+    function: stringSchema,
+    entryState: stringSchema,
+    exitState: stringSchema,
+    pressures: nonEmptyArraySchema({ type: "string", minLength: 1 }),
+    promiseWindows: { type: "array", items: { type: "object" } },
+  },
+);
+
+const longHorizonThreadSchema = objectSchema(
+  ["threadRef", "direction", "closureCondition", "doNotConsumeBefore", "responsibleVolumeOrdinals", "nextResponsibility"],
+  {
+    threadRef: stringSchema,
+    direction: stringSchema,
+    closureCondition: stringSchema,
+    doNotConsumeBefore: stringSchema,
+    responsibleVolumeOrdinals: nonEmptyArraySchema({ type: "integer", minimum: 1 }),
+    nextResponsibility: stringSchema,
+  },
+);
+
+const independentActionSchema = objectSchema(
+  ["desire", "choice", "cost", "knowledgeBoundary"],
+  {
+    desire: stringSchema,
+    choice: stringSchema,
+    cost: stringSchema,
+    knowledgeBoundary: stringOrObjectSchema,
+  },
+);
+
 const foundationDataSchemas: Record<string, JsonSchema> = {
   "project-positioning": objectSchema(
     ["bookTitle", "sellingPoints", "targetReader", "coreConflict", "activePressureSource", "corePromise", "protagonistNeed", "centralOpposition", "emotionalContract", "themeQuestion"],
@@ -103,9 +138,10 @@ const foundationDataSchemas: Record<string, JsonSchema> = {
   ),
   architecture: objectSchema(["structure", "volumes", "povStrategy", "timeSpan"], {
     structure: stringSchema,
-    volumes: nonEmptyArraySchema(),
+    volumes: nonEmptyArraySchema(architectureVolumeSchema),
     povStrategy: stringSchema,
     timeSpan: stringSchema,
+    longHorizonBoundaries: { type: "object" },
   }),
   characters: nonEmptyArraySchema(objectSchema(["id", "name", "role", "motivation", "fear", "voiceAnchor", "arc", "independentAction"], {
     id: stringSchema,
@@ -115,7 +151,7 @@ const foundationDataSchemas: Record<string, JsonSchema> = {
     fear: stringSchema,
     voiceAnchor: { type: "object" },
     arc: { type: "object" },
-    independentAction: { type: "object" },
+    independentAction: independentActionSchema,
   })),
   worldview: objectSchema(["geography", "politics", "factions", "rules"], {
     geography: { type: "object" },
@@ -138,9 +174,15 @@ const foundationDataSchemas: Record<string, JsonSchema> = {
   foreshadowings: nonEmptyArraySchema(objectSchema(["id", "description", "expectedPayoffWindow"], { id: stringSchema, description: stringSchema, expectedPayoffWindow: stringSchema })),
   timeline: objectSchema(["storyEvents"], { storyEvents: nonEmptyArraySchema() }),
   storyControl: objectSchema(["paceCurve", "payoffDistribution"], { paceCurve: nonEmptyArraySchema(), payoffDistribution: nonEmptyArraySchema() }),
-  plotStrategy: objectSchema(["narrativePromises", "characterDestinations", "endingEnvelope", "nonNegotiables"], {
+  plotStrategy: objectSchema(["narrativePromises", "characterDestinations", "longHorizonThreads", "informationBoundaries", "endingEnvelope", "nonNegotiables"], {
     narrativePromises: nonEmptyArraySchema({ type: "string", minLength: 1 }),
     characterDestinations: nonEmptyArraySchema(),
+    longHorizonThreads: nonEmptyArraySchema(longHorizonThreadSchema),
+    informationBoundaries: objectSchema(["hidden", "notDesigned", "open"], {
+      hidden: { type: "array", items: { type: "object" } },
+      notDesigned: { type: "array", items: { type: "object" } },
+      open: { type: "array", items: { type: "object" } },
+    }),
     endingEnvelope: { type: "object" },
     nonNegotiables: nonEmptyArraySchema({ type: "string", minLength: 1 }),
   }),
@@ -212,6 +254,13 @@ function validateRepeatedEntries(taskKey: string, structuredData: Record<string,
     for (const key of requiredByTask[taskKey] ?? []) {
       if (!meaningful((entry as Record<string, unknown>)[key])) errors.push(`${collectionKey}[${index}].${key} 不能为空`);
     }
+    if (taskKey === "characters") {
+      const action = (entry as Record<string, unknown>).independentAction;
+      const actionRecord = action && typeof action === "object" && !Array.isArray(action) ? action as Record<string, unknown> : undefined;
+      for (const key of ["desire", "choice", "cost", "knowledgeBoundary"]) {
+        if (!meaningful(actionRecord?.[key])) errors.push(`${collectionKey}[${index}].independentAction.${key} 不能为空`);
+      }
+    }
   }
 }
 
@@ -232,6 +281,24 @@ function validateWorldviewRules(structuredData: Record<string, unknown>, errors:
   }
 }
 
+function validateArchitectureVolumes(structuredData: Record<string, unknown>, errors: string[]): void {
+  const architecture = structuredData.architecture;
+  if (!architecture || typeof architecture !== "object" || Array.isArray(architecture)) return;
+  const volumes = (architecture as Record<string, unknown>).volumes;
+  if (!Array.isArray(volumes)) return;
+  for (const [index, volume] of volumes.entries()) {
+    if (!volume || typeof volume !== "object" || Array.isArray(volume)) {
+      errors.push(`architecture.volumes[${index}] 必须包含卷级状态、压力和承诺窗口`);
+      continue;
+    }
+    const entry = volume as Record<string, unknown>;
+    for (const key of ["entryState", "exitState", "pressures", "promiseWindows"]) {
+      const valid = key === "promiseWindows" ? Array.isArray(entry[key]) : meaningful(entry[key]);
+      if (!valid) errors.push(`architecture.volumes[${index}].${key} 不能为空`);
+    }
+  }
+}
+
 /** Validate semantic fields that generic foundationSchema cannot express. */
 export function validateFoundationTaskContract(value: FoundationOutput, taskKey: string): string[] {
   const contract = FOUNDATION_TASK_CONTRACTS[taskKey];
@@ -247,6 +314,7 @@ export function validateFoundationTaskContract(value: FoundationOutput, taskKey:
   }
   validateRepeatedEntries(taskKey, structuredData, errors);
   if (taskKey === "worldview") validateWorldviewRules(structuredData, errors);
+  if (taskKey === "architecture") validateArchitectureVolumes(structuredData, errors);
   return errors;
 }
 

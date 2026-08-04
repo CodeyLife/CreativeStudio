@@ -28,7 +28,7 @@ describe("foundation context projection", () => {
           role: "配角",
           motivation: "守住证据",
           voiceAnchor: { sentenceLength: "短句", vocabulary: "克制", directness: "间接", avoidance: "回避承诺" },
-          independentAction: { desire: "保护证据", choice: "拒绝交易", cost: "失去职位" },
+          independentAction: { desire: "保护证据", choice: "拒绝交易", cost: "失去职位", knowledgeBoundary: "不知道幕后交易的完整参与者" },
         }],
       }),
     ]);

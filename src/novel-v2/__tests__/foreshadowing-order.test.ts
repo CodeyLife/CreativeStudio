@@ -98,7 +98,54 @@ describe("foreshadowing narrative visibility", () => {
       expect.objectContaining({ id: `${snapshot.id}:pov:甲`, knowledgeScope: { characterId: "甲" } }),
     ]));
     const stateClaim = pinned.find((item) => item.id === snapshot.id);
-    expect(stateClaim?.content).not.toContain("测试伏笔");
-    expect(stateClaim?.content).not.toContain("过去承诺");
+    expect(stateClaim?.content).toContain(snapshot.openForeshadowings[0].id);
+    expect(stateClaim?.content).toContain(snapshot.openPromises[0].id);
+  });
+
+  it("requires an exact payoff ID or a unique legacy fallback before closing a promise", async () => {
+    if (!available) return;
+    const documentId = `document-payoff-${randomUUID()}`;
+    const revisionId = `revision-payoff-${randomUUID()}`;
+    const contentHash = `content-payoff-${randomUUID()}`;
+    await repository.pool.query("INSERT INTO manuscript_documents(id,project_id,title,narrative_order) VALUES($1,$2,$3,20)", [documentId, projectId, "兑现测试章节"]);
+    await repository.pool.query("INSERT INTO content_blobs(content_hash,object_key,byte_length) VALUES($1,$2,0)", [contentHash, `test/${contentHash}`]);
+    await repository.pool.query(
+      "INSERT INTO manuscript_revisions(id,project_id,document_id,revision,base_revision,content_hash) VALUES($1,$2,$3,1,0,$4)",
+      [revisionId, projectId, documentId, contentHash],
+    );
+    const exactPromiseId = `promise-exact-${randomUUID()}`;
+    const exactForeshadowingId = `foreshadowing-exact-${randomUUID()}`;
+    const ambiguousPromiseIds = [`promise-ambiguous-a-${randomUUID()}`, `promise-ambiguous-b-${randomUUID()}`];
+    await repository.pool.query(
+      `INSERT INTO promises(id,project_id,statement,source_revision_id,status,payload,narrative_order)
+       VALUES($1,$4,'精确承诺',$5,'open',$6,3),($2,$4,'模糊承诺甲',$5,'open',$6,4),($3,$4,'模糊承诺乙',$5,'open',$6,5)`,
+      [exactPromiseId, ambiguousPromiseIds[0], ambiguousPromiseIds[1], projectId, revisionId, { promiser: "同一承诺者", promisee: "乙" }],
+    );
+    await repository.pool.query(
+      `INSERT INTO foreshadowing(id,project_id,planted_revision_id,status,payload,narrative_order)
+       VALUES($1,$2,$3,'open',$4,3)`,
+      [exactForeshadowingId, projectId, revisionId, { description: "精确伏笔", triggerKeywords: ["精确"] }],
+    );
+    await repository.recordNarrativeElements({
+      projectId,
+      documentId,
+      revisionId,
+      artifact: { id: `artifact-payoff-${randomUUID()}` } as never,
+      narrativeOrder: 20,
+      narrativeElements: {
+        foreshadowings: [],
+        promises: [],
+        payoffs: [
+          { description: "精确兑现", payoffType: "promise", matchedPromiseId: exactPromiseId, evidence: "正文明确完成精确承诺" },
+          { description: "无法唯一关联", payoffType: "promise", matchedPromiser: "同一承诺者", evidence: "正文完成但来源不唯一" },
+          { description: "精确伏笔兑现", payoffType: "foreshadowing", matchedForeshadowingIds: [exactForeshadowingId], evidence: "正文明确回收精确伏笔" },
+        ],
+      },
+    });
+    const statuses = await repository.pool.query<{ id: string; status: string }>("SELECT id,status FROM promises WHERE id=ANY($1::text[])", [[exactPromiseId, ...ambiguousPromiseIds]]);
+    expect(statuses.rows.find((row) => row.id === exactPromiseId)?.status).toBe("fulfilled");
+    expect(statuses.rows.filter((row) => ambiguousPromiseIds.includes(row.id)).every((row) => row.status === "open")).toBe(true);
+    const foreshadowingStatus = await repository.pool.query<{ status: string }>("SELECT status FROM foreshadowing WHERE id=$1", [exactForeshadowingId]);
+    expect(foreshadowingStatus.rows[0]?.status).toBe("fulfilled");
   });
 });

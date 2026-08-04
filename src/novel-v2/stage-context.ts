@@ -99,7 +99,6 @@ export function compileStageContext(request: StageContextRequest, now = Date.now
   const receipts: PromptContextSectionReceipt[] = [];
   const candidates: Array<StageContextSection & { fingerprint: string }> = [];
   const contentSeen = new Set<string>();
-  const artifactSeen = new Set<string>();
 
   for (const section of normalized.sort((left, right) => PRIORITY_RANK[right.priority] - PRIORITY_RANK[left.priority])) {
     if (section.exclusionReason) {
@@ -114,12 +113,7 @@ export function compileStageContext(request: StageContextRequest, now = Date.now
       receipts.push(receipt(section, "excluded", "duplicate-content"));
       continue;
     }
-    if (section.sourceArtifactId && artifactSeen.has(section.sourceArtifactId)) {
-      receipts.push(receipt(section, "excluded", "duplicate-source"));
-      continue;
-    }
     contentSeen.add(section.fingerprint);
-    if (section.sourceArtifactId) artifactSeen.add(section.sourceArtifactId);
     candidates.push(section);
   }
 

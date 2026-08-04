@@ -116,6 +116,17 @@ describe("model routing config", () => {
     expect(resolveRoute(next, "review.foundation")).toEqual(next.routes["review.foundation"]);
     expect(() => validateModelRoutingConfig(next)).not.toThrow();
   });
+
+  it("resolves canonical chapter review purposes through the review wildcard", () => {
+    const next = config([profile()]);
+    next.routes = {
+      "review.*": { candidates: [{ executor: "api", profileId: "primary" }], conversationPolicy: "stateless" },
+      "*": { candidates: [{ executor: "external-mcp" }], conversationPolicy: "stateless" },
+    };
+    expect(resolveRoute(next, "review.structure")).toEqual(next.routes["review.*"]);
+    expect(resolveRoute(next, "review.prose")).toEqual(next.routes["review.*"]);
+    expect(() => validateModelRoutingConfig(next)).not.toThrow();
+  });
 });
 
 describe("model routing persistence", () => {
@@ -201,6 +212,18 @@ describe("RoutedModelGateway adapters", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it("propagates provider cached input usage into the invocation audit", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
+      choices: [{ message: { content: "ok" } }],
+      usage: { prompt_tokens: 12, completion_tokens: 2, prompt_tokens_details: { cached_tokens: 8 } },
+    }), { status: 200 })));
+    const recorder = vi.fn(async () => undefined);
+    const result = await new RoutedModelGateway(new ModelConfigStore("unused", config()), recorder).generateText({ purpose: "writing.draft", prompt: "完整上下文" });
+
+    expect(result.usage).toMatchObject({ providerInputTokens: 12, providerCachedInputTokens: 8 });
+    expect(recorder).toHaveBeenLastCalledWith(expect.objectContaining({ providerInputTokens: 12, providerCachedInputTokens: 8 }));
+  });
+
   it("uses previous_response_id only for a configured Responses writing chain", async () => {
     const responsesProfile = profile({ protocol: "responses", responseMode: "json", capabilities: ["text", "structured", "responses-continuation", "embedding", "rerank"] });
     const next = config([responsesProfile]);
@@ -213,6 +236,27 @@ describe("RoutedModelGateway adapters", () => {
     vi.stubGlobal("fetch", fetchMock);
     const result = await new RoutedModelGateway(new ModelConfigStore("unused", next)).generateText({ purpose: "writing.revision", prompt: "revise", previousProfileId: "primary", previousResponseId: "resp_previous" });
     expect(result.provenance.responseId).toBe("resp_next");
+  });
+
+  it("uses the Responses schema contract without repeating the JSON Schema in user input", async () => {
+    const responsesProfile = profile({ protocol: "responses", responseMode: "json", capabilities: ["text", "structured", "stream", "embedding", "rerank"] });
+    const next = config([responsesProfile]);
+    const schema = { type: "object", additionalProperties: false, required: ["ok"], properties: { ok: { type: "boolean" } } };
+    let requestBody: Record<string, unknown> | undefined;
+    vi.stubGlobal("fetch", vi.fn(async (_url: string, init?: RequestInit) => {
+      requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return new Response(JSON.stringify({ id: "response-1", output_text: JSON.stringify({ ok: true }) }), { status: 200 });
+    }));
+
+    await expect(new RoutedModelGateway(new ModelConfigStore("unused", next)).generateStructured({
+      purpose: "review.arc",
+      prompt: "只判断当前故事弧是否满足状态合同。",
+      schema,
+    })).resolves.toMatchObject({ value: { ok: true } });
+
+    expect(requestBody?.input).toBe("只判断当前故事弧是否满足状态合同。");
+    expect(JSON.stringify(requestBody?.input)).not.toContain("additionalProperties");
+    expect(requestBody?.text).toEqual({ format: { type: "json_schema", name: "model_output", strict: true, schema } });
   });
 
   it("moves to the next explicit candidate after a non-retryable provider error", async () => {

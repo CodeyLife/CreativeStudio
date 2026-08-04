@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { assessRuntimeLearningWithModel, parseRuntimeLearningAssessmentV2, reviewIssuesForLearning } from "../learning-assessment";
+import { assessRuntimeLearningWithModel, buildRuntimeLearningPrompt, parseRuntimeLearningAssessmentV2, reviewIssuesForLearning } from "../learning-assessment";
+import { buildCraftRuleCandidateInput } from "../temporal/activities";
 import type { Artifact, Review } from "../protocol";
 import type { ModelGateway, ModelUsage } from "../model-gateway";
 import type { ModelExecutionProvenance, ModelRoutingSnapshot } from "../model-routing";
@@ -62,20 +63,49 @@ describe("V2 runtime learning assessment", () => {
           targetKind: "skill",
           targetId: "pov-boundary",
           rationale: "把审校机制前移到 drafting 自检",
-          afterText: "通用原则：生成限知视角章节时，先列出 POV 角色在当前叙事截止点已经亲历、听闻或可合理推断的信息，再写正文。决策规则：凡是只存在于作者全局记忆、反派私下行动或未来章节的事实，除非通过可观察痕迹被 POV 角色感知，否则不得直接进入叙述、心理判断或解释性旁白。验证方式：完成草稿后逐段检查信息来源，无法标注来源的句子必须改写为可观察现象、角色误判或暂时留白。",
+          afterText: JSON.stringify({ "chapter.review.structure": "通用原则：审核限知视角章节时，先核对 POV 角色在当前叙事截止点已经亲历、听闻或可合理推断的信息。决策规则：凡是只存在于作者全局记忆、他人私下行动或未来章节的事实，除非通过可观察痕迹被 POV 角色感知，否则标记为知识边界问题。验证方式：逐段检查信息来源，无法标注来源的句子必须要求改写为可观察现象、角色误判或暂时留白。" }),
         },
       } as T, usage, provenance: mockProvenance }),
       generateText: async () => ({ value: "", text: "", usage, provenance: mockProvenance }),
       embed: async () => ({ value: [], vectors: [], usage, provenance: mockProvenance }),
       rerank: async () => ({ value: [], scores: [], usage, provenance: mockProvenance }),
     };
-    const { assessment } = await assessRuntimeLearningWithModel({ projectId: "p1", workflowId: "wf-1", artifact, reviews: [blockingReview], model, now: 5 });
+    const { assessment } = await assessRuntimeLearningWithModel({
+      projectId: "p1",
+      workflowId: "wf-1",
+      artifact,
+      reviews: [blockingReview],
+      model,
+      now: 5,
+      availableSkills: [{ skillId: "pov-boundary", capabilities: ["review"], executionPoints: ["chapter.review.structure"] }],
+    });
     expect(assessment).toMatchObject({
       conclusion: "propose-improvement",
       underlyingMechanism: expect.stringContaining("POV"),
       affectedInputClass: expect.stringContaining("限知 POV"),
       candidate: { targetKind: "skill", targetId: "pov-boundary" },
     });
+    const rejected = await assessRuntimeLearningWithModel({
+      projectId: "p1",
+      workflowId: "wf-1",
+      artifact,
+      reviews: [blockingReview],
+      model,
+      now: 6,
+      availableSkills: [{ skillId: "pov-boundary", capabilities: ["draft"], executionPoints: ["chapter.drafting"] }],
+    });
+    expect(rejected.assessment.conclusion).toBe("no-shared-learning");
+    expect(rejected.validationError).toContain("未声明的 executionPoint");
+  });
+
+  it("exposes declared execution points when asking for a reusable Skill patch", () => {
+    const prompt = buildRuntimeLearningPrompt({
+      artifact,
+      reviews: [blockingReview],
+      availableSkills: [{ skillId: "pov-boundary", capabilities: ["review"], executionPoints: ["chapter.review.structure"] }],
+    });
+    expect(prompt).toContain("executionPoints: chapter.review.structure");
+    expect(prompt).toContain("JSON 对象的字符串表示");
   });
 
   it("keeps warning-only review evidence in the learning assessment path", async () => {
@@ -114,5 +144,45 @@ describe("V2 runtime learning assessment", () => {
     const { assessment, validationError } = await assessRuntimeLearningWithModel({ projectId: "p1", workflowId: "wf-1", artifact, reviews: [blockingReview], model, now: 6 });
     expect(assessment.conclusion).toBe("no-shared-learning");
     expect(validationError).toContain("underlyingMechanism");
+  });
+
+  it("does not build a candidate for no-shared-learning and preserves propose evidence", () => {
+    const noShared = {
+      ...base(),
+      id: "learning-no-shared",
+      projectId: "p1",
+      conclusion: "no-shared-learning" as const,
+    };
+    expect(buildCraftRuleCandidateInput(noShared)).toBeUndefined();
+
+    const propose = {
+      ...base(),
+      id: "learning-propose",
+      projectId: "p1",
+      conclusion: "propose-improvement" as const,
+      symptom: "限知视角泄漏作者信息",
+      failingLayer: "drafting skill",
+      underlyingMechanism: "写作执行点没有把 POV 的可知边界转化为逐段决策",
+      affectedInputClass: "限知 POV 且存在角色未知事实的章节",
+      boundaries: "不适用于全知叙事或已授权的戏剧反讽",
+      regressionRisks: ["可能压制合法悬念铺垫"],
+      candidate: {
+        targetKind: "skill" as const,
+        targetId: "narrative-continuity",
+        rationale: "在 drafting 前置检查角色可知范围",
+        afterText: "通用规则：写作前列出 POV 角色已知信息，正文中的事实必须能回溯到亲历、听闻、合理推断或可观察痕迹；无法回溯的作者信息改写为现象、误判或留白。".repeat(2),
+      },
+    };
+    expect(buildCraftRuleCandidateInput(propose)).toMatchObject({
+      targetId: "narrative-continuity",
+      afterText: propose.candidate.afterText,
+      scope: {
+        underlyingMechanism: propose.underlyingMechanism,
+        affectedInputClass: propose.affectedInputClass,
+        boundaries: [propose.boundaries],
+        regressionRisks: propose.regressionRisks,
+      },
+      learningSource: { assessmentId: propose.id, mechanism: propose.underlyingMechanism },
+    });
   });
 });

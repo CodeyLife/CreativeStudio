@@ -184,8 +184,8 @@ export function NovelModelRoutingSettings() {
   if (!config && !loading) return <Alert type="error" showIcon message="无法读取 V2 模型路由配置" action={<Button onClick={() => void load()}>重试</Button>} />;
 
   return (
-    <section style={{ marginTop: 32, paddingTop: 24, borderTop: "1px solid #27272a" }}>
-      <Space style={{ width: "100%", justifyContent: "space-between", marginBottom: 16 }} align="start">
+    <section className="settings-routing-section">
+      <Space className="settings-routing-header" style={{ width: "100%", justifyContent: "space-between", marginBottom: 16 }} align="start" wrap>
         <div>
           <Title level={3} style={{ margin: 0, fontSize: 20 }}>小说模型路由</Title>
           <Text type="secondary">V2 Runtime 全局 provider、purpose 路由与外部 MCP 执行策略</Text>
@@ -196,8 +196,11 @@ export function NovelModelRoutingSettings() {
         </Space>
       </Space>
 
-      <Table<Profile>
+      <div className="settings-table-scroll">
+        <Table<Profile>
         rowKey="id" loading={loading} pagination={false} size="small" dataSource={config?.profiles ?? []}
+        scroll={{ x: 900 }}
+        className="settings-table"
         columns={[
           { title: "接口", dataIndex: "label", render: (_, profile) => <Space direction="vertical" size={0}><Text strong>{profile.label}</Text><Text type="secondary" style={{ fontSize: 12 }}>{profile.id}</Text></Space> },
           { title: "协议", dataIndex: "protocol", render: (value) => <Tag color={value === "responses" ? "blue" : "green"}>{value}</Tag> },
@@ -213,12 +216,16 @@ export function NovelModelRoutingSettings() {
             <Popconfirm title="删除该接口？" onConfirm={() => setConfig((current) => current ? { ...current, profiles: current.profiles.filter((item) => item.id !== profile.id) } : current)}><Tooltip title="删除"><Button danger aria-label="删除" icon={<DeleteOutlined />} /></Tooltip></Popconfirm>
           </Space> },
         ]}
-      />
+        />
+      </div>
 
-      <div style={{ marginTop: 24 }}>
+      <div className="settings-routing-table-group">
         <Title level={4} style={{ fontSize: 16 }}>调用位置</Title>
-        <Table<Purpose>
+        <div className="settings-table-scroll">
+          <Table<Purpose>
           rowKey={(purpose) => purpose} pagination={false} size="small" dataSource={[...PURPOSES]}
+          scroll={{ x: 880 }}
+          className="settings-table"
           columns={[
             { title: "用途 / 角色", width: 220, render: (purpose: Purpose) => <Space direction="vertical" size={0}><Text strong>{PURPOSE_LABELS[purpose]}</Text><Text type="secondary" style={{ fontSize: 12 }}>{purpose}</Text></Space> },
             { title: "有序候选链", render: (purpose: Purpose) => {
@@ -250,7 +257,8 @@ export function NovelModelRoutingSettings() {
               return purpose.startsWith("writing.") ? <Segmented size="small" value={route.conversationPolicy ?? "stateless"} options={[{ label: "无会话", value: "stateless" }, { label: "任务续接", value: "task-chain" }]} onChange={(value) => setConfig((current) => current ? { ...current, routes: { ...current.routes, [purpose]: { ...route, conversationPolicy: value as Route["conversationPolicy"] } } } : current)} /> : <Tag>隔离</Tag>;
             } },
           ]}
-        />
+          />
+        </div>
       </div>
 
       <Modal title={editing ? "编辑模型接口" : "添加模型接口"} open={modalOpen} onCancel={() => setModalOpen(false)} onOk={() => void saveProfile()} forceRender>

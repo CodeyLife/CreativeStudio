@@ -185,10 +185,13 @@ export function computeTokenBudget(taskClass: PreflightPlan["taskClass"], totalC
   return 32_000;
 }
 
-export async function buildMemoryBundle(plan: PreflightPlan, input: { projectId: string; provider: MemoryProvider; tokenBudget?: number; pinnedClaims?: MemoryHit[] }, now = Date.now()): Promise<MemoryBundle> {
+export async function buildMemoryBundle(plan: PreflightPlan, input: { projectId: string; provider: MemoryProvider; tokenBudget?: number; pinnedClaims?: MemoryHit[]; additionalClaims?: MemoryHit[] }, now = Date.now()): Promise<MemoryBundle> {
   const retrieved = await input.provider.search({ projectId: input.projectId, facets: plan.facets, narrativeCutoff: plan.narrativeCutoff, povCharacterId: plan.povCharacterId });
   const pinnedIds = new Set((input.pinnedClaims ?? []).map((claim) => claim.id));
-  const claims = [...(input.pinnedClaims ?? []), ...retrieved];
+  // Additional claims are available for ranking and required-facet selection,
+  // but do not become unconditionally frozen. This keeps a durable ledger
+  // visible without turning every open thread into a hard local instruction.
+  const claims = [...(input.pinnedClaims ?? []), ...(input.additionalClaims ?? []), ...retrieved];
   const tokenBudget = input.tokenBudget ?? 24_000;
   const receipts: MemorySelectionReceipt[] = [];
   const visible = claims.filter((claim) => {

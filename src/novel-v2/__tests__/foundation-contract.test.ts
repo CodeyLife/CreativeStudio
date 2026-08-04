@@ -14,15 +14,15 @@ describe("foundation task semantic contracts", () => {
   it("accepts the required structured anchors for all ten tasks", () => {
     const fixtures: Record<string, Record<string, unknown>> = {
       "project-positioning": { positioning: { bookTitle: "长夜归舟", sellingPoints: ["关系悬疑"], targetReader: "成年悬疑读者", coreConflict: "追查与自保", activePressureSource: "制度追责", corePromise: "每次揭示都改变关系", protagonistNeed: "承认失去", centralOpposition: "沉默的共同体", emotionalContract: "克制但有回响", themeQuestion: { notApplicable: true, rationale: "主题保留到故事弧中处理" } } },
-      architecture: { architecture: { structure: "三卷递进", volumes: ["寻找", "对抗"], povStrategy: "限知视角", timeSpan: "两年" } },
-      characters: { characters: [{ id: "p1", name: "甲", role: "主角", motivation: "查清旧案", fear: "失去最后的亲人", voiceAnchor: { sentenceLength: "短句", vocabulary: "克制", directness: "间接", avoidance: "回避承诺" }, arc: "从逃避到承担", independentAction: { desire: "保护证据", choice: "拒绝交易", cost: "失去职位" } }] },
+      architecture: { architecture: { structure: "三卷递进", volumes: [{ name: "寻找", theme: "查明", function: "建立问题", entryState: "未知", exitState: "开始追查", pressures: ["制度追责"], promiseWindows: [] }, { name: "对抗", theme: "承担", function: "公开后果", entryState: "开始追查", exitState: "承担结果", pressures: ["关系破裂"], promiseWindows: [] }], povStrategy: "限知视角", timeSpan: "两年" } },
+      characters: { characters: [{ id: "p1", name: "甲", role: "主角", motivation: "查清旧案", fear: "失去最后的亲人", voiceAnchor: { sentenceLength: "短句", vocabulary: "克制", directness: "间接", avoidance: "回避承诺" }, arc: "从逃避到承担", independentAction: { desire: "保护证据", choice: "拒绝交易", cost: "失去职位", knowledgeBoundary: "不知道幕后交易的完整参与者" } }] },
       worldview: { worldview: { geography: "沿江城市", politics: "地方机构", factions: ["调查组"], rules: [{ statement: "证据必须付出关系代价", cost: "失去盟友", boundary: "不能凭空恢复被毁证据" }] } },
       relations: { relations: [{ from: "甲", to: "乙", type: "互相利用", strength: "脆弱", evolution: { from: "利用", to: "合作", trigger: "共同承担风险" }, choiceConsequence: "任一方退出都会失去翻案机会" }] },
       "plot-threads": { plotThreads: { main: ["查案"], subplots: ["家庭关系"] } },
       foreshadowing: { foreshadowings: [{ id: "f1", description: "旧照片缺角", expectedPayoffWindow: "第二卷末" }] },
       timeline: { timeline: { storyEvents: ["归乡", "发现照片"] } },
       "story-control": { storyControl: { paceCurve: ["缓", "紧"], payoffDistribution: ["关系回报", "真相回报"] } },
-      "plot-design": { plotStrategy: { narrativePromises: ["真相改变关系"], characterDestinations: ["甲承担后果"], endingEnvelope: "开放但不否定代价", nonNegotiables: ["不抹除已付出的代价"] } },
+      "plot-design": { plotStrategy: { narrativePromises: ["真相改变关系"], characterDestinations: ["甲承担后果"], longHorizonThreads: [{ threadRef: "main", direction: "查明真相", closureCondition: "公开真相", doNotConsumeBefore: "后期", responsibleVolumeOrdinals: [1, 2], nextResponsibility: "在第二阶段公开证据" }], informationBoundaries: { hidden: [], notDesigned: [], open: [] }, endingEnvelope: "开放但不否定代价", nonNegotiables: ["不抹除已付出的代价"] } },
     };
     for (const [taskKey, structuredData] of Object.entries(fixtures)) {
       expect(validateFoundationTaskContract(output(structuredData), taskKey), taskKey).toEqual([]);
@@ -44,6 +44,8 @@ describe("foundation task semantic contracts", () => {
     expect(validateFoundationTaskContract(value, "characters")).toEqual(expect.arrayContaining([
       "characters[0].motivation 不能为空",
       "characters[0].arc 不能为空",
+      "characters[0].independentAction.desire 不能为空",
+      "characters[0].independentAction.knowledgeBoundary 不能为空",
     ]));
   });
 
@@ -51,6 +53,6 @@ describe("foundation task semantic contracts", () => {
     const validate = new Ajv({ allErrors: true, strict: false }).compile(foundationSchemaForTask("architecture"));
     const base = { title: "架构", summary: "这是一段足够长的规划摘要，用于说明结构决策、冲突来源、人物方向、信息释放、卷级职责、视角边界、时间跨度和后续修订边界。", sections: [] };
     expect(validate({ ...base, structuredData: { structure: "三卷递进", volumes: ["寻找"], povStrategy: "限知", timeSpan: "两年" } })).toBe(false);
-    expect(validate({ ...base, structuredData: { architecture: { structure: "三卷递进", volumes: [{ name: "寻找" }], povStrategy: "限知", timeSpan: "两年" } } })).toBe(true);
+    expect(validate({ ...base, structuredData: { architecture: { structure: "三卷递进", volumes: [{ name: "寻找", theme: "查明", function: "建立问题", entryState: "未知", exitState: "开始追查", pressures: ["制度追责"], promiseWindows: [] }], povStrategy: "限知", timeSpan: "两年" } } })).toBe(true);
   });
 });

@@ -158,6 +158,20 @@ describe("fact-extraction retention contract", () => {
     expect(prompt).toContain("服饰");
     expect(prompt).toContain("承诺");
   });
+
+  it("offers exact open-element IDs while leaving unmatched payoffs unlinked", () => {
+    const prompt = buildFactExtractionPrompt({
+      artifact,
+      text: "正文略。",
+      openNarrativeElements: {
+        foreshadowings: [{ id: "foreshadowing-1", description: "门上的刻痕", triggerKeywords: ["刻痕"], expectedPayoffWindow: "本卷末" }],
+        promises: [{ id: "promise-1", promiser: "甲", promisee: "乙", statement: "会回来" }],
+      },
+    });
+    expect(prompt).toContain("foreshadowing-1");
+    expect(prompt).toContain("promise-1");
+    expect(prompt).toContain("不要填写 ID，也不要为了完成关联猜测");
+  });
 });
 
 describe("fact-extraction classifyFactRisk maps to risk tiers", () => {

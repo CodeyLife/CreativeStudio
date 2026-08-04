@@ -22,6 +22,7 @@
 import type { PromotionReceipt } from "../protocol";
 import type { NovelPostgresRepository } from "../postgres-repository";
 import type { CraftRuleCandidate } from "./index";
+import { mergeCraftRulePromptSections, parseCraftRulePromptPatch } from "./prompt-patch";
 
 // ===== 类型 =====
 
@@ -65,10 +66,6 @@ function mapReceiptRow(row: ReceiptRow): PromotionReceipt {
  * 把 prompt 文本序列化为 skill_definitions.prompt_sections 可写入的 JSON 字符串。
  * 与 evaluation/promotion.ts 处理逻辑一致：能解析为 JSON 则直接用，否则包装为 { drafting: text }。
  */
-function toPromptSectionsJson(text: string): string {
-  try { JSON.parse(text); return text; } catch { return JSON.stringify({ drafting: text }); }
-}
-
 /**
  * 解析 system-prompt target 的 targetId。
  * 与 craft-rule/index.ts splitPromptTargetId 一致：支持 "<projectId>:<templateId>" 或 "<templateId>"。
@@ -111,43 +108,8 @@ class CraftRulePromotionServiceImpl implements CraftRulePromotionService {
       return existing;
     }
 
-    // 2. 校验 target 当前版本仍为 beforeVersion（防并发晋升覆盖）
-    if (candidate.targetKind === "skill") {
-      const result = await this.repository.pool.query<{ version: string }>(
-        "SELECT version FROM skill_definitions WHERE skill_id = $1",
-        [candidate.targetId],
-      );
-      if (!result.rowCount) {
-        return this.writeFailedReceipt(candidate, `stale-target-version：skill_definitions 不存在：${candidate.targetId}`);
-      }
-      if (result.rows[0].version !== candidate.beforeVersion) {
-        return this.writeFailedReceipt(
-          candidate,
-          `stale-target-version：skill_definitions.version 已漂移（before=${candidate.beforeVersion}, current=${result.rows[0].version}）`,
-        );
-      }
-    } else {
-      // system-prompt target：校验 prompt_templates.version 未漂移
-      const [promptProjectId, templateId] = splitPromptTargetId(candidate.targetId, candidate.projectId);
-      const result = await this.repository.pool.query<{ version: string }>(
-        "SELECT version FROM prompt_templates WHERE project_id = $1 AND template_id = $2",
-        [promptProjectId, templateId],
-      );
-      if (!result.rowCount) {
-        return this.writeFailedReceipt(
-          candidate,
-          `stale-target-version：prompt_templates 不存在：project_id=${promptProjectId}, template_id=${templateId}`,
-        );
-      }
-      if (result.rows[0].version !== candidate.beforeVersion) {
-        return this.writeFailedReceipt(
-          candidate,
-          `stale-target-version：prompt_templates.version 已漂移（before=${candidate.beforeVersion}, current=${result.rows[0].version}）`,
-        );
-      }
-    }
-
-    // 3. 执行原子事务
+    // 2. 执行原子事务。目标版本必须在同一事务内锁定并校验，
+    // 否则事务外的 preflight 与实际 UPDATE 之间会留下覆盖窗口。
     const receiptId = `promote:${candidate.id}`;
     const now = Date.now();
 
@@ -162,16 +124,29 @@ class CraftRulePromotionServiceImpl implements CraftRulePromotionService {
         // 设计依据：Phase 3.3 + AGENTS.md「reusable contracts over case-specific rules」——
         // craft rule 通过 learning 闭环沉淀题材相关规则，promote 必须把 applicableGenres 持久化。
         const applicableGenres = candidate.applicableGenres ?? [];
-        await client.query(
-          "UPDATE skill_definitions SET prompt_sections = $2::jsonb, version = $3, applicable_genres = $4, updated_at = now() WHERE skill_id = $1",
-          [candidate.targetId, toPromptSectionsJson(candidate.afterText), candidate.proposedVersion, applicableGenres],
+        const current = await client.query<{ prompt_sections: Record<string, unknown> | null; version: string }>(
+          "SELECT prompt_sections, version FROM skill_definitions WHERE skill_id = $1 FOR UPDATE",
+          [candidate.targetId],
         );
+        if (!current.rowCount || current.rows[0].version !== candidate.beforeVersion) throw new Error(`stale-target-version：skill_definitions.version 已漂移（before=${candidate.beforeVersion}, current=${current.rows[0]?.version ?? "missing"}）`);
+        const promptSections = mergeCraftRulePromptSections(current.rows[0].prompt_sections, parseCraftRulePromptPatch(candidate.afterText));
+        const updated = await client.query(
+          "UPDATE skill_definitions SET prompt_sections = $2::jsonb, version = $3, applicable_genres = $4, updated_at = now() WHERE skill_id = $1 AND version = $5",
+          [candidate.targetId, JSON.stringify(promptSections), candidate.proposedVersion, applicableGenres, candidate.beforeVersion],
+        );
+        if (updated.rowCount !== 1) throw new Error(`stale-target-version：skill_definitions.version 已漂移（before=${candidate.beforeVersion}）`);
       } else {
         const [promptProjectId, templateId] = splitPromptTargetId(candidate.targetId, candidate.projectId);
-        await client.query(
-          "UPDATE prompt_templates SET content = $3, version = $4, content_fingerprint = md5($3), updated_at = now() WHERE project_id = $1 AND template_id = $2",
-          [promptProjectId, templateId, candidate.afterText, candidate.proposedVersion],
+        const current = await client.query<{ version: string }>(
+          "SELECT version FROM prompt_templates WHERE project_id = $1 AND template_id = $2 FOR UPDATE",
+          [promptProjectId, templateId],
         );
+        if (!current.rowCount || current.rows[0].version !== candidate.beforeVersion) throw new Error(`stale-target-version：prompt_templates.version 已漂移（before=${candidate.beforeVersion}, current=${current.rows[0]?.version ?? "missing"}）`);
+        const updated = await client.query(
+          "UPDATE prompt_templates SET content = $3, version = $4, content_fingerprint = md5($3), updated_at = now() WHERE project_id = $1 AND template_id = $2 AND version = $5",
+          [promptProjectId, templateId, candidate.afterText, candidate.proposedVersion, candidate.beforeVersion],
+        );
+        if (updated.rowCount !== 1) throw new Error(`stale-target-version：prompt_templates.version 已漂移（before=${candidate.beforeVersion}）`);
       }
 
       // 3.2 INSERT promotion_receipts（status=promoted）
@@ -207,7 +182,14 @@ class CraftRulePromotionServiceImpl implements CraftRulePromotionService {
       return receipt;
     } catch (error) {
       await client.query("ROLLBACK");
+      // 同一 candidate 的并发调用可能在本事务等待期间已经成功提交。
+      // 成功 receipt 是幂等结果，不能被后来的 stale 错误降级为 failed。
+      const promoted = await this.getReceipt(candidate.id);
+      if (promoted?.status === "promoted") return promoted;
       const errorMessage = (error as Error).message ?? String(error);
+      if (errorMessage.startsWith("stale-target-version")) {
+        return this.writeFailedReceipt(candidate, errorMessage, receiptId);
+      }
       await this.writeFailedReceipt(candidate, `transaction-failure：${errorMessage}`, receiptId);
       throw error;
     } finally {
@@ -232,10 +214,11 @@ class CraftRulePromotionServiceImpl implements CraftRulePromotionService {
       target_kind: "skill" | "system-prompt";
       target_id: string;
       before_version: string;
+      proposed_version: string;
       before_text: string;
       project_id: string;
     }>(
-      "SELECT target_kind, target_id, before_version, before_text, project_id FROM craft_rule_candidates WHERE id = $1",
+      "SELECT target_kind, target_id, before_version, proposed_version, before_text, project_id FROM craft_rule_candidates WHERE id = $1",
       [receipt.candidateId],
     );
     if (!candidateResult.rowCount) {
@@ -249,16 +232,28 @@ class CraftRulePromotionServiceImpl implements CraftRulePromotionService {
 
       // 3.1 恢复 target（skill → skill_definitions，system-prompt → prompt_templates）
       if (candidateRow.target_kind === "skill") {
-        await client.query(
-          "UPDATE skill_definitions SET prompt_sections = $2::jsonb, version = $3, updated_at = now() WHERE skill_id = $1",
-          [candidateRow.target_id, toPromptSectionsJson(candidateRow.before_text), candidateRow.before_version],
+        const current = await client.query<{ version: string }>(
+          "SELECT version FROM skill_definitions WHERE skill_id = $1 FOR UPDATE",
+          [candidateRow.target_id],
         );
+        if (!current.rowCount || current.rows[0].version !== candidateRow.proposed_version) throw new Error(`stale-target-version：skill_definitions.version 已漂移，拒绝覆盖回滚（expected=${candidateRow.proposed_version}, current=${current.rows[0]?.version ?? "missing"}）`);
+        const updated = await client.query(
+          "UPDATE skill_definitions SET prompt_sections = $2::jsonb, version = $3, updated_at = now() WHERE skill_id = $1 AND version = $4",
+          [candidateRow.target_id, JSON.stringify(parseCraftRulePromptPatch(candidateRow.before_text)), candidateRow.before_version, candidateRow.proposed_version],
+        );
+        if (updated.rowCount !== 1) throw new Error(`stale-target-version：skill_definitions.version 已漂移，拒绝覆盖回滚（expected=${candidateRow.proposed_version}）`);
       } else {
         const [promptProjectId, templateId] = splitPromptTargetId(candidateRow.target_id, candidateRow.project_id);
-        await client.query(
-          "UPDATE prompt_templates SET content = $3, version = $4, content_fingerprint = md5($3), updated_at = now() WHERE project_id = $1 AND template_id = $2",
-          [promptProjectId, templateId, candidateRow.before_text, candidateRow.before_version],
+        const current = await client.query<{ version: string }>(
+          "SELECT version FROM prompt_templates WHERE project_id = $1 AND template_id = $2 FOR UPDATE",
+          [promptProjectId, templateId],
         );
+        if (!current.rowCount || current.rows[0].version !== candidateRow.proposed_version) throw new Error(`stale-target-version：prompt_templates.version 已漂移，拒绝覆盖回滚（expected=${candidateRow.proposed_version}, current=${current.rows[0]?.version ?? "missing"}）`);
+        const updated = await client.query(
+          "UPDATE prompt_templates SET content = $3, version = $4, content_fingerprint = md5($3), updated_at = now() WHERE project_id = $1 AND template_id = $2 AND version = $5",
+          [promptProjectId, templateId, candidateRow.before_text, candidateRow.before_version, candidateRow.proposed_version],
+        );
+        if (updated.rowCount !== 1) throw new Error(`stale-target-version：prompt_templates.version 已漂移，拒绝覆盖回滚（expected=${candidateRow.proposed_version}）`);
       }
 
       // 3.2 更新 receipt status = rolled-back
@@ -300,7 +295,7 @@ class CraftRulePromotionServiceImpl implements CraftRulePromotionService {
     };
     try {
       await this.repository.pool.query(
-        "INSERT INTO promotion_receipts(id, candidate_id, project_id, status, result, failure_reason, created_at) VALUES($1, $2, $3, $4, $5, $6, to_timestamp($7 / 1000.0)) ON CONFLICT(candidate_id) DO UPDATE SET status = EXCLUDED.status, failure_reason = EXCLUDED.failure_reason",
+        "INSERT INTO promotion_receipts(id, candidate_id, project_id, status, result, failure_reason, created_at) VALUES($1, $2, $3, $4, $5, $6, to_timestamp($7 / 1000.0)) ON CONFLICT(candidate_id) DO UPDATE SET status = EXCLUDED.status, failure_reason = EXCLUDED.failure_reason WHERE promotion_receipts.status <> 'promoted'",
         [receipt.id, receipt.candidateId, receipt.projectId, receipt.status, JSON.stringify(receipt.result), reason, now],
       );
     } catch {

@@ -72,13 +72,37 @@ Foundation 只生成 project-positioning、architecture、characters、worldview
 
 章节蓝图只承载局部因果和状态执行合同：index、title、narrativeFunction、povCharacterId、stateTransition、scenes、continuityConstraints、unresolvedAtClose。scene 只承载 title、participants、situation、observableActions，以及可为空的 opposition、decision、outcome、cost。
 
-正文 prompt 只保留少量硬边界：正文输出、事实与 POV、章节执行合同、禁止元注释、自然收束。不得写入固定字数、3000 字、最小段落、narrativeScale、固定钩子、每章新贡献、持续施压或逐章主题/感情/幽默要求。
+结构质量门分为两层：事实、身份、时间线、知识边界、状态转移、活动批次归属和权威记忆投影是硬门；characterFocus、worldRuleRefs、payoffRefs、场景数量、篇幅、钩子和章节功能分布只作为软诊断。`fullBookArchitecture` 缺少或为空的必需根集合产生 major；故事弧批准必须同时通过 Foundation.required 和 fullBookArchitecture 的 blocker/major 门禁。`architecture/health` 负责先报告问题，章节蓝图在审批前缺正文仍属 planned，不计 orphaned；只有已批准故事弧缺正文、关联正文不存在或缺故事弧才计 orphaned。
+
+故事弧引用采用“规范 ID + 兼容别名”：输入边界可以提交旧名称或自然语言别名，内部诊断使用规范 ID；多个对象匹配同一别名时不得自动合并。新伏笔概念在规划阶段可以暂存为未知警告，待事实提取或作者确认后再建立正式对象。
+
+### 5.1 全书架构质量门
+
+全书架构质量不是把五大正文审核维度提前套到每一章，而是检查 Foundation 是否提供了能向 Story Arc 传递的阶段合同。当前共享审计覆盖四类根因：卷缺少入口/压力/出口/承诺窗口，人物只有主线功能而没有独立行动和代价，世界规则只有设定描述而没有成本与边界，长线或人物终点跨阶段引用无法解析。长线还需要阶段责任、下一次可见推进和信息状态边界。
+
+这些检查属于结构数据门，不是写作禁令：`chapterCount` 只能是资源估计；`promiseWindows` 是责任窗口而不是逐章兑现清单；`informationBoundaries` 允许作者保留 hidden、notDesigned 和 open 状态。审计通过后，基础设定的作者确认才允许完成；受影响的活动故事弧必须 rebase，再由 Story Arc 审核确认。它不因架构审计通过而要求正文变长，也不因章节审校出现问题而反向增加卷级字段。
+
+长期叙事上下文采用“账本硬约束、开放元素可检索”的分层：当前叙事状态、截止点事实和满足当前 facet 的必要记忆不得静默丢弃；开放伏笔/承诺保留规范 ID、窗口和来源，但作为可排序候选进入局部创作。故事弧规划额外接收结构化的近期机制反馈，用于修复规划回写缺口，不把某个章节的问题直接变成所有章节的固定写法。
+
+正文 prompt 只保留少量硬边界：正文输出、事实与 POV、章节执行合同、禁止元注释、自然收束。不得写入固定字数、3000 字、最小段落、narrativeScale、固定钩子、每章新贡献、持续施压或逐章主题/感情/幽默要求。若问题是卷级状态、跨卷长线、人物终点或世界规则边界缺失，先修上游架构，不用正文 prompt 代偿。
 
 ## 6. 修订与学习
 
 修订必须从正文证据和 revisionRanges 出发，只改变问题机制相关范围，其余正文保持稳定。输出净化基于 Markdown 围栏、标题行、冒号前缀等结构特征，不使用精确短语黑名单。
 
-review/commit 后的 learning 必须分析 underlyingMechanism 和 affectedInputClass，而不只是复制 issue 症状。propose-improvement 记录边界、回归风险和候选输入类；promote 后重新运行失败场景，验证改进没有把局部偏好变成全局硬约束。
+review/commit 后的 learning 必须分析 underlyingMechanism 和 affectedInputClass，而不只是复制 issue 症状。`no-shared-learning` 只保存 assessment，不创建候选；`propose-improvement` 必须同时保存机制、影响输入类、适用边界、回归风险和 before/after 候选文本。
+
+章节生命周期中，成功章节只在 `commit → enrichCharacters` 完成后执行一次持久化 learning；质量门失败的终态尝试可以执行一次 learning 作为原始失败证据；事实人工审批挂起时不得对未提交 artifact 创建候选，恢复后由 post-commit learning 统一完成。不得对同一提交候选重复评估并用后一次 assessment 覆盖前一次结果。
+
+事实提取对伏笔/承诺兑现采用精确 ID 优先、唯一候选兼容回退的关联契约。没有足够证据时保持开放，不因关键词相似或承诺者相同而批量关闭；该规则保护长期可信度，同时不要求每章处理所有开放元素。
+
+候选队列是作者可见的审计对象，状态为 `proposed → evidencing → reviewing → promoted / rolled-back / rejected`。候选生成不等于 skill 迭代：正式版本在实验、作者审核和原子晋升前不得改变，历史候选不得自动合并或自动晋升。
+
+实验回归必须复用正式章节生命周期，并在隔离 schema 的实际 Skill execution point 注入候选版本。至少覆盖一条原失败场景和一条异构输入场景；异构场景必须由历史蓝图派生的 `ScenarioProfile` 在叙事功能、POV、未解决事项模式或场景结构上产生实质差异，不能只依赖不同章节 ID。候选版本必须在 prompt execution manifest 中被实际读取。回归通过要求正式提交成功、结构质量不退化、总体质量不下降、blocker/major 数量不增加、新 blocker/major 模式不出现且原模式不复现。任一回归失败、作者拒绝或目标版本漂移，都只能记录原因并保持正式 skill/prompt 不变。
+
+作者审核通过且两类回归证据齐全后，promotion service 在单一事务中更新目标文本、版本、适用题材和晋升收据。Skill target 的 afterText JSON 是 execution-point patch，历史普通文本映射为 drafting，并合并到既有 `prompt_sections`；system-prompt target 仍写入完整文本。后续 drafting/revision 通过数据库 Skill provider 重新解析版本，不能只更新候选状态或 receipt。promote 后的验证只允许在隔离环境重跑；失败时用保存的完整 beforeText 恢复旧文本并把候选标记为 rolled-back。
+
+Skill descriptor 中未知 execution point 必须保留为诊断信息；`novel:skills:check --target database` 报告数据库漂移，实际 Skill resolution 遇到失效点时直接阻断并指出 skill/version/失效值，不得静默过滤。
 
 ## 7. 历史兼容
 

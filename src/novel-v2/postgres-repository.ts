@@ -53,7 +53,9 @@ import type { ObjectStoreAdapter } from "./object-store";
 import { countNovelCharacters } from "./word-count";
 import type { ObjectStoreIdentity } from "./object-store";
 import { normalizeManuscriptStructuralReview } from "./application/manuscript-structure";
-import { CHAPTER_NARRATIVE_FUNCTIONS, canGenerateNextStoryArcBatch, compileChapterPlanValidationReport, normalizeChapterPlanningContext, parseStoryArcBundle, planningContextFingerprint, type ArcPlanningStatus, type ChapterBlueprint, type ChapterBlueprintRecord, type ChapterPlanningContext, type ChapterSceneBlueprint, type NarrativeArcPlan, type StoryArcBatchRecord, type StoryArcBundle, type StoryArcRebaseTarget, type StoryArcRecord } from "./application/story-arc";
+import { auditNamedReferences, auditStoryArcBatchRanges, canonicalReferenceId, normalizeThreadResponsibilityReferences, resolveNamedReference, type NamedReferenceCandidate, type StoryArcIntegrityIssue } from "./application/story-arc-integrity";
+import { auditFullBookArchitecture } from "./application/full-book-architecture";
+import { CHAPTER_NARRATIVE_FUNCTIONS, canGenerateNextStoryArcBatch, compileChapterPlanValidationReport, normalizeChapterPlanningContext, parseStoryArcBundle, planningContextFingerprint, validateStoryArcPlanContracts, type ArcPlanningStatus, type ChapterBlueprint, type ChapterBlueprintRecord, type ChapterPlanningContext, type ChapterSceneBlueprint, type NarrativeArcPlan, type StoryArcBatchRecord, type StoryArcBundle, type StoryArcContextReceipt, type StoryArcRebaseTarget, type StoryArcRecord } from "./application/story-arc";
 import type { StoryArcReviewOutput } from "./prompts/story-arc";
 import { aggregateChapterReviews, reviewIssueFingerprint, type ChapterReviewIssueStatus } from "./chapter-review-snapshot";
 import {
@@ -67,6 +69,42 @@ import { chapterTitleSourceFingerprint, type ChapterTitleSource } from "./applic
 import { canonicalSha256 } from "./canonical-json";
 import { canonicalizeFactPredicate, normalizeFactToken } from "./fact-extraction/fingerprint";
 import { scopeClaimsToChapter } from "./fact-extraction/narrative-scope";
+
+export const V1_MIGRATED_SKILL_IDS = [
+  "long-form-master-craft",
+  "story-facts-invariant",
+  "premise-pressure-test",
+  "character-desire-engine",
+  "character-voice-matrix",
+  "world-rule-contract",
+  "hierarchical-outline",
+  "causal-thread-weaving",
+  "foreshadowing-ledger",
+  "chapter-blueprint",
+  "scene-action-reaction",
+  "embodied-prose",
+  "serial-rhythm",
+  "continuity-audit",
+  "style-specificity-audit",
+  "plot-pacing-audit",
+  "fact-delta-extraction",
+  "classic-character-ensemble",
+  "classic-narrative-tension",
+  "classic-prose-texture",
+  "romance-arc-design",
+  "imagery-aesthetics",
+  "prose-discipline",
+  "plot-segment-design",
+  "plot-segment-audit",
+  "blueprint-audit",
+  "prose-audit",
+  "reader-audit",
+] as const;
+
+export function hasCompatibleV1SkillSet(skillIds: readonly string[]): boolean {
+  const available = new Set(skillIds);
+  return V1_MIGRATED_SKILL_IDS.every((skillId) => available.has(skillId));
+}
 
 export interface NovelProjectSnapshot {
   projectId: string;
@@ -89,6 +127,12 @@ export interface NovelProjectSnapshot {
 export type MutableKnowledgeRecordKind = "planning" | "worldview" | "characters" | "relations" | "timeline" | "facts" | "claims" | "skills";
 export type KnowledgeRecordKind = MutableKnowledgeRecordKind | "foundation" | "claims" | "chapter-memories" | "project-skills";
 
+export interface LearningAssessmentView {
+  assessment: RuntimeLearningAssessmentV2;
+  sourceChapter?: { id: string; title: string; narrativeOrder: number; status: string };
+  candidate?: { id: string; status: string; targetKind: string; targetId: string; proposedVersion: string };
+}
+
 type ProjectRow = { id: string; title: string; current_revision: string | number; metadata: Record<string, unknown>; created_at: Date | string; updated_at: Date | string };
 type DocumentRow = { id: string; project_id: string; title: string; narrative_order: string | number; pov_character_id: string | null; current_revision_id: string | null; status: string; created_at: Date | string; updated_at: Date | string; word_count?: string | number | null; latest_revision?: string | number | null; chapter_goal?: string | null; blocking_issue_count?: string | number | null; review_score?: string | number | null; review_verdict?: "passed" | "revise" | "blocked" | null; review_stale?: boolean | null; arc_id?: string | null; arc_title?: string | null; arc_planning_status?: string | null };
 type WorkflowRunRow = { id: string; workflow_type: string; project_id: string; temporal_workflow_id: string; status: string; payload: Record<string, unknown>; created_at: Date | string; updated_at: Date | string };
@@ -99,6 +143,16 @@ type ProjectPlanSectionRow = { project_id: string; task_key: string; work_item_i
 type ArcRow = { id: string; volume_id: string; project_id: string; title: string; ordinal: string | number; planning_status: StoryArcRecord["planningStatus"]; execution_status: StoryArcRecord["executionStatus"]; payload: NarrativeArcPlan; source_artifact_id: string | null; blueprint_artifact_id: string | null; context_fingerprint: string | null; review_artifact_id: string | null; review_fingerprint: string | null; edit_revision: string | number; approved_at: Date | string | null; completed_at: Date | string | null; abandoned_at: Date | string | null; updated_at: Date | string };
 type ChapterBlueprintRow = { id: string; arc_id: string; project_id: string; document_id: string | null; title: string; ordinal: string | number; status: string; payload: Record<string, unknown>; source_artifact_id: string | null; blueprint_revision: string | number };
 type StoryArcBatchRow = { id: string; arc_id: string; project_id: string; batch_index: string | number; start_chapter_index: string | number; end_chapter_index: string | number; status: StoryArcBatchRecord["status"]; entry_fingerprint: string; source_artifact_id: string | null; payload: Record<string, unknown>; approved_at: Date | string | null };
+
+export function buildNarrativeRhythmSnapshotQuery(): string {
+  return `SELECT d.id AS document_id,d.current_revision_id AS revision_id,d.narrative_order,d.title,c.arc_id,c.payload AS chapter_payload
+       FROM chapters target
+       JOIN chapters c ON c.arc_id=target.arc_id AND c.project_id=target.project_id
+       JOIN manuscript_documents d ON d.id=c.document_id AND d.project_id=c.project_id
+       WHERE target.project_id=$1 AND target.document_id=$2
+         AND d.status='final' AND d.current_revision_id IS NOT NULL AND d.narrative_order<=$3
+       ORDER BY d.narrative_order`;
+}
 
 function iso(value: Date | string) { return value instanceof Date ? value.toISOString() : value; }
 export function isTransientPostgresStartupError(error: unknown): boolean {
@@ -299,24 +353,87 @@ export class NovelPostgresRepository {
                 ) markers
               `);
               compatibleAppliedMigration = markers.rows[0]?.object_count === 6;
-            } else if (file === "030_memory_claim_revision_lifecycle.sql") {
+            } else if (file === "013_default_skills.sql") {
+              // 013 is a repeatable seed migration. Older deployments may have
+              // the same three canonical seed rows under a different checksum.
+              const markers = await client.query<{ compatible: boolean }>(`
+                SELECT count(*) = 3 AS compatible
+                FROM skill_definitions
+                WHERE skill_id=ANY($1::text[])
+              `, [["longform-continuity", "independent-quality-gate", "memory-consolidation"]]);
+              compatibleAppliedMigration = markers.rows[0]?.compatible === true;
+            } else if (file === "017_migrate_v1_skills.sql") {
+              // 017 only adds repeatable skill seeds. The live database already
+              // contains the migrated set when this compatibility marker holds.
+              const markers = await client.query<{ compatible: boolean }>(`
+                SELECT count(DISTINCT skill_id) = $2 AS compatible
+                FROM skill_definitions
+                WHERE skill_id=ANY($1::text[])
+              `, [V1_MIGRATED_SKILL_IDS, V1_MIGRATED_SKILL_IDS.length]);
+              compatibleAppliedMigration = markers.rows[0]?.compatible === true;
+            } else if (file === "020_foreshadowing_narrative_order.sql") {
               const markers = await client.query<{ compatible: boolean }>(`
                 SELECT
                   (SELECT count(*) FROM information_schema.columns
+                   WHERE table_schema=current_schema() AND table_name='foreshadowing' AND column_name='narrative_order') = 1
+                  AND (SELECT count(*) FROM pg_indexes
+                       WHERE schemaname=current_schema() AND indexname='idx_foreshadowing_project_order') = 1
+                  AS compatible
+              `);
+              compatibleAppliedMigration = markers.rows[0]?.compatible === true;
+            } else if (file === "030_memory_claim_revision_lifecycle.sql") {
+              const markers = await client.query<{ compatible: boolean }>(`
+                SELECT
+                  (SELECT count(DISTINCT table_name || ':' || column_name) FROM information_schema.columns
                    WHERE table_schema=current_schema() AND (
                      (table_name='memory_claims' AND column_name IN ('lifecycle_status','source_document_id','source_workflow_id','identity_hash','value_hash')) OR
                      (table_name='memory_claim_sources' AND column_name IN ('claim_id','project_id','document_id','revision_id','artifact_id','workflow_id','lifecycle_status','created_at'))
                    )) = 13
-                  AND (SELECT count(*) FROM pg_indexes
+                  AND (SELECT count(DISTINCT indexname) FROM pg_indexes
                        WHERE schemaname=current_schema() AND indexname IN ('memory_claims_active_project','memory_claims_active_identity','memory_claims_project_content_scope','memory_claim_sources_revision')) = 4
-                  AND (SELECT count(*) FROM pg_constraint
+                  AND (SELECT count(DISTINCT conname) FROM pg_constraint
                        WHERE conname IN ('memory_claims_lifecycle_status_check','memory_claim_sources_lifecycle_status_check','memory_claim_sources_pkey')) = 3
                   AS compatible
               `);
               compatibleAppliedMigration = markers.rows[0]?.compatible === true;
             }
-            if (!compatibleAppliedMigration) throw new Error(`已应用迁移被修改：${file}`);
-            await client.query("UPDATE schema_migrations SET checksum=$2 WHERE version=$1", [file, checksum]);
+            if (!compatibleAppliedMigration && file === "017_migrate_v1_skills.sql") {
+              // 017 的历史 SQL 会在冲突时更新 canonical Skill。兼容回放只应补齐
+              // 缺失种子，因此先保存已有行的可变字段，并在回放后恢复它们。
+              await client.query("BEGIN");
+              try {
+                await client.query(`
+                  CREATE TEMP TABLE preserved_v1_skills ON COMMIT DROP AS
+                  SELECT skill_id,version,capabilities,applicable_tasks,required_memory_kinds,
+                         conflicts,quality_gates,prompt_sections,enabled,updated_at
+                  FROM skill_definitions
+                  WHERE skill_id=ANY($1::text[])
+                `, [V1_MIGRATED_SKILL_IDS]);
+                await client.query(sql);
+                await client.query(`
+                  UPDATE skill_definitions current
+                  SET version=preserved.version,
+                      capabilities=preserved.capabilities,
+                      applicable_tasks=preserved.applicable_tasks,
+                      required_memory_kinds=preserved.required_memory_kinds,
+                      conflicts=preserved.conflicts,
+                      quality_gates=preserved.quality_gates,
+                      prompt_sections=preserved.prompt_sections,
+                      enabled=preserved.enabled,
+                      updated_at=preserved.updated_at
+                  FROM preserved_v1_skills preserved
+                  WHERE current.skill_id=preserved.skill_id
+                `);
+                await client.query("UPDATE schema_migrations SET checksum=$2 WHERE version=$1", [file, checksum]);
+                await client.query("COMMIT");
+              } catch (error) {
+                await client.query("ROLLBACK");
+                throw new Error(`数据库迁移失败 ${file}: ${(error as Error).message}`, { cause: error });
+              }
+            } else {
+              if (!compatibleAppliedMigration) throw new Error(`已应用迁移被修改：${file}`);
+              await client.query("UPDATE schema_migrations SET checksum=$2 WHERE version=$1", [file, checksum]);
+            }
           }
           continue;
         }
@@ -480,15 +597,15 @@ export class NovelPostgresRepository {
 
   async recordModelInvocation(input: ModelInvocationAudit): Promise<void> {
     await this.pool.query(
-      `INSERT INTO model_invocations(workflow_run_id,task_id,purpose,config_revision,candidate_index,executor,profile_id,protocol,model,status,input_tokens,output_tokens,provider_input_tokens,provider_output_tokens,estimated_input_tokens,estimated_output_tokens,usage_source,latency_ms,prompt_fingerprint,response_id,error_category)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)`,
-      [input.workflowRunId ?? null, input.taskId ?? null, input.purpose, input.configRevision, input.candidateIndex, input.executor, input.profileId ?? null, input.protocol ?? null, input.model, input.status, input.inputTokens, input.outputTokens, input.providerInputTokens ?? null, input.providerOutputTokens ?? null, input.estimatedInputTokens ?? null, input.estimatedOutputTokens ?? null, input.usageSource ?? "provider", input.latencyMs, input.promptFingerprint, input.responseId ?? null, input.errorCategory ?? null],
+      `INSERT INTO model_invocations(workflow_run_id,task_id,purpose,config_revision,candidate_index,executor,profile_id,protocol,model,status,input_tokens,output_tokens,provider_input_tokens,provider_output_tokens,provider_cached_input_tokens,estimated_input_tokens,estimated_output_tokens,usage_source,latency_ms,prompt_fingerprint,response_id,error_category)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`,
+      [input.workflowRunId ?? null, input.taskId ?? null, input.purpose, input.configRevision, input.candidateIndex, input.executor, input.profileId ?? null, input.protocol ?? null, input.model, input.status, input.inputTokens, input.outputTokens, input.providerInputTokens ?? null, input.providerOutputTokens ?? null, input.providerCachedInputTokens ?? null, input.estimatedInputTokens ?? null, input.estimatedOutputTokens ?? null, input.usageSource ?? "provider", input.latencyMs, input.promptFingerprint, input.responseId ?? null, input.errorCategory ?? null],
     );
   }
 
   async listModelUsage(limit = 100) {
     const result = await this.pool.query(
-      `SELECT purpose,profile_id,protocol,model,status,usage_source,COUNT(*)::int AS calls,COALESCE(SUM(input_tokens),0)::bigint AS input_tokens,COALESCE(SUM(output_tokens),0)::bigint AS output_tokens,COALESCE(SUM(provider_input_tokens),0)::bigint AS provider_input_tokens,COALESCE(SUM(provider_output_tokens),0)::bigint AS provider_output_tokens,COALESCE(SUM(estimated_input_tokens),0)::bigint AS estimated_input_tokens,COALESCE(SUM(estimated_output_tokens),0)::bigint AS estimated_output_tokens,COALESCE(AVG(latency_ms),0)::int AS average_latency_ms
+      `SELECT purpose,profile_id,protocol,model,status,usage_source,COUNT(*)::int AS calls,COALESCE(SUM(input_tokens),0)::bigint AS input_tokens,COALESCE(SUM(output_tokens),0)::bigint AS output_tokens,COALESCE(SUM(provider_input_tokens),0)::bigint AS provider_input_tokens,COALESCE(SUM(provider_output_tokens),0)::bigint AS provider_output_tokens,COALESCE(SUM(provider_cached_input_tokens),0)::bigint AS provider_cached_input_tokens,COALESCE(SUM(estimated_input_tokens),0)::bigint AS estimated_input_tokens,COALESCE(SUM(estimated_output_tokens),0)::bigint AS estimated_output_tokens,COALESCE(AVG(latency_ms),0)::int AS average_latency_ms
        FROM model_invocations GROUP BY purpose,profile_id,protocol,model,status,usage_source ORDER BY MAX(created_at) DESC LIMIT $1`,
       [limit],
     );
@@ -1459,7 +1576,7 @@ export class NovelPostgresRepository {
         const artifactIds = artifactRows.rows.map((row) => row.id);
         const reviewCount = artifactIds.length ? await client.query<{ count: string }>("SELECT COUNT(*)::text AS count FROM reviews WHERE artifact_id=ANY($1::text[])", [artifactIds]) : { rows: [{ count: "0" }] };
         const eventCount = await client.query<{ count: string }>("SELECT COUNT(*)::text AS count FROM outbox_events WHERE (aggregate_type='workflow-run' AND aggregate_id=$1) OR payload->>'workflowId'=$1 OR payload->>'runId'=$1", [current.temporal_workflow_id]);
-        const usage = await client.query<{ calls: string; input_tokens: string; output_tokens: string }>("SELECT COUNT(*)::text AS calls,COALESCE(SUM(input_tokens),0)::text AS input_tokens,COALESCE(SUM(output_tokens),0)::text AS output_tokens FROM model_invocations WHERE workflow_run_id=$1", [current.temporal_workflow_id]);
+        const usage = await client.query<{ calls: string; input_tokens: string; output_tokens: string; provider_cached_input_tokens: string }>("SELECT COUNT(*)::text AS calls,COALESCE(SUM(input_tokens),0)::text AS input_tokens,COALESCE(SUM(output_tokens),0)::text AS output_tokens,COALESCE(SUM(provider_cached_input_tokens),0)::text AS provider_cached_input_tokens FROM model_invocations WHERE workflow_run_id=$1", [current.temporal_workflow_id]);
         const elapsedMs = Math.max(0, new Date(current.updated_at).getTime() - new Date(current.created_at).getTime());
         const finalStage = typeof current.payload.stage === "string" ? current.payload.stage : null;
         const failureSummary = typeof current.payload.error === "string" ? current.payload.error.slice(0, 1000) : null;
@@ -1469,7 +1586,7 @@ export class NovelPostgresRepository {
           ON CONFLICT(workflow_run_id) DO UPDATE SET cleaned_at=EXCLUDED.cleaned_at,metrics=EXCLUDED.metrics
         `, [current.id, current.project_id, documentId, current.workflow_type, current.status, finalStage, elapsedMs, failureSummary, {
           artifacts: artifactIds.length, reviews: Number(reviewCount.rows[0]?.count ?? 0), events: Number(eventCount.rows[0]?.count ?? 0),
-          modelCalls: Number(usage.rows[0]?.calls ?? 0), inputTokens: Number(usage.rows[0]?.input_tokens ?? 0), outputTokens: Number(usage.rows[0]?.output_tokens ?? 0),
+          modelCalls: Number(usage.rows[0]?.calls ?? 0), inputTokens: Number(usage.rows[0]?.input_tokens ?? 0), outputTokens: Number(usage.rows[0]?.output_tokens ?? 0), providerCachedInputTokens: Number(usage.rows[0]?.provider_cached_input_tokens ?? 0),
         }, current.updated_at]);
         if (artifactIds.length) {
           await client.query("UPDATE manuscript_revisions SET artifact_id=NULL WHERE artifact_id=ANY($1::text[])", [artifactIds]);
@@ -2461,7 +2578,7 @@ export class NovelPostgresRepository {
       const ordinalResult = await client.query<{ ordinal: number }>("SELECT COALESCE(MAX(ordinal),0)+1 AS ordinal FROM arcs WHERE project_id=$1", [input.projectId]);
       const ordinal = Number(ordinalResult.rows[0]?.ordinal ?? 1);
       arcId = randomUUID();
-      const payload = { title: `故事弧 ${ordinal}`, objective: input.authorIntent || "依据当前宏观规划和已定稿故事状态，形成一个完整的小故事", entryState: "", centralConflict: "", development: [], resolution: "", exitState: "", plotThreadRefs: [], foreshadowingRefs: [], expectedChapterCount: 0, phases: [], authorIntent: input.authorIntent, workflowId: input.workflowId };
+      const payload = { title: `故事弧 ${ordinal}`, objective: input.authorIntent || "依据当前宏观规划和已定稿故事状态，形成一个完整的小故事", entryState: "", centralConflict: "", development: [], resolution: "", exitState: "", plotThreadRefs: [], threadResponsibilities: [], foreshadowingRefs: [], expectedChapterCount: 0, phases: [], authorIntent: input.authorIntent, workflowId: input.workflowId };
       await client.query(
         `INSERT INTO arcs(id,volume_id,project_id,title,ordinal,planning_status,execution_status,payload)
          VALUES($1,$2,$3,$4,$5,'generating','planned',$6)`,
@@ -2517,6 +2634,14 @@ export class NovelPostgresRepository {
       const batchPayload = { ...input.bundle.batch, startChapterIndex: batchStartChapterIndex };
       const batchId = `batch:${input.arcId}:${input.bundle.batch.batchIndex}`;
       const isInitialBatch = input.bundle.batch.batchIndex === 1;
+      const batchRows = await client.query<StoryArcBatchRow>("SELECT * FROM story_arc_batches WHERE arc_id=$1 AND project_id=$2", [input.arcId, input.projectId]);
+      const batchIssues = auditStoryArcBatchRanges([
+        ...batchRows.rows
+          .filter((batch) => Number(batch.batch_index) !== input.bundle.batch.batchIndex)
+          .map((batch) => ({ batchIndex: Number(batch.batch_index), startChapterIndex: Number(batch.start_chapter_index), endChapterIndex: Number(batch.end_chapter_index), status: batch.status })),
+        { batchIndex: input.bundle.batch.batchIndex, startChapterIndex: batchStartChapterIndex, endChapterIndex: batchStartChapterIndex + input.bundle.chapters.length - 1, status: "awaiting-review" },
+      ]);
+      if (batchIssues.length && !input.edited) throw new Error(`故事弧批次区间不合法：${batchIssues.map((issue) => issue.message).join("；")}`);
       const editingCurrentAwaitingReviewBatch = input.edited === true
         && (existingBatch.rowCount ?? 0) > 0
         && existingBatch.rows[0].status === "awaiting-review";
@@ -2591,6 +2716,229 @@ export class NovelPostgresRepository {
     const result: StoryArcRecord[] = [];
     for (const arc of arcs.rows) result.push((await this.getStoryArc(projectId, arc.id))!);
     return result;
+  }
+
+  /**
+   * Read-only architecture diagnostic. It reports hard-boundary risks without
+   * imposing literary requirements on chapters or changing persisted data.
+   */
+  async getArchitectureHealth(projectId: string) {
+    const [project, sections, arcs, batches, chapters, threads, foreshadowing] = await Promise.all([
+      this.pool.query<{ id: string; title: string; current_revision: string | number }>("SELECT id,title,current_revision FROM novel_projects WHERE id=$1", [projectId]),
+      this.pool.query<{ task_key: string; status: ProjectPlanStatus; payload: Record<string, unknown> }>("SELECT task_key,status,payload FROM project_plan_sections WHERE project_id=$1 ORDER BY task_key", [projectId]),
+      this.pool.query<{ id: string; ordinal: string | number; planning_status: StoryArcRecord["planningStatus"]; execution_status: StoryArcRecord["executionStatus"]; payload: NarrativeArcPlan }>("SELECT id,ordinal,planning_status,execution_status,payload FROM arcs WHERE project_id=$1 ORDER BY ordinal", [projectId]),
+      this.pool.query<StoryArcBatchRow>("SELECT * FROM story_arc_batches WHERE project_id=$1 ORDER BY arc_id,batch_index", [projectId]),
+      this.pool.query<{ arc_id: string | null; ordinal: string | number; batch_id: string | null; batch_index: string | number | null; document_id: string | null; document_status: string | null; current_revision_id: string | null }>(
+        `SELECT c.arc_id,c.ordinal,c.batch_id,c.batch_index,c.document_id,d.status AS document_status,d.current_revision_id
+         FROM chapters c LEFT JOIN manuscript_documents d ON d.id=c.document_id AND d.project_id=c.project_id
+         WHERE c.project_id=$1 ORDER BY c.ordinal`,
+        [projectId],
+      ),
+      this.pool.query<{ id: string; title: string; payload: Record<string, unknown> }>("SELECT id,title,payload FROM plot_threads WHERE project_id=$1 ORDER BY id", [projectId]),
+      this.pool.query<{ id: string; payload: Record<string, unknown> }>("SELECT id,payload FROM foreshadowing WHERE project_id=$1 ORDER BY id", [projectId]),
+    ]);
+    if (!project.rowCount) throw new Error("项目不存在");
+
+    const labels = (payload: Record<string, unknown> | undefined): string[] => {
+      if (!payload) return [];
+      const values = [payload.name, payload.title, payload.description, payload.label, payload.aliases, payload.names];
+      return values.flatMap((value) => Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : typeof value === "string" ? [value] : []);
+    };
+    const threadCandidates: NamedReferenceCandidate[] = threads.rows.map((row) => ({ id: row.id, labels: [row.title, ...labels(row.payload)] }));
+    const foreshadowingCandidates: NamedReferenceCandidate[] = foreshadowing.rows.map((row) => ({ id: row.id, labels: labels(row.payload) }));
+    const referenceReports = arcs.rows.map((arc) => {
+      const plotThreadAudit = auditNamedReferences(Array.isArray(arc.payload?.plotThreadRefs) ? arc.payload.plotThreadRefs.filter((value): value is string => typeof value === "string") : [], threadCandidates);
+      const foreshadowingAudit = auditNamedReferences(Array.isArray(arc.payload?.foreshadowingRefs) ? arc.payload.foreshadowingRefs.filter((value): value is string => typeof value === "string") : [], foreshadowingCandidates);
+      return {
+        arcId: arc.id,
+        plotThreads: plotThreadAudit,
+        foreshadowing: foreshadowingAudit,
+      };
+    });
+    const batchReports = arcs.rows.map((arc) => {
+      const ranges = batches.rows.filter((batch) => batch.arc_id === arc.id).map((batch) => ({ batchIndex: Number(batch.batch_index), startChapterIndex: Number(batch.start_chapter_index), endChapterIndex: Number(batch.end_chapter_index), status: batch.status }));
+      return { arcId: arc.id, ranges, issues: auditStoryArcBatchRanges(ranges) };
+    });
+    const issues: StoryArcIntegrityIssue[] = [
+      ...batchReports.flatMap((report) => report.issues.map((issue) => ({ ...issue, message: `${report.arcId}: ${issue.message}` }))),
+      ...referenceReports.flatMap((report) => [
+        ...report.plotThreads.issues.map((issue) => ({ ...issue, message: `${report.arcId}: 剧情线${issue.message}` })),
+        ...report.foreshadowing.issues.map((issue) => ({ ...issue, message: `${report.arcId}: 伏笔${issue.message}` })),
+      ]),
+    ];
+    const required = REQUIRED_APPROVED_PLAN_TASK_KEYS.map((taskKey) => ({ taskKey, approved: sections.rows.some((section) => section.task_key === taskKey && section.status === "approved") }));
+    const finalChapters = chapters.rows.filter((chapter) => chapter.document_status === "final" && Boolean(chapter.current_revision_id)).length;
+    const foundationData = Object.fromEntries(sections.rows.map((section) => {
+      const structuredData = section.payload?.structuredData;
+      const root = structuredData && typeof structuredData === "object" && !Array.isArray(structuredData) ? structuredData as Record<string, unknown> : {};
+      return [section.task_key, root[section.task_key === "plot-design" ? "plotStrategy" : section.task_key]];
+    }));
+    const fullBookArchitecture = auditFullBookArchitecture({
+      architecture: foundationData.architecture,
+      characters: Array.isArray(foundationData.characters) ? { characters: foundationData.characters } : foundationData.characters,
+      worldview: foundationData.worldview,
+      plotStrategy: foundationData["plot-design"],
+    });
+    return {
+      projectId,
+      projectTitle: project.rows[0].title,
+      runtime: { protocolVersion: "2.0", foundationStageCount: PROJECT_PLAN_STAGES.length },
+      foundation: { required, missing: required.filter((item) => !item.approved).map((item) => item.taskKey) },
+      arcs: arcs.rows.map((arc) => ({ id: arc.id, ordinal: Number(arc.ordinal), planningStatus: arc.planning_status, executionStatus: arc.execution_status })),
+      chapters: (() => {
+        const arcPlanningStatus = new Map(arcs.rows.map((arc) => [arc.id, arc.planning_status]));
+        const planned = chapters.rows.filter((chapter) => !chapter.document_id || chapter.document_status === "planned").length;
+        const orphaned = chapters.rows.filter((chapter) => {
+          if (!chapter.arc_id) return true;
+          if (chapter.document_id && !chapter.document_status) return true;
+          return !chapter.document_id && arcPlanningStatus.get(chapter.arc_id) === "approved";
+        }).length;
+        return { total: chapters.rowCount ?? 0, final: finalChapters, planned, orphaned };
+      })(),
+      batches: batchReports,
+      references: referenceReports,
+      fullBookArchitecture,
+      issues,
+    };
+  }
+
+  /**
+   * Convert legacy story-arc labels into project-scoped canonical records.
+   * Unknown labels become author-visible records instead of being silently lost.
+   */
+  async normalizeStoryArcReferences(projectId: string, arcId: string, actor = "web-author") {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const arcResult = await client.query<{ payload: NarrativeArcPlan }>("SELECT payload FROM arcs WHERE id=$1 AND project_id=$2 FOR UPDATE", [arcId, projectId]);
+      if (!arcResult.rowCount) throw new Error("故事弧不存在");
+      const [threads, foreshadowing] = await Promise.all([
+        client.query<{ id: string; title: string; payload: Record<string, unknown> }>("SELECT id,title,payload FROM plot_threads WHERE project_id=$1 ORDER BY id", [projectId]),
+        client.query<{ id: string; payload: Record<string, unknown> }>("SELECT id,payload FROM foreshadowing WHERE project_id=$1 ORDER BY id", [projectId]),
+      ]);
+      const labels = (payload: Record<string, unknown> | undefined): string[] => {
+        if (!payload) return [];
+        return [payload.name, payload.title, payload.description, payload.label, payload.aliases, payload.names].flatMap((value) => Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : typeof value === "string" ? [value] : []);
+      };
+      const created: string[] = [];
+      const mappings: Array<{ kind: "thread" | "foreshadowing"; input: string; canonicalId: string; created: boolean }> = [];
+      const normalize = async (kind: "thread" | "foreshadowing", values: unknown[], candidates: NamedReferenceCandidate[]): Promise<string[]> => {
+        const result: string[] = [];
+        for (const value of values) {
+          if (typeof value !== "string" || !value.trim()) continue;
+          const resolution = resolveNamedReference(value, candidates);
+          if (resolution.status === "ambiguous") throw new Error(`引用“${value}”匹配多个${kind === "thread" ? "剧情线" : "伏笔"}：${resolution.candidateIds.join("、")}`);
+          if (resolution.status === "resolved" && resolution.canonicalId) {
+            result.push(resolution.canonicalId);
+            mappings.push({ kind, input: value, canonicalId: resolution.canonicalId, created: false });
+            continue;
+          }
+          const id = canonicalReferenceId(kind, projectId, value);
+          if (kind === "thread") {
+            await client.query(
+              `INSERT INTO plot_threads(id,project_id,title,status,payload)
+               VALUES($1,$2,$3,'open',$4)
+               ON CONFLICT(id) DO UPDATE SET title=EXCLUDED.title,payload=plot_threads.payload || EXCLUDED.payload`,
+              [id, projectId, value.trim(), { aliases: [value.trim()], source: "story-arc-reference", sourceArcId: arcId }],
+            );
+          } else {
+            await client.query(
+              `INSERT INTO foreshadowing(id,project_id,status,payload)
+               VALUES($1,$2,'open',$3)
+               ON CONFLICT(id) DO UPDATE SET payload=foreshadowing.payload || EXCLUDED.payload`,
+              [id, projectId, { description: value.trim(), aliases: [value.trim()], source: "story-arc-reference", sourceArcId: arcId }],
+            );
+          }
+          created.push(id);
+          result.push(id);
+          mappings.push({ kind, input: value, canonicalId: id, created: true });
+          candidates.push({ id, labels: [value.trim()] });
+        }
+        return [...new Set(result)];
+      };
+      const payload = arcResult.rows[0].payload ?? {};
+      const threadCandidates = threads.rows.map((row) => ({ id: row.id, labels: [row.title, ...labels(row.payload)] }));
+      const plotThreadRefs = await normalize("thread", Array.isArray(payload.plotThreadRefs) ? payload.plotThreadRefs : [], threadCandidates);
+      const originalResponsibilities = Array.isArray(payload.threadResponsibilities) ? payload.threadResponsibilities : [];
+      const threadResponsibilities = normalizeThreadResponsibilityReferences(
+        originalResponsibilities,
+        threadCandidates,
+      );
+      threadResponsibilities.forEach((responsibility, index) => {
+        const original = originalResponsibilities[index];
+        if (original && original.threadRef !== responsibility.threadRef) {
+          mappings.push({ kind: "thread", input: original.threadRef, canonicalId: responsibility.threadRef, created: created.includes(responsibility.threadRef) });
+        }
+      });
+      const foreshadowingRefs = await normalize("foreshadowing", Array.isArray(payload.foreshadowingRefs) ? payload.foreshadowingRefs : [], foreshadowing.rows.map((row) => ({ id: row.id, labels: labels(row.payload) })));
+      const normalizedPayload = { ...payload, plotThreadRefs, threadResponsibilities, foreshadowingRefs };
+      validateStoryArcPlanContracts(normalizedPayload);
+      await client.query("UPDATE arcs SET payload=$3,updated_at=now() WHERE id=$1 AND project_id=$2", [arcId, projectId, normalizedPayload]);
+      await client.query(
+        "INSERT INTO audit_records(project_id,actor,action,aggregate_type,aggregate_id,payload) VALUES($1,$2,'story-arc.references-normalized','story-arc',$3,$4)",
+        [projectId, actor, arcId, { mappings, created: [...new Set(created)] }],
+      );
+      await client.query("COMMIT");
+      return { arc: await this.getStoryArc(projectId, arcId), mappings, created: [...new Set(created)] };
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Reconcile legacy overlapping batches only when the later batch has no
+   * chapter ownership. Non-empty overlaps remain visible for author review.
+   */
+  async reconcileStoryArcBatchRanges(projectId: string, arcId: string, actor = "web-author") {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const batches = await client.query<StoryArcBatchRow>("SELECT * FROM story_arc_batches WHERE arc_id=$1 AND project_id=$2 ORDER BY start_chapter_index,batch_index FOR UPDATE", [arcId, projectId]);
+      const ranges = batches.rows.map((batch) => ({ batchIndex: Number(batch.batch_index), startChapterIndex: Number(batch.start_chapter_index), endChapterIndex: Number(batch.end_chapter_index), status: batch.status }));
+      const activeRanges = ranges.filter((range) => range.status !== "failed");
+      const reconciled: number[] = [];
+      const unresolved: StoryArcIntegrityIssue[] = [];
+      let previous = activeRanges[0];
+      for (let index = 1; index < activeRanges.length; index += 1) {
+        const current = activeRanges[index];
+        if (current.startChapterIndex > previous.endChapterIndex) {
+          previous = current;
+          continue;
+        }
+        const currentRow = batches.rows.find((batch) => Number(batch.batch_index) === current.batchIndex);
+        if (!currentRow || currentRow.status !== "approved") {
+          if (current.endChapterIndex > previous.endChapterIndex) previous = current;
+          continue;
+        }
+        const owned = await client.query<{ count: number }>("SELECT count(*)::int AS count FROM chapters WHERE batch_id=$1", [currentRow.id]);
+        if (Number(owned.rows[0]?.count ?? 0) === 0) {
+          await client.query(
+            "UPDATE story_arc_batches SET status='failed',payload=payload || $3,updated_at=now() WHERE id=$1 AND project_id=$2",
+            [currentRow.id, projectId, { reconciled: true, reconciliationReason: "overlapping-empty-batch" }],
+          );
+          reconciled.push(current.batchIndex);
+        } else {
+          unresolved.push({ code: "overlapping-batch", severity: "blocking", batchIndex: current.batchIndex, message: `批次 ${previous.batchIndex} 与批次 ${current.batchIndex} 重叠且后者仍拥有章节` });
+          if (current.endChapterIndex > previous.endChapterIndex) previous = current;
+        }
+      }
+      if (reconciled.length) {
+        await client.query(
+          "INSERT INTO audit_records(project_id,actor,action,aggregate_type,aggregate_id,payload) VALUES($1,$2,'story-arc-batches.reconciled','story-arc',$3,$4)",
+          [projectId, actor, arcId, { reconciled, unresolved }],
+        );
+      }
+      await client.query("COMMIT");
+      return { arc: await this.getStoryArc(projectId, arcId), reconciled, unresolved };
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   async getStoryArc(projectId: string, arcId: string): Promise<StoryArcRecord | undefined> {
@@ -2899,6 +3247,20 @@ export class NovelPostgresRepository {
     if (reviewArtifact.structuredData?.subjectArtifactId !== artifactId) throw new Error("故事弧审核证据不属于当前蓝图");
     const review = reviewArtifact.structuredData as unknown as StoryArcReviewOutput;
     const bundle = parseStoryArcBundle(blueprintArtifact.structuredData);
+    const architectureHealth = await this.getArchitectureHealth(projectId);
+    const missingFoundation = architectureHealth.foundation.missing;
+    const blockingArchitectureIssues = architectureHealth.fullBookArchitecture.issues.filter((issue) => issue.severity === "blocker" || issue.severity === "major");
+    if (missingFoundation.length || blockingArchitectureIssues.length) {
+      const foundationMessage = missingFoundation.length ? `Foundation 未批准：${missingFoundation.join("、")}` : "";
+      const architectureMessage = blockingArchitectureIssues.length ? `全书架构审计：${blockingArchitectureIssues.map((issue) => `${issue.path} ${issue.message}`).join("；")}` : "";
+      throw new Error(`故事弧审批前置门禁未通过：${[foundationMessage, architectureMessage].filter(Boolean).join("；")}`);
+    }
+    const references = architectureHealth.references.find((item) => item.arcId === arcId);
+    const blockingReferenceIssues = [
+      ...(references?.plotThreads.issues ?? []),
+      ...(references?.foreshadowing.issues ?? []),
+    ].filter((issue) => issue.severity === "blocking");
+    if (blockingReferenceIssues.length) throw new Error(`故事弧存在未解决的结构引用：${blockingReferenceIssues.map((issue) => issue.message).join("；")}`);
     const validation = compileChapterPlanValidationReport(bundle, Array.isArray(review.chapterChecks) ? review.chapterChecks : [], Array.isArray(review.arcChecks) ? review.arcChecks : []);
     const hasBlockingIssue = Array.isArray(review.issues) && review.issues.some((item) => item.severity === "blocker" || item.severity === "major");
     if (review.verdict !== "passed" || hasBlockingIssue || !validation.passed) throw new Error("故事弧审核尚未通过，不能批准");
@@ -3008,21 +3370,62 @@ export class NovelPostgresRepository {
   }
 
   async getStoryArcPlanningInput(projectId: string) {
-    const [project, macro, memories, threads, narrativeState] = await Promise.all([
+    const [project, macro, memories, threads, narrativeState, openElements, learning] = await Promise.all([
       this.pool.query<{ title: string }>("SELECT title FROM novel_projects WHERE id=$1", [projectId]),
       this.listCurrentFoundationArtifacts(projectId),
       this.getChapterMemories({ projectId, limit: 6 }),
       this.pool.query<{ id: string; title: string; payload: Record<string, unknown> }>("SELECT id,title,payload FROM plot_threads WHERE project_id=$1 AND status='open' ORDER BY id", [projectId]),
       this.getLatestNarrativeStateSnapshot(projectId),
+      this.getOpenForeshadowingAndPromises(projectId),
+      this.listLearningAssessments(projectId, 24),
     ]);
     if (!project.rowCount) throw new Error("项目不存在");
-    return {
+    const planningFeedback = learning
+      .filter((view) => view.assessment.conclusion === "propose-improvement" && view.assessment.underlyingMechanism && view.assessment.affectedInputClass)
+      .filter((view) => {
+        const target = view.assessment.candidate?.targetId ?? "";
+        const layer = view.assessment.failingLayer ?? "";
+        return /planning|arc|continuity|causal|plot|state|memory/iu.test(`${target} ${layer}`);
+      })
+      .slice(0, 8)
+      .map((view) => ({
+        sourceChapterOrder: view.sourceChapter?.narrativeOrder,
+        targetId: view.assessment.candidate?.targetId ?? "system-prompt",
+        underlyingMechanism: view.assessment.underlyingMechanism!,
+        affectedInputClass: view.assessment.affectedInputClass!,
+        boundaries: view.assessment.boundaries,
+        sourceArtifactId: view.assessment.source.artifactId,
+      }));
+    const contextData = {
       projectTitle: project.rows[0].title,
       macro: macro.map((artifact) => ({ taskKey: foundationTaskKey(artifact) ?? "unknown", title: typeof artifact.structuredData?.title === "string" ? artifact.structuredData.title : "", summary: typeof artifact.structuredData?.summary === "string" ? artifact.structuredData.summary : "" })),
       recentChapters: memories.slice().reverse().map((memory) => ({ order: memory.narrativeRange.end, summary: memory.summary, unresolvedThreads: memory.unresolvedThreads, emotionalArc: memory.emotionalArc })),
       openThreads: threads.rows,
+      openForeshadowings: openElements.foreshadowings,
+      openPromises: openElements.promises,
+      planningFeedback,
       narrativeState,
     };
+    const narrativeCutoff = (narrativeState?.narrativeOrder ?? memories.reduce((max, memory) => Math.max(max, memory.narrativeRange.end), 0)) || undefined;
+    const sourceArtifactIds = [...new Set([
+      ...macro.map((artifact) => artifact.id),
+      ...learning.flatMap((view) => view.assessment.source.artifactId ? [view.assessment.source.artifactId] : []),
+    ])];
+    const sourceRevisionIds = [...new Set([
+      ...memories.map((memory) => memory.revisionId),
+      ...(narrativeState?.revisionId ? [narrativeState.revisionId] : []),
+      ...openElements.foreshadowings.map((item) => item.plantedRevisionId),
+      ...openElements.promises.map((item) => item.sourceRevisionId),
+    ])];
+    const sectionFingerprints = {
+      macro: canonicalSha256(contextData.macro),
+      recent: canonicalSha256(contextData.recentChapters),
+      "open-elements": canonicalSha256({ openThreads: contextData.openThreads, openForeshadowings: contextData.openForeshadowings, openPromises: contextData.openPromises }),
+      "feedback-state": canonicalSha256({ planningFeedback: contextData.planningFeedback, narrativeState: contextData.narrativeState }),
+    };
+    const receiptBase: Omit<StoryArcContextReceipt, "fingerprint"> = { narrativeCutoff, sourceArtifactIds, sourceRevisionIds, sectionFingerprints, legacy: false };
+    const contextReceipt: StoryArcContextReceipt = { ...receiptBase, fingerprint: canonicalSha256(receiptBase) };
+    return { ...contextData, contextReceipt };
   }
 
   async getStoryArcRebaseTarget(projectId: string, arcId: string): Promise<StoryArcRebaseTarget> {
@@ -3253,6 +3656,8 @@ export class NovelPostgresRepository {
         `当前弧阶段：${snapshot.arcPhase || "未记录"}`,
         `角色状态：${snapshot.characterStates.map((item) => `${item.characterId}=${item.stateSnapshot}`).join("；") || "无"}`,
         `开放线索：${snapshot.openThreads.join("；") || "无"}`,
+        `开放伏笔 ID（详细内容按需检索）：${snapshot.openForeshadowings.map((item) => item.id).join("、") || "无"}`,
+        `开放承诺 ID（详细内容按需检索）：${snapshot.openPromises.map((item) => item.id).join("、") || "无"}`,
         `已兑现：${snapshot.fulfilledNodes.join("；") || "无"}`,
         `禁止提前消费：${snapshot.prohibitedEarlyConsumption.filter((item) => !item.startsWith("故事弧退出状态：")).join("；") || "无"}`,
       ].join("\n");
@@ -3322,13 +3727,7 @@ export class NovelPostgresRepository {
       arc_id: string;
       chapter_payload: Record<string, unknown>;
     }>(
-      `SELECT d.id AS document_id,d.current_revision_id AS revision_id,d.narrative_order,d.title,c.arc_id,c.payload AS chapter_payload,
-       FROM chapters target
-       JOIN chapters c ON c.arc_id=target.arc_id AND c.project_id=target.project_id
-       JOIN manuscript_documents d ON d.id=c.document_id AND d.project_id=c.project_id
-       WHERE target.project_id=$1 AND target.document_id=$2
-         AND d.status='final' AND d.current_revision_id IS NOT NULL AND d.narrative_order<=$3
-       ORDER BY d.narrative_order`,
+      buildNarrativeRhythmSnapshotQuery(),
       [projectId, documentId, narrativeCutoff],
     );
     if (!result.rowCount) return undefined;
@@ -4160,28 +4559,41 @@ export class NovelPostgresRepository {
       promiseCount += 1;
     }
 
-    // 3. 写入 payoffs 并尝试关联未兑现的 foreshadowing/promise
+    // 3. 写入 payoffs 并关联未兑现的 foreshadowing/promise。
+    // 优先使用提取阶段看到的精确 ID；旧输出没有 ID 时只接受唯一的
+    // 模糊候选，避免“同一承诺者/关键词”误关闭多个叙事元素。
     for (const payoff of narrativeElements.payoffs ?? []) {
       const payoffId = `payoff:${projectId}:${createHash("sha256").update(`${artifact.id}:${payoff.description}`).digest("hex").slice(0, 12)}`;
       let matchedPromiseId: string | null = null;
 
-      if (payoff.payoffType === "promise" && payoff.matchedPromiser) {
-        const cutoffClause = narrativeOrder === undefined ? "" : " AND narrative_order <= $3";
-        const candidateParams: unknown[] = [projectId, payoff.matchedPromiser];
-        if (narrativeOrder !== undefined) candidateParams.push(narrativeOrder);
-        const candidate = await connection.query<{ id: string }>(
-          `SELECT id FROM promises
-           WHERE project_id=$1 AND status='open' AND payload->>'promiser'=$2${cutoffClause}
-           ORDER BY narrative_order DESC NULLS LAST,source_revision_id DESC LIMIT 1`,
-          candidateParams,
-        );
-        if (candidate.rowCount) matchedPromiseId = candidate.rows[0].id;
+      if (payoff.payoffType === "promise") {
+        if (payoff.matchedPromiseId) {
+          const cutoffClause = narrativeOrder === undefined ? "" : " AND narrative_order <= $3";
+          const params: unknown[] = [projectId, payoff.matchedPromiseId];
+          if (narrativeOrder !== undefined) params.push(narrativeOrder);
+          const exact = await connection.query<{ id: string }>(
+            `SELECT id FROM promises WHERE project_id=$1 AND id=$2 AND status='open'${cutoffClause}`,
+            params,
+          );
+          if (exact.rowCount === 1) matchedPromiseId = exact.rows[0].id;
+        } else if (payoff.matchedPromiser) {
+          const cutoffClause = narrativeOrder === undefined ? "" : " AND narrative_order <= $3";
+          const candidateParams: unknown[] = [projectId, payoff.matchedPromiser];
+          if (narrativeOrder !== undefined) candidateParams.push(narrativeOrder);
+          const candidates = await connection.query<{ id: string }>(
+            `SELECT id FROM promises
+             WHERE project_id=$1 AND status='open' AND payload->>'promiser'=$2${cutoffClause}
+             ORDER BY narrative_order DESC NULLS LAST,source_revision_id DESC LIMIT 2`,
+            candidateParams,
+          );
+          if (candidates.rowCount === 1) matchedPromiseId = candidates.rows[0].id;
+        }
       }
 
       if (matchedPromiseId) {
         await connection.query(
           "INSERT INTO payoffs(id, promise_id, revision_id, evidence) VALUES($1,$2,$3,$4) ON CONFLICT(id) DO UPDATE SET evidence=EXCLUDED.evidence",
-          [payoffId, matchedPromiseId, revisionId, { description: payoff.description, payoffType: payoff.payoffType, matchedTriggerKeywords: payoff.matchedTriggerKeywords, matchedPromiser: payoff.matchedPromiser, intensity: payoff.intensity, artifactId: artifact.id }],
+          [payoffId, matchedPromiseId, revisionId, { description: payoff.description, payoffType: payoff.payoffType, matchedTriggerKeywords: payoff.matchedTriggerKeywords, matchedForeshadowingIds: payoff.matchedForeshadowingIds, matchedPromiseId: payoff.matchedPromiseId, matchedPromiser: payoff.matchedPromiser, intensity: payoff.intensity, artifactId: artifact.id }],
         );
       }
 
@@ -4190,19 +4602,28 @@ export class NovelPostgresRepository {
         await connection.query("UPDATE promises SET status='fulfilled' WHERE id=$1", [matchedPromiseId]);
       }
 
-      // payoffType=foreshadowing 时，尝试用 matchedTriggerKeywords 关联并更新 foreshadowing 状态
-      if (payoff.payoffType === "foreshadowing" && payoff.matchedTriggerKeywords?.length) {
+      // payoffType=foreshadowing 时，优先使用精确 ID；旧输出只有关键词时，
+      // 只有恰好命中一个开放伏笔才允许自动兑现。
+      if (payoff.payoffType === "foreshadowing") {
         const foreshadowingCutoff = narrativeOrder === undefined ? "" : " AND narrative_order <= $2";
-        const openForeshadowings = await connection.query<{ id: string; payload: { triggerKeywords?: string[] } }>(
-          `SELECT id,payload FROM foreshadowing WHERE project_id=$1 AND status='open'${foreshadowingCutoff}`,
-          narrativeOrder === undefined ? [projectId] : [projectId, narrativeOrder],
-        );
-        for (const row of openForeshadowings.rows) {
-          const triggerKeywords = row.payload?.triggerKeywords ?? [];
-          const hasMatch = triggerKeywords.some((kw) => payoff.matchedTriggerKeywords!.includes(kw));
-          if (hasMatch) {
-            await connection.query("UPDATE foreshadowing SET status='fulfilled', payoff_revision_id=$2 WHERE id=$1", [row.id, revisionId]);
-          }
+        let matchedForeshadowingIds: string[] = [];
+        if (payoff.matchedForeshadowingIds?.length) {
+          const exactCutoff = narrativeOrder === undefined ? "" : " AND narrative_order <= $3";
+          const exact = await connection.query<{ id: string }>(
+            `SELECT id FROM foreshadowing WHERE project_id=$1 AND status='open' AND id=ANY($2::text[])${exactCutoff}`,
+            narrativeOrder === undefined ? [projectId, payoff.matchedForeshadowingIds] : [projectId, payoff.matchedForeshadowingIds, narrativeOrder],
+          );
+          matchedForeshadowingIds = exact.rows.map((row) => row.id);
+        } else if (payoff.matchedTriggerKeywords?.length) {
+          const openForeshadowings = await connection.query<{ id: string; payload: { triggerKeywords?: string[] } }>(
+            `SELECT id,payload FROM foreshadowing WHERE project_id=$1 AND status='open'${foreshadowingCutoff}`,
+            narrativeOrder === undefined ? [projectId] : [projectId, narrativeOrder],
+          );
+          const candidates = openForeshadowings.rows.filter((row) => (row.payload?.triggerKeywords ?? []).some((keyword) => payoff.matchedTriggerKeywords!.includes(keyword)));
+          if (candidates.length === 1) matchedForeshadowingIds = [candidates[0].id];
+        }
+        for (const foreshadowingId of matchedForeshadowingIds) {
+          await connection.query("UPDATE foreshadowing SET status='fulfilled', payoff_revision_id=$2 WHERE id=$1", [foreshadowingId, revisionId]);
         }
       }
 
@@ -4668,6 +5089,110 @@ export class NovelPostgresRepository {
       fingerprint: row.fingerprint,
       createdAt: Number(row.created_at),
     };
+  }
+
+  /**
+   * 项目级 learning 读取接口。
+   * learning_assessments 仍是 assessment 真源；章节与候选只是可见化关联，
+   * 关联缺失时保留 assessment 本身，避免历史记录因旧 provenance 不完整而消失。
+   */
+  async listLearningAssessments(projectId: string, limit = 100): Promise<LearningAssessmentView[]> {
+    const boundedLimit = Math.max(1, Math.min(Math.floor(limit), 500));
+    const result = await this.pool.query<{
+      payload: RuntimeLearningAssessmentV2;
+      source_chapter_id: string | null;
+      source_chapter_title: string | null;
+      source_chapter_order: string | number | null;
+      source_chapter_status: string | null;
+      candidate_id: string | null;
+      candidate_status: string | null;
+      candidate_target_kind: string | null;
+      candidate_target_id: string | null;
+      candidate_proposed_version: string | null;
+    }>(
+      `SELECT la.payload,
+              COALESCE(d.id, workflow_document.id) AS source_chapter_id,
+              COALESCE(d.title, workflow_document.title) AS source_chapter_title,
+              COALESCE(d.narrative_order, workflow_document.narrative_order) AS source_chapter_order,
+              COALESCE(d.status, workflow_document.status) AS source_chapter_status,
+              c.id AS candidate_id,
+              c.status AS candidate_status,
+              c.target_kind AS candidate_target_kind,
+              c.target_id AS candidate_target_id,
+              c.proposed_version AS candidate_proposed_version
+       FROM learning_assessments la
+       LEFT JOIN artifacts a
+         ON a.project_id = la.project_id
+        AND a.id = la.source->>'artifactId'
+       LEFT JOIN manuscript_revisions mr
+         ON mr.project_id = la.project_id
+        AND mr.artifact_id = a.id
+       LEFT JOIN manuscript_documents d
+         ON d.project_id = la.project_id
+        AND d.id = mr.document_id
+       LEFT JOIN workflow_runs wr
+         ON wr.project_id = la.project_id
+        AND (wr.id = la.source->>'workflowId' OR wr.temporal_workflow_id = la.source->>'workflowId')
+       LEFT JOIN manuscript_documents workflow_document
+         ON workflow_document.project_id = la.project_id
+        AND workflow_document.id = COALESCE(
+          wr.payload->>'documentId',
+          wr.payload->'intent'->'target'->>'id'
+        )
+       LEFT JOIN craft_rule_candidates c
+         ON c.project_id = la.project_id
+        AND c.learning_source->>'assessmentId' = la.id
+       WHERE la.project_id = $1
+       ORDER BY la.created_at DESC, la.id DESC
+       LIMIT $2`,
+      [projectId, boundedLimit],
+    );
+    return result.rows.map((row) => ({
+      assessment: row.payload,
+      sourceChapter: row.source_chapter_id && row.source_chapter_title
+        ? { id: row.source_chapter_id, title: row.source_chapter_title, narrativeOrder: Number(row.source_chapter_order), status: row.source_chapter_status ?? "" }
+        : undefined,
+      candidate: row.candidate_id
+        ? { id: row.candidate_id, status: row.candidate_status ?? "proposed", targetKind: row.candidate_target_kind ?? "", targetId: row.candidate_target_id ?? "", proposedVersion: row.candidate_proposed_version ?? "" }
+        : undefined,
+    }));
+  }
+
+  async getLearningAssessmentSourceChapter(projectId: string, assessmentId: string): Promise<LearningAssessmentView["sourceChapter"]> {
+    const result = await this.pool.query<{
+      source_chapter_id: string | null;
+      source_chapter_title: string | null;
+      source_chapter_order: string | number | null;
+      source_chapter_status: string | null;
+    }>(
+      `SELECT COALESCE(d.id, workflow_document.id) AS source_chapter_id,
+              COALESCE(d.title, workflow_document.title) AS source_chapter_title,
+              COALESCE(d.narrative_order, workflow_document.narrative_order) AS source_chapter_order,
+              COALESCE(d.status, workflow_document.status) AS source_chapter_status
+       FROM learning_assessments la
+       LEFT JOIN artifacts a
+         ON a.project_id = la.project_id
+        AND a.id = la.source->>'artifactId'
+       LEFT JOIN manuscript_revisions mr
+         ON mr.project_id = la.project_id
+        AND mr.artifact_id = a.id
+       LEFT JOIN manuscript_documents d
+         ON d.project_id = la.project_id
+        AND d.id = mr.document_id
+       LEFT JOIN workflow_runs wr
+         ON wr.project_id = la.project_id
+        AND (wr.id = la.source->>'workflowId' OR wr.temporal_workflow_id = la.source->>'workflowId')
+       LEFT JOIN manuscript_documents workflow_document
+         ON workflow_document.project_id = la.project_id
+        AND workflow_document.id = COALESCE(wr.payload->>'documentId', wr.payload->'intent'->'target'->>'id')
+       WHERE la.project_id = $1 AND la.id = $2
+       LIMIT 1`,
+      [projectId, assessmentId],
+    );
+    const row = result.rows[0];
+    return row?.source_chapter_id && row.source_chapter_title
+      ? { id: row.source_chapter_id, title: row.source_chapter_title, narrativeOrder: Number(row.source_chapter_order), status: row.source_chapter_status ?? "" }
+      : undefined;
   }
 
   async recordLearningAssessment(assessment: RuntimeLearningAssessmentV2) {

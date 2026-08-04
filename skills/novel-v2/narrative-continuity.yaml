@@ -7,7 +7,6 @@ executionPoints:
   - arc.revision
   - chapter.drafting
   - chapter.review.structure
-  - chapter.review.continuity
   - chapter.revision
   - chapter.fact-extraction
   - character.enrichment
@@ -32,8 +31,8 @@ promptSections:
     修订只能统一已建立的事实和状态边界，不得把审核意见中的猜测提升为新的世界事实。
   chapter.drafting: |
     写作时遵守叙事截止、视角人物知识边界、既有世界规则和人物当前状态；连续性约束应通过可感知行动、判断、信息差和后果体现，而不是机械复述设定。
-  chapter.review.continuity: |
-    只依据冻结事实、章节规划和正文证据检查时间线、世界规则、人物知识、关系状态和伏笔账本。
+  chapter.review.structure: |
+    只依据冻结事实、章节规划和正文证据检查时间线、世界规则、人物知识、关系状态和伏笔账本；不把安静章节或未承担相关内容的章节强行判为失败。
   chapter.revision: |
     修订正文不得新增冻结来源和原文都未建立的事实；无法确认的边界保持原状，不用修辞性解释掩盖不确定性。
   chapter.fact-extraction: |

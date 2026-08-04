@@ -34,8 +34,8 @@ const TASK_KEY_GUIDANCE: Record<string, FoundationGuidance> = {
   characters: {
     dimension: "设计主要人物、动机、声部、知识边界、关系压力和变化可能。",
     focus: ["主要人物的外部欲望、内部需要、恐惧/限制、核心矛盾和弧线方向", "人物惯用但会失败的策略，以及会如何在选择中承担代价", "人物声部与表达差异：句长、词汇、直接度、回避方式和注意力", "人物独立行动、知识边界、价值与关系压力", "关系网络中每个人的互惠、冲突、误解、边界和不可被主角随意调用的选择"],
-    structuredDataHint: "characters: [{id, name, role, motivation, fear, voiceAnchor, arc, independentAction, relations}]",
-    required: ["id", "name", "role", "motivation", "fear", "voiceAnchor", "arc", "independentAction"],
+    structuredDataHint: "characters: [{id, name, role, motivation, fear, voiceAnchor, arc, independentAction: {desire, choice, cost, knowledgeBoundary}, relations}]",
+    required: ["id", "name", "role", "motivation", "fear", "voiceAnchor", "arc", "independentAction.desire", "independentAction.choice", "independentAction.cost", "independentAction.knowledgeBoundary"],
     root: "characters",
   },
   worldview: {

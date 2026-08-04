@@ -27,6 +27,7 @@ import {
   nextPatchVersion,
   type CraftRuleScopeAnalysis,
 } from "../craft-rule";
+import { createCraftRulePromotionService } from "../craft-rule/promotion-service";
 
 /**
  * 基础任务评估结果类型（与 craft-rule/index.ts 内部 FoundationEvaluationResult 一致）。
@@ -170,7 +171,7 @@ describe("craft-rule integration", () => {
     const projectId = `test-craft-skill-${randomUUID().slice(0, 8)}`;
     await repository.ensureProject(projectId, "Craft Rule Skill Test");
     const skillId = "test-craft-skill";
-    const beforeText = JSON.stringify({ drafting: "原始 skill prompt" });
+    const beforeText = JSON.stringify({ drafting: "原始 skill prompt", "chapter.review": "原始 review prompt" });
     await repository.pool.query(
       `INSERT INTO skill_definitions(skill_id, version, prompt_sections)
        VALUES($1, '1.0.0', $2::jsonb)
@@ -252,7 +253,7 @@ describe("craft-rule integration", () => {
       [skillId],
     );
     expect(skillAfter.rows[0].version).toBe("1.0.1");
-    expect(skillAfter.rows[0].prompt_sections).toEqual(JSON.parse(afterText));
+    expect(skillAfter.rows[0].prompt_sections).toEqual({ ...JSON.parse(JSON.stringify({ drafting: "原始 skill prompt", "chapter.review": "原始 review prompt" })), ...JSON.parse(afterText) });
 
     // 6. rollbackCraftRuleCandidate
     const rolledBack = await rollbackCraftRuleCandidate(repository, model, {
@@ -406,6 +407,85 @@ describe("craft-rule integration", () => {
     );
     expect(ptRolledBack.rows[0].version).toBe("1.0.0");
     expect(ptRolledBack.rows[0].content).toBe(beforeText);
+  });
+
+  it("system-prompt promotions serialize on the target version", async () => {
+    if (!postgresAvailable) return;
+
+    const projectId = `test-craft-prompt-concurrency-${randomUUID().slice(0, 8)}`;
+    await repository.ensureProject(projectId, "Craft Rule Prompt Concurrency Test");
+    const templateId = "chapter-draft-system";
+    const beforeText = "原始 system prompt，用于并发晋升测试。";
+    const afterTextA = `并发候选 A：${"依据当前章节功能分配叙事空间并保留必要的背景、心理和意象层次；".repeat(8)}`;
+    const afterTextB = `并发候选 B：${"依据当前章节功能分配叙事空间并保留必要的背景、心理和意象层次；".repeat(8)}`;
+    await repository.pool.query(
+      `INSERT INTO prompt_templates(id, project_id, template_id, version, content, stages, content_fingerprint, enabled)
+       VALUES($1, $2, $3, '1.0.0', $4, ARRAY['drafting'], md5($4), TRUE)`,
+      [`pt-${projectId}-${templateId}`, projectId, templateId, beforeText],
+    );
+
+    const candidateA = await createCraftRuleCandidate(repository, {
+      projectId, targetKind: "system-prompt", targetId: templateId, afterText: afterTextA,
+      rationale: "并发候选 A", scope: makeScope(),
+    });
+    const candidateB = await createCraftRuleCandidate(repository, {
+      projectId, targetKind: "system-prompt", targetId: templateId, afterText: afterTextB,
+      rationale: "并发候选 B", scope: makeScope(),
+    });
+
+    const service = createCraftRulePromotionService(repository);
+    const results = await Promise.allSettled([
+      service.promote({ candidate: candidateA, authorId: "test" }),
+      service.promote({ candidate: candidateB, authorId: "test" }),
+    ]);
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(2);
+    expect(results.map((result) => result.status === "fulfilled" ? result.value.status : "rejected"))
+      .toEqual(expect.arrayContaining(["promoted", "failed"]));
+
+    const target = await repository.pool.query<{ version: string; content: string }>(
+      "SELECT version, content FROM prompt_templates WHERE project_id=$1 AND template_id=$2",
+      [projectId, templateId],
+    );
+    expect(target.rows[0].version).toBe("1.0.1");
+    expect([afterTextA, afterTextB]).toContain(target.rows[0].content);
+    const receipts = await repository.pool.query<{ status: string }>(
+      "SELECT status FROM promotion_receipts WHERE project_id=$1 ORDER BY candidate_id",
+      [projectId],
+    );
+    expect(receipts.rows.map((row) => row.status)).toEqual(expect.arrayContaining(["promoted", "failed"]));
+  });
+
+  it("does not rollback a prompt after an external version drift", async () => {
+    if (!postgresAvailable) return;
+
+    const projectId = `test-craft-prompt-rollback-${randomUUID().slice(0, 8)}`;
+    await repository.ensureProject(projectId, "Craft Rule Prompt Rollback Test");
+    const templateId = "chapter-draft-system";
+    const beforeText = "原始 system prompt，用于回滚版本保护测试。";
+    const afterText = `晋升后的 system prompt：${"保留章节的背景、心理和意象层次，并依据功能调整推进密度；".repeat(8)}`;
+    await repository.pool.query(
+      `INSERT INTO prompt_templates(id, project_id, template_id, version, content, stages, content_fingerprint, enabled)
+       VALUES($1, $2, $3, '1.0.0', $4, ARRAY['drafting'], md5($4), TRUE)`,
+      [`pt-${projectId}-${templateId}`, projectId, templateId, beforeText],
+    );
+    const candidate = await createCraftRuleCandidate(repository, {
+      projectId, targetKind: "system-prompt", targetId: templateId, afterText,
+      rationale: "回滚版本保护", scope: makeScope(),
+    });
+    const service = createCraftRulePromotionService(repository);
+    const receipt = await service.promote({ candidate, authorId: "test" });
+
+    await repository.pool.query(
+      "UPDATE prompt_templates SET content=$3, version='2.0.0', content_fingerprint=md5($3) WHERE project_id=$1 AND template_id=$2",
+      [projectId, templateId, "外部修改后的 system prompt"],
+    );
+    await expect(service.rollback(receipt.id)).rejects.toThrow(/拒绝覆盖回滚/);
+
+    const target = await repository.pool.query<{ version: string; content: string }>(
+      "SELECT version, content FROM prompt_templates WHERE project_id=$1 AND template_id=$2",
+      [projectId, templateId],
+    );
+    expect(target.rows[0]).toMatchObject({ version: "2.0.0", content: "外部修改后的 system prompt" });
   });
 
   // ===== 错误路径 =====

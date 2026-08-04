@@ -38,6 +38,102 @@ body {
   -moz-osx-font-smoothing: grayscale;
 }
 
+/* ===== 设置页 =====
+ * 设置包含表单和高密度路由表：表单使用可伸缩分栏，表格只在自身边界内横向滚动。
+ */
+.settings-page {
+  width: min(1400px, 100%);
+  margin: 0 auto;
+  padding: 24px 28px 48px;
+  box-sizing: border-box;
+}
+
+.settings-core-card {
+  width: 100%;
+}
+
+.settings-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  column-gap: 20px;
+}
+
+.settings-form-grid > .ant-form-item {
+  min-width: 0;
+}
+
+.settings-form-grid-compact {
+  grid-template-columns: minmax(0, 360px);
+}
+
+.settings-form-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.settings-routing-section {
+  margin-top: 32px;
+  padding-top: 24px;
+  border-top: 1px solid #27272a;
+}
+
+.settings-routing-header {
+  row-gap: 12px;
+}
+
+.settings-table-scroll {
+  width: 100%;
+  overflow-x: auto;
+  overscroll-behavior-inline: contain;
+  scrollbar-width: thin;
+}
+
+.settings-table {
+  min-width: 880px;
+}
+
+.settings-routing-table-group {
+  margin-top: 24px;
+}
+
+@media (max-width: 767px) {
+  .settings-page {
+    padding: 20px 16px 36px;
+  }
+
+  .settings-core-card .ant-card-body {
+    padding: 16px;
+  }
+
+  .settings-form-grid,
+  .settings-form-grid-compact {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .settings-routing-section {
+    margin-top: 24px;
+    padding-top: 20px;
+  }
+
+  .settings-routing-header {
+    align-items: stretch !important;
+  }
+
+  .settings-routing-header > .ant-space-item:last-child {
+    width: 100%;
+  }
+
+  .settings-routing-header > .ant-space-item:last-child .ant-space {
+    width: 100%;
+  }
+
+  .settings-routing-header > .ant-space-item:last-child .ant-btn {
+    flex: 1;
+  }
+}
+
 /* 细滚动条 */
 ::-webkit-scrollbar {
   width: 8px;

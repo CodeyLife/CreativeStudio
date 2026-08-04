@@ -183,6 +183,12 @@ export const factExtractionSchema = {
                 items: { type: "string", minLength: 1 },
                 description: "匹配到的伏笔触发关键词（用于关联到对应 foreshadowing）",
               },
+              matchedForeshadowingIds: {
+                type: "array",
+                items: { type: "string", minLength: 1 },
+                description: "已知开放伏笔的精确 ID；只有明确兑现时填写，不得自行编造 ID",
+              },
+              matchedPromiseId: { type: "string", description: "已知开放承诺的精确 ID；只有明确兑现时填写，不得自行编造 ID" },
               matchedPromiser: { type: "string", description: "匹配到的承诺者（用于关联到对应 promise）" },
               intensity: { type: "integer", minimum: 1, maximum: 5, description: "兑现强度（1=轻描淡写，5=高潮爆发）" },
               evidence: { type: "string", minLength: 1, description: "正文逐字证据" },
@@ -271,6 +277,8 @@ export interface FactExtractionOutput {
       description: string;
       payoffType: "foreshadowing" | "promise";
       matchedTriggerKeywords?: string[];
+      matchedForeshadowingIds?: string[];
+      matchedPromiseId?: string;
       matchedPromiser?: string;
       intensity?: number;
       evidence: string;

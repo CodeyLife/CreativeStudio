@@ -41,6 +41,7 @@ import { describeEvent, documentStatusMeta, relativeTime, statusMeta, type Event
 import ArtifactContentModal, { ArtifactCard, type ArtifactSummary } from "./ArtifactContentModal";
 import ManuscriptEditor from "./ManuscriptEditor";
 import TextDiff from "./TextDiff";
+import LearningPanel from "./LearningPanel";
 import {
   useDecideFactCandidate,
   useChapterVersionActions,
@@ -1093,12 +1094,13 @@ function ChapterInfoPanel({ projectId, documentId, workspace }: { projectId: str
   </div>;
 }
 
-function ChapterContextPanel({ projectId, documentId, workspace, state, manuscriptDirty, activeKey, onActiveKeyChange, onLocate, workflow }: { projectId: string; documentId?: string; workspace?: NovelChapterWorkspace; state: ChapterWorkspaceState; manuscriptDirty: boolean; activeKey: string; onActiveKeyChange: (key: string) => void; onLocate: (paragraph: number) => void; workflow: React.ComponentProps<typeof WorkflowInspector> }) {
+function ChapterContextPanel({ projectId, documentId, workspace, state, manuscriptDirty, activeKey, onActiveKeyChange, onLocate, workflow, documents }: { projectId: string; documentId?: string; workspace?: NovelChapterWorkspace; state: ChapterWorkspaceState; manuscriptDirty: boolean; activeKey: string; onActiveKeyChange: (key: string) => void; onLocate: (paragraph: number) => void; workflow: React.ComponentProps<typeof WorkflowInspector>; documents: NovelDocumentSummary[] }) {
   const defaultKey = state.mode === "running" || state.mode === "failed" ? "workflow" : state.mode === "planned" ? "info" : "review";
   return <aside className="pb-author-context"><Tabs key={`${documentId}:${defaultKey}`} activeKey={activeKey} onChange={onActiveKeyChange} items={[
     { key: "review", label: "审核", children: <SnapshotReviewPanel projectId={projectId} documentId={documentId} workspace={workspace} state={state} manuscriptDirty={manuscriptDirty} onLocate={onLocate} onRepairStarted={() => onActiveKeyChange("workflow")} /> },
     { key: "workflow", label: "工作流", children: <WorkflowInspector {...workflow} /> },
     { key: "info", label: "章节信息", children: <ChapterInfoPanel projectId={projectId} documentId={documentId} workspace={workspace} /> },
+    { key: "learning", label: "经验沉淀", children: <LearningPanel projectId={projectId} documents={documents} /> },
   ]} /></aside>;
 }
 
@@ -1414,6 +1416,7 @@ export default function NovelProductionWorkspace({
               activeKey={contextTab}
               onActiveKeyChange={setContextTab}
               onLocate={setActiveParagraph}
+              documents={documents}
               workflow={{
                 runs: documentRuns,
                 selectedWorkflowId: effectiveDiagnosticWfId,

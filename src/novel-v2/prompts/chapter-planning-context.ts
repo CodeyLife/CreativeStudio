@@ -1,5 +1,5 @@
 import { projectChapterForExecution, type ChapterPlanningContext } from "../application/story-arc";
-import type { MemoryBundle, MemoryClaim, NarrativeRhythmSnapshot } from "../protocol";
+import type { MemoryBundle, MemoryClaim, NarrativeRhythmSnapshot, StageContextPriority } from "../protocol";
 
 function list(items: string[], empty = "无"): string {
   return items.length ? items.map((item) => `- ${item}`).join("\n") : `- ${empty}`;
@@ -35,6 +35,18 @@ export function renderExecutionMemoryClaim(claim: MemoryClaim): { title: string;
     title: `角色知识边界：${characterId}`,
     text: `可知命题：${proposition || claim.title}\n使用边界：只据此判断该角色能否知晓相关信息，不照搬为对白、叙述或客观规则。`,
   };
+}
+
+/**
+ * Preserve the retrieval decision instead of treating authority alone as a
+ * prompt priority. Approved ranked-fill claims remain available context, but
+ * only pinned ledger items and required facets are hard stage requirements.
+ */
+export function memoryClaimPriority(memory: MemoryBundle, claim: MemoryClaim): StageContextPriority {
+  const receipt = memory.selectionReceipts?.find((item) => item.claimId === claim.id && item.status === "included");
+  if (receipt?.reason === "pinned-narrative" || receipt?.reason === "required-facet") return "required";
+  if (!receipt && claim.authority === "author") return "required";
+  return "normal";
 }
 
 /**

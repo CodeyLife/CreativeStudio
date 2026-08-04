@@ -37,6 +37,11 @@ export interface ExtractFactsInput {
    * 让 retrieval 层屏蔽被覆盖的旧版本，避免 LLM 看到自相矛盾的事实。
    */
   existingClaimsIndex?: Map<string, string[]>;
+  /** 当前叙事截止点可见的开放伏笔/承诺，用于兑现时建立精确关联。 */
+  openNarrativeElements?: {
+    foreshadowings: Array<{ id: string; description: string; triggerKeywords: string[]; expectedPayoffWindow: string }>;
+    promises: Array<{ id: string; promiser: string; promisee: string; statement: string }>;
+  };
   routingSnapshot?: ModelRoutingSnapshot;
   candidateStartIndex?: number;
   workflowRunId?: string;
@@ -106,6 +111,7 @@ export async function extractFactsWithStats(input: ExtractFactsInput): Promise<E
     artifact: input.artifact,
     text: input.text,
     existingClaimsDigest: input.existingClaimsDigest,
+    openNarrativeElements: input.openNarrativeElements,
   });
   const system = "你是事实提取 Worker。只输出符合 JSON Schema 的 JSON。只提取正文实际呈现的事实，不提取隐喻、修辞或读者推断。";
   const skillSections = buildSkillContextSections({ skills: input.skillBundle?.skills ?? input.skills ?? [] }, "chapter.fact-extraction", "事实提取 Skill");

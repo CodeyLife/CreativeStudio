@@ -70,9 +70,13 @@ function asStringArray(value: unknown): string[] {
 }
 
 function deriveExecutionPoints(input: { executionPoints?: unknown; applicableTasks?: unknown }): SkillExecutionPoint[] {
-  const explicit = asStringArray(input.executionPoints).filter((item): item is SkillExecutionPoint => item in SKILL_EXECUTION_POLICIES);
-  if (explicit.length) return [...new Set(explicit)];
+  const explicit = asStringArray(input.executionPoints);
+  if (explicit.length) return [...new Set(explicit.filter((item): item is SkillExecutionPoint => item in SKILL_EXECUTION_POLICIES))];
   return [...new Set(asStringArray(input.applicableTasks).flatMap((task) => TASK_CLASS_POINTS[task] ?? []))];
+}
+
+function invalidExecutionPoints(input: { executionPoints?: unknown }): string[] {
+  return [...new Set(asStringArray(input.executionPoints).filter((item) => !(item in SKILL_EXECUTION_POLICIES)))];
 }
 
 function normalizePromptSections(raw: unknown, executionPoints: SkillExecutionPoint[]): Partial<Record<string, string>> {
@@ -92,6 +96,10 @@ function normalizePromptSections(raw: unknown, executionPoints: SkillExecutionPo
 
 export function normalizeSkillDescriptor(input: Partial<SkillDescriptor> & { skillId: string; version: string }, sourceRef?: string): SkillDescriptor {
   const executionPoints = deriveExecutionPoints(input);
+  const invalidPoints = [...new Set([
+    ...invalidExecutionPoints(input),
+    ...(input.invalidExecutionPoints ?? []),
+  ])];
   const applicableTasks = asStringArray(input.applicableTasks) as PreflightPlan["taskClass"][];
   const normalized: SkillDescriptor = {
     skillId: input.skillId,
@@ -104,6 +112,7 @@ export function normalizeSkillDescriptor(input: Partial<SkillDescriptor> & { ski
     promptSections: normalizePromptSections(input.promptSections, executionPoints),
     enabled: input.enabled !== false,
     executionPoints,
+    ...(invalidPoints.length ? { invalidExecutionPoints: invalidPoints } : {}),
     roles: asStringArray(input.roles),
     dependsOn: asStringArray(input.dependsOn),
     priority: input.priority,
@@ -124,6 +133,7 @@ export function normalizeSkillDescriptor(input: Partial<SkillDescriptor> & { ski
     dependsOn: normalized.dependsOn,
     priority: normalized.priority,
     applicableGenres: normalized.applicableGenres,
+    invalidExecutionPoints: normalized.invalidExecutionPoints,
   });
   return normalized;
 }
@@ -259,6 +269,10 @@ export async function resolveStageSkillBundle(input: {
 }): Promise<SkillBundle> {
   const policy = SKILL_EXECUTION_POLICIES[input.executionPoint];
   const available = (await input.provider.list(input.projectId)).map((skill) => normalizeSkillDescriptor(skill, skill.sourceRef));
+  const invalid = available.filter((skill) => skill.invalidExecutionPoints?.length);
+  if (invalid.length) {
+    throw new Error(`Skill execution point 漂移：${invalid.map((skill) => `${skill.skillId}@${skill.version}=[${skill.invalidExecutionPoints!.join(", ")}]`).join("；")}`);
+  }
   const direct = available.filter((skill) => skill.enabled
     && skill.executionPoints?.includes(input.executionPoint)
     && (!skill.roles?.length || !input.role || skill.roles.includes(input.role))
@@ -331,7 +345,11 @@ export async function resolveStageSkillBundle(input: {
     executionPoint: input.executionPoint,
     role: input.role,
     resolution,
-    availableSkills: available.filter((skill) => skill.enabled).map((skill) => ({ skillId: skill.skillId, capabilities: skill.capabilities })),
+    availableSkills: available.filter((skill) => skill.enabled).map((skill) => ({
+      skillId: skill.skillId,
+      capabilities: skill.capabilities,
+      executionPoints: skill.executionPoints,
+    })),
   };
   bundle.fingerprint = canonicalSha256({ ...bundle, fingerprint: undefined, createdAt: undefined });
   return bundle;

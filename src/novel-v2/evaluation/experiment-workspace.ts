@@ -317,8 +317,13 @@ async function restoreProjectSnapshot(
   // 8. skill_definitions
   for (const skill of bundle.payload.skillDefinitions) {
     await pool.query(
-      `INSERT INTO ${s}.skill_definitions(skill_id, version, capabilities, applicable_tasks, required_memory_kinds, conflicts, quality_gates, prompt_sections, enabled, updated_at)
-       VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, now())`,
+      `INSERT INTO ${s}.skill_definitions(
+         skill_id, version, capabilities, applicable_tasks, required_memory_kinds,
+         conflicts, quality_gates, prompt_sections, enabled, execution_points,
+         roles, depends_on, priority, applicable_genres, content_fingerprint,
+         source_ref, updated_at
+       )
+       VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, now())`,
       [
         skill.skillId,
         skill.version,
@@ -329,6 +334,13 @@ async function restoreProjectSnapshot(
         skill.qualityGates,
         JSON.stringify(skill.promptSections),
         skill.enabled,
+        skill.executionPoints ?? [],
+        skill.roles ?? [],
+        skill.dependsOn ?? [],
+        skill.priority ?? "normal",
+        skill.applicableGenres ?? [],
+        skill.contentFingerprint ?? "",
+        skill.sourceRef ?? null,
       ],
     );
   }

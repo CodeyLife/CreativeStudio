@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { Artifact, ExecutionBlueprint, MemoryBundle, Review, ReviewIssue, SkillBundle, SkillExecutionPoint, StageGoalContract, StagePromptPackage } from "../protocol";
 import type { ChapterPlanningContext } from "../application/story-arc";
-import { dedupeNarrativeRhythmMemory, renderChapterExecutionContract, renderNarrativeRhythm } from "./chapter-planning-context";
+import { dedupeNarrativeRhythmMemory, memoryClaimPriority, renderChapterExecutionContract, renderNarrativeRhythm } from "./chapter-planning-context";
 import { compileStageContext } from "../stage-context";
 import { reviewerSchema } from "./schemas";
 import type { ReviewerOutput } from "./schemas";
@@ -157,7 +157,7 @@ export function buildChapterReviewPromptPackage(input: ReviewPromptInput & { wor
     { id: "manuscript", kind: "manuscript" as const, title: "正文", text: buildNumberedDraft(input.text), priority: "critical" as const, provenanceRefs: [input.artifact.id], sourceArtifactId: input.artifact.id },
     ...(input.planningContext ? [{ id: "execution-contract", kind: "planning" as const, title: "章节执行合同", text: renderChapterExecutionContract(input.planningContext), priority: "required" as const, provenanceRefs: [input.planningContext.fingerprint] }] : []),
     ...(memory.narrativeRhythm ? [{ id: "narrative-rhythm", kind: "planning" as const, title: "连续章节位置", text: renderNarrativeRhythm(memory.narrativeRhythm), priority: "normal" as const, provenanceRefs: [memory.narrativeRhythm.fingerprint] }] : []),
-    ...memory.claims.map((claim) => ({ id: "memory:" + claim.id, kind: "fact" as const, title: "相关事实：" + claim.title, text: claim.content, priority: "required" as const, provenanceRefs: [claim.id, ...claim.sourceRevisionIds] })),
+    ...memory.claims.map((claim) => ({ id: "memory:" + claim.id, kind: "fact" as const, title: "相关事实：" + claim.title, text: claim.content, priority: memoryClaimPriority(memory, claim), provenanceRefs: [claim.id, ...claim.sourceRevisionIds] })),
     ...buildSkillContextSections(skills ?? { skills: [] }, skills?.executionPoint ?? reviewExecutionPoint(input.role), "审校 Skill"),
   ];
   const purpose = ({ "structure-reviewer": "review.structure", "character-reviewer": "review.character", "prose-reviewer": "review.prose" } as const)[input.role];

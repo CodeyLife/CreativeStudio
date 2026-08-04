@@ -7,7 +7,6 @@ executionPoints:
   - arc.revision
   - chapter.blueprint
   - chapter.review.structure
-  - chapter.review.plot
   - chapter.revision
 capabilities:
   - planning
@@ -32,9 +31,7 @@ promptSections:
     按审核证据修复最小的因果断点，优先保留原有有效的人物选择、关系积累、前置证据和合理未知；不要用新增危机掩盖过程缺失。
   chapter.blueprint: |
     本章目标、阻力、行动、选择、代价和结果必须相互连接；场景结束时至少明确状态、认知、关系、资源或代价中的一项证据变化，没有变化时说明功能而不是硬造事件。
-  chapter.review.plot: |
-    审查目标与行动是否相连、阻力是否真实、结果是否由前文条件产生，承诺与后续动力是否有证据；不把固定章尾、反转或持续升级当成硬标准。
   chapter.review.structure: |
-    检查章节结构、功能、因果、世界压力、知识边界和选择后果是否由规划上下文与正文证据支撑，区分可验证问题与审美偏好。
+    检查章节结构、功能、因果、世界压力、知识边界和选择后果是否由规划上下文与正文证据支撑；目标与行动、阻力与结果必须能连回前文条件，区分可验证问题与审美偏好。
   chapter.revision: |
     修订剧情问题时先修复因果和承载，不用额外危机、解释段或固定钩子掩盖过程缺失。

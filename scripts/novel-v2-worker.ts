@@ -57,6 +57,11 @@ const worker = await Worker.create({
   connection: await NativeConnection.connect({ address: process.env.TEMPORAL_ADDRESS ?? "127.0.0.1:7233" }),
   namespace: process.env.TEMPORAL_NAMESPACE ?? "default",
   taskQueue: process.env.TEMPORAL_TASK_QUEUE ?? "novel-v2",
+  // Keep the build id stable while this namespace runs without Worker Versioning.
+  // The SDK default includes the workflow bundle hash, which can orphan open
+  // workflow activities after a local code reload. Deployments using versioning
+  // should provide an explicit release id through TEMPORAL_WORKER_BUILD_ID.
+  buildId: process.env.TEMPORAL_WORKER_BUILD_ID ?? "creative-studio-v2",
   workflowsPath,
   activities: createNovelWorkflowActivities({
     repository,

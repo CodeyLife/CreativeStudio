@@ -414,6 +414,8 @@ export interface SkillDescriptor {
   promptSections: Partial<Record<string, string>>;
   enabled: boolean;
   executionPoints?: SkillExecutionPoint[];
+  /** 非持久化诊断：来源 descriptor 声明但当前 Runtime 不认识的 execution point。 */
+  invalidExecutionPoints?: string[];
   roles?: string[];
   dependsOn?: string[];
   priority?: SkillPriority;
@@ -445,7 +447,7 @@ export interface SkillBundle {
   role?: string;
   resolution?: SkillResolutionManifest;
   /** 当前解析来源中的可用 Skill 目录，仅供 learning/iteration 选择目标，不代表注入 Prompt。 */
-  availableSkills?: Array<{ skillId: string; capabilities: string[] }>;
+  availableSkills?: Array<{ skillId: string; capabilities: string[]; executionPoints?: SkillExecutionPoint[] }>;
 }
 
 export interface BlueprintTask {

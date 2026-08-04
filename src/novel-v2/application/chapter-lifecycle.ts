@@ -224,11 +224,18 @@ export async function runChapterLifecycle(params: {
     structuralReport = bestStructuralReport;
   }
 
-  await params.assessLearning(draft, reviews);
   const finalDecision = decideRevision({ reviews, iteration, maxIterations: DEFAULT_MAX_AUTO_REVISIONS, previousScore });
   const commitGate = evaluateCommitGate(reviews, draft.artifact.fingerprint, structuralReport);
-  if (params.commitBlocked) return { draft, reviews, iteration, finalScore: finalDecision.currentScore, structuralReport, commitGate, commitBlocked: params.commitBlocked };
-  if (!commitGate.passed) return { draft, reviews, iteration, finalScore: finalDecision.currentScore, structuralReport, commitGate };
+  if (params.commitBlocked) {
+    // A blocked attempt is still useful learning evidence, but successful
+    // chapters must only learn from the committed artifact below.
+    await params.assessLearning(draft, reviews);
+    return { draft, reviews, iteration, finalScore: finalDecision.currentScore, structuralReport, commitGate, commitBlocked: params.commitBlocked };
+  }
+  if (!commitGate.passed) {
+    await params.assessLearning(draft, reviews);
+    return { draft, reviews, iteration, finalScore: finalDecision.currentScore, structuralReport, commitGate };
+  }
 
   // Facts are durable manuscript state. Extract them only after the review gate
   // passes so manual approval can follow the same approval -> facts -> commit order.

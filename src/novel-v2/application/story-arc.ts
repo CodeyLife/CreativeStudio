@@ -10,6 +10,12 @@ export interface ThematicQuestion {
   resolutionWindow: string;
 }
 
+export interface StoryArcThreadResponsibility {
+  threadRef: string;
+  responsibility: string;
+  nextAdvance: string;
+}
+
 export const CHAPTER_NARRATIVE_FUNCTIONS = ["setup", "development", "relationship", "discovery", "confrontation", "payoff", "aftermath", "transition", "reflection"] as const;
 export type ChapterNarrativeFunction = (typeof CHAPTER_NARRATIVE_FUNCTIONS)[number];
 
@@ -22,6 +28,8 @@ export interface StoryArcPlan {
   resolution: string;
   exitState: string;
   plotThreadRefs: string[];
+  /** Optional for legacy persisted arcs; parsed/generated bundles normalize it to an array. */
+  threadResponsibilities?: StoryArcThreadResponsibility[];
   foreshadowingRefs: string[];
   expectedChapterCount: number;
   phases: Array<{ title: string; objective: string; exitCondition: string }>;
@@ -225,9 +233,18 @@ export function normalizeStoryArcRebaseBundle(bundle: StoryArcBundle, target: St
 }
 
 export function validateStoryArcExecutionContracts(bundle: StoryArcBundle): void {
+  validateStoryArcPlanContracts(bundle.arc);
   for (const chapter of bundle.chapters) {
     validateChapterExecutionContract(chapter);
   }
+}
+
+export function validateStoryArcPlanContracts(arc: NarrativeArcPlan): void {
+  const responsibilities = arc.threadResponsibilities ?? [];
+  const refs = new Set(responsibilities.map((item) => item.threadRef));
+  const missing = arc.plotThreadRefs.filter((threadRef) => !refs.has(threadRef));
+  if (missing.length) throw new Error(`故事弧缺少剧情线阶段责任：${missing.join("、")}`);
+  if (refs.size !== responsibilities.length) throw new Error("故事弧的剧情线阶段责任不能重复");
 }
 
 export function validateChapterExecutionContract(chapter: ChapterBlueprint): void {
@@ -286,8 +303,29 @@ export interface ChapterPlanningContext {
   fingerprint: string;
 }
 
+export interface StoryArcContextReceipt {
+  narrativeCutoff?: number;
+  sourceArtifactIds: string[];
+  sourceRevisionIds: string[];
+  sectionFingerprints: Record<string, string>;
+  fingerprint: string;
+  legacy: boolean;
+}
+
 function strings(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+function parseThreadResponsibilities(value: unknown): StoryArcThreadResponsibility[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
+    const item = entry as Record<string, unknown>;
+    const threadRef = typeof item.threadRef === "string" ? item.threadRef.trim() : "";
+    const responsibility = typeof item.responsibility === "string" ? item.responsibility.trim() : "";
+    const nextAdvance = typeof item.nextAdvance === "string" ? item.nextAdvance.trim() : "";
+    return threadRef && responsibility && nextAdvance ? [{ threadRef, responsibility, nextAdvance }] : [];
+  });
 }
 
 function enumValue<T extends string>(value: unknown, allowed: readonly T[]): T | undefined {
@@ -367,6 +405,7 @@ export function parseStoryArcBundle(value: unknown): StoryArcBundle {
       resolution: typeof arcValue.resolution === "string" ? arcValue.resolution : "",
       exitState: typeof arcValue.exitState === "string" ? arcValue.exitState : "",
       plotThreadRefs: strings(arcValue.plotThreadRefs),
+      threadResponsibilities: parseThreadResponsibilities(arcValue.threadResponsibilities),
       foreshadowingRefs: strings(arcValue.foreshadowingRefs),
       expectedChapterCount: Math.max(chapters.length, Number.isInteger(arcValue.expectedChapterCount) ? Number(arcValue.expectedChapterCount) : chapters.length),
       phases: Array.isArray(arcValue.phases) ? arcValue.phases.map((phase) => {
@@ -410,6 +449,7 @@ export function normalizeChapterPlanningContext(value: unknown): ChapterPlanning
     resolution: typeof arcSource.resolution === "string" ? arcSource.resolution : "",
     exitState: typeof arcSource.exitState === "string" ? arcSource.exitState : "",
     plotThreadRefs: strings(arcSource.plotThreadRefs),
+    threadResponsibilities: parseThreadResponsibilities(arcSource.threadResponsibilities),
     foreshadowingRefs: strings(arcSource.foreshadowingRefs),
     expectedChapterCount: Number.isInteger(arcSource.expectedChapterCount) ? Number(arcSource.expectedChapterCount) : 0,
     phases: Array.isArray(arcSource.phases) ? arcSource.phases.flatMap((phase) => {

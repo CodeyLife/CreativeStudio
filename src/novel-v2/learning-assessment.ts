@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { Artifact, Review, RuntimeLearningAssessmentV2, SkillBundle, SkillResolutionManifest } from "./protocol";
+import type { Artifact, Review, RuntimeLearningAssessmentV2, SkillBundle, SkillExecutionPoint, SkillResolutionManifest } from "./protocol";
 import type { ModelGateway, ModelUsage } from "./model-gateway";
 import { ExternalMcpRequiredError, type ModelRoutingSnapshot } from "./model-routing";
 import { compileStageContext } from "./stage-context";
@@ -175,7 +175,7 @@ export function buildRuntimeLearningPrompt(input: {
    * LLM 自行编造 skill ID（如 "drafting"），导致 createCraftRuleCandidate 找不到
    * skill definition 而抛错。注入实际列表从源头消除 ID 不匹配。
    */
-  availableSkills?: Array<{ skillId: string; capabilities: string[] }>;
+  availableSkills?: Array<{ skillId: string; capabilities: string[]; executionPoints?: SkillExecutionPoint[] }>;
 }): string {
   // P0-B3: 汇总所有 issue（含 warning），让 LLM 判断是否形成可迁移的共享缺陷模式
   const issues = reviewIssuesForLearning(input.reviews)
@@ -184,7 +184,7 @@ export function buildRuntimeLearningPrompt(input: {
 证据：${issue.evidence}`)
     .join("\n\n");
   const skillList = input.availableSkills?.length
-    ? input.availableSkills.map((s) => `- ${s.skillId} (capabilities: ${s.capabilities.join(", ")})`).join("\n")
+    ? input.availableSkills.map((s) => `- ${s.skillId} (capabilities: ${s.capabilities.join(", ")}; executionPoints: ${s.executionPoints?.join(", ") || "未声明"})`).join("\n")
     : "- （skill_definitions 表为空，targetKind=skill 时无法创建 candidate，请改用 system-prompt 或返回 no-shared-learning）";
   return `# V2 Runtime Learning Assessment
 
@@ -208,11 +208,36 @@ targetKind=system-prompt 时，targetId 格式为 "<projectId>:<templateId>"，�
 - propose-improvement 必须填写 symptom、failingLayer、underlyingMechanism、affectedInputClass、boundaries、regressionRisks。
   - underlyingMechanism：底层机制（如"drafting prompt 未注入前章爽点统计，writer 无法感知干旱"），不要只复述症状。
   - affectedInputClass：受影响的输入类别（如"长篇中后段章节，铺陈/相处章连续出现时"）。
-- candidate.afterText 必须是完整规则文本，先写通用原则与决策边界，再写验证方式；不得只写一句补丁。
+- targetKind=skill 时，candidate.afterText 必须是 JSON 对象的字符串表示：key 只能选择该 skill 已声明且与 failingLayer 对应的 executionPoint，value 是该执行点的完整替换规则文本。至少修改一个会在失败工作流中实际执行的 executionPoint；不要把仅 drafting 消费的规则用于 review/revision 失败。规则文本先写通用原则与决策边界，再写验证方式，不得只写一句补丁。
+- targetKind=system-prompt 时，candidate.afterText 仍是完整规则文本。
 - candidate.applicableGenres（仅 targetKind=skill 时有意义）：若改进只适用于特定题材，填写题材标签数组（如 ["玄幻","仙侠"]）；若题材无关则留空数组。不内置固定题材枚举，由你根据 affectedInputClass 推断。
 - 不要把具体书名、人物名、章节号、固定句子或本次样例当成规则。
 
 输出 JSON，必须匹配 schema。conclusion=propose-improvement 时所有 mechanism 字段必填。`;
+}
+
+function validateSkillCandidatePatch(
+  assessment: RuntimeLearningAssessmentV2,
+  availableSkills?: Array<{ skillId: string; capabilities: string[]; executionPoints?: SkillExecutionPoint[] }>,
+): void {
+  if (assessment.conclusion !== "propose-improvement" || assessment.candidate?.targetKind !== "skill") return;
+  let patch: unknown;
+  try {
+    patch = JSON.parse(assessment.candidate.afterText);
+  } catch {
+    throw new Error("learning.candidate.afterText 必须是 execution-point JSON 对象字符串");
+  }
+  if (!patch || typeof patch !== "object" || Array.isArray(patch)) throw new Error("learning.candidate.afterText 必须是 execution-point JSON 对象字符串");
+  const entries = Object.entries(patch);
+  if (!entries.length || entries.some(([key, value]) => !key.trim() || typeof value !== "string" || !value.trim())) {
+    throw new Error("learning.candidate.afterText 必须包含至少一个非空 execution-point 规则");
+  }
+  const descriptor = availableSkills?.find((skill) => skill.skillId === assessment.candidate?.targetId);
+  if (availableSkills && !descriptor) throw new Error(`learning.candidate.targetId 不在可用 Skill 中：${assessment.candidate.targetId}`);
+  if (descriptor?.executionPoints?.length) {
+    const unsupported = entries.map(([key]) => key).filter((key) => !descriptor.executionPoints?.includes(key as SkillExecutionPoint));
+    if (unsupported.length) throw new Error(`learning.candidate.afterText 包含目标 Skill 未声明的 executionPoint：${unsupported.join("、")}`);
+  }
 }
 
 export async function assessRuntimeLearningWithModel(input: {
@@ -226,7 +251,7 @@ export async function assessRuntimeLearningWithModel(input: {
   candidateStartIndex?: number;
   now?: number;
   /** 透传到 buildRuntimeLearningPrompt，让 LLM 使用真实 skill ID */
-  availableSkills?: Array<{ skillId: string; capabilities: string[] }>;
+  availableSkills?: Array<{ skillId: string; capabilities: string[]; executionPoints?: SkillExecutionPoint[] }>;
   /** 当前 learning Skill bundle；由 compileStageContext 负责实际注入和 manifest 对账。 */
   skillBundle?: SkillBundle;
   skillManifest?: SkillResolutionManifest;
@@ -267,13 +292,15 @@ export async function assessRuntimeLearningWithModel(input: {
       taskId: `${input.artifact.taskId}:learning`,
       promptContext: promptPackage.manifest,
     });
+    const assessment = parseRuntimeLearningAssessmentV2(result.value, {
+      id: `learning:${input.artifact.id}`,
+      projectId: input.projectId,
+      source,
+      createdAt,
+    });
+    validateSkillCandidatePatch(assessment, input.availableSkills);
     return {
-      assessment: parseRuntimeLearningAssessmentV2(result.value, {
-        id: `learning:${input.artifact.id}`,
-        projectId: input.projectId,
-        source,
-        createdAt,
-      }),
+      assessment,
       usage: result.usage,
     };
   } catch (error) {

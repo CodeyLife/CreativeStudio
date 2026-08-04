@@ -17,6 +17,10 @@ export interface FactExtractionPromptInput {
   artifact: Artifact;
   text: string;
   existingClaimsDigest?: string;
+  openNarrativeElements?: {
+    foreshadowings: Array<{ id: string; description: string; triggerKeywords: string[]; expectedPayoffWindow: string }>;
+    promises: Array<{ id: string; promiser: string; promisee: string; statement: string }>;
+  };
 }
 
 /**
@@ -69,6 +73,7 @@ export function buildFactExtractionPrompt(input: FactExtractionPromptInput): str
     `- 只提取本章实际兑现的内容，不提取"即将兑现"的暗示。`,
     `- payoffType=foreshadowing：兑现了之前的伏笔；matchedTriggerKeywords 填匹配到的伏笔触发关键词。`,
     `- payoffType=promise：兑现了之前的承诺；matchedPromiser 填承诺者角色名。`,
+    `- 如果下方提供了开放叙事元素，明确兑现时必须填写对应的精确 ID（matchedForeshadowingIds 或 matchedPromiseId）；没有明确对应关系时不要填写 ID，也不要为了完成关联猜测。`,
     `- intensity 1-5：1=轻描淡写，3=明显推进，5=高潮爆发。`,
     "",
     `## 提取规则（payoffMoments，Phase 3.2）`,
@@ -111,6 +116,14 @@ export function buildFactExtractionPrompt(input: FactExtractionPromptInput): str
     "",
     `## 已存在记忆摘要（用于 novelty/conflict 判断）`,
     input.existingClaimsDigest ?? "- 暂无已存在记忆。所有事实 novelty=new。",
+    "",
+    `## 已知开放叙事元素（只用于兑现关联，不代表本章必须处理）`,
+    input.openNarrativeElements
+      ? [
+        `伏笔：${input.openNarrativeElements.foreshadowings.map((item) => `${item.id}｜${item.description}｜关键词=${item.triggerKeywords.join("、") || "未指定"}｜窗口=${item.expectedPayoffWindow}`).join("\n") || "无"}`,
+        `承诺：${input.openNarrativeElements.promises.map((item) => `${item.id}｜${item.promiser}->${item.promisee}｜${item.statement}`).join("\n") || "无"}`,
+      ].join("\n")
+      : "- 未提供；兑现关联只能保留为未关联的结构记录。",
     "",
     `## 章节正文（段落编号仅用于定位）`,
     buildNumberedText(input.text),

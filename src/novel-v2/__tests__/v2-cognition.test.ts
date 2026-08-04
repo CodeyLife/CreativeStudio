@@ -203,6 +203,17 @@ describe("V2 cognition compiler", () => {
     await expect(buildMemoryBundle(plan, { projectId: "p1", provider: { search: async () => [requiredFact] }, tokenBudget: 10 })).rejects.toThrow(/必要记忆 facet fact 超过记忆预算/);
   });
 
+  it("keeps open ledger candidates available without making every item a pinned local constraint", async () => {
+    const plan = createPreflightPlan(intent, { projectId: "p1", currentRevision: 7, targetDocumentOrder: 12 });
+    const requiredFact = { id: "required-fact", projectId: "p1", kind: "canonical" as const, title: "必要事实", content: "主角仍在旧站台", subjectRefs: ["hero"], knowledgeScope: "author" as const, authority: "approved" as const, confidence: 1, sourceRevisionIds: ["r1"], contentHash: "required-fact", supersedes: [], score: 1, matchedFacet: "fact", reason: "required" };
+    const openPromise = { id: "promise-1", projectId: "p1", kind: "working" as const, title: "开放承诺", content: "承诺内容：" + "x".repeat(100), subjectRefs: [], knowledgeScope: "author" as const, authority: "derived" as const, confidence: 0.9, sourceRevisionIds: ["r3"], contentHash: "promise-1", supersedes: [], score: 1, matchedFacet: "foreshadowing", reason: "open-promise" };
+    const bundle = await buildMemoryBundle(plan, { projectId: "p1", provider: { search: async () => [requiredFact] }, tokenBudget: 12, additionalClaims: [openPromise] });
+
+    expect(bundle.claims.map((claim) => claim.id)).toEqual(["required-fact"]);
+    expect(bundle.selectionReceipts).toContainEqual(expect.objectContaining({ claimId: "promise-1", status: "excluded", reason: "budget" }));
+    expect(bundle.selectionReceipts).not.toContainEqual(expect.objectContaining({ claimId: "promise-1", reason: "pinned-narrative" }));
+  });
+
   it("fingerprints the selected claim and pinned narrative content without depending on creation time", async () => {
     const plan = createPreflightPlan(intent, { projectId: "p1", currentRevision: 7, targetDocumentOrder: 12 }, 1);
     const makeClaim = (content: string) => ({ id: "fact", projectId: "p1", kind: "canonical" as const, title: "事实", content, subjectRefs: [], knowledgeScope: "author" as const, authority: "approved" as const, confidence: 1, sourceRevisionIds: ["r1"], contentHash: content, supersedes: [], score: 1, matchedFacet: "fact", reason: "test" });

@@ -3,7 +3,7 @@ import { Client, Connection } from "@temporalio/client";
 import { QdrantClient } from "@qdrant/js-client-rest";
 import { createHash, randomUUID } from "node:crypto";
 import { NovelPostgresRepository, type KnowledgeRecordKind, type MutableKnowledgeRecordKind } from "../src/novel-v2/postgres-repository";
-import type { Artifact, AuthorDecision, NovelIntent } from "../src/novel-v2/protocol";
+import { NOVEL_V2_PROTOCOL_VERSION, type Artifact, type AuthorDecision, type NovelIntent } from "../src/novel-v2/protocol";
 import { CommitService } from "../src/novel-v2/commit-service";
 import { createRuntimeModelGateway } from "../src/novel-v2/model-runtime";
 import type { ModelRoutingConfig, ModelTaskRecord } from "../src/novel-v2/model-routing";
@@ -12,6 +12,14 @@ import { createExperimentWorkspace, getExperimentWorkspace, listExperimentWorksp
 import { extractCandidateBundle } from "../src/novel-v2/evaluation/candidate-bundle";
 import { createPromotionService } from "../src/novel-v2/evaluation/promotion";
 import { runClosedLoop } from "../src/novel-v2/evaluation/closed-loop";
+import { runCraftRuleCandidateExperiment, runCraftRuleCandidatePromotionVerification } from "../src/novel-v2/evaluation/craft-rule-experiment";
+import {
+  inspectCraftRuleCandidate,
+  listCraftRuleCandidates,
+  promoteCraftRuleCandidate,
+  rollbackCraftRuleCandidate,
+  submitCraftRuleReview,
+} from "../src/novel-v2/craft-rule";
 import {
   createCreativeRun,
   enqueueCreativeWork,
@@ -29,6 +37,8 @@ import { provisionalTitle } from "../src/novel-v2/application/provisional-title"
 import { ContentObjectStore } from "../src/novel-v2/object-store";
 import { bindRuntimeObjectStore } from "../src/novel-v2/runtime-object-store";
 import { PROJECT_PLAN_STAGES, isProjectPlanTaskKey, requiresFoundationAuthorConfirmation } from "../src/novel-v2/application/project-plan";
+import { assertFoundationTaskContract } from "../src/novel-v2/application/foundation-contract";
+import type { FoundationOutput } from "../src/novel-v2/prompts/schemas";
 import {
   bookSynopsisSourceFingerprint,
   bookTitleSourceFingerprint,
@@ -150,6 +160,14 @@ async function createEditedPlanArtifact(input: {
   runId: string;
   payload: Record<string, unknown>;
 }): Promise<Artifact> {
+  const structuredData = input.payload.structuredData;
+  if (!structuredData || typeof structuredData !== "object" || Array.isArray(structuredData)) throw new Error("规划内容缺少 structuredData");
+  assertFoundationTaskContract({
+    title: typeof input.payload.title === "string" ? input.payload.title : input.taskKey,
+    summary: typeof input.payload.summary === "string" ? input.payload.summary : input.taskKey,
+    sections: Array.isArray(input.payload.sections) ? input.payload.sections : [],
+    structuredData: structuredData as Record<string, unknown>,
+  } as FoundationOutput, input.taskKey);
   const text = JSON.stringify(input.payload, null, 2);
   const object = await objectStore.putText(text);
   const taskId = `${input.workItemId}:foundation:user-edit`;
@@ -289,7 +307,7 @@ const server = createServer(async (request, response) => {
       const requiredReady = dependencies.postgres.ok && dependencies.objectStore.ok && dependencies.qdrant.ok && dependencies.temporal.ok;
       const fullyHealthy = requiredReady && dependencies.embedding.ok && dependencies.worker.ok;
       const status = fullyHealthy ? "healthy" : requiredReady ? "degraded" : "unready";
-      return send(response, request.url === "/ready" && !fullyHealthy ? 503 : 200, { service: "ymcp-novel-v2", status, dependencies });
+      return send(response, request.url === "/ready" && !fullyHealthy ? 503 : 200, { service: "ymcp-novel-v2", status, runtime: { protocolVersion: NOVEL_V2_PROTOCOL_VERSION, foundationStageCount: PROJECT_PLAN_STAGES.length, taskQueue }, dependencies });
     }
     if (request.method === "GET" && request.url === "/v2/model-config") return send(response, 200, { config: modelConfigStore.getMaskedConfig() });
     if (request.method === "PUT" && request.url === "/v2/model-config") {
@@ -887,6 +905,27 @@ const server = createServer(async (request, response) => {
     }
     const requestPath = request.url?.split("?")[0] ?? "/";
     const requestQuery = new URL(request.url ?? "/", "http://localhost").searchParams;
+    const architectureHealthMatch = requestPath.match(/^\/v2\/projects\/([^/?]+)\/architecture\/health$/);
+    if (request.method === "GET" && architectureHealthMatch) {
+      const projectId = decodeURIComponent(architectureHealthMatch[1]);
+      return send(response, 200, { health: await repository.getArchitectureHealth(projectId) });
+    }
+    const architectureReferenceRepairMatch = requestPath.match(/^\/v2\/projects\/([^/?]+)\/architecture\/normalize-references$/);
+    if (request.method === "POST" && architectureReferenceRepairMatch) {
+      const projectId = decodeURIComponent(architectureReferenceRepairMatch[1]);
+      const input = await readJson(request);
+      const arcId = asString(input.arcId);
+      if (!arcId) return send(response, 400, { error: "arcId 必填" });
+      return send(response, 200, { result: await repository.normalizeStoryArcReferences(projectId, arcId, "web-author") });
+    }
+    const architectureBatchRepairMatch = requestPath.match(/^\/v2\/projects\/([^/?]+)\/architecture\/reconcile-batches$/);
+    if (request.method === "POST" && architectureBatchRepairMatch) {
+      const projectId = decodeURIComponent(architectureBatchRepairMatch[1]);
+      const input = await readJson(request);
+      const arcId = asString(input.arcId);
+      if (!arcId) return send(response, 400, { error: "arcId 必填" });
+      return send(response, 200, { result: await repository.reconcileStoryArcBatchRanges(projectId, arcId, "web-author") });
+    }
     const storyArcListMatch = requestPath.match(/^\/v2\/projects\/([^/?]+)\/story-arcs$/);
     const memoryRebuildMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/memory\/rebuild$/);
     if (request.method === "POST" && memoryRebuildMatch) {
@@ -1229,6 +1268,71 @@ const server = createServer(async (request, response) => {
     }
     const learningPromoteMatch = request.url?.match(/^\/v2\/learning\/([^/?]+)\/promote$/);
     if (request.method === "POST" && learningPromoteMatch) return send(response, 202, { promotion: await repository.requestLearningPromotion(decodeURIComponent(learningPromoteMatch[1])) });
+
+    // ===== Learning / Craft Rule 可见化与隔离回归 =====
+    const projectLearningAssessmentsMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/learning-assessments$/);
+    if (request.method === "GET" && projectLearningAssessmentsMatch) {
+      const projectId = decodeURIComponent(projectLearningAssessmentsMatch[1]);
+      return send(response, 200, { assessments: await repository.listLearningAssessments(projectId) });
+    }
+    const projectCraftRuleCandidateDetailMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/craft-rule-candidates\/([^/?]+)(?:\/(experiment|review|promote|rollback))?$/);
+    if (projectCraftRuleCandidateDetailMatch) {
+      const projectId = decodeURIComponent(projectCraftRuleCandidateDetailMatch[1]);
+      const candidateId = decodeURIComponent(projectCraftRuleCandidateDetailMatch[2]);
+      if (request.method === "GET") {
+        const candidate = await inspectCraftRuleCandidate(repository, projectId, candidateId);
+        if (!candidate) return send(response, 404, { error: "Craft Rule 候选不存在" });
+        return send(response, 200, { candidate });
+      }
+      if (request.method === "POST") {
+        const input = await readJson(request);
+        const operation = asString(input.operation) ?? projectCraftRuleCandidateDetailMatch[3];
+        if (operation === "experiment") {
+          const sourceDocumentId = asString(input.sourceDocumentId);
+          const crossScenarioDocumentId = asString(input.crossScenarioDocumentId);
+          if (!crossScenarioDocumentId) return send(response, 400, { error: "crossScenarioDocumentId 必填" });
+          const result = await runCraftRuleCandidateExperiment({ repository, model, skillProvider, projectId, candidateId, sourceDocumentId, crossScenarioDocumentId, instruction: asString(input.instruction) });
+          return send(response, 200, { result });
+        }
+        if (operation === "review") {
+          const verdict = input.verdict === "passed" || input.verdict === "revise" || input.verdict === "rejected" ? input.verdict : undefined;
+          if (!verdict) return send(response, 400, { error: "verdict 必须为 passed、revise 或 rejected" });
+          const candidate = await submitCraftRuleReview(repository, {
+            projectId,
+            candidateId,
+            role: asString(input.role) ?? "author-reviewer",
+            reviewerId: asString(input.reviewerId) ?? "web-author",
+            reviewRunId: asString(input.reviewRunId) ?? `learning-review:${candidateId}:${Date.now()}`,
+            model: asString(input.model) ?? "human",
+            provider: asString(input.provider),
+            promptFingerprint: asString(input.promptFingerprint),
+            verdict,
+            summary: asString(input.summary) ?? "作者审核完成",
+            concerns: Array.isArray(input.concerns) ? input.concerns.filter((item): item is string => typeof item === "string") : [],
+          });
+          return send(response, 200, { candidate });
+        }
+        if (operation === "promote") {
+          const result = await promoteCraftRuleCandidate(repository, model, {
+            projectId,
+            candidateId,
+            authorId: asString(input.authorId) ?? "web-author",
+            chapterRegressionVerifier: (candidate) => runCraftRuleCandidatePromotionVerification({ repository, model, candidate, skillProvider }),
+          });
+          return send(response, 200, { result });
+        }
+        if (operation === "rollback") {
+          const result = await rollbackCraftRuleCandidate(repository, model, { projectId, candidateId });
+          return send(response, 200, { result });
+        }
+        return send(response, 400, { error: "未知 Craft Rule 操作" });
+      }
+    }
+    const projectCraftRuleCandidatesMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/craft-rule-candidates$/);
+    if (request.method === "GET" && projectCraftRuleCandidatesMatch) {
+      const projectId = decodeURIComponent(projectCraftRuleCandidatesMatch[1]);
+      return send(response, 200, { candidates: await listCraftRuleCandidates(repository, projectId) });
+    }
 
     // ===== 评估闭环路由（B-1.5）=====
     const snapshotsMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/snapshots$/);

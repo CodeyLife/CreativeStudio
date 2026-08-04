@@ -19,6 +19,7 @@ export interface ModelUsage {
   outputTokens: number;
   providerInputTokens?: number;
   providerOutputTokens?: number;
+  providerCachedInputTokens?: number;
   estimatedInputTokens?: number;
   estimatedOutputTokens?: number;
   usageSource?: "provider" | "estimated" | "mixed";
@@ -79,6 +80,7 @@ export interface ModelInvocationAudit {
   outputTokens: number;
   providerInputTokens?: number;
   providerOutputTokens?: number;
+  providerCachedInputTokens?: number;
   estimatedInputTokens?: number;
   estimatedOutputTokens?: number;
   usageSource?: "provider" | "estimated" | "mixed";
@@ -121,6 +123,7 @@ interface TransportResponse {
   outputTokens: number;
   providerInputTokens?: number;
   providerOutputTokens?: number;
+  providerCachedInputTokens?: number;
   estimatedInputTokens: number;
   estimatedOutputTokens: number;
   usageSource: "provider" | "estimated" | "mixed";
@@ -163,6 +166,19 @@ function promptFingerprint(system: string | undefined, prompt: string): string {
 
 function endpoint(baseUrl: string, path: string): string {
   return `${baseUrl.replace(/\/+$/, "")}/${path.replace(/^\/+/, "")}`;
+}
+
+function structuredPromptForProfile(prompt: string, schema: Record<string, unknown> | undefined, protocol: ModelProviderProfile["protocol"]): string {
+  // Responses carries the schema in `text.format`; repeating the full schema in
+  // the user input only increases billed context. Chat-compatible gateways may
+  // accept but ignore response_format, so retain one prompt-level fallback there.
+  if (!schema || protocol === "responses") return prompt;
+  return [
+    prompt,
+    "## 结构化输出契约",
+    "只输出一个严格符合下列 JSON Schema 的 JSON 值，不使用 Markdown，不在 JSON 前后添加说明。",
+    JSON.stringify(schema),
+  ].join("\n\n");
 }
 
 function jsonSchemaPrimitiveType(value: unknown): string | undefined {
@@ -229,12 +245,14 @@ export function normalizeUsage(
   usageValue: unknown,
   inputText: string,
   outputText: string,
-): Pick<TransportResponse, "inputTokens" | "outputTokens" | "providerInputTokens" | "providerOutputTokens" | "estimatedInputTokens" | "estimatedOutputTokens" | "usageSource"> {
+): Pick<TransportResponse, "inputTokens" | "outputTokens" | "providerInputTokens" | "providerOutputTokens" | "providerCachedInputTokens" | "estimatedInputTokens" | "estimatedOutputTokens" | "usageSource"> {
   const usage = usageValue && typeof usageValue === "object" && !Array.isArray(usageValue) ? usageValue as Record<string, unknown> : {};
-  const inputDetails = usage.input_tokens_details && typeof usage.input_tokens_details === "object" ? usage.input_tokens_details as Record<string, unknown> : {};
+  const inputDetailsValue = usage.input_tokens_details ?? usage.prompt_tokens_details;
+  const inputDetails = inputDetailsValue && typeof inputDetailsValue === "object" && !Array.isArray(inputDetailsValue) ? inputDetailsValue as Record<string, unknown> : {};
   const outputDetails = usage.output_tokens_details && typeof usage.output_tokens_details === "object" ? usage.output_tokens_details as Record<string, unknown> : {};
   const providerInputTokens = finiteToken(usage.input_tokens ?? usage.prompt_tokens ?? usage.promptTokens ?? inputDetails.total_tokens);
   const providerOutputTokens = finiteToken(usage.output_tokens ?? usage.completion_tokens ?? usage.completionTokens ?? outputDetails.total_tokens);
+  const providerCachedInputTokens = finiteToken(inputDetails.cached_tokens ?? inputDetails.cachedTokens);
   const estimatedInputTokens = tokenEstimate(inputText);
   const estimatedOutputTokens = tokenEstimate(outputText);
   const hasProviderInput = providerInputTokens !== undefined;
@@ -245,6 +263,7 @@ export function normalizeUsage(
     outputTokens: providerOutputTokens ?? estimatedOutputTokens,
     providerInputTokens,
     providerOutputTokens,
+    providerCachedInputTokens,
     estimatedInputTokens,
     estimatedOutputTokens,
     usageSource,
@@ -409,6 +428,34 @@ function balancedJsonObjects(content: string): string[] {
   return candidates;
 }
 
+/**
+ * Project provider envelopes onto the declared structured-output contract.
+ * Providers sometimes echo persistence metadata even when strict JSON schema
+ * mode is requested. Only objects that explicitly disallow additional fields
+ * are projected; required fields and value constraints remain AJV's job.
+ */
+function projectStructuredCandidate(value: unknown, schema: AnySchema): unknown {
+  if (typeof schema === "boolean") return value;
+  const schemaObject = schema as { anyOf?: unknown; items?: AnySchema; properties?: unknown; additionalProperties?: unknown };
+  if (schemaObject.anyOf && Array.isArray(schemaObject.anyOf)) {
+    // A union needs branch selection, which cannot be inferred from the schema
+    // alone. Leave it intact and let AJV select the valid branch.
+    return value;
+  }
+  if (Array.isArray(value) && schemaObject.items && typeof schemaObject.items === "object" && !Array.isArray(schemaObject.items)) {
+    return value.map((item) => projectStructuredCandidate(item, schemaObject.items as AnySchema));
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value) || !schemaObject.properties || typeof schemaObject.properties !== "object") return value;
+  const source = value as Record<string, unknown>;
+  const properties = schemaObject.properties as Record<string, AnySchema>;
+  const projected: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(source)) {
+    if (schemaObject.additionalProperties === false && !(key in properties)) continue;
+    projected[key] = key in properties ? projectStructuredCandidate(child, properties[key]) : child;
+  }
+  return projected;
+}
+
 export function normalizeStructuredContent<T>(content: string, validate: ValidateFunction<T>): T | undefined {
   const fenced = [...content.matchAll(/```(?:json)?\s*([\s\S]*?)```/giu)].map((match) => match[1]);
   const fullValue = parseJsonCandidate(content);
@@ -420,20 +467,25 @@ export function normalizeStructuredContent<T>(content: string, validate: Validat
       const root = parsed as Record<string, unknown>;
       for (const key of ["data", "result", "output"]) if (key in root) candidates.push(root[key]);
     }
-    for (const candidate of candidates) if (validate(candidate)) return candidate;
+    for (const candidate of candidates) {
+      if (validate(candidate)) return candidate;
+      const projected = projectStructuredCandidate(candidate, validate.schema as AnySchema);
+      if (validate(projected)) return projected;
+    }
   }
   return undefined;
 }
 
-function repairPrompt(schema: Record<string, unknown>, originalTask: string, content: string, errors: string, attempt: number, maxInputTokens: number, system?: string): string {
+function repairPrompt(originalTask: string, content: string, errors: string, attempt: number, maxInputTokens: number, system?: string, transportOverheadCharacters = 0): string {
   const prefix = [
     attempt ? "上一次修复仍未通过。重新生成完整 JSON。" : "修复下面输出，使其严格符合 JSON Schema。",
     "只输出 JSON。必须继续完成原始任务，不得只追求通过 Schema；不得新增原输出和原始任务依据中都不存在的故事事实。",
+    "结构化 Schema 由请求层提供；不要输出 Schema、Markdown 或解释。",
+    "如果校验错误涉及 additionalProperties，删除所有未在 Schema 声明的字段；尤其不要把上下文中的持久化、执行、批准、提交、文档或修订包装字段复制进返回值。输出应是规范业务对象，而不是输入记录的回显。",
     `原始任务与语义约束：\n${originalTask}`,
-    `Schema:\n${JSON.stringify(schema)}`,
     `校验错误：${errors}`,
   ].join("\n\n");
-  const maxCharacters = Number.isFinite(maxInputTokens) ? Math.max(0, maxInputTokens * 2 - (system?.length ?? 0) - prefix.length - 128) : content.length;
+  const maxCharacters = Number.isFinite(maxInputTokens) ? Math.max(0, maxInputTokens * 2 - (system?.length ?? 0) - prefix.length - transportOverheadCharacters - 128) : content.length;
   const retained = content.slice(0, maxCharacters);
   const outputSection = retained
     ? `${retained.length < content.length ? "原输出（因上下文预算仅保留开头，必要时按原始任务重新生成）" : "原输出"}：\n${retained}`
@@ -482,9 +534,9 @@ export class RoutedModelGateway implements ModelGateway {
 
   private async invokeCandidate(input: BaseModelInput & { prompt: string; schema?: Record<string, unknown>; schemaName?: string }, snapshot: ModelRoutingSnapshot, route: ModelRoute, candidateIndex: number): Promise<{ response: TransportResponse; profile: ModelProviderProfile; model: string; provenance: ModelExecutionProvenance; latencyMs: number }> {
     const candidate = route.candidates[candidateIndex];
-    const fingerprint = promptFingerprint(input.system, input.prompt);
     if (!candidate) throw new Error(`模型候选索引越界：${candidateIndex}`);
     if (candidate.executor === "external-mcp") {
+      const fingerprint = promptFingerprint(input.system, input.prompt);
       const effectiveInputLimit = Math.min(route.maxInputTokens ?? Number.MAX_SAFE_INTEGER, input.promptContext?.maxInputTokens ?? Number.MAX_SAFE_INTEGER);
       const estimatedInputTokens = Math.ceil(`${input.system ?? ""}\n${input.prompt}`.length / 2);
       if (estimatedInputTokens > effectiveInputLimit) {
@@ -498,13 +550,15 @@ export class RoutedModelGateway implements ModelGateway {
     }
     const profile = this.resolveProfile(snapshot, candidate.profileId);
     const model = candidate.model ?? profile.model;
+    const transportPrompt = structuredPromptForProfile(input.prompt, input.schema, profile.protocol);
+    const fingerprint = promptFingerprint(input.system, transportPrompt);
     const outputReserve = Math.max(1, Math.min(input.maxTokens ?? route.maxOutputTokens ?? 4_096, route.maxOutputTokens ?? Number.MAX_SAFE_INTEGER));
     const profileInputLimit = profile.contextWindow ? Math.max(0, profile.contextWindow - outputReserve) : Number.MAX_SAFE_INTEGER;
     const effectiveInputLimit = Math.min(route.maxInputTokens ?? Number.MAX_SAFE_INTEGER, input.promptContext?.maxInputTokens ?? Number.MAX_SAFE_INTEGER, profileInputLimit);
-    const estimatedInputTokens = Math.ceil(`${input.system ?? ""}\n${input.prompt}`.length / 2);
+    const estimatedInputTokens = Math.ceil(`${input.system ?? ""}\n${transportPrompt}`.length / 2);
     if (estimatedInputTokens > effectiveInputLimit) {
       const error = new ModelContextBudgetError(estimatedInputTokens, effectiveInputLimit, input.purpose);
-      await this.recordPrompt({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, candidateIndex, status: "failed", system: input.system, prompt: input.prompt, promptFingerprint: fingerprint, contextManifest: input.promptContext, errorCategory: error.category });
+      await this.recordPrompt({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, candidateIndex, status: "failed", system: input.system, prompt: transportPrompt, promptFingerprint: fingerprint, contextManifest: input.promptContext, errorCategory: error.category });
       await this.record({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, configRevision: snapshot.id, candidateIndex, executor: "api", profileId: profile.id, protocol: profile.protocol, model, status: "failed", inputTokens: estimatedInputTokens, outputTokens: 0, estimatedInputTokens, estimatedOutputTokens: 0, usageSource: "estimated", latencyMs: 0, promptFingerprint: fingerprint, errorCategory: error.category });
       throw error;
     }
@@ -516,11 +570,11 @@ export class RoutedModelGateway implements ModelGateway {
     let continuationFallbackUsed = false;
     while (true) {
       try {
-        const response = await requestTransport({ profile, model, system: input.system, prompt: input.prompt, schema: input.schema, schemaName: input.schemaName, maxTokens: input.maxTokens, temperature: input.temperature, previousResponseId, signal: input.signal });
+        const response = await requestTransport({ profile, model, system: input.system, prompt: transportPrompt, schema: input.schema, schemaName: input.schemaName, maxTokens: input.maxTokens, temperature: input.temperature, previousResponseId, signal: input.signal });
         if (!response.text.trim()) throw new ModelTransportError("模型返回空内容", true, "empty-response");
         const latencyMs = Date.now() - started;
         const provenance: ModelExecutionProvenance = { routeSnapshotId: snapshot.id, purpose: input.purpose, candidateIndex, executor: "api", profileId: profile.id, protocol: profile.protocol, model, responseId: response.responseId, promptFingerprint: fingerprint };
-        await this.recordPrompt({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, candidateIndex, status: "completed", system: input.system, prompt: input.prompt, response: response.text, promptFingerprint: fingerprint, contextManifest: input.promptContext });
+        await this.recordPrompt({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, candidateIndex, status: "completed", system: input.system, prompt: transportPrompt, response: response.text, promptFingerprint: fingerprint, contextManifest: input.promptContext });
         return { response, profile, model, provenance, latencyMs };
       } catch (error) {
         if (previousResponseId && !continuationFallbackUsed && error instanceof ModelTransportError && error.status === 400) {
@@ -534,7 +588,7 @@ export class RoutedModelGateway implements ModelGateway {
         }
         const latencyMs = Date.now() - started;
         const errorCategory = error instanceof ModelTransportError ? error.category : error instanceof ModelContextBudgetError ? error.category : "protocol";
-        await this.recordPrompt({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, candidateIndex, status: "failed", system: input.system, prompt: input.prompt, promptFingerprint: fingerprint, contextManifest: input.promptContext, errorCategory });
+        await this.recordPrompt({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, candidateIndex, status: "failed", system: input.system, prompt: transportPrompt, promptFingerprint: fingerprint, contextManifest: input.promptContext, errorCategory });
         await this.record({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, configRevision: snapshot.id, candidateIndex, executor: "api", profileId: profile.id, protocol: profile.protocol, model, status: "failed", inputTokens: 0, outputTokens: 0, latencyMs, promptFingerprint: fingerprint, errorCategory });
         throw error;
       }
@@ -547,8 +601,8 @@ export class RoutedModelGateway implements ModelGateway {
     for (let index = input.candidateStartIndex ?? 0; index < route.candidates.length; index += 1) {
       try {
         const result = await this.invokeCandidate(input, snapshot, route, index);
-        const usage = { model: result.model, inputTokens: result.response.inputTokens, outputTokens: result.response.outputTokens, providerInputTokens: result.response.providerInputTokens, providerOutputTokens: result.response.providerOutputTokens, estimatedInputTokens: result.response.estimatedInputTokens, estimatedOutputTokens: result.response.estimatedOutputTokens, usageSource: result.response.usageSource, costUsd: 0, latencyMs: result.latencyMs };
-        await this.record({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, configRevision: snapshot.id, candidateIndex: index, executor: "api", profileId: result.profile.id, protocol: result.profile.protocol, model: result.model, status: "completed", inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, providerInputTokens: usage.providerInputTokens, providerOutputTokens: usage.providerOutputTokens, estimatedInputTokens: usage.estimatedInputTokens, estimatedOutputTokens: usage.estimatedOutputTokens, usageSource: usage.usageSource, latencyMs: usage.latencyMs, promptFingerprint: result.provenance.promptFingerprint, responseId: result.response.responseId });
+        const usage = { model: result.model, inputTokens: result.response.inputTokens, outputTokens: result.response.outputTokens, providerInputTokens: result.response.providerInputTokens, providerOutputTokens: result.response.providerOutputTokens, providerCachedInputTokens: result.response.providerCachedInputTokens, estimatedInputTokens: result.response.estimatedInputTokens, estimatedOutputTokens: result.response.estimatedOutputTokens, usageSource: result.response.usageSource, costUsd: 0, latencyMs: result.latencyMs };
+        await this.record({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, configRevision: snapshot.id, candidateIndex: index, executor: "api", profileId: result.profile.id, protocol: result.profile.protocol, model: result.model, status: "completed", inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, providerInputTokens: usage.providerInputTokens, providerOutputTokens: usage.providerOutputTokens, providerCachedInputTokens: usage.providerCachedInputTokens, estimatedInputTokens: usage.estimatedInputTokens, estimatedOutputTokens: usage.estimatedOutputTokens, usageSource: usage.usageSource, latencyMs: usage.latencyMs, promptFingerprint: result.provenance.promptFingerprint, responseId: result.response.responseId });
         return { value: result.response.text, text: result.response.text, usage, provenance: result.provenance };
       } catch (error) {
         if (error instanceof ExternalMcpRequiredError) throw error;
@@ -576,27 +630,20 @@ export class RoutedModelGateway implements ModelGateway {
     let lastError: unknown;
     for (let index = input.candidateStartIndex ?? 0; index < route.candidates.length; index += 1) {
       try {
-        // Some OpenAI-compatible providers accept response_format but do not
-        // enforce it. Keep the schema in the same coherent user payload so the
-        // output contract remains explicit even on compatibility transports.
-        const originalPrompt = [
-          input.prompt,
-          "## 结构化输出契约",
-          "只输出一个严格符合下列 JSON Schema 的 JSON 值，不使用 Markdown，不在 JSON 前后添加说明。",
-          JSON.stringify(input.schema),
-        ].join("\n\n");
-        let currentPrompt = originalPrompt;
+        let currentPrompt = input.prompt;
         let currentSystem = input.system;
         let totalInput = 0;
         let totalOutput = 0;
         let providerInputTotal = 0;
         let providerOutputTotal = 0;
+        let providerCachedInputTotal = 0;
         let estimatedInputTotal = 0;
         let estimatedOutputTotal = 0;
         let providerInputComplete = true;
         let providerOutputComplete = true;
         let providerInputSeen = false;
         let providerOutputSeen = false;
+        let providerCachedInputSeen = false;
         let latest: Awaited<ReturnType<RoutedModelGateway["invokeCandidate"]>> | undefined;
         const repairs = input.maxRepairAttempts ?? 2;
         for (let repair = 0; repair <= repairs; repair += 1) {
@@ -609,30 +656,34 @@ export class RoutedModelGateway implements ModelGateway {
           else { providerInputSeen = true; providerInputTotal += latest.response.providerInputTokens; }
           if (latest.response.providerOutputTokens === undefined) providerOutputComplete = false;
           else { providerOutputSeen = true; providerOutputTotal += latest.response.providerOutputTokens; }
+          if (latest.response.providerCachedInputTokens !== undefined) { providerCachedInputSeen = true; providerCachedInputTotal += latest.response.providerCachedInputTokens; }
           const parsed = normalizeStructuredContent(latest.response.text, validate);
           if (parsed !== undefined) {
             const providerInputTokens = providerInputSeen ? providerInputTotal : undefined;
             const providerOutputTokens = providerOutputSeen ? providerOutputTotal : undefined;
+            const providerCachedInputTokens = providerCachedInputSeen ? providerCachedInputTotal : undefined;
             const usageSource = providerInputComplete && providerOutputComplete ? "provider" as const : providerInputSeen || providerOutputSeen ? "mixed" as const : "estimated" as const;
-            const usage = { model: latest.model, inputTokens: totalInput, outputTokens: totalOutput, providerInputTokens, providerOutputTokens, estimatedInputTokens: estimatedInputTotal, estimatedOutputTokens: estimatedOutputTotal, usageSource, costUsd: 0, latencyMs: latest.latencyMs };
-            await this.record({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, configRevision: snapshot.id, candidateIndex: index, executor: "api", profileId: latest.profile.id, protocol: latest.profile.protocol, model: latest.model, status: "completed", inputTokens: totalInput, outputTokens: totalOutput, providerInputTokens: usage.providerInputTokens, providerOutputTokens: usage.providerOutputTokens, estimatedInputTokens: usage.estimatedInputTokens, estimatedOutputTokens: usage.estimatedOutputTokens, usageSource: usage.usageSource, latencyMs: latest.latencyMs, promptFingerprint: latest.provenance.promptFingerprint, responseId: latest.response.responseId });
+            const usage = { model: latest.model, inputTokens: totalInput, outputTokens: totalOutput, providerInputTokens, providerOutputTokens, providerCachedInputTokens, estimatedInputTokens: estimatedInputTotal, estimatedOutputTokens: estimatedOutputTotal, usageSource, costUsd: 0, latencyMs: latest.latencyMs };
+            await this.record({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, configRevision: snapshot.id, candidateIndex: index, executor: "api", profileId: latest.profile.id, protocol: latest.profile.protocol, model: latest.model, status: "completed", inputTokens: totalInput, outputTokens: totalOutput, providerInputTokens: usage.providerInputTokens, providerOutputTokens: usage.providerOutputTokens, providerCachedInputTokens: usage.providerCachedInputTokens, estimatedInputTokens: usage.estimatedInputTokens, estimatedOutputTokens: usage.estimatedOutputTokens, usageSource: usage.usageSource, latencyMs: latest.latencyMs, promptFingerprint: latest.provenance.promptFingerprint, responseId: latest.response.responseId });
             return { value: parsed, usage, provenance: latest.provenance };
           }
           const errors = validate.errors?.map((item) => `${item.instancePath || "root"} ${item.message ?? ""}`).join("；") ?? "JSON 无法解析";
           if (repair === repairs) {
-            await this.record({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, configRevision: snapshot.id, candidateIndex: index, executor: "api", profileId: latest.profile.id, protocol: latest.profile.protocol, model: latest.model, status: "failed", inputTokens: totalInput, outputTokens: totalOutput, providerInputTokens: providerInputSeen ? providerInputTotal : undefined, providerOutputTokens: providerOutputSeen ? providerOutputTotal : undefined, estimatedInputTokens: estimatedInputTotal, estimatedOutputTokens: estimatedOutputTotal, usageSource: providerInputComplete && providerOutputComplete ? "provider" : providerInputSeen || providerOutputSeen ? "mixed" : "estimated", latencyMs: latest.latencyMs, promptFingerprint: latest.provenance.promptFingerprint, responseId: latest.response.responseId, errorCategory: "schema-validation" });
+            await this.record({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, configRevision: snapshot.id, candidateIndex: index, executor: "api", profileId: latest.profile.id, protocol: latest.profile.protocol, model: latest.model, status: "failed", inputTokens: totalInput, outputTokens: totalOutput, providerInputTokens: providerInputSeen ? providerInputTotal : undefined, providerOutputTokens: providerOutputSeen ? providerOutputTotal : undefined, providerCachedInputTokens: providerCachedInputSeen ? providerCachedInputTotal : undefined, estimatedInputTokens: estimatedInputTotal, estimatedOutputTokens: estimatedOutputTotal, usageSource: providerInputComplete && providerOutputComplete ? "provider" : providerInputSeen || providerOutputSeen ? "mixed" : "estimated", latencyMs: latest.latencyMs, promptFingerprint: latest.provenance.promptFingerprint, responseId: latest.response.responseId, errorCategory: "schema-validation" });
             throw new ModelTransportError(`结构化输出校验失败：${errors}`, false, "schema-validation");
           }
           const repairSystem = [input.system, "修复结构化输出时仍须遵守原始角色、任务目标和事实边界。只输出严格符合 JSON Schema 的 JSON，不使用 Markdown。"].filter(Boolean).join("\n\n");
           const candidate = route.candidates[index];
           let repairInputLimit = Math.min(route.maxInputTokens ?? Number.MAX_SAFE_INTEGER, input.promptContext?.maxInputTokens ?? Number.MAX_SAFE_INTEGER);
+          let schemaPromptOverhead = 0;
           if (candidate?.executor === "api") {
             const profile = this.resolveProfile(snapshot, candidate.profileId);
             const outputReserve = Math.max(1, Math.min(input.maxTokens ?? route.maxOutputTokens ?? 4_096, route.maxOutputTokens ?? Number.MAX_SAFE_INTEGER));
             if (profile.contextWindow) repairInputLimit = Math.min(repairInputLimit, Math.max(0, profile.contextWindow - outputReserve));
+            schemaPromptOverhead = profile.protocol === "chat-completions" ? structuredPromptForProfile("", input.schema, profile.protocol).length : 0;
           }
           currentSystem = repairSystem;
-          currentPrompt = repairPrompt(input.schema, input.prompt, latest.response.text, errors, repair, repairInputLimit, repairSystem);
+          currentPrompt = repairPrompt(input.prompt, latest.response.text, errors, repair, repairInputLimit, repairSystem, schemaPromptOverhead);
         }
       } catch (error) {
         if (error instanceof ExternalMcpRequiredError) throw error;
@@ -643,12 +694,17 @@ export class RoutedModelGateway implements ModelGateway {
           index = nextApi - 1;
           continue;
         }
-        // schema-validation 是 LLM 已返回内容但形状不匹配 schema——
-        // 已在 maxRepairAttempts 内多次修复失败，说明该模型对此 prompt+schema 组合无法稳定产出。
-        // 回退 external-mcp 无意义：外部客户端会面对相同的 schema 约束，只会无限等待。
-        // 让错误冒泡到 activity，runAllReviewers 的 Promise.allSettled 会跳过此 reviewer
-        // 继续工作流；其他依赖该结果的调用方应通过 revision-policy 容错。
-        if (error instanceof ModelTransportError && error.category === "schema-validation") throw error;
+        // Structured validation is candidate-local: providers can differ in their
+        // ability to honor the same schema. Exhaust the next explicit API
+        // candidates before surfacing the failure; never fall back to an
+        // external-MCP wait just because all API candidates failed.
+        if (error instanceof ModelTransportError && error.category === "schema-validation") {
+          const nextApi = nextApiCandidateIndex(route, index);
+          if (nextApi === undefined) throw error;
+          lastError = error;
+          index = nextApi - 1;
+          continue;
+        }
         lastError = error;
       }
     }
@@ -677,7 +733,7 @@ export class RoutedModelGateway implements ModelGateway {
         const normalized = normalizeUsage(data.usage ?? meta?.tokens, JSON.stringify(input.body), "");
         const usage = { model, ...normalized, costUsd: 0, latencyMs: Date.now() - started };
         const provenance = { routeSnapshotId: snapshot.id, purpose: input.purpose, candidateIndex: index, executor: "api" as const, profileId: profile.id, protocol: profile.protocol, model, promptFingerprint: fingerprint };
-        await this.record({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, configRevision: snapshot.id, candidateIndex: index, executor: "api", profileId: profile.id, protocol: profile.protocol, model, status: "completed", inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, providerInputTokens: usage.providerInputTokens, providerOutputTokens: usage.providerOutputTokens, estimatedInputTokens: usage.estimatedInputTokens, estimatedOutputTokens: usage.estimatedOutputTokens, usageSource: usage.usageSource, latencyMs: usage.latencyMs, promptFingerprint: fingerprint });
+        await this.record({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, configRevision: snapshot.id, candidateIndex: index, executor: "api", profileId: profile.id, protocol: profile.protocol, model, status: "completed", inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, providerInputTokens: usage.providerInputTokens, providerOutputTokens: usage.providerOutputTokens, providerCachedInputTokens: usage.providerCachedInputTokens, estimatedInputTokens: usage.estimatedInputTokens, estimatedOutputTokens: usage.estimatedOutputTokens, usageSource: usage.usageSource, latencyMs: usage.latencyMs, promptFingerprint: fingerprint });
         return { data, provenance, usage };
       } catch (error) { lastError = error; }
     }

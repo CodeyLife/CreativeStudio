@@ -228,6 +228,79 @@ export interface NovelFactCandidate {
   authority: string;
 }
 
+export interface NovelLearningAssessmentView {
+  assessment: {
+    id: string;
+    projectId: string;
+    source: { workflowId: string; artifactId?: string; reviewIds: string[]; fingerprint: string };
+    conclusion: "no-shared-learning" | "propose-improvement";
+    symptom?: string;
+    failingLayer?: string;
+    underlyingMechanism?: string;
+    affectedInputClass?: string;
+    boundaries?: string;
+    regressionRisks?: string[];
+    candidate?: { targetKind: "skill" | "system-prompt"; targetId: string; rationale: string; afterText: string; applicableGenres?: string[] };
+    createdAt: number;
+  };
+  sourceChapter?: { id: string; title: string; narrativeOrder: number; status: string };
+  candidate?: { id: string; status: string; targetKind: string; targetId: string; proposedVersion: string };
+}
+
+export interface NovelCraftRuleCandidate {
+  id: string;
+  projectId: string;
+  targetKind: "skill" | "system-prompt";
+  targetId: string;
+  beforeVersion: string;
+  proposedVersion: string;
+  beforeText: string;
+  afterText: string;
+  rationale: string;
+  scope: {
+    observedSymptom: string;
+    failingLayer: string;
+    underlyingMechanism: string;
+    affectedInputClass: string;
+    intendedBenefits: string[];
+    boundaries: string[];
+    nonGoals: string[];
+    regressionRisks: string[];
+  };
+  status: "proposed" | "evidencing" | "reviewing" | "promoted" | "rolled-back" | "rejected";
+  evidenceCases: Array<{
+    scenarioClass: string;
+    scenarioRole: "source-failure" | "cross-scenario";
+    baselineWorkItemId: string;
+    candidateWorkItemId: string;
+    capturedAt: number;
+    evidenceKind?: "foundation" | "chapter";
+    experimentId?: string;
+    documentId?: string;
+    baselineScore?: number;
+    candidateScore?: number;
+    blockerDelta?: number;
+    majorDelta?: number;
+    summary?: string;
+    regressionPassed?: boolean;
+    regressionError?: string;
+  }>;
+  reviews: Array<{ role: string; reviewerId: string; verdict: "passed" | "revise" | "rejected"; summary: string; concerns: string[]; submittedAt: number }>;
+  learningSource?: { assessmentId: string; conclusion: string; mechanism: string };
+  applicableGenres?: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface NovelCraftRuleExperimentResponse {
+  result: {
+    candidate: NovelCraftRuleCandidate;
+    snapshotId: string;
+    passed: boolean;
+    scenarios: Array<{ scenarioRole: "source-failure" | "cross-scenario"; scenarioClass: string; passed: boolean; error?: string }>;
+  };
+}
+
 // ---------- fetch 帮助 ----------
 async function novelFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, init);
@@ -251,6 +324,7 @@ export const novelKeys = {
   docContent: (id: string, docId: string) => ["novel", "doc", id, docId, "content"] as const,
   chapterWorkspace: (id: string, docId: string) => ["novel", "doc", id, docId, "workspace"] as const,
   factCandidates: (id: string, docId: string) => ["novel", "facts", id, docId] as const,
+  learningCenter: (id: string) => ["novel", "learning-center", id] as const,
 };
 
 // ---------- 读 ----------
@@ -345,6 +419,53 @@ export function useSubmitChapterReview(projectId: string, documentId: string | u
       void qc.invalidateQueries({ queryKey: novelKeys.runs(projectId) });
       void qc.invalidateQueries({ queryKey: novelKeys.project(projectId) });
     },
+  });
+}
+
+export function useNovelLearningCenter(projectId: string) {
+  return useQuery({
+    queryKey: novelKeys.learningCenter(projectId),
+    queryFn: async () => {
+      const [assessments, candidates] = await Promise.all([
+        novelFetch<{ assessments: NovelLearningAssessmentView[] }>(`/v2/projects/${enc(projectId)}/learning-assessments`),
+        novelFetch<{ candidates: NovelCraftRuleCandidate[] }>(`/v2/projects/${enc(projectId)}/craft-rule-candidates`),
+      ]);
+      return { assessments: assessments.assessments ?? [], candidates: candidates.candidates ?? [] };
+    },
+    enabled: Boolean(projectId),
+    refetchInterval: 10_000,
+  });
+}
+
+async function postCraftRuleOperation<T>(projectId: string, candidateId: string, input: Record<string, unknown>): Promise<T> {
+  return novelFetch<T>(`/v2/projects/${enc(projectId)}/craft-rule-candidates/${enc(candidateId)}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input),
+  });
+}
+
+export function useRunCraftRuleCandidateExperiment(projectId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { candidateId: string; crossScenarioDocumentId: string; instruction?: string }) => postCraftRuleOperation<NovelCraftRuleExperimentResponse>(projectId, input.candidateId, { operation: "experiment", ...input }),
+    onSuccess: () => { void queryClient.invalidateQueries({ queryKey: novelKeys.learningCenter(projectId) }); },
+  });
+}
+
+export function useSubmitCraftRuleCandidateReview(projectId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { candidateId: string; verdict: "passed" | "rejected"; summary: string }) => postCraftRuleOperation<{ candidate: NovelCraftRuleCandidate }>(projectId, input.candidateId, { operation: "review", reviewerId: "web-author", role: "author-reviewer", model: "human", ...input }),
+    onSuccess: () => { void queryClient.invalidateQueries({ queryKey: novelKeys.learningCenter(projectId) }); },
+  });
+}
+
+export function usePromoteCraftRuleCandidate(projectId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { candidateId: string; authorId?: string }) => postCraftRuleOperation<{ result: { candidate: NovelCraftRuleCandidate } }>(projectId, input.candidateId, { operation: "promote", ...input }),
+    onSuccess: () => { void queryClient.invalidateQueries({ queryKey: novelKeys.learningCenter(projectId) }); },
   });
 }
 

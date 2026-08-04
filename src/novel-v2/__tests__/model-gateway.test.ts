@@ -1,6 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import Ajv from "ajv";
-import { InMemoryModelGateway, normalizeStructuredContent, normalizeUsage, type GenerateStructuredInput, type ModelGateway, type ModelUsage } from "../model-gateway";
+import { InMemoryModelGateway, normalizeStructuredContent, normalizeUsage, RoutedModelGateway, type GenerateStructuredInput, type ModelGateway, type ModelUsage } from "../model-gateway";
+import { ModelConfigStore } from "../model-config-store";
+import type { ModelRoutingConfig } from "../model-routing";
 
 const usage: ModelUsage = { model: "test", inputTokens: 0, outputTokens: 0, costUsd: 0, latencyMs: 0 };
 
@@ -114,6 +116,39 @@ describe("ModelGateway interface contract", () => {
   });
 });
 
+describe("RoutedModelGateway structured candidate fallback", () => {
+  it("tries the next API candidate after a candidate exhausts schema repairs", async () => {
+    const config = {
+      version: 1 as const,
+      profiles: [
+        { id: "first", label: "first", protocol: "responses" as const, baseUrl: "https://first.test/v1", model: "first", responseMode: "json" as const, capabilities: ["text", "structured", "stream", "responses-continuation", "embedding", "rerank"], enabled: true },
+        { id: "second", label: "second", protocol: "responses" as const, baseUrl: "https://second.test/v1", model: "second", responseMode: "json" as const, capabilities: ["text", "structured", "stream", "responses-continuation", "embedding", "rerank"], enabled: true },
+      ],
+      routes: { "*": { conversationPolicy: "stateless" as const, candidates: [{ executor: "api" as const, profileId: "first" }, { executor: "api" as const, profileId: "second" }] } },
+    } as unknown as ModelRoutingConfig;
+    const store = new ModelConfigStore(".tmp-model-config-do-not-read.yaml", config);
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const output = url.includes("first.test") ? { score: 4, extra: true } : { name: "beta", score: 3 };
+      return new Response(JSON.stringify({ output_text: JSON.stringify(output) }), { status: 200, headers: { "content-type": "application/json" } });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const result = await new RoutedModelGateway(store).generateStructured<Passthrough>({
+        purpose: "facts.extract",
+        prompt: "p",
+        schema: passthroughSchema as unknown as Record<string, unknown>,
+        schemaName: "passthrough",
+        maxRepairAttempts: 0,
+      });
+      expect(result.value).toEqual({ name: "beta", score: 3 });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
 describe("structured response normalization", () => {
   const validate = new Ajv({ strict: false }).compile(passthroughSchema);
 
@@ -121,6 +156,11 @@ describe("structured response normalization", () => {
     expect(normalizeStructuredContent('说明如下\n```json\n{"name":"alpha","score":4}\n```', validate)).toEqual({ name: "alpha", score: 4 });
     expect(normalizeStructuredContent(JSON.stringify(JSON.stringify({ name: "beta", score: 3.5 })), validate)).toEqual({ name: "beta", score: 3.5 });
     expect(normalizeStructuredContent('{"result":{"name":"gamma","score":5}}', validate)).toEqual({ name: "gamma", score: 5 });
+  });
+
+  it("projects schema-disallowed envelope fields without weakening required validation", () => {
+    expect(normalizeStructuredContent('{"name":"alpha","score":4,"persistence":{"id":"x"}}', validate)).toEqual({ name: "alpha", score: 4 });
+    expect(normalizeStructuredContent('{"name":"alpha","persistence":{"id":"x"}}', validate)).toBeUndefined();
   });
 
   it("does not coerce arrays, primitives, or incomplete objects", () => {
@@ -134,6 +174,11 @@ describe("provider usage normalization", () => {
   it("supports both Responses and Chat token field names", () => {
     expect(normalizeUsage({ input_tokens: 120, output_tokens: 40 }, "input", "output")).toMatchObject({ inputTokens: 120, outputTokens: 40, usageSource: "provider" });
     expect(normalizeUsage({ prompt_tokens: "90", completion_tokens: "12" }, "input", "output")).toMatchObject({ inputTokens: 90, outputTokens: 12, usageSource: "provider" });
+  });
+
+  it("preserves provider cache usage from Responses and Chat detail fields", () => {
+    expect(normalizeUsage({ input_tokens: 120, output_tokens: 40, input_tokens_details: { cached_tokens: 80 } }, "input", "output")).toMatchObject({ providerInputTokens: 120, providerCachedInputTokens: 80 });
+    expect(normalizeUsage({ prompt_tokens: 90, completion_tokens: 12, prompt_tokens_details: { cached_tokens: 30 } }, "input", "output")).toMatchObject({ providerInputTokens: 90, providerCachedInputTokens: 30 });
   });
 
   it("keeps provider values separate from estimates and estimates missing usage", () => {

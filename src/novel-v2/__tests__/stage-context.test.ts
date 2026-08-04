@@ -13,7 +13,7 @@ function productionTypeScriptFiles(root: string): string[] {
 }
 
 describe("stage context compiler", () => {
-  it("deduplicates repeated artifacts and content before filling the budget", () => {
+  it("deduplicates repeated content without dropping distinct claims from one artifact", () => {
     const result = compileStageContext({
       projectId: "p1",
       workflowId: "wf1",
@@ -31,8 +31,8 @@ describe("stage context compiler", () => {
 
     expect(result.instruction).toContain("保留人物克制感");
     expect(result.instruction).toContain("城市处于停电状态");
-    expect(result.instruction).not.toContain("重复但文字不同");
-    expect(result.manifest.sections.find((item) => item.id === "foundation-memory")?.reason).toBe("duplicate-source");
+    expect(result.instruction).toContain("重复但文字不同");
+    expect(result.manifest.sections.find((item) => item.id === "foundation-memory")?.status).toBe("included");
     expect(result.manifest.sections.find((item) => item.id === "duplicate")?.reason).toBe("duplicate-content");
   });
 
@@ -102,8 +102,8 @@ describe("stage context compiler", () => {
       projectId: "p1", workflowId: "wf-claims", purpose: "review.prose", stage: "review",
       maxInputTokens: 1_000, reservedOutputTokens: 100,
       sections: [
-        { id: "claim-1", kind: "fact", title: "位置", text: "角色仍在车站", priority: "required", provenanceRefs: ["claim-1", "artifact-facts"] },
-        { id: "claim-2", kind: "fact", title: "持有物", text: "角色携带旧钥匙", priority: "required", provenanceRefs: ["claim-2", "artifact-facts"] },
+        { id: "claim-1", kind: "fact", title: "位置", text: "角色仍在车站", priority: "required", provenanceRefs: ["claim-1", "artifact-facts"], sourceArtifactId: "artifact-facts" },
+        { id: "claim-2", kind: "fact", title: "持有物", text: "角色携带旧钥匙", priority: "required", provenanceRefs: ["claim-2", "artifact-facts"], sourceArtifactId: "artifact-facts" },
       ],
     });
     expect(result.instruction).toContain("角色仍在车站");

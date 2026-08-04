@@ -96,7 +96,8 @@ describe("runChapterLifecycle", () => {
 
     expect(result.commitGate.passed).toBe(true);
     expect(result.commitResult?.revisionId).toBe("revision-2");
-    expect(events).toEqual(["learning", "facts", "fact-approval", "commit", "enrich", "learning"]);
+    expect(events).toEqual(["facts", "fact-approval", "commit", "enrich", "learning"]);
+    expect(params.assessLearning).toHaveBeenCalledTimes(1);
   });
 
   it("returns factApprovalBlocked without committing when manual mode has pending facts", async () => {
@@ -115,8 +116,9 @@ describe("runChapterLifecycle", () => {
     expect(result.commitResult).toBeUndefined();
     expect(params.commit).not.toHaveBeenCalled();
     expect(params.enrich).not.toHaveBeenCalled();
-    // 仍应执行 facts 提取与 fact-approval，但不应进入 commit/enrich/末尾 learning
-    expect(events).toEqual(["learning", "facts", "fact-approval"]);
+    // 仍应执行 facts 提取与 fact-approval，但不应在未提交的 artifact 上执行 learning。
+    expect(events).toEqual(["facts", "fact-approval"]);
+    expect(params.assessLearning).not.toHaveBeenCalled();
   });
 
   it("commits normally in manual mode when no pending facts exist", async () => {
@@ -130,7 +132,8 @@ describe("runChapterLifecycle", () => {
     expect(result.factApprovalBlocked).toBeUndefined();
     expect(result.commitGate.passed).toBe(true);
     expect(result.commitResult?.revisionId).toBe("revision-2");
-    expect(events).toEqual(["learning", "facts", "fact-approval", "commit", "enrich", "learning"]);
+    expect(events).toEqual(["facts", "fact-approval", "commit", "enrich", "learning"]);
+    expect(params.assessLearning).toHaveBeenCalledTimes(1);
   });
 
   it("runs post-commit learning when a manually approved fact gate resumes", async () => {

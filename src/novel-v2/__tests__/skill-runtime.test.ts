@@ -8,6 +8,7 @@ import {
   createDatabaseSkillProvider,
   createWorkspaceSkillProvider,
   buildSkillContextSections,
+  normalizeSkillDescriptor,
   renderSkillInstruction,
   resolveStageSkillBundle,
 } from "../skill-runtime";
@@ -52,6 +53,15 @@ describe("Skill runtime resolution", () => {
       expect(bundle.resolution?.source).toBe("workspace");
       expect(bundle.skills.some((skill) => skill.priority === "required")).toBe(true);
       expect(bundle.resolution?.skills.every((skill) => skill.contentFingerprint)).toBe(true);
+    }
+  });
+
+  it("keeps workspace Skill execution points aligned with the live reviewer contract", async () => {
+    const provider = createWorkspaceSkillProvider(path.resolve(process.cwd(), "skills", "novel-v2"));
+    const descriptors = await provider.list("test-project");
+    const validPoints = new Set(Object.keys(SKILL_EXECUTION_POLICIES));
+    for (const descriptor of descriptors) {
+      for (const point of descriptor.executionPoints ?? []) expect(validPoints.has(point)).toBe(true);
     }
   });
 
@@ -103,6 +113,14 @@ describe("Skill runtime resolution", () => {
 
     const emptyDatabase = createDatabaseSkillProvider(async () => []);
     await expect(resolveStageSkillBundle({ projectId: "p1", provider: emptyDatabase, executionPoint: "chapter.drafting", role: "writer" })).rejects.toThrow("database Skill 为空");
+  });
+
+  it("keeps invalid database execution points visible and refuses runtime resolution", async () => {
+    const descriptor = normalizeSkillDescriptor({ ...draftSkill("draft"), executionPoints: ["chapter.drafting", "stale.execution-point"] as unknown as SkillDescriptor["executionPoints"] });
+    expect(descriptor.executionPoints).toEqual(["chapter.drafting"]);
+    expect(descriptor.invalidExecutionPoints).toEqual(["stale.execution-point"]);
+    const provider = createDatabaseSkillProvider(async () => [descriptor]);
+    await expect(resolveStageSkillBundle({ projectId: "p1", provider, executionPoint: "chapter.drafting", role: "writer" })).rejects.toThrow(/stale.execution-point/);
   });
 
   it("rejects missing dependencies and conflicts", async () => {

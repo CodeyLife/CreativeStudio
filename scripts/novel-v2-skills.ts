@@ -36,12 +36,14 @@ async function validateWorkspace(): Promise<void> {
 
 async function syncDatabase(): Promise<void> {
   const provider = createWorkspaceSkillProvider(option("--root"));
-  const skills = await listCurrentSkillDescriptors(provider, option("--project") ?? "skill-cli");
+  const projectId = option("--project");
+  if (!projectId) throw new Error("同步数据库 Skill 必须提供真实项目：--project <projectId>");
+  const skills = await listCurrentSkillDescriptors(provider, projectId);
   const repository = new NovelPostgresRepository();
   try {
     await repository.migrate();
     for (const skill of skills) {
-      await repository.upsertKnowledgeRecord("skill-sync", "skills", {
+      await repository.upsertKnowledgeRecord(projectId, "skills", {
         id: skill.skillId,
         version: skill.version,
         capabilities: skill.capabilities,
@@ -71,6 +73,13 @@ async function checkDatabase(): Promise<void> {
   const loaded = await loadDatabase();
   try {
     const database = new Map(loaded.skills.map((skill) => [skill.skillId, skill]));
+    const invalidExecutionPoints = loaded.skills.flatMap((skill) => skill.invalidExecutionPoints?.length
+      ? [{ skillId: skill.skillId, version: skill.version, invalidExecutionPoints: skill.invalidExecutionPoints }]
+      : []);
+    if (invalidExecutionPoints.length) {
+      print({ target: "database", status: "invalid-execution-points", invalidExecutionPoints });
+      throw new Error(`Skill database 包含未知 execution point：${JSON.stringify(invalidExecutionPoints)}`);
+    }
     const mismatches = workspace.flatMap((skill) => {
       const current = database.get(skill.skillId);
       if (!current) return [{ skillId: skill.skillId, reason: "missing-in-database" }];

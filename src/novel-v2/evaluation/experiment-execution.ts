@@ -3,7 +3,7 @@ import { runChapterLifecycle } from "../application/chapter-lifecycle";
 import type { ManuscriptStructuralReport } from "../application/manuscript-structure";
 import { ContentObjectStore } from "../object-store";
 import type { ModelGateway } from "../model-gateway";
-import type { Artifact, NovelIntent, Review, RuntimeLearningAssessmentV2 } from "../protocol";
+import type { Artifact, NovelIntent, Review, RuntimeLearningAssessmentV2, SkillProvider } from "../protocol";
 import type { ReviewerRole } from "../prompts/chapter-review";
 import { createNovelWorkflowActivities } from "../temporal/activities";
 import type { ExperimentWorkspaceHandle } from "./experiment-workspace";
@@ -31,13 +31,15 @@ export async function executeChapterReviewExperiment(input: {
   projectId: string;
   documentId: string;
   instruction?: string;
+  /** 与正式调用方相同的 Skill provider；候选实验可在其上叠加 after 版本。 */
+  skillProvider?: SkillProvider;
 }): Promise<ExperimentExecutionResult> {
   const repository = input.workspace.createRepository();
   const objectStore = new ContentObjectStore();
   const activities = createNovelWorkflowActivities({
     repository,
     memoryProvider: { search: (request) => repository.searchMemory(request) },
-    skillProvider: { list: (projectId) => repository.listSkills(projectId) },
+    skillProvider: input.skillProvider ?? { source: "database", list: (projectId) => repository.listSkills(projectId) },
     modelGateway: input.model,
     objectStore,
   });
