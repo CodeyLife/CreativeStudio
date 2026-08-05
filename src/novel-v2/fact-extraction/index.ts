@@ -67,19 +67,9 @@ export interface ExtractFactsResult {
    * Phase 3.1 叙事元素（伏笔/承诺/兑现）。
    *
    * 由 LLM 在 fact-extraction 阶段一并提取，由 activity 层调用
-   * repository.recordNarrativeElements 写入对应表。
-   * 可能为 undefined（LLM 未返回 narrativeElements 字段时）。
+   * repository.recordNarrativeElements 写入对应表；没有对应内容时使用空数组。
    */
-  narrativeElements?: FactExtractionOutput["narrativeElements"];
-  /**
-   * Phase 3.2 爽点时刻（本章的爽点列表）。
-   *
-   * 由 activity 层调用 repository.recordPayoffCurve 写入 payoff_curve 表。
-   * payoff_type 是通用爽感维度（非金手指/系统流特化）。
-   */
-  payoffMoments?: FactExtractionOutput["payoffMoments"];
-  chapterMemory?: ChapterStateDelta["chapterMemory"];
-  characterDeltas?: ChapterStateDelta["characterDeltas"];
+  narrativeElements: FactExtractionOutput["narrativeElements"];
   stats: {
     totalCandidates: number;
     kept: number;
@@ -139,33 +129,24 @@ function decodeFactObjectValue(kind: string, value: string): unknown {
 }
 
 export function normalizeFactExtractionOutput(output: FactExtractionModelOutput | ChapterStateDelta): ChapterStateDelta {
-  const source = output as FactExtractionModelOutput & Partial<ChapterStateDelta>;
+  const source = output as FactExtractionModelOutput;
   return {
-    summary: typeof source.summary === "string" ? source.summary : undefined,
     facts: source.facts.map((fact) => ({
       ...fact,
       object: { ...fact.object, value: decodeFactObjectValue(fact.object.kind, fact.object.value) },
     })),
-    narrativeElements: source.narrativeElements
-      ? {
-        foreshadowings: source.narrativeElements.foreshadowings,
-        promises: source.narrativeElements.promises,
-        payoffs: source.narrativeElements.payoffs.map((payoff) => ({
-          ...payoff,
-          matchedTriggerKeywords: payoff.matchedTriggerKeywords?.length ? payoff.matchedTriggerKeywords : undefined,
-          matchedForeshadowingIds: payoff.matchedForeshadowingIds?.length ? payoff.matchedForeshadowingIds : undefined,
-          matchedPromiseId: payoff.matchedPromiseId || undefined,
-          matchedPromiser: payoff.matchedPromiser || undefined,
-          intensity: payoff.intensity > 0 ? payoff.intensity : undefined,
-        })),
-      }
-      : undefined,
-    payoffMoments: source.payoffMoments?.map((moment) => ({
-      ...moment,
-      setupDescription: moment.setupDescription || undefined,
-    })),
-    chapterMemory: source.chapterMemory,
-    characterDeltas: source.characterDeltas,
+    narrativeElements: {
+      foreshadowings: source.narrativeElements.foreshadowings,
+      promises: source.narrativeElements.promises,
+      payoffs: source.narrativeElements.payoffs.map((payoff) => ({
+        ...payoff,
+        matchedTriggerKeywords: payoff.matchedTriggerKeywords?.length ? payoff.matchedTriggerKeywords : undefined,
+        matchedForeshadowingIds: payoff.matchedForeshadowingIds?.length ? payoff.matchedForeshadowingIds : undefined,
+        matchedPromiseId: payoff.matchedPromiseId || undefined,
+        matchedPromiser: payoff.matchedPromiser || undefined,
+        intensity: payoff.intensity > 0 ? payoff.intensity : undefined,
+      })),
+    },
   };
 }
 
@@ -198,10 +179,6 @@ export function projectFactExtractionOutput(input: Omit<ExtractFactsInput, "mode
     claims,
     // Phase 3.1: 透传 narrativeElements 给 activity 层，由其调用 recordNarrativeElements
     narrativeElements: normalized.narrativeElements,
-    // Phase 3.2: 透传 payoffMoments 给 activity 层，由其调用 recordPayoffCurve
-    payoffMoments: normalized.payoffMoments,
-    chapterMemory: normalized.chapterMemory,
-    characterDeltas: normalized.characterDeltas,
     stats: {
       totalCandidates: deduped.totalCandidates,
       kept: deduped.kept.length,

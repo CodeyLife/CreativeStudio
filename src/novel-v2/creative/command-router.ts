@@ -48,7 +48,7 @@ import {
   startWork,
 } from "./work-item";
 import { checkGate, submitReview } from "./review-gate";
-import { buildChapterReviewPrompt } from "../prompts/chapter-review";
+import { buildChapterReviewPromptPackage } from "../prompts/chapter-review";
 import { reviewerSchema, type ReviewerOutput } from "../prompts/schemas";
 
 // ===== 幂等检查 =====
@@ -210,7 +210,7 @@ function reviewerOutputToCreativeInput(
  * 2. 从 artifact.payload 取 draft text
  * 3. 加载 blueprint（从 artifact.task_id 反查 execution_blueprints）
  * 4. 加载 memory bundle（查 memory_bundles 表）
- * 5. 用 buildChapterReviewPrompt 构造完整 prompt（结构审校角色，注入 blueprint + memory）
+ * 5. 用 buildChapterReviewPromptPackage 构造完整 prompt（结构审校角色，注入 blueprint + memory）
  * 6. 调用 model.generateStructured 生成 ReviewerOutput
  * 7. 转换为 CreativeReviewInput 返回
  *
@@ -263,46 +263,23 @@ export async function defaultReviewer(
     memoryBundle = null;
   }
 
-  // 构造完整 review prompt（注入 blueprint + memory）
-  // 若 blueprint 缺失，降级为简化 prompt（保持向后兼容）
-  let reviewPrompt: string;
-  if (blueprint && memoryBundle) {
-    const artifactForPrompt: Artifact = {
-      id: latestArtifactId,
-      projectId: artifactRow.project_id,
-      taskId: artifactRow.task_id,
-      attemptId: "default-reviewer",
-      kind: "draft",
-      contentHash: "default-reviewer",
-      structuredData,
-      baseRevision: 0,
-      createdAt: Date.now(),
-      fingerprint: "default-reviewer",
-    };
-    reviewPrompt = buildChapterReviewPrompt({
-      role: "structure-reviewer",
-      artifact: artifactForPrompt,
-      text: draftText,
-      blueprint,
-      memory: memoryBundle,
-    });
-  } else {
-    // 降级：blueprint 或 memory 缺失，用简化 prompt
-    reviewPrompt = `你是结构与事实审校者。请审核以下章节内容，输出 JSON：
-{
-  "verdict": "passed" | "revise" | "blocked",
-  "score": 0-5,
-  "issues": [{ "severity": "blocker"|"major"|"warning", "title": "...", "description": "...", "excerpt": "...", "revisionRanges": [], "rule": "...", "suggestion": "..." }]
-}
-
-章节内容：
-${draftText}`;
-  }
-
-  try {
-    const system = "你是内置的结构与事实 reviewer，只依据提供的正文和冻结上下文给出结构化审核。";
-    const workflowId = workResult.rows[0].run_id;
-    const promptPackage = compileStageContext({
+  const artifactForPrompt: Artifact = {
+    id: latestArtifactId,
+    projectId: artifactRow.project_id,
+    taskId: artifactRow.task_id,
+    attemptId: "default-reviewer",
+    kind: "draft",
+    contentHash: "default-reviewer",
+    structuredData,
+    baseRevision: 0,
+    createdAt: Date.now(),
+    fingerprint: "default-reviewer",
+  };
+  const system = "你是内置的结构与事实 reviewer，只依据提供的正文和冻结上下文给出结构化审核。";
+  const workflowId = workResult.rows[0].run_id;
+  const promptPackage = blueprint && memoryBundle
+    ? buildChapterReviewPromptPackage({ workflowId, system, role: "structure-reviewer", artifact: artifactForPrompt, text: draftText, blueprint, memory: memoryBundle })
+    : compileStageContext({
       projectId: artifactRow.project_id,
       workflowId,
       purpose: "review.structure",
@@ -311,8 +288,10 @@ ${draftText}`;
       schema: reviewerSchema as unknown as Record<string, unknown>,
       maxInputTokens: 128_000,
       reservedOutputTokens: 4_096,
-      sections: [{ id: "creative-default-review", kind: "review", title: "默认读者审校任务与正文", text: reviewPrompt, priority: "critical", provenanceRefs: [latestArtifactId, workItemId], sourceArtifactId: latestArtifactId }],
+      sections: [{ id: "creative-default-review", kind: "review", title: "默认读者审校任务与正文", text: `只依据正文给出结构化审核，严格遵守 reviewer schema。\n\n章节正文：\n${draftText}`, priority: "critical", provenanceRefs: [latestArtifactId, workItemId], sourceArtifactId: latestArtifactId }],
     });
+
+  try {
     const result = await model.generateStructured<ReviewerOutput>({
       purpose: "review.structure",
       schema: reviewerSchema,

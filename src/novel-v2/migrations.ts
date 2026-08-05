@@ -4,7 +4,11 @@ import { join } from "node:path";
 
 export interface MigrationFile { version: string; checksum: string; }
 export interface AppliedMigration { version: string; checksum: string; appliedAt?: string; }
-export interface MigrationManifest { legacyAliases?: Array<{ version: string; reason: string }>; }
+export interface MigrationManifest {
+  legacyAliases?: Array<{ version: string; reason: string }>;
+  checksumAliases?: Array<{ version: string; checksum: string; reason: string }>;
+  schemaSubtractions?: Array<{ version: string; reason: string }>;
+}
 export interface MigrationAudit {
   files: MigrationFile[];
   applied: AppliedMigration[];
@@ -40,13 +44,20 @@ export function auditMigrations(files: MigrationFile[], applied: AppliedMigratio
   const fileMap = new Map(files.map((file) => [file.version, file.checksum]));
   const appliedMap = new Map(applied.map((row) => [row.version, row]));
   const legacy = new Set((manifest.legacyAliases ?? []).map((item) => item.version));
+  const checksumAliases = new Map<string, Set<string>>();
+  for (const alias of manifest.checksumAliases ?? []) {
+    const checksums = checksumAliases.get(alias.version) ?? new Set<string>();
+    checksums.add(alias.checksum);
+    checksumAliases.set(alias.version, checksums);
+  }
   const ordinalCounts = new Map<string, number>();
   for (const file of files) ordinalCounts.set(file.version.slice(0, 3), (ordinalCounts.get(file.version.slice(0, 3)) ?? 0) + 1);
   const duplicateOrdinals = [...ordinalCounts.entries()].filter(([, count]) => count > 1).map(([ordinal]) => ordinal);
   const missingInDatabase = files.filter((file) => !appliedMap.has(file.version)).map((file) => file.version);
   const checksumMismatches = files.flatMap((file) => {
     const row = appliedMap.get(file.version);
-    return row && row.checksum !== file.checksum ? [{ version: file.version, expected: file.checksum, actual: row.checksum }] : [];
+    const acceptedAlias = row ? checksumAliases.get(file.version)?.has(row.checksum) === true : false;
+    return row && row.checksum !== file.checksum && !acceptedAlias ? [{ version: file.version, expected: file.checksum, actual: row.checksum }] : [];
   });
   const unexpectedApplied = applied.filter((row) => !fileMap.has(row.version) && !legacy.has(row.version)).map((row) => row.version);
   const legacyApplied = applied.filter((row) => !fileMap.has(row.version) && legacy.has(row.version)).map((row) => row.version);

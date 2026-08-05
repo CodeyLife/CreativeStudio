@@ -29,6 +29,12 @@ describe("novel runtime config", () => {
     expect(otherObjectStore.runtimeFingerprint).not.toBe(local.runtimeFingerprint);
   });
 
+  it("changes identity when the migration contract changes", () => {
+    const local = resolveNovelRuntimeConfig(baseEnv);
+    const withoutMigrationDirectory = resolveNovelRuntimeConfig({ ...baseEnv, NOVEL_V2_MIGRATIONS_DIR: "I:/Projects/CreativeStudio" });
+    expect(withoutMigrationDirectory.runtimeFingerprint).not.toBe(local.runtimeFingerprint);
+  });
+
   it("rejects a relative file object root", () => {
     expect(() => resolveNovelRuntimeConfig({ ...baseEnv, NOVEL_OBJECT_BACKEND: "file", NOVEL_OBJECT_ROOT: ".data/objects" })).toThrow(/绝对路径/u);
   });

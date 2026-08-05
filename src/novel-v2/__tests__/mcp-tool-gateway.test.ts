@@ -357,6 +357,7 @@ describe("executeTool error paths", () => {
             blueprintArtifactId: "blueprint-1",
             chapters: [],
           }),
+          listActiveStoryArcWorkflowIds: vi.fn().mockResolvedValue([]),
           prepareStoryArcReviewRetry: vi.fn().mockResolvedValue({
             id: "arc-1",
             planningStatus: "awaiting-review",
@@ -364,6 +365,7 @@ describe("executeTool error paths", () => {
             blueprintArtifactId: "blueprint-1",
             chapters: [],
           }),
+          withStoryArcWorkflowLock: async (_projectId: string, _arcId: string, callback: () => Promise<unknown>) => callback(),
           putWorkflowRun,
         } as never,
         temporal: { workflow: { start } } as never,
@@ -390,7 +392,7 @@ describe("executeTool error paths", () => {
       "novel_story_arc_batch_start",
       { projectId: "p1", arcId: "arc-1" },
       {
-        repository: { prepareNextStoryArcBatch, putWorkflowRun } as never,
+        repository: { prepareNextStoryArcBatch, withStoryArcWorkflowLock: async (_projectId: string, _arcId: string, callback: () => Promise<unknown>) => callback(), putWorkflowRun } as never,
         temporal: { workflow: { start } } as never,
         taskQueue: "novel-v2",
       },

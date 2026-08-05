@@ -4,6 +4,8 @@ import { fileURLToPath } from "node:url";
 import { startStoryArcBatchPlanning, startStoryArcPlanning, startStoryArcReview } from "../application/story-arc-workflow";
 import type { NovelPostgresRepository } from "../postgres-repository";
 
+const withStoryArcWorkflowLock = async <T>(_projectId: string, _arcId: string, callback: () => Promise<T>): Promise<T> => callback();
+
 describe("story arc review authority boundary", () => {
   it("retries a failed arc without chapters as ordinary planning, not rebase", async () => {
     const putWorkflowRun = vi.fn(async () => undefined);
@@ -13,6 +15,9 @@ describe("story arc review authority boundary", () => {
       getStoryArc: vi.fn(async () => ({ id: "arc-1", planningStatus: "failed", blueprintArtifactId: undefined, chapters: [] })),
       markStoryArcGenerating,
       putWorkflowRun,
+      updateWorkflowRunStatus: vi.fn(async () => undefined),
+      recoverStoryArcAfterWorkflowCancellation: vi.fn(async () => undefined),
+      withStoryArcWorkflowLock,
     } as unknown as NovelPostgresRepository;
     const temporal = { workflow: { start } } as never;
 
@@ -21,6 +26,52 @@ describe("story arc review authority boundary", () => {
     expect(markStoryArcGenerating).toHaveBeenCalledWith("project-1", "arc-1", "web-author", { workflowId: expect.any(String) });
     expect(putWorkflowRun).toHaveBeenCalledWith(expect.objectContaining({ payload: expect.objectContaining({ rebase: false }) }));
     expect(start).toHaveBeenCalledWith("storyArcPlanningWorkflow", expect.objectContaining({ args: [expect.objectContaining({ rebase: false })] }));
+  });
+
+  it("recovers the arc and records a failed run when Temporal start fails", async () => {
+    const recoverStoryArcAfterWorkflowCancellation = vi.fn(async () => undefined);
+    const updateWorkflowRunStatus = vi.fn(async () => undefined);
+    const repository = {
+      getStoryArc: vi.fn(async () => ({ id: "arc-1", planningStatus: "failed", blueprintArtifactId: undefined, chapters: [] })),
+      markStoryArcGenerating: vi.fn(async () => ({ id: "arc-1", blueprintArtifactId: undefined, chapters: [] })),
+      putWorkflowRun: vi.fn(async () => undefined),
+      updateWorkflowRunStatus,
+      recoverStoryArcAfterWorkflowCancellation,
+      withStoryArcWorkflowLock,
+    } as unknown as NovelPostgresRepository;
+    const temporal = {
+      workflow: { start: vi.fn(async () => { throw new Error("Temporal unavailable"); }) },
+    } as never;
+
+    await expect(startStoryArcPlanning(repository, temporal, {
+      projectId: "project-1",
+      arcId: "arc-1",
+      mode: "web",
+      reviewPolicy: "manual",
+      taskQueue: "creative-studio-v2",
+    })).rejects.toThrow("Temporal unavailable");
+
+    expect(updateWorkflowRunStatus).toHaveBeenCalledWith(expect.any(String), "failed", expect.objectContaining({ reasonCode: "workflow-start-failed" }));
+    expect(recoverStoryArcAfterWorkflowCancellation).toHaveBeenCalledWith("project-1", "arc-1");
+  });
+
+  it("rejects a review while another story-arc workflow is active", async () => {
+    const start = vi.fn(async () => ({ firstExecutionRunId: "run-1" }));
+    const repository = {
+      listActiveStoryArcWorkflowIds: vi.fn(async () => ["story-arc-active"]),
+      withStoryArcWorkflowLock,
+    } as unknown as NovelPostgresRepository;
+    const temporal = { workflow: { start } } as never;
+
+    await expect(startStoryArcReview(repository, temporal, {
+      projectId: "project-1",
+      arcId: "arc-1",
+      mode: "web",
+      reviewPolicy: "manual",
+      taskQueue: "creative-studio-v2",
+    })).rejects.toThrow("故事弧已有活动工作流");
+
+    expect(start).not.toHaveBeenCalled();
   });
 
   it("marks an active arc with committed chapters as a frozen-history review", async () => {
@@ -34,6 +85,9 @@ describe("story arc review authority boundary", () => {
         chapters: [{ documentId: "document-1" }],
       })),
       putWorkflowRun,
+      listActiveStoryArcWorkflowIds: vi.fn(async () => []),
+      updateWorkflowRunStatus: vi.fn(async () => undefined),
+      withStoryArcWorkflowLock,
     } as unknown as NovelPostgresRepository;
     const temporal = {
       workflow: { start: vi.fn(async () => ({ firstExecutionRunId: "run-1" })) },
@@ -55,6 +109,9 @@ describe("story arc review authority boundary", () => {
         chapters: [{ documentId: undefined }],
       })),
       putWorkflowRun,
+      listActiveStoryArcWorkflowIds: vi.fn(async () => []),
+      updateWorkflowRunStatus: vi.fn(async () => undefined),
+      withStoryArcWorkflowLock,
     } as unknown as NovelPostgresRepository;
     const temporal = { workflow: { start: vi.fn(async () => ({ firstExecutionRunId: "run-1" })) } } as never;
 
@@ -78,6 +135,9 @@ describe("story arc review authority boundary", () => {
         ],
       })),
       putWorkflowRun,
+      listActiveStoryArcWorkflowIds: vi.fn(async () => []),
+      updateWorkflowRunStatus: vi.fn(async () => undefined),
+      withStoryArcWorkflowLock,
     } as unknown as NovelPostgresRepository;
     const temporal = {
       workflow: { start: vi.fn(async () => ({ firstExecutionRunId: "run-1" })) },
@@ -110,6 +170,28 @@ describe("story arc review authority boundary", () => {
     expect(block).toContain("storyArcModelActivities.generateStoryArcBundle");
   });
 
+  it("feeds warning-only story-arc review evidence into learning", () => {
+    const source = readFileSync(fileURLToPath(new URL("../temporal/workflows.ts", import.meta.url)), "utf8");
+    const start = source.indexOf("const runStoryArcLearning = async");
+    const end = source.indexOf("  try {", start);
+    const block = source.slice(start, end);
+
+    expect(block).toContain("if (!reviewed.review.issues.length) return;");
+    expect(block).not.toContain('issue.severity === "blocker" || issue.severity === "major"');
+  });
+
+  it("keeps Temporal cancellation on the cancellation lifecycle", () => {
+    const source = readFileSync(fileURLToPath(new URL("../temporal/workflows.ts", import.meta.url)), "utf8");
+    const start = source.indexOf("export async function storyArcPlanningWorkflow");
+    const end = source.indexOf("export async function creativeRunWorkflow", start);
+    const block = source.slice(start, end);
+
+    expect(source).toContain("isCancellation");
+    expect(block).toContain("CancellationScope.nonCancellable");
+    expect(block).toContain('status: "cancelled"');
+    expect(block).toContain('if (isCancellation(error))');
+  });
+
   it("reopens a failed arc review without regenerating its blueprint", async () => {
     const putWorkflowRun = vi.fn(async () => undefined);
     const retry = vi.fn(async () => ({
@@ -129,6 +211,9 @@ describe("story arc review authority boundary", () => {
       })),
       prepareStoryArcReviewRetry: retry,
       putWorkflowRun,
+      listActiveStoryArcWorkflowIds: vi.fn(async () => []),
+      updateWorkflowRunStatus: vi.fn(async () => undefined),
+      withStoryArcWorkflowLock,
     } as unknown as NovelPostgresRepository;
     const temporal = { workflow: { start: vi.fn(async () => ({ firstExecutionRunId: "run-1" })) } } as never;
 
@@ -142,7 +227,13 @@ describe("story arc review authority boundary", () => {
     const putWorkflowRun = vi.fn(async () => undefined);
     const retry = vi.fn(async () => ({ batchIndex: 2, startChapterIndex: 11 }));
     const start = vi.fn(async () => ({ firstExecutionRunId: "run-2" }));
-    const repository = { prepareStoryArcBatchRetry: retry, putWorkflowRun } as unknown as NovelPostgresRepository;
+    const repository = {
+      prepareStoryArcBatchRetry: retry,
+      putWorkflowRun,
+      updateWorkflowRunStatus: vi.fn(async () => undefined),
+      failStoryArcBatch: vi.fn(async () => undefined),
+      withStoryArcWorkflowLock,
+    } as unknown as NovelPostgresRepository;
     const temporal = { workflow: { start } } as never;
 
     await startStoryArcBatchPlanning(repository, temporal, { projectId: "project-1", arcId: "arc-1", mode: "mcp", retryFailed: true, taskQueue: "novel-v2" });

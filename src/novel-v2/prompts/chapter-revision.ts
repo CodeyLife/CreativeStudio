@@ -173,13 +173,8 @@ function locatedRanges(issue: ReviewIssue, paragraphs: string[]): Array<{ start:
   if (typeof issue.paragraph === "number" && issue.paragraph >= 1 && issue.paragraph <= paragraphs.length) {
     return [{ start: issue.paragraph - 1, end: issue.paragraph - 1 }];
   }
-  const excerpt = issue.excerpt?.trim() || issue.evidence.trim();
-  if (!excerpt) return [];
-  const exact = paragraphs.findIndex((paragraph) => paragraph.includes(excerpt) || excerpt.includes(paragraph));
-  if (exact >= 0) return [{ start: exact, end: exact }];
-  const anchor = excerpt.slice(0, 32);
-  const partial = paragraphs.findIndex((paragraph) => paragraph.includes(anchor));
-  return partial >= 0 ? [{ start: partial, end: partial }] : [];
+  // Excerpt/evidence is descriptive only; without an explicit range, let the caller choose full-chapter or manual handling.
+  return [];
 }
 
 export function planRevisionWindows(text: string, issues: ReviewIssue[]): RevisionWindow[] {
@@ -333,14 +328,6 @@ function renderAuthorDirectedPlanningContext(context: ChapterPlanningContext): s
   return renderChapterExecutionContract(context);
 }
 
-function renderRevisionMemory(memory: MemoryBundle, authorInstruction?: string): string {
-  if (authorInstruction?.trim()) return renderAuthorDirectedMemory(memory);
-  return dedupeNarrativeRhythmMemory(memory).claims.map((claim) => {
-    const projected = renderExecutionMemoryClaim(claim);
-    return `- [${claim.authority}/${claim.kind}] ${projected.title}: ${projected.text}`;
-  }).join("\n") || "（无）";
-}
-
 function renderRevisionMemorySections(memory: MemoryBundle, authorInstruction?: string): { hard: string; soft: string; hardRefs: string[]; softRefs: string[] } {
   const projected = dedupeNarrativeRhythmMemory(memory);
   const hardClaims = projected.claims.filter((claim) => authorInstruction?.trim()
@@ -405,7 +392,7 @@ export function buildAuthorRevisionAlignmentPrompt(input: { original: string; ca
   ].join("\n\n");
 }
 
-export function buildAuthorRevisionRepairPrompt(input: {
+function renderAuthorRevisionRepairPrompt(input: {
   original: string;
   candidate: string;
   authorInstruction: string;
@@ -448,45 +435,6 @@ export function buildAuthorRevisionBrief(authorInstruction?: string): string {
     "3. 自行判断受影响范围。若达到作者目标需要联动多个段落，可以调整所有必要段落，但必须保持冻结事实、章节规划、人物关系、POV 和既定因果。",
     "4. 生成前先形成内部修改计划，生成后逐项核对作者原话；正文必须出现可感知的实质变化，不能只做同义替换。不要输出分析、计划或核对过程。",
   ].join("\n");
-}
-
-export function buildFullChapterRevisionPrompt(input: {
-  text: string;
-  issues: ReviewIssue[];
-  memory: MemoryBundle;
-  skills?: SkillBundle;
-  planningContext?: ChapterPlanningContext;
-  authorInstruction?: string;
-  revisionHistory?: RevisionAttempt[];
-}): string {
-  const historySection = renderRevisionHistory(input.revisionHistory ?? []);
-  return [
-    "修订下面整章正文，修复所有列出的审核问题，并按作者反馈重定本轮场景取舍。输出必须且只能是完整修订后正文，不使用 Markdown，不解释过程。",
-    "## 作者反馈转译为本轮修订策略（最高优先级）",
-    buildAuthorRevisionBrief(input.authorInstruction),
-    "作者要求可以扩大本轮需要检查的正文范围，但不得违反冻结事实、章节规划、人物既定关系与已发生事件。",
-    "## 审核问题解读指引",
-    renderRevisionInterpretationGuide(false),
-    "## 原文",
-    input.text,
-    "## 审核问题",
-    formatIssues(input.issues) || "（无结构化审核问题）",
-    ...(historySection ? [historySection] : []),
-    "## 事实与背景边界",
-    renderRevisionMemory(input.memory, input.authorInstruction),
-    renderRevisionPlanningContext(input.planningContext, input.authorInstruction),
-    renderRevisionRhythm(input.memory),
-    "## 整章修订契约",
-    [
-      "1. 逐项落实作者策略和审核问题，不得仅做近义改写或只处理其中一类意见。",
-      "2. 保留原章事件、关键信息、POV 和因果；根据作者要求重新选择承载信息与情绪的表达方式。",
-      "3. 不得新增冻结事实和原文都未建立的人物、关系、线索或事件。",
-      "4. 修改幅度由作者目标决定；既不能用局部同义替换敷衍结构性要求，也不能无依据重写与目标无关的内容。",
-      "5. 最小改动原则：只改动与审核问题直接相关的句子，不重写未触及的段落。修复一个问题时不得引入新问题。",
-      "6. 章末未解列表是冻结边界：不得因局部修订删除、回答或合并其中的问题；若目标段承载未解线索，只能在保留未解状态的前提下具象化表达。",
-      "7. 一致性约束处理：标注为[一致性约束]的审核问题，修订方向是统一为已建立设定值，不是创造新值或更换名称。审核者给出的值可能不准确，必须通过真值确认流程独立验证后再统一。无法确认时保持原值不变。",
-    ].join("\n"),
-  ].join("\n\n");
 }
 
 export function buildFullChapterRevisionPromptPackage(input: {
@@ -542,6 +490,39 @@ export function buildFullChapterRevisionPromptPackage(input: {
   });
 }
 
+export function buildAuthorRevisionRepairPromptPackage(input: {
+  projectId: string;
+  workflowId: string;
+  system: string;
+  sourceArtifactId: string;
+  maxInputTokens: number;
+  maxOutputTokens: number;
+  goal?: StageGoalContract;
+  original: string;
+  candidate: string;
+  authorInstruction: string;
+  alignment: AuthorRevisionAlignment;
+  memory: MemoryBundle;
+  skills?: SkillBundle;
+  planningContext?: ChapterPlanningContext;
+}): StagePromptPackage {
+  return compileStageContext({
+    projectId: input.projectId,
+    workflowId: input.workflowId,
+    purpose: "writing.revision",
+    stage: "revision",
+    system: input.system,
+    goal: input.goal,
+    maxInputTokens: input.maxInputTokens,
+    reservedOutputTokens: input.maxOutputTokens,
+    skillManifest: input.skills?.resolution,
+    sections: [
+      { id: "author-alignment-repair", kind: "manuscript", title: "作者目标未满足项、证据与待修正文", text: renderAuthorRevisionRepairPrompt(input), priority: "critical", provenanceRefs: [input.sourceArtifactId, input.memory.id, input.goal?.id ?? ""] },
+      ...buildSkillContextSections(input.skills ?? { skills: [] }, "chapter.revision", "修订 Skill"),
+    ],
+  });
+}
+
 function revisionWindowSharedSections(input: RevisionWindowPromptInput): string[] {
   const memory = dedupeNarrativeRhythmMemory(input.memory).claims.map((claim) => {
     const projected = renderExecutionMemoryClaim(claim);
@@ -572,6 +553,29 @@ function revisionWindowSharedSections(input: RevisionWindowPromptInput): string[
   ];
 }
 
+export function buildRevisionWindowPromptPackage(input: RevisionWindowPromptInput & {
+  window: RevisionWindow;
+  projectId: string;
+  workflowId: string;
+  system: string;
+  maxInputTokens: number;
+  maxOutputTokens: number;
+  goal?: StageGoalContract;
+}): StagePromptPackage {
+  return compileStageContext({
+    projectId: input.projectId,
+    workflowId: input.workflowId,
+    purpose: "writing.revision",
+    stage: "revision",
+    system: input.system,
+    goal: input.goal,
+    maxInputTokens: input.maxInputTokens,
+    reservedOutputTokens: input.maxOutputTokens,
+    skillManifest: input.skills?.resolution,
+    sections: [{ id: `revision-window:${input.window.start + 1}-${input.window.end + 1}`, kind: "manuscript", title: "局部修订任务、约束与正文", text: renderRevisionWindowPrompt(input), priority: "critical", provenanceRefs: [input.memory.id] }, ...buildSkillContextSections(input.skills ?? { skills: [] }, "chapter.revision", "修订 Skill")],
+  });
+}
+
 function revisionWindowLocalSections(input: RevisionWindowPromptInput, window: RevisionWindow): string[] {
   const paragraphs = splitChapterParagraphs(input.text);
   const source = paragraphs.slice(window.start, window.end + 1).join("\n\n");
@@ -590,7 +594,7 @@ function revisionWindowLocalSections(input: RevisionWindowPromptInput, window: R
   ];
 }
 
-export function buildRevisionWindowPrompt(input: RevisionWindowPromptInput & { window: RevisionWindow }): string {
+function renderRevisionWindowPrompt(input: RevisionWindowPromptInput & { window: RevisionWindow }): string {
   return [...revisionWindowSharedSections(input), ...revisionWindowLocalSections(input, input.window)].join("\n\n");
 }
 
@@ -616,7 +620,7 @@ export const targetedRevisionBatchSchema = {
   },
 } as const;
 
-export function buildTargetedRevisionBatchPrompt(input: RevisionWindowPromptInput & { windows: RevisionWindow[] }): string {
+function renderTargetedRevisionBatchPrompt(input: RevisionWindowPromptInput & { windows: RevisionWindow[] }): string {
   const outputExample = {
     replacements: input.windows.map((window) => ({
       start: window.start + 1,
@@ -633,6 +637,30 @@ export function buildTargetedRevisionBatchPrompt(input: RevisionWindowPromptInpu
     `start/end 必须使用上文标明的原章段号，并完整返回以下所有范围：${input.windows.map((window) => `${window.start + 1}-${window.end + 1}`).join("、")}。`,
     JSON.stringify(outputExample),
   ].join("\n\n");
+}
+
+export function buildTargetedRevisionBatchPromptPackage(input: RevisionWindowPromptInput & {
+  windows: RevisionWindow[];
+  projectId: string;
+  workflowId: string;
+  system: string;
+  maxInputTokens: number;
+  maxOutputTokens: number;
+  goal?: StageGoalContract;
+}): StagePromptPackage {
+  return compileStageContext({
+    projectId: input.projectId,
+    workflowId: input.workflowId,
+    purpose: "writing.revision",
+    stage: "revision",
+    system: input.system,
+    goal: input.goal,
+    schema: targetedRevisionBatchSchema as unknown as Record<string, unknown>,
+    maxInputTokens: input.maxInputTokens,
+    reservedOutputTokens: input.maxOutputTokens,
+    skillManifest: input.skills?.resolution,
+    sections: [{ id: "targeted-revision-batch", kind: "manuscript", title: "共享上下文与局部修订窗口", text: renderTargetedRevisionBatchPrompt(input), priority: "critical", provenanceRefs: [input.memory.id] }, ...buildSkillContextSections(input.skills ?? { skills: [] }, "chapter.revision", "修订 Skill")],
+  });
 }
 
 export function applyRevisionWindows(text: string, replacements: Array<{ window: RevisionWindow; text: string }>): string {

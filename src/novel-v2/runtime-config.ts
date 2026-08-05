@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { isAbsolute, join, resolve } from "node:path";
+import { readMigrationFiles, readMigrationManifest } from "./migrations";
 
 export type NovelRuntimeProfile = "local-hybrid" | "container";
 
@@ -82,6 +83,10 @@ export function resolveNovelRuntimeConfig(env: NodeJS.ProcessEnv = process.env):
   const modelConfigPath = resolve(value(env, "NOVEL_MODEL_CONFIG_PATH", join(projectRoot, "config", "model-providers.local.yaml")));
   const migrationsDir = resolve(value(env, "NOVEL_V2_MIGRATIONS_DIR", join(projectRoot, "deploy", "postgres")));
   const runtimeId = value(env, "NOVEL_RUNTIME_ID", `creative-studio-${profile}`);
+  const migrationIdentity = {
+    files: readMigrationFiles(migrationsDir),
+    manifest: readMigrationManifest(migrationsDir),
+  };
   const identity = {
     profile,
     runtimeId,
@@ -96,6 +101,7 @@ export function resolveNovelRuntimeConfig(env: NodeJS.ProcessEnv = process.env):
     embeddingRevision,
     objectBackend,
     objectLocation: objectBackend === "file" ? resolve(objectRoot!) : `${s3Endpoint!.replace(/\/+$/u, "")}/${s3Bucket}`,
+    migrationIdentity,
   };
   const runtimeFingerprint = createHash("sha256").update(JSON.stringify(identity), "utf8").digest("hex");
   return {

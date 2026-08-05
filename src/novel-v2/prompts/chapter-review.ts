@@ -25,27 +25,6 @@ export function reviewExecutionPoint(role: ReviewerRole): SkillExecutionPoint {
   return REVIEW_ROLE_EXECUTION_POINTS[role];
 }
 
-function normalizeReviewText(value: string): string {
-  return value.replace(/\s+/gu, "").replace(/[“”]/gu, '"').replace(/[‘’]/gu, "'");
-}
-
-export function groundReviewerIssues<T extends { excerpt?: string; evidence?: string }>(issues: T[], text: string): { issues: T[]; discardedCount: number } {
-  const normalizedText = normalizeReviewText(text);
-  const grounded = issues.filter((issue) => {
-    const evidence = (issue.excerpt ?? issue.evidence ?? "").trim();
-    if (normalizeReviewText(evidence).length < 4) return false;
-    const fragments = evidence.split(/(?:…{2,}|\.{3,})/gu).map(normalizeReviewText).filter((fragment) => fragment.length >= 4);
-    return fragments.length > 0 && fragments.every((fragment) => normalizedText.includes(fragment));
-  });
-  return { issues: grounded, discardedCount: issues.length - grounded.length };
-}
-
-export function groundReviewForText(review: Review, text: string): Review {
-  const grounded = groundReviewerIssues(review.issues, text);
-  if (grounded.discardedCount === 0) return review;
-  return { ...review, issues: grounded.issues, ...(grounded.issues.length === 0 ? { verdict: "passed" as const, score: undefined } : {}) };
-}
-
 export function getReviewFocus(role: ReviewerRole, skills?: SkillBundle): string {
   const base = DEFAULT_REVIEW_FOCUS[role];
   const executionPoint = skills?.executionPoint ?? reviewExecutionPoint(role);
@@ -64,7 +43,6 @@ export interface ReviewPromptInput {
   skills?: SkillBundle;
   planningContext?: ChapterPlanningContext;
   stageGoal?: StageGoalContract;
-  instructionsOnly?: boolean;
 }
 
 export function selectReviewerSkills(skills: SkillBundle | undefined, role: ReviewerRole, _limit = 6): SkillBundle | undefined {
@@ -90,11 +68,6 @@ function buildNumberedDraft(text: string): string {
   return text.split(/\n\s*\n/u).map((item) => item.trim()).filter(Boolean).map((paragraph, index) => "### 段落 " + (index + 1) + "\n" + paragraph).join("\n\n");
 }
 
-function buildReviewerContext(memory: MemoryBundle): string {
-  if (!memory.claims.length) return "- 暂无检索到的相关事实。";
-  return memory.claims.map((claim) => "- [" + claim.authority + "/" + claim.kind + "] " + (claim.subjectRefs.join(",") || "未绑定主体") + ": " + claim.title + " - " + claim.content).join("\n");
-}
-
 export function buildBlueprintSummary(blueprint: ExecutionBlueprint, planningContext?: ChapterPlanningContext): string {
   const tasks = blueprint.tasks.map((task) => "- " + task.kind + "/" + task.role + " (" + task.queue + ")").join("\n") || "- 无额外任务";
   return [
@@ -113,8 +86,8 @@ function reviewInstruction(input: ReviewPromptInput, memory: MemoryBundle): stri
     input.role,
     "",
     "## 输出契约",
-    "只输出一个对象，键只能是 verdict、score、issues。verdict 必须是字符串 passed、revise 或 blocked：没有可定位问题时用 passed；存在已经影响正文的可修复问题时用 revise；只有审核无法继续或存在硬阻塞时用 blocked。score 必须是 0 到 5 的数字，不要输出 passed 布尔字段，也不要把分数写入 verdict。issues 必须是数组。每个 issue 的 severity 只能是 warning、major 或 blocker：warning 表示局部且不阻塞提交的质量问题，major 表示已经实质影响当前章节并需要修订的问题，blocker 表示违反事实、因果、POV 或硬执行合同而不能接受的问题；不要使用 medium、minor、critical 等其他等级。",
-    "先判断本角色负责的质量维度在当前章节是否适用；不适用或已经有效时不要为了凑覆盖制造问题。每个 issue 必须引用当前正文中的逐字 excerpt，并给出最小 revisionRanges；revisionRanges 的 start/end 是从 1 开始计数的正文段落编号，不是字符位置、token 位置或字节偏移。若描述的是重复或连续机制，revisionRanges 必须覆盖每一处承载同一机制且可安全修改的范围，不能只给一个代表段再把局部修订当作全局修复；无法安全定位时不要报告。description 说明实际损害，rule 描述通用问题机制，suggestion 只给修复方向，不写改写示例。",
+    "只输出一个对象，键只能是 verdict、score、issues。verdict 必须是字符串 passed、revise 或 blocked：没有实际问题时用 passed；存在已经影响正文的可修复问题时用 revise；只有审核无法继续或存在硬阻塞时用 blocked。score 必须是 0 到 5 的数字，不要输出 passed 布尔字段，也不要把分数写入 verdict。issues 必须是数组。每个 issue 的 severity 只能是 warning、major 或 blocker：warning 表示局部且不阻塞提交的质量问题，major 表示已经实质影响当前章节并需要修订的问题，blocker 表示违反事实、因果、POV 或硬执行合同而不能接受的问题；不要使用 medium、minor、critical 等其他等级。",
+    "先判断本角色负责的质量维度在当前章节是否适用；不适用或已经有效时不要为了凑覆盖制造问题。每个 issue 都应提供能说明问题的 excerpt/evidence，并尽量给出最小 revisionRanges；excerpt/evidence 是审校说明，不要求与当前正文逐字一致，也不得因为无法逐字匹配而删除 issue。revisionRanges 的 start/end 是从 1 开始计数的正文段落编号，不是字符位置、token 位置或字节偏移。若描述的是重复或连续机制，revisionRanges 必须覆盖每一处承载同一机制且可安全修改的范围，不能只给一个代表段再把局部修订当作全局修复。description 说明实际损害，rule 描述通用问题机制，suggestion 只给修复方向，不写改写示例。",
     "结构角色优先寻找状态/因果/功能/世界规则/知识边界证据；人物角色优先寻找欲望、能动性、声部、关系行为和情感变化证据；文风角色优先寻找 POV、具体细节、场景承载、节奏疲劳和幽默后果证据。不要把同一偏好复制成三个 issue。",
     "不要把篇幅、章节必须有新事件、固定钩子、反转、主题、感情线或幽默的出现与否单独当作问题。",
     "",
@@ -123,30 +96,6 @@ function reviewInstruction(input: ReviewPromptInput, memory: MemoryBundle): stri
   if (input.stageGoal) lines.push("", "## 本轮阶段目标", input.stageGoal.authorInstruction || "无额外作者要求", "验收点：" + (input.stageGoal.acceptanceCriteria.join("；") || "按本角色职责判断"), "允许范围：" + input.stageGoal.allowedChangeScope);
   if (memory.claims.length) lines.push("", "相关冻结事实数量：" + memory.claims.length + "；只以这些来源和正文证据为准。");
   return lines.join("\n");
-}
-
-export function buildChapterReviewPrompt(input: ReviewPromptInput): string {
-  const memory = selectReviewerMemory(dedupeNarrativeRhythmMemory(input.memory), input.role);
-  const sections = [reviewInstruction(input, memory)];
-  if (input.instructionsOnly) return sections.join("\n");
-  sections.push(
-    "",
-    "## 当前章节执行合同",
-    input.planningContext ? renderChapterExecutionContract(input.planningContext) : "未提供章节合同；只依据冻结事实和正文审校，不猜测缺失规划。",
-    "",
-    "## 连续章节位置",
-    renderNarrativeRhythm(memory.narrativeRhythm),
-    "",
-    "## 工作流蓝图",
-    buildBlueprintSummary(input.blueprint, input.planningContext),
-    "",
-    "## 正文（段落编号仅用于定位）",
-    buildNumberedDraft(input.text),
-    "",
-    "## 相关事实",
-    buildReviewerContext(memory),
-  );
-  return sections.join("\n");
 }
 
 export function buildChapterReviewPromptPackage(input: ReviewPromptInput & { workflowId: string; system: string }): StagePromptPackage {
@@ -164,8 +113,7 @@ export function buildChapterReviewPromptPackage(input: ReviewPromptInput & { wor
   return compileStageContext({ projectId: input.artifact.projectId, workflowId: input.workflowId, purpose, stage: "review", system: input.system, schema: reviewerSchema, maxInputTokens: input.blueprint.budget.maxInputTokens, reservedOutputTokens: input.blueprint.budget.maxOutputTokens, goal: input.stageGoal, skillManifest: skills?.resolution, sections });
 }
 
-export function toReview(params: { artifact: Artifact; identity: "internal" | "independent"; role: ReviewerRole; output: ReviewerOutput; text?: string }): Review {
-  const grounded = params.text === undefined ? { issues: params.output.issues, discardedCount: 0 } : groundReviewerIssues(params.output.issues, params.text);
-  const issues: ReviewIssue[] = grounded.issues.map((issue) => ({ severity: issue.severity, title: issue.title, description: issue.description, evidence: issue.excerpt ?? issue.description, excerpt: issue.excerpt, paragraph: issue.paragraph ?? issue.revisionRanges[0]?.start, revisionRanges: issue.revisionRanges, rule: issue.rule, sourceId: issue.sourceId, suggestion: issue.suggestion }));
-  return { id: randomUUID(), projectId: params.artifact.projectId, artifactId: params.artifact.id, reviewerId: params.identity + "-" + params.role, identity: params.identity, role: params.role, verdict: grounded.discardedCount > 0 && issues.length === 0 ? "passed" : params.output.verdict, issues, score: grounded.discardedCount > 0 && issues.length === 0 ? undefined : params.output.score, createdAt: Date.now(), artifactFingerprint: params.artifact.fingerprint };
+export function toReview(params: { artifact: Artifact; identity: "internal" | "independent"; role: ReviewerRole; output: ReviewerOutput }): Review {
+  const issues: ReviewIssue[] = params.output.issues.map((issue) => ({ severity: issue.severity, title: issue.title, description: issue.description, evidence: issue.excerpt ?? issue.description, excerpt: issue.excerpt, paragraph: issue.paragraph ?? issue.revisionRanges[0]?.start, revisionRanges: issue.revisionRanges, rule: issue.rule, sourceId: issue.sourceId, suggestion: issue.suggestion }));
+  return { id: randomUUID(), projectId: params.artifact.projectId, artifactId: params.artifact.id, reviewerId: params.identity + "-" + params.role, identity: params.identity, role: params.role, verdict: params.output.verdict, issues, score: params.output.score, createdAt: Date.now(), artifactFingerprint: params.artifact.fingerprint };
 }

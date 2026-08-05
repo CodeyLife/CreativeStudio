@@ -72,13 +72,13 @@ export function storyArcAuthorityClaims(chapter: StoryArcBundle["chapters"][numb
 
 function frozenBlueprint(targetChapter: StoryArcRebaseTarget["chapters"][number] | undefined) {
   if (!targetChapter) return undefined;
-  return targetChapter.plannedBlueprint && !targetChapter.revisionId && !targetChapter.committedMemory
+  return targetChapter.plannedBlueprint && !targetChapter.revisionId && !targetChapter.chapterMemory
     ? targetChapter.plannedBlueprint
     : targetChapter.committedBlueprint;
 }
 
 function isFrozenHistoricalChapter(targetChapter: StoryArcRebaseTarget["chapters"][number] | undefined): boolean {
-  return Boolean(targetChapter?.revisionId || targetChapter?.committedMemory);
+  return Boolean(targetChapter?.revisionId || targetChapter?.chapterMemory);
 }
 
 function frozenAuthorityEvidence(chapter: StoryArcBundle["chapters"][number], targetChapter: StoryArcRebaseTarget["chapters"][number] | undefined): string[] {

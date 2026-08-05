@@ -56,13 +56,13 @@ AI 味是正文质量问题的观察标签，不是单一检测分数，也不�
 每个 issue 必须：
 
 - 针对当前 artifact fingerprint；
-- 引用当前正文逐字 excerpt/evidence；
+- 提供能够说明问题的 excerpt/evidence；该字段是审校说明，不要求与当前正文逐字一致；
 - 指定最小 revisionRanges；
 - 描述实际损害；
 - 说明通用问题机制 rule；
 - 只提供修复方向，不强制 rewriteExample。
 
-无法被正文或冻结来源证明的问题不进入修订和 commit gate。审核不以字数、段落数量、关键词、固定章尾、反转、爽点、主题、感情线或幽默是否出现作为单独失败依据。
+所有审核 issue 都保留为审计记录，不因 excerpt/evidence 无法与正文逐字匹配而丢弃；是否进入自动修订仍按 severity 和 revision policy 决定，修订窗口无法安全定位时走整章修订或人工处理。审核不以字数、段落数量、关键词、固定章尾、反转、爽点、主题、感情线或幽默是否出现作为单独失败依据。
 
 ## 4. 审核角色
 
@@ -96,7 +96,7 @@ Foundation 只生成 project-positioning、architecture、characters、worldview
 
 ## 6. 修订与学习
 
-修订必须从正文证据和 revisionRanges 出发，只改变问题机制相关范围，其余正文保持稳定。输出净化基于 Markdown 围栏、标题行、冒号前缀等结构特征，不使用精确短语黑名单。
+修订必须从审核 issue 和 revisionRanges 出发，只改变问题机制相关范围，其余正文保持稳定；excerpt/evidence 不参与与正文的逐字匹配门禁。输出净化基于 Markdown 围栏、标题行、冒号前缀等结构特征，不使用精确短语黑名单。
 
 review/commit 后的 learning 必须分析 underlyingMechanism 和 affectedInputClass，而不只是复制 issue 症状。`no-shared-learning` 只保存 assessment，不创建候选；`propose-improvement` 必须同时保存机制、影响输入类、适用边界、回归风险和 before/after 候选文本。
 

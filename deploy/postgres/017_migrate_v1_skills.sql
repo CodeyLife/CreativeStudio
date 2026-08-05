@@ -74,7 +74,7 @@
 --   source, sourceUrl, license, readonly, triggers, requires (skillId 依赖，见上 TODO P2)
 --
 -- ON CONFLICT 策略：
---   ON CONFLICT(skill_id) DO UPDATE —— 迁移可重复执行，并让数据库内容跟随当前迁移版本更新。
+--   ON CONFLICT(skill_id) DO NOTHING —— 迁移可重复执行，只补齐缺失 seed，不覆盖已有或已晋升的 Skill 定义。
 --   v1 的 28 个 skill_id 与 v2 已有 skill_id 不冲突（v1 用 long-form-master-craft 等，
 --   v2 用 longform-continuity 等）。
 --
@@ -164,7 +164,7 @@ SELECT 'long-form-master-craft', '1.0.0',
   jsonb_build_object('foundation', prompt_text, 'planning', prompt_text, 'drafting', prompt_text, 'review', prompt_text, 'revision', prompt_text),
   TRUE
 FROM p01
-ON CONFLICT(skill_id) DO UPDATE SET version=EXCLUDED.version, capabilities=EXCLUDED.capabilities, applicable_tasks=EXCLUDED.applicable_tasks, required_memory_kinds=EXCLUDED.required_memory_kinds, conflicts=EXCLUDED.conflicts, quality_gates=EXCLUDED.quality_gates, prompt_sections=EXCLUDED.prompt_sections, enabled=EXCLUDED.enabled, updated_at=now();
+ON CONFLICT(skill_id) DO NOTHING;
 
 
 -- Skill 02: story-facts-invariant (故事事实优先)
@@ -179,7 +179,7 @@ SELECT 'story-facts-invariant', '1.0.0',
   jsonb_build_object('foundation', prompt_text, 'planning', prompt_text, 'drafting', prompt_text, 'review', prompt_text, 'revision', prompt_text, 'fact-extraction', prompt_text),
   TRUE
 FROM p02
-ON CONFLICT(skill_id) DO UPDATE SET version=EXCLUDED.version, capabilities=EXCLUDED.capabilities, applicable_tasks=EXCLUDED.applicable_tasks, required_memory_kinds=EXCLUDED.required_memory_kinds, conflicts=EXCLUDED.conflicts, quality_gates=EXCLUDED.quality_gates, prompt_sections=EXCLUDED.prompt_sections, enabled=EXCLUDED.enabled, updated_at=now();
+ON CONFLICT(skill_id) DO NOTHING;
 
 
 -- Skill 03: premise-pressure-test (核心创意压力测试)
@@ -195,7 +195,7 @@ SELECT 'premise-pressure-test', '1.0.0',
   jsonb_build_object('foundation', prompt_text),
   TRUE
 FROM p03
-ON CONFLICT(skill_id) DO UPDATE SET version=EXCLUDED.version, capabilities=EXCLUDED.capabilities, applicable_tasks=EXCLUDED.applicable_tasks, required_memory_kinds=EXCLUDED.required_memory_kinds, conflicts=EXCLUDED.conflicts, quality_gates=EXCLUDED.quality_gates, prompt_sections=EXCLUDED.prompt_sections, enabled=EXCLUDED.enabled, updated_at=now();
+ON CONFLICT(skill_id) DO NOTHING;
 
 
 -- Skill 04: character-desire-engine (人物欲望引擎)
@@ -211,7 +211,7 @@ SELECT 'character-desire-engine', '1.0.0',
   jsonb_build_object('foundation', prompt_text, 'planning', prompt_text, 'review', prompt_text, 'revision', prompt_text),
   TRUE
 FROM p04
-ON CONFLICT(skill_id) DO UPDATE SET version=EXCLUDED.version, capabilities=EXCLUDED.capabilities, applicable_tasks=EXCLUDED.applicable_tasks, required_memory_kinds=EXCLUDED.required_memory_kinds, conflicts=EXCLUDED.conflicts, quality_gates=EXCLUDED.quality_gates, prompt_sections=EXCLUDED.prompt_sections, enabled=EXCLUDED.enabled, updated_at=now();
+ON CONFLICT(skill_id) DO NOTHING;
 
 
 -- Skill 05: character-voice-matrix (角色声音矩阵)
@@ -228,7 +228,7 @@ SELECT 'character-voice-matrix', '1.0.0',
   jsonb_build_object('drafting', prompt_text, 'review', prompt_text, 'revision', prompt_text),
   TRUE
 FROM p05
-ON CONFLICT(skill_id) DO UPDATE SET version=EXCLUDED.version, capabilities=EXCLUDED.capabilities, applicable_tasks=EXCLUDED.applicable_tasks, required_memory_kinds=EXCLUDED.required_memory_kinds, conflicts=EXCLUDED.conflicts, quality_gates=EXCLUDED.quality_gates, prompt_sections=EXCLUDED.prompt_sections, enabled=EXCLUDED.enabled, updated_at=now();
+ON CONFLICT(skill_id) DO NOTHING;
 
 
 -- Skill 06: world-rule-contract (世界规则契约)
@@ -243,7 +243,7 @@ SELECT 'world-rule-contract', '1.0.0',
   jsonb_build_object('foundation', prompt_text, 'planning', prompt_text, 'review', prompt_text),
   TRUE
 FROM p06
-ON CONFLICT(skill_id) DO UPDATE SET version=EXCLUDED.version, capabilities=EXCLUDED.capabilities, applicable_tasks=EXCLUDED.applicable_tasks, required_memory_kinds=EXCLUDED.required_memory_kinds, conflicts=EXCLUDED.conflicts, quality_gates=EXCLUDED.quality_gates, prompt_sections=EXCLUDED.prompt_sections, enabled=EXCLUDED.enabled, updated_at=now();
+ON CONFLICT(skill_id) DO NOTHING;
 
 
 -- Skill 07: hierarchical-outline (分层剧情控制)
@@ -261,7 +261,7 @@ SELECT 'hierarchical-outline', '1.0.0',
   jsonb_build_object('foundation', prompt_text, 'planning', prompt_text),
   TRUE
 FROM p07
-ON CONFLICT(skill_id) DO UPDATE SET version=EXCLUDED.version, capabilities=EXCLUDED.capabilities, applicable_tasks=EXCLUDED.applicable_tasks, required_memory_kinds=EXCLUDED.required_memory_kinds, conflicts=EXCLUDED.conflicts, quality_gates=EXCLUDED.quality_gates, prompt_sections=EXCLUDED.prompt_sections, enabled=EXCLUDED.enabled, updated_at=now();
+ON CONFLICT(skill_id) DO NOTHING;
 
 
 -- Skill 08: causal-thread-weaving (因果与剧情线编织)
@@ -279,7 +279,7 @@ SELECT 'causal-thread-weaving', '1.0.0',
   jsonb_build_object('planning', prompt_text, 'review', prompt_text),
   TRUE
 FROM p08
-ON CONFLICT(skill_id) DO UPDATE SET version=EXCLUDED.version, capabilities=EXCLUDED.capabilities, applicable_tasks=EXCLUDED.applicable_tasks, required_memory_kinds=EXCLUDED.required_memory_kinds, conflicts=EXCLUDED.conflicts, quality_gates=EXCLUDED.quality_gates, prompt_sections=EXCLUDED.prompt_sections, enabled=EXCLUDED.enabled, updated_at=now();
+ON CONFLICT(skill_id) DO NOTHING;
 
 
 -- Skill 09: foreshadowing-ledger (伏笔账本)
@@ -299,7 +299,7 @@ SELECT 'foreshadowing-ledger', '1.0.0',
   jsonb_build_object('planning', prompt_text, 'review', prompt_text, 'fact-extraction', prompt_text),
   TRUE
 FROM p09
-ON CONFLICT(skill_id) DO UPDATE SET version=EXCLUDED.version, capabilities=EXCLUDED.capabilities, applicable_tasks=EXCLUDED.applicable_tasks, required_memory_kinds=EXCLUDED.required_memory_kinds, conflicts=EXCLUDED.conflicts, quality_gates=EXCLUDED.quality_gates, prompt_sections=EXCLUDED.prompt_sections, enabled=EXCLUDED.enabled, updated_at=now();
+ON CONFLICT(skill_id) DO NOTHING;
 
 
 -- Skill 10: chapter-blueprint (章节蓝图)
@@ -319,7 +319,7 @@ SELECT 'chapter-blueprint', '1.0.0',
   jsonb_build_object('planning', prompt_text),
   TRUE
 FROM p10
-ON CONFLICT(skill_id) DO UPDATE SET version=EXCLUDED.version, capabilities=EXCLUDED.capabilities, applicable_tasks=EXCLUDED.applicable_tasks, required_memory_kinds=EXCLUDED.required_memory_kinds, conflicts=EXCLUDED.conflicts, quality_gates=EXCLUDED.quality_gates, prompt_sections=EXCLUDED.prompt_sections, enabled=EXCLUDED.enabled, updated_at=now();
+ON CONFLICT(skill_id) DO NOTHING;
 
 
 -- Skill 11: scene-action-reaction (行动与反应场景)
@@ -334,7 +334,7 @@ SELECT 'scene-action-reaction', '1.0.0',
   jsonb_build_object('planning', prompt_text, 'drafting', prompt_text, 'review', prompt_text),
   TRUE
 FROM p11
-ON CONFLICT(skill_id) DO UPDATE SET version=EXCLUDED.version, capabilities=EXCLUDED.capabilities, applicable_tasks=EXCLUDED.applicable_tasks, required_memory_kinds=EXCLUDED.required_memory_kinds, conflicts=EXCLUDED.conflicts, quality_gates=EXCLUDED.quality_gates, prompt_sections=EXCLUDED.prompt_sections, enabled=EXCLUDED.enabled, updated_at=now();
+ON CONFLICT(skill_id) DO NOTHING;
 
 
 -- Skill 12: embodied-prose (具象场景正文)
@@ -350,7 +350,7 @@ SELECT 'embodied-prose', '1.0.0',
   jsonb_build_object('drafting', prompt_text, 'revision', prompt_text),
   TRUE
 FROM p12
-ON CONFLICT(skill_id) DO UPDATE SET version=EXCLUDED.version, capabilities=EXCLUDED.capabilities, applicable_tasks=EXCLUDED.applicable_tasks, required_memory_kinds=EXCLUDED.required_memory_kinds, conflicts=EXCLUDED.conflicts, quality_gates=EXCLUDED.quality_gates, prompt_sections=EXCLUDED.prompt_sections, enabled=EXCLUDED.enabled, updated_at=now();
+ON CONFLICT(skill_id) DO NOTHING;
 
 
 -- Skill 13: serial-rhythm (通用连载节奏)
@@ -366,7 +366,7 @@ SELECT 'serial-rhythm', '1.0.0',
   jsonb_build_object('planning', prompt_text, 'drafting', prompt_text, 'review', prompt_text),
   TRUE
 FROM p13
-ON CONFLICT(skill_id) DO UPDATE SET version=EXCLUDED.version, capabilities=EXCLUDED.capabilities, applicable_tasks=EXCLUDED.applicable_tasks, required_memory_kinds=EXCLUDED.required_memory_kinds, conflicts=EXCLUDED.conflicts, quality_gates=EXCLUDED.quality_gates, prompt_sections=EXCLUDED.prompt_sections, enabled=EXCLUDED.enabled, updated_at=now();
+ON CONFLICT(skill_id) DO NOTHING;
 
 
 -- Skill 14: continuity-audit (连续性审校)
@@ -381,7 +381,7 @@ SELECT 'continuity-audit', '1.0.0',
   jsonb_build_object('review', prompt_text),
   TRUE
 FROM p14
-ON CONFLICT(skill_id) DO UPDATE SET version=EXCLUDED.version, capabilities=EXCLUDED.capabilities, applicable_tasks=EXCLUDED.applicable_tasks, required_memory_kinds=EXCLUDED.required_memory_kinds, conflicts=EXCLUDED.conflicts, quality_gates=EXCLUDED.quality_gates, prompt_sections=EXCLUDED.prompt_sections, enabled=EXCLUDED.enabled, updated_at=now();
+ON CONFLICT(skill_id) DO NOTHING;
 
 
 -- Skill 15: style-specificity-audit (文风与具体性审校)
@@ -402,7 +402,7 @@ SELECT 'style-specificity-audit', '1.0.0',
   jsonb_build_object('review', prompt_text),
   TRUE
 FROM p15
-ON CONFLICT(skill_id) DO UPDATE SET version=EXCLUDED.version, capabilities=EXCLUDED.capabilities, applicable_tasks=EXCLUDED.applicable_tasks, required_memory_kinds=EXCLUDED.required_memory_kinds, conflicts=EXCLUDED.conflicts, quality_gates=EXCLUDED.quality_gates, prompt_sections=EXCLUDED.prompt_sections, enabled=EXCLUDED.enabled, updated_at=now();
+ON CONFLICT(skill_id) DO NOTHING;
 
 
 -- Skill 16: plot-pacing-audit (剧情与节奏审校)
@@ -417,7 +417,7 @@ SELECT 'plot-pacing-audit', '1.0.0',
   jsonb_build_object('review', prompt_text),
   TRUE
 FROM p16
-ON CONFLICT(skill_id) DO UPDATE SET version=EXCLUDED.version, capabilities=EXCLUDED.capabilities, applicable_tasks=EXCLUDED.applicable_tasks, required_memory_kinds=EXCLUDED.required_memory_kinds, conflicts=EXCLUDED.conflicts, quality_gates=EXCLUDED.quality_gates, prompt_sections=EXCLUDED.prompt_sections, enabled=EXCLUDED.enabled, updated_at=now();
+ON CONFLICT(skill_id) DO NOTHING;
 
 
 -- Skill 17: fact-delta-extraction (事实差异提取)
@@ -445,7 +445,7 @@ SELECT 'fact-delta-extraction', '1.0.0',
   jsonb_build_object('fact-extraction', prompt_text),
   TRUE
 FROM p17
-ON CONFLICT(skill_id) DO UPDATE SET version=EXCLUDED.version, capabilities=EXCLUDED.capabilities, applicable_tasks=EXCLUDED.applicable_tasks, required_memory_kinds=EXCLUDED.required_memory_kinds, conflicts=EXCLUDED.conflicts, quality_gates=EXCLUDED.quality_gates, prompt_sections=EXCLUDED.prompt_sections, enabled=EXCLUDED.enabled, updated_at=now();
+ON CONFLICT(skill_id) DO NOTHING;
 
 
 -- Skill 18: classic-character-ensemble (经典人物群像法)
@@ -461,7 +461,7 @@ SELECT 'classic-character-ensemble', '1.0.0',
   jsonb_build_object('foundation', prompt_text, 'planning', prompt_text, 'drafting', prompt_text, 'review', prompt_text, 'revision', prompt_text),
   TRUE
 FROM p18
-ON CONFLICT(skill_id) DO UPDATE SET version=EXCLUDED.version, capabilities=EXCLUDED.capabilities, applicable_tasks=EXCLUDED.applicable_tasks, required_memory_kinds=EXCLUDED.required_memory_kinds, conflicts=EXCLUDED.conflicts, quality_gates=EXCLUDED.quality_gates, prompt_sections=EXCLUDED.prompt_sections, enabled=EXCLUDED.enabled, updated_at=now();
+ON CONFLICT(skill_id) DO NOTHING;
 
 
 -- Skill 19: classic-narrative-tension (经典叙事张力法)
@@ -481,7 +481,7 @@ SELECT 'classic-narrative-tension', '1.0.0',
   jsonb_build_object('planning', prompt_text, 'review', prompt_text),
   TRUE
 FROM p19
-ON CONFLICT(skill_id) DO UPDATE SET version=EXCLUDED.version, capabilities=EXCLUDED.capabilities, applicable_tasks=EXCLUDED.applicable_tasks, required_memory_kinds=EXCLUDED.required_memory_kinds, conflicts=EXCLUDED.conflicts, quality_gates=EXCLUDED.quality_gates, prompt_sections=EXCLUDED.prompt_sections, enabled=EXCLUDED.enabled, updated_at=now();
+ON CONFLICT(skill_id) DO NOTHING;
 
 
 -- Skill 20: classic-prose-texture (经典文笔质感法)
@@ -497,7 +497,7 @@ SELECT 'classic-prose-texture', '1.0.0',
   jsonb_build_object('drafting', prompt_text, 'revision', prompt_text),
   TRUE
 FROM p20
-ON CONFLICT(skill_id) DO UPDATE SET version=EXCLUDED.version, capabilities=EXCLUDED.capabilities, applicable_tasks=EXCLUDED.applicable_tasks, required_memory_kinds=EXCLUDED.required_memory_kinds, conflicts=EXCLUDED.conflicts, quality_gates=EXCLUDED.quality_gates, prompt_sections=EXCLUDED.prompt_sections, enabled=EXCLUDED.enabled, updated_at=now();
+ON CONFLICT(skill_id) DO NOTHING;
 
 
 -- Skill 21: romance-arc-design (言情感情线弧光设计)
@@ -513,7 +513,7 @@ SELECT 'romance-arc-design', '1.0.0',
   jsonb_build_object('foundation', prompt_text, 'planning', prompt_text, 'drafting', prompt_text, 'review', prompt_text, 'revision', prompt_text),
   TRUE
 FROM p21
-ON CONFLICT(skill_id) DO UPDATE SET version=EXCLUDED.version, capabilities=EXCLUDED.capabilities, applicable_tasks=EXCLUDED.applicable_tasks, required_memory_kinds=EXCLUDED.required_memory_kinds, conflicts=EXCLUDED.conflicts, quality_gates=EXCLUDED.quality_gates, prompt_sections=EXCLUDED.prompt_sections, enabled=EXCLUDED.enabled, updated_at=now();
+ON CONFLICT(skill_id) DO NOTHING;
 
 
 -- Skill 22: imagery-aesthetics (意象美学)
@@ -529,7 +529,7 @@ SELECT 'imagery-aesthetics', '1.0.0',
   jsonb_build_object('drafting', prompt_text, 'revision', prompt_text),
   TRUE
 FROM p22
-ON CONFLICT(skill_id) DO UPDATE SET version=EXCLUDED.version, capabilities=EXCLUDED.capabilities, applicable_tasks=EXCLUDED.applicable_tasks, required_memory_kinds=EXCLUDED.required_memory_kinds, conflicts=EXCLUDED.conflicts, quality_gates=EXCLUDED.quality_gates, prompt_sections=EXCLUDED.prompt_sections, enabled=EXCLUDED.enabled, updated_at=now();
+ON CONFLICT(skill_id) DO NOTHING;
 
 
 -- Skill 23: prose-discipline (文笔纪律)
@@ -544,7 +544,7 @@ SELECT 'prose-discipline', '1.0.0',
   jsonb_build_object('drafting', prompt_text, 'review', prompt_text),
   TRUE
 FROM p23
-ON CONFLICT(skill_id) DO UPDATE SET version=EXCLUDED.version, capabilities=EXCLUDED.capabilities, applicable_tasks=EXCLUDED.applicable_tasks, required_memory_kinds=EXCLUDED.required_memory_kinds, conflicts=EXCLUDED.conflicts, quality_gates=EXCLUDED.quality_gates, prompt_sections=EXCLUDED.prompt_sections, enabled=EXCLUDED.enabled, updated_at=now();
+ON CONFLICT(skill_id) DO NOTHING;
 
 
 -- Skill 24: plot-segment-design (剧情段与章节编排)
@@ -560,7 +560,7 @@ SELECT 'plot-segment-design', '1.0.0',
   jsonb_build_object('planning', prompt_text),
   TRUE
 FROM p24
-ON CONFLICT(skill_id) DO UPDATE SET version=EXCLUDED.version, capabilities=EXCLUDED.capabilities, applicable_tasks=EXCLUDED.applicable_tasks, required_memory_kinds=EXCLUDED.required_memory_kinds, conflicts=EXCLUDED.conflicts, quality_gates=EXCLUDED.quality_gates, prompt_sections=EXCLUDED.prompt_sections, enabled=EXCLUDED.enabled, updated_at=now();
+ON CONFLICT(skill_id) DO NOTHING;
 
 
 -- Skill 25: plot-segment-audit (剧情段设计审核)
@@ -576,7 +576,7 @@ SELECT 'plot-segment-audit', '1.0.0',
   jsonb_build_object('review', prompt_text),
   TRUE
 FROM p25
-ON CONFLICT(skill_id) DO UPDATE SET version=EXCLUDED.version, capabilities=EXCLUDED.capabilities, applicable_tasks=EXCLUDED.applicable_tasks, required_memory_kinds=EXCLUDED.required_memory_kinds, conflicts=EXCLUDED.conflicts, quality_gates=EXCLUDED.quality_gates, prompt_sections=EXCLUDED.prompt_sections, enabled=EXCLUDED.enabled, updated_at=now();
+ON CONFLICT(skill_id) DO NOTHING;
 
 
 -- Skill 26: blueprint-audit (章节蓝图审核)
@@ -594,7 +594,7 @@ SELECT 'blueprint-audit', '1.0.0',
   jsonb_build_object('review', prompt_text),
   TRUE
 FROM p26
-ON CONFLICT(skill_id) DO UPDATE SET version=EXCLUDED.version, capabilities=EXCLUDED.capabilities, applicable_tasks=EXCLUDED.applicable_tasks, required_memory_kinds=EXCLUDED.required_memory_kinds, conflicts=EXCLUDED.conflicts, quality_gates=EXCLUDED.quality_gates, prompt_sections=EXCLUDED.prompt_sections, enabled=EXCLUDED.enabled, updated_at=now();
+ON CONFLICT(skill_id) DO NOTHING;
 
 
 -- Skill 27: prose-audit (正文元审核)
@@ -610,7 +610,7 @@ SELECT 'prose-audit', '1.0.0',
   jsonb_build_object('review', prompt_text),
   TRUE
 FROM p27
-ON CONFLICT(skill_id) DO UPDATE SET version=EXCLUDED.version, capabilities=EXCLUDED.capabilities, applicable_tasks=EXCLUDED.applicable_tasks, required_memory_kinds=EXCLUDED.required_memory_kinds, conflicts=EXCLUDED.conflicts, quality_gates=EXCLUDED.quality_gates, prompt_sections=EXCLUDED.prompt_sections, enabled=EXCLUDED.enabled, updated_at=now();
+ON CONFLICT(skill_id) DO NOTHING;
 
 
 -- Skill 28: reader-audit (读者留存审校)
@@ -626,7 +626,7 @@ SELECT 'reader-audit', '1.0.0',
   jsonb_build_object('review', prompt_text),
   TRUE
 FROM p28
-ON CONFLICT(skill_id) DO UPDATE SET version=EXCLUDED.version, capabilities=EXCLUDED.capabilities, applicable_tasks=EXCLUDED.applicable_tasks, required_memory_kinds=EXCLUDED.required_memory_kinds, conflicts=EXCLUDED.conflicts, quality_gates=EXCLUDED.quality_gates, prompt_sections=EXCLUDED.prompt_sections, enabled=EXCLUDED.enabled, updated_at=now();
+ON CONFLICT(skill_id) DO NOTHING;
 
 -- ============================================================
 -- 迁移完成：28 个 v1 内置 skill 已写入 skill_definitions 表。

@@ -2,7 +2,7 @@ import Ajv from "ajv";
 import { describe, expect, it } from "vitest";
 import { FOUNDATION_TASK_CONTRACTS, foundationRequiredFields, foundationSchemaForTask } from "../application/foundation-contract";
 import { parseStoryArcBundle } from "../application/story-arc";
-import { buildChapterReviewPrompt, getReviewFocus } from "../prompts/chapter-review";
+import { buildChapterReviewPromptPackage, getReviewFocus } from "../prompts/chapter-review";
 import { buildFoundationPrompt } from "../prompts/foundation";
 import { reviewerSchema } from "../prompts/schemas";
 import type { Artifact, ExecutionBlueprint, MemoryBundle } from "../protocol";
@@ -57,14 +57,15 @@ describe("workflow contract hardening", () => {
   });
 
   it("keeps reviewer focus in the system role instead of repeating it in user instructions", () => {
-    const prompt = buildChapterReviewPrompt({
+    const prompt = buildChapterReviewPromptPackage({
       role: "structure-reviewer",
       artifact: { id: "artifact", projectId: "project" } as Artifact,
       text: "正文",
-      blueprint: {} as ExecutionBlueprint,
+      blueprint: { tasks: [], budget: { maxInputTokens: 10000, maxOutputTokens: 1000 } } as unknown as ExecutionBlueprint,
       memory: { claims: [], conflicts: [], missingFacets: [] } as unknown as MemoryBundle,
-      instructionsOnly: true,
-    });
+      workflowId: "workflow-1",
+      system: "系统",
+    }).instruction;
     const focus = getReviewFocus("structure-reviewer");
     expect(focus).toContain("D1 世界观与 D2 故事性");
     expect(prompt).not.toContain("D1 世界观与 D2 故事性");
@@ -72,14 +73,15 @@ describe("workflow contract hardening", () => {
   });
 
   it("makes reviewer enum and paragraph-range semantics explicit", () => {
-    const prompt = buildChapterReviewPrompt({
+    const prompt = buildChapterReviewPromptPackage({
       role: "prose-reviewer",
       artifact: { id: "artifact", projectId: "project" } as Artifact,
       text: "正文第一段。\n\n正文第二段。",
-      blueprint: {} as ExecutionBlueprint,
+      blueprint: { tasks: [], budget: { maxInputTokens: 10000, maxOutputTokens: 1000 } } as unknown as ExecutionBlueprint,
       memory: { claims: [], conflicts: [], missingFacets: [] } as unknown as MemoryBundle,
-      instructionsOnly: true,
-    });
+      workflowId: "workflow-1",
+      system: "系统",
+    }).instruction;
     expect(prompt).toContain("verdict 必须是字符串 passed、revise 或 blocked");
     expect(prompt).toContain("severity 只能是 warning、major 或 blocker");
     expect(prompt).toContain("start/end 是从 1 开始计数的正文段落编号");

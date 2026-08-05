@@ -24,11 +24,10 @@ const sceneSchema = {
 const storyArcPlanSchema = {
   type: "object",
   additionalProperties: false,
-  required: ["title", "objective", "entryState", "centralConflict", "development", "resolution", "exitState", "plotThreadRefs", "threadResponsibilities", "foreshadowingRefs", "expectedChapterCount", "phases"],
+  required: ["title", "objective", "entryState", "centralConflict", "development", "resolution", "exitState", "threadResponsibilities", "foreshadowingRefs", "expectedChapterCount", "phases"],
   properties: {
     title: { type: "string", minLength: 1 }, objective: { type: "string", minLength: 1 }, entryState: { type: "string" }, centralConflict: { type: "string" },
     development: { type: "array", items: { type: "string" } }, resolution: { type: "string" }, exitState: { type: "string" },
-    plotThreadRefs: { type: "array", items: { type: "string" } },
     threadResponsibilities: { type: "array", items: { type: "object", additionalProperties: false, required: ["threadRef", "responsibility", "nextAdvance"], properties: { threadRef: { type: "string", minLength: 1 }, responsibility: { type: "string", minLength: 1 }, nextAdvance: { type: "string", minLength: 1 } } } },
     foreshadowingRefs: { type: "array", items: { type: "string" } },
     expectedChapterCount: { type: "integer", minimum: 1, maximum: 80 },
@@ -137,9 +136,6 @@ export function buildStoryArcPlanningContextSections(input: StoryArcPromptInput)
 function renderNarrativeState(state: NarrativeStateSnapshot): string {
   return [
     `账本章节：第${state.narrativeOrder}章；弧阶段：${state.arcPhase || "未记录"}`,
-    `章节摘要：${state.chapterSummary}`,
-    `关键事件：${state.keyEvents.join("；") || "无"}`,
-    `角色状态：${state.characterStates.map((item) => `${item.characterId}=${item.stateSnapshot}`).join("；") || "无"}`,
     `开放线索：${state.openThreads.join("；") || "无"}`,
     `开放伏笔 ID（详情见开放伏笔段）：${state.openForeshadowings.map((item) => item.id).join("、") || "无"}`,
     `开放承诺 ID（详情见开放承诺段）：${state.openPromises.map((item) => item.id).join("、") || "无"}`,
@@ -177,7 +173,7 @@ export function buildStoryArcPrompt(input: StoryArcPromptInput): string {
     "规划一个可滚动推进的故事弧及其第一批连续章节。全书规划只提供承诺、边界和长期方向；故事弧负责把当前状态转成阶段性因果链，章节蓝图只冻结当前因果、状态、事实边界和场景执行材料。",
     "输出必须是 schema 定义的规范蓝图对象：根对象只包含 arc、batch、chapters，章节和场景只填写 schema 声明的执行字段。上下文中的持久化记录、执行状态、文档/修订标识、已批准或已提交的包装对象只是参考证据，不得原样复制到输出。",
     "先写清故事弧入口状态、主要欲望/压力、关键选择、代价、退出状态和新问题；每个阶段都要说明它改变了什么人物选择、关系状态、信息分布、资源条件或读者期待。",
-    "主线、支线、人物线、关系线和世界压力线要标明当前责任、交汇/退出条件和未回收承诺；每个 plotThreadRefs 必须在 threadResponsibilities 中对应一次，写清本弧责任和下一推进条件。若某条线本弧暂缓，写清可验证的保持/观察责任和触发条件；没有剧情线时两个数组都为空。不为了填满结构而制造无依据事件，也不提前消费后续答案。",
+    "主线、支线、人物线、关系线和世界压力线要直接在 threadResponsibilities 中标明本弧责任、交汇/退出条件和未回收承诺，并写清下一推进条件。若某条线本弧暂缓，写清可验证的保持/观察责任和触发条件；没有剧情线时数组为空。不为了填满结构而制造无依据事件，也不提前消费后续答案。",
     "上下文优先级：已定稿事实、叙事状态账本和明确作者边界高于当前故事弧草案；开放线索是待判断的责任与素材，不是本批次必须兑现的事件；规划反馈只用于修复共享机制，不把某一章的表面问题复制成剧情规则。",
     "章节可以推进、停顿、相处、等待、恢复、内省或处理余波，不要求每章新增事件、压力、爽点、主题表达或固定结尾。未指定的表达层由作者自然发挥。",
     "每章填写起始状态、结束状态和可观察证据；状态保持稳定也是合法结果，但必须说明本章承担的体验、关系、理解、条件或余波功能。每个场景填写处境、可观察行动和结果；阻力、选择、代价在自然承担时写清，不用标签代替过程。没有真实连续性约束时使用空数组，不要为了满足格式虚构内容。",
@@ -192,7 +188,7 @@ export function buildStoryArcPlanPrompt(input: StoryArcPromptInput, target?: Sto
     "只规划故事弧和当前批次，不展开章节。故事弧负责把当前状态转成阶段性因果链，批次只冻结当前章节窗口的位置和是否完成。",
     "输出根对象只包含 arc、batch；上下文中的持久化记录、执行状态、文档/修订标识、已批准或已提交的包装对象只是参考证据，不得原样复制到输出。",
     "先写清故事弧入口状态、主要欲望/压力、关键选择、代价、退出状态和新问题；每个阶段都要说明它改变了什么人物选择、关系状态、信息分布、资源条件或读者期待。",
-    "主线、支线、人物线、关系线和世界压力线要标明当前责任、交汇/退出条件和未回收承诺；每个 plotThreadRefs 必须在 threadResponsibilities 中对应一次。没有剧情线时两个数组都为空，不为了填满结构制造无依据事件，也不提前消费后续答案。",
+    "主线、支线、人物线、关系线和世界压力线要直接在 threadResponsibilities 中标明当前责任、交汇/退出条件和未回收承诺。没有剧情线时数组为空，不为了填满结构制造无依据事件，也不提前消费后续答案。",
     "上下文优先级：已定稿事实、叙事状态账本和明确作者边界高于当前故事弧草案；开放线索是待判断的责任与素材，不是本批次必须兑现的事件；规划反馈只用于修复共享机制。",
     `批次位置必须是 batch.batchIndex=${target?.batchIndex ?? 1}、batch.startChapterIndex=${target?.startChapterIndex ?? 1}；${target ? "这是重基线，不能改写目标批次窗口。" : "这是新规划，批次从当前输入上下文确定。"}`,
     context(input),
@@ -219,7 +215,7 @@ export function buildStoryArcRebasePrompt(input: StoryArcPromptInput & { target:
   return [
     "这是重基线，不是下一批次生成：在不改写已定稿事实、因果结果、状态边界和未解事项的前提下，重建故事弧蓝图。历史章节只允许复用冻结数据，未来章节可以补充尚未冻结的执行细节。",
     `输出必须保持重基线位置：batch.batchIndex=${input.target.batchIndex}，batch.startChapterIndex=${input.target.startChapterIndex}，chapters 必须与输入目标逐章对应且数量为 ${input.target.chapters.length}。不得把目标中的未来/持久化章节包装改成新的批次，也不得生成目标范围之外的章节。`,
-    "重基线目标是只读输入 envelope；将其中的 approvedArc、currentArc、章节提交包和存储元数据投影为规范 schema，而不是把 envelope 当作输出 schema。approvedArc 是历史批准弧经过兼容投影后的弧级对照视图，历史章节权威仍只来自章节提交包、committedMemory 和 authoritativeFacts；currentArc 与当前输出 bundle.arc 才是本次待审的弧级契约。若 legacyArcContractGaps 标记某字段是旧批准记录尚未拥有的新契约（例如 threadResponsibilities），该字段的历史空缺不能判为当前弧丢失；仍必须检查当前 bundle.arc 是否覆盖自己的 plotThreadRefs。",
+    "重基线目标是只读输入 envelope；将其中的 approvedArc、章节提交包和存储元数据投影为规范 schema，而不是把 envelope 当作输出 schema。approvedArc 必须已经符合当前故事弧契约，历史章节权威仍只来自章节提交包、chapterMemory 和 authoritativeFacts；当前输出 bundle.arc 仍必须完整返回 threadResponsibilities。缺少当前契约的旧批准记录由迁移标记为 stale，不能在提示词或运行时补全。",
     buildStoryArcPrompt(input),
     `重基线目标：${JSON.stringify(input.target)}`,
   ].join("\n\n");
@@ -245,7 +241,7 @@ export function buildStoryArcReviewPrompt(bundle: StoryArcBundle, contextText: s
     `故事弧蓝图：${JSON.stringify(bundle)}`,
     `权威路径示例：${bundle.chapters.map((chapter) => storyArcAuthorityPaths(chapter).join("、")).join("；")}`,
     rebaseTarget ? `重基线：${JSON.stringify(rebaseTarget)}` : "",
-    rebaseTarget ? "重基线目标中的历史章节可能保留旧版可选场景字段（例如空的 situation 或 observableActions）；这些字段属于冻结兼容数据，不要把它们当作新的正文缺陷或要求虚构补写。对历史章节以 committedMemory、approvedPlan 和 authoritativeFacts 检查状态与事实边界；只有候选蓝图真正新增且没有证据支持的确定性，才报告为问题。" : "",
+    rebaseTarget ? "重基线目标中的历史章节可能保留旧版可选场景字段（例如空的 situation 或 observableActions）；这些字段属于冻结兼容数据，不要把它们当作新的正文缺陷或要求虚构补写。对历史章节以 chapterMemory 和 authoritativeFacts 检查状态与事实边界；只有候选蓝图真正新增且没有证据支持的确定性，才报告为问题。" : "",
     "每个问题必须引用实际蓝图字段、章节或场景证据，说明是事实/权威边界、因果承载、章节功能还是审美偏好；只输出 schema JSON。",
   ].filter(Boolean).join("\n\n");
 }

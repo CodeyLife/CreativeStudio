@@ -20,9 +20,7 @@ export interface StoryArcPlan {
   development: string[];
   resolution: string;
   exitState: string;
-  plotThreadRefs: string[];
-  /** Optional for legacy persisted arcs; parsed/generated bundles normalize it to an array. */
-  threadResponsibilities?: StoryArcThreadResponsibility[];
+  threadResponsibilities: StoryArcThreadResponsibility[];
   foreshadowingRefs: string[];
   expectedChapterCount: number;
   phases: Array<{ title: string; objective: string }>;
@@ -142,14 +140,7 @@ export interface StoryArcRebaseTargetChapter {
    * baseline; rebase may enrich its execution scale but may not rewrite it.
    */
   committedBlueprint?: ChapterBlueprint;
-  approvedPlan: {
-    summary?: string;
-    sceneEvents: string[];
-    continuityConstraints: string[];
-    setupRefs: string[];
-    payoffRefs: string[];
-  };
-  committedMemory?: {
+  chapterMemory?: {
     summary: string;
     keyEvents: string[];
     characterStates: Array<{ characterId: string; stateSnapshot: string }>;
@@ -167,39 +158,10 @@ export interface StoryArcRebaseTargetChapter {
 export interface StoryArcRebaseTarget {
   arcId: string;
   executionStatus: ArcExecutionStatus;
-  /**
-   * The current persisted arc contract being reviewed. This is separate from
-   * the historical approval used to reconstruct chapter authority.
-   */
-  currentArc?: NarrativeArcPlan;
   approvedArc: NarrativeArcPlan;
-  /**
-   * Fields absent from the historical approval because the contract was
-   * introduced later. They are compatibility metadata, not chapter evidence.
-   */
-  legacyArcContractGaps?: string[];
   batchIndex: number;
   startChapterIndex: number;
   chapters: StoryArcRebaseTargetChapter[];
-}
-
-/**
- * Project a historical approval into the current arc-contract vocabulary for
- * review only. Missing fields introduced after that approval are not chapter
- * authority; the current persisted arc supplies the contract view while the
- * gap remains auditable metadata on the rebase target.
- */
-export function projectLegacyArcContractForReview(input: {
-  approvedArc: NarrativeArcPlan;
-  currentArc: NarrativeArcPlan;
-  legacyArcContractGaps?: string[];
-}): NarrativeArcPlan {
-  if (!input.legacyArcContractGaps?.includes("threadResponsibilities")) return input.approvedArc;
-  return {
-    ...input.approvedArc,
-    plotThreadRefs: [...input.currentArc.plotThreadRefs],
-    threadResponsibilities: [...(input.currentArc.threadResponsibilities ?? [])],
-  };
 }
 
 export function validateStoryArcRebaseBundle(bundle: StoryArcBundle, target: StoryArcRebaseTarget): void {
@@ -217,11 +179,11 @@ export function validateStoryArcRebaseBundle(bundle: StoryArcBundle, target: Sto
   }
   bundle.chapters.forEach((chapter, index) => {
     const targetChapter = target.chapters[index];
-    const expectedUnresolved = targetChapter?.committedMemory?.unresolvedThreads ?? targetChapter?.plannedBlueprint?.unresolvedAtClose;
+    const expectedUnresolved = targetChapter?.chapterMemory?.unresolvedThreads ?? targetChapter?.plannedBlueprint?.unresolvedAtClose;
     if (expectedUnresolved && JSON.stringify(chapter.unresolvedAtClose ?? []) !== JSON.stringify(expectedUnresolved)) {
       throw new Error(`第 ${chapter.index} 章的 unresolvedAtClose 必须保持冻结章节规划或已提交章节记忆中的未解边界`);
     }
-    if (!targetChapter?.revisionId && !targetChapter?.committedMemory && !targetChapter?.plannedBlueprint) {
+    if (!targetChapter?.revisionId && !targetChapter?.chapterMemory && !targetChapter?.plannedBlueprint) {
       throw new Error(`第 ${chapter.index} 章缺少已批准的未来蓝图，不能在重基线中凭空生成未创作章节`);
     }
   });
@@ -232,10 +194,10 @@ export function normalizeStoryArcRebaseBundle(bundle: StoryArcBundle, target: St
     ...bundle,
     chapters: bundle.chapters.map((chapter, index) => {
       const targetChapter = target.chapters[index];
-      const plannedBlueprint = !targetChapter?.revisionId && !targetChapter?.committedMemory
+      const plannedBlueprint = !targetChapter?.revisionId && !targetChapter?.chapterMemory
         ? targetChapter.plannedBlueprint
         : undefined;
-      const isHistoricalTarget = Boolean(targetChapter?.revisionId || targetChapter?.committedMemory);
+      const isHistoricalTarget = Boolean(targetChapter?.revisionId || targetChapter?.chapterMemory);
       const committedBlueprint = isHistoricalTarget ? targetChapter.committedBlueprint : undefined;
       const candidate = plannedBlueprint
         ? { ...plannedBlueprint, index: chapter.index }
@@ -244,8 +206,8 @@ export function normalizeStoryArcRebaseBundle(bundle: StoryArcBundle, target: St
           : chapter;
       return {
         ...candidate,
-        unresolvedAtClose: targetChapter?.committedMemory
-          ? [...targetChapter.committedMemory.unresolvedThreads]
+        unresolvedAtClose: targetChapter?.chapterMemory
+          ? [...targetChapter.chapterMemory.unresolvedThreads]
           : [...(plannedBlueprint?.unresolvedAtClose ?? candidate.unresolvedAtClose ?? [])],
       };
     }),
@@ -260,10 +222,13 @@ export function validateStoryArcExecutionContracts(bundle: StoryArcBundle): void
 }
 
 export function validateStoryArcPlanContracts(arc: NarrativeArcPlan): void {
-  const responsibilities = arc.threadResponsibilities ?? [];
+  const responsibilities = arc.threadResponsibilities;
+  for (const responsibility of responsibilities) {
+    if (!responsibility.threadRef.trim()) throw new Error("故事弧的剧情线阶段责任必须包含 threadRef");
+    if (!responsibility.responsibility.trim()) throw new Error("故事弧的剧情线阶段责任必须包含 responsibility");
+    if (!responsibility.nextAdvance.trim()) throw new Error("故事弧的剧情线阶段责任必须包含 nextAdvance");
+  }
   const refs = new Set(responsibilities.map((item) => item.threadRef));
-  const missing = arc.plotThreadRefs.filter((threadRef) => !refs.has(threadRef));
-  if (missing.length) throw new Error(`故事弧缺少剧情线阶段责任：${missing.join("、")}`);
   if (refs.size !== responsibilities.length) throw new Error("故事弧的剧情线阶段责任不能重复");
 }
 
@@ -366,7 +331,6 @@ export function parseStoryArcPlan(value: unknown): NarrativeArcPlan {
     development: strings(source.development),
     resolution: typeof source.resolution === "string" ? source.resolution : "",
     exitState: typeof source.exitState === "string" ? source.exitState : "",
-    plotThreadRefs: strings(source.plotThreadRefs),
     threadResponsibilities: parseThreadResponsibilities(source.threadResponsibilities),
     foreshadowingRefs: strings(source.foreshadowingRefs),
     expectedChapterCount: Number.isInteger(source.expectedChapterCount) ? Number(source.expectedChapterCount) : 0,
@@ -467,7 +431,6 @@ export function normalizeChapterPlanningContext(value: unknown): ChapterPlanning
     development: strings(arcSource.development),
     resolution: typeof arcSource.resolution === "string" ? arcSource.resolution : "",
     exitState: typeof arcSource.exitState === "string" ? arcSource.exitState : "",
-    plotThreadRefs: strings(arcSource.plotThreadRefs),
     threadResponsibilities: parseThreadResponsibilities(arcSource.threadResponsibilities),
     foreshadowingRefs: strings(arcSource.foreshadowingRefs),
     expectedChapterCount: Number.isInteger(arcSource.expectedChapterCount) ? Number(arcSource.expectedChapterCount) : 0,

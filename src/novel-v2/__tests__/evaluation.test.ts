@@ -656,10 +656,8 @@ describe("evaluation integration", () => {
           return { characters: [] };
         }
         if (properties?.facts) return {
-          summary: "测试章节事实提取",
           facts: [{ subject: { kind: "entity", id: "night-watchman" }, predicate: "持有", object: { kind: "string", value: "未寄出的信" }, polarity: "affirmed", truthStatus: "objective", humanReadable: "值夜人持有一封未寄出的信", evidence: "值夜人把未寄出的信压在登记册下", confidence: 0.98, novelty: "new", conflict: false }],
-          chapterMemory: { summary: "值夜人在雨夜的废弃车站守着一封未寄出的信，连续两次钟声都没有改变他的等待。信件仍未寄出，人物的克制与隐约紧张被保留下来，形成下一章可以继续追踪的行动、物件和情绪状态。".repeat(2), keyEvents: ["值夜人继续压着未寄出的信"], characterStates: [{ characterId: "night-watchman", stateSnapshot: "仍在废弃车站等待" }], unresolvedThreads: ["信为何没有寄出"], emotionalArc: "由克制转为隐约紧张" },
-          characterDeltas: [{ characterId: "night-watchman", voiceAnchor: { sentenceLength: "短句", vocabulary: "克制", directness: "间接", avoidance: "回避解释信件" }, motivationDelta: "继续等待并保护信件", newKnowledge: [], relationDeltas: [] }],
+          narrativeElements: { foreshadowings: [], promises: [], payoffs: [] },
         };
         if (properties?.keyEvents) return { summary: "值夜人在废弃车站守着一封未寄出的信，雨水和钟声构成现场压力；他始终没有抬头，纸边却在指腹下发抖，说明平静表面下仍有尚未说出的决定与持续悬念。".repeat(2), keyEvents: ["值夜人在第二声钟响后仍压着未寄出的信"], characterStates: [], unresolvedThreads: ["信为何没有寄出"], emotionalArc: "由克制的平静转为可感知的紧张" };
         if (!input.schema) return input.prompt.includes(regressionMarker)

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { applyRevisionWindows, applyTargetedRevisionReplacements, buildAuthorRevisionBrief, buildFullChapterRevisionPrompt, buildFullChapterRevisionPromptPackage, buildRevisionWindowPrompt, buildTargetedRevisionBatchPrompt, planRevisionWindows, sanitizeRevisionOutput, TargetedRevisionContractError } from "../prompts/chapter-revision";
+import { applyRevisionWindows, applyTargetedRevisionReplacements, buildAuthorRevisionBrief, buildFullChapterRevisionPromptPackage, buildRevisionWindowPromptPackage, buildTargetedRevisionBatchPromptPackage, planRevisionWindows, sanitizeRevisionOutput, TargetedRevisionContractError } from "../prompts/chapter-revision";
 import type { Artifact, ExecutionBlueprint, MemoryBundle, ReviewIssue, SkillBundle } from "../protocol";
 import type { ModelGateway } from "../model-gateway";
 import type { ContentObjectStore } from "../object-store";
@@ -44,6 +44,11 @@ describe("chapter revision", () => {
     expect(window).toMatchObject({ start: 1, end: 1 });
   });
 
+  it("does not create a revision window from excerpt text matching", () => {
+    const text = "甲。\n\n乙。\n\n丙。";
+    expect(planRevisionWindows(text, [{ severity: "major", title: "边界变化", evidence: "乙。" }])).toEqual([]);
+  });
+
   it("classifies invalid batch replacements as contract errors", () => {
     const text = "甲。\n\n乙。";
     const windows = planRevisionWindows(text, [{ severity: "major", title: "目标", evidence: "乙。", revisionRanges: [{ start: 2, end: 2 }] }]);
@@ -58,8 +63,9 @@ describe("chapter revision", () => {
     ];
     const windows = planRevisionWindows(text, issues);
     const input = { text, windows, memory, authorInstruction: "保持局部修改，不重写无关段落。" };
-    const batch = buildTargetedRevisionBatchPrompt(input);
-    const individual = windows.map((window) => buildRevisionWindowPrompt({ ...input, window })).join("\n\n");
+    const packageInput = { ...input, projectId: "p", workflowId: "workflow-1", system: "系统", maxInputTokens: 10000, maxOutputTokens: 1000 };
+    const batch = buildTargetedRevisionBatchPromptPackage(packageInput).instruction;
+    const individual = windows.map((window) => buildRevisionWindowPromptPackage({ ...packageInput, window })).map((item) => item.instruction).join("\n\n");
 
     expect((batch.match(/## 冻结事实（只读）/g) ?? [])).toHaveLength(1);
     expect((batch.match(/## 局部修订契约/g) ?? [])).toHaveLength(1);
@@ -77,12 +83,18 @@ describe("chapter revision", () => {
   });
 
   it("uses evidence and author direction without adding chapter-level literary obligations", () => {
-    const prompt = buildFullChapterRevisionPrompt({
+    const prompt = buildFullChapterRevisionPromptPackage({
+      projectId: "p",
+      workflowId: "workflow-1",
+      system: "系统",
+      sourceArtifactId: "artifact-1",
+      maxInputTokens: 10000,
+      maxOutputTokens: 1000,
       text: "她推开门。\n\n屋里没有人。",
       memory,
       issues: [{ severity: "major", title: "因果跳步", evidence: "她推开门。", revisionRanges: [{ start: 1, end: 1 }], suggestion: "补足可观察的承接" }],
       authorInstruction: "让动作更有停顿感。",
-    });
+    }).instruction;
     expect(prompt).toContain("让动作更有停顿感。");
     expect(prompt).toContain("因果跳步");
     expect(prompt).toContain("至少两类相互独立的可观察锚点");

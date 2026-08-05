@@ -11,11 +11,11 @@ Novel V2 is the direct replacement for the previous browser/SQLite novel runtime
 pnpm dev
 ```
 
-`pnpm dev` supplies one absolute-path configuration for PostgreSQL, Temporal, Qdrant, MinIO/S3, API, Worker, migrations, and Vite. It reuses an existing service only when the runtime fingerprint matches; an occupied port with an unknown or different identity is a hard failure. The V2 API listens on `http://127.0.0.1:4770` and Vite proxies `/v2/*` to it. Model providers are configured only through `config/model-providers.local.yaml` or the settings API; a missing local file means external-MCP-only execution.
+`pnpm dev` supplies one absolute-path configuration for PostgreSQL, Temporal, Qdrant, MinIO/S3, API, Worker, migrations, and Vite. The runtime fingerprint includes the migration files and manifest, so a schema subtraction cannot silently reuse an old API or Worker process. It reuses an existing service only when the runtime fingerprint matches; an occupied port with an unknown or different identity is a hard failure. The V2 API listens on `http://127.0.0.1:4770` and Vite proxies `/v2/*` to it. Model providers are configured only through `config/model-providers.local.yaml` or the settings API; a missing local file means external-MCP-only execution.
 
 所有结构化调用统一使用 provider 原生 JSON Schema envelope：Responses 使用 `text.format`，Chat Completions 使用 `response_format.json_schema`。Gateway 会在发送前拒绝 optional properties、动态 object、空 object、`additionalProperties: true` 和不稳定组合关键字；失败分类为 schema incompatibility，只切换下一个原生候选或外部 MCP，不把 schema 注入 prompt，也不回退到 prompt 模式。原生响应仍经过 AJV 和业务语义校验/修复循环。
 
-Story Arc 的模型输出契约只包含当前需要的弧、批次和章节字段；`authorIntent` 仅作为规划输入，不写入弧模型，`thematicQuestions` 与 `phases[].exitCondition` 已从输出契约删除。弧规划先请求 `arc+batch`，再请求 `chapters`，两段都通过 schema 与业务校验后才组装 artifact。定向正文修订恢复一次调用；旧审核范围失效时按当前 paragraph、excerpt、evidence 顺序重新定位，批量结果缺失、越界、重复或无实际修改时降级为逐窗口修订，失败结果不会创建 artifact。
+Story Arc 的模型输出契约只包含当前需要的弧、批次和章节字段；剧情线引用只存在于 `threadResponsibilities[].threadRef`，`authorIntent` 仅作为规划输入，不写入弧模型，`thematicQuestions` 与 `phases[].exitCondition` 已从输出契约删除。弧规划先请求 `arc+batch`，再请求 `chapters`，两段都通过 schema 与业务校验后才组装 artifact。draft/review/revision 统一通过 `StagePromptPackage` 编译，三类 reviewer 并行启动；定向正文修订在同一上下文契约下按窗口或全文执行，失败结果不会创建 artifact。
 
 Do not run `docker compose up -d` for the full stack alongside `pnpm dev`. The default Compose invocation starts infrastructure only. API, Worker, and Web are under the `container` profile and are started by `pnpm novel:v2:compose` with isolated `creative_studio_container_*` volumes and a separate MinIO bucket.
 

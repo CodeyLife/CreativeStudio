@@ -834,7 +834,7 @@ export function useSubmitNovelIntent(projectId: string) {
   });
 }
 
-export function useSignalHumanDecision(projectId: string, workflowId: string | undefined) {
+export function useSignalHumanDecision(projectId: string, workflowId: string | undefined, documentId?: string) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: async (input: { artifactId: string; decision: "approve" | "reject" | "revise" | "abandon"; feedback?: string; revisionBase?: "current" | "previous" }) => {
@@ -854,6 +854,10 @@ export function useSignalHumanDecision(projectId: string, workflowId: string | u
         ? { ...current, status: input.decision === "abandon" ? "abandoned" : "running", record: current.record ? markRunning(current.record) : current.record }
         : current);
       qc.setQueryData<NovelWorkflowRunRecord[]>(novelKeys.runs(projectId), (current) => current?.map(markRunning));
+      if (input.decision === "approve") {
+        invalidateNovelProject(qc, projectId, documentId, workflowId);
+        return;
+      }
       void qc.invalidateQueries({ queryKey: novelKeys.run(workflowId) });
       void qc.invalidateQueries({ queryKey: novelKeys.runs(projectId) });
       void qc.invalidateQueries({ queryKey: novelKeys.project(projectId) });

@@ -1,21 +1,27 @@
 import { describe, expect, it } from "vitest";
-import { buildFoundationContextMarkdown } from "../prompts/chapter-draft";
-import { buildChapterDraftPrompt } from "../prompts/chapter-draft";
+import { buildChapterDraftPromptPackage, buildFoundationContextMarkdown } from "../prompts/chapter-draft";
 import { dedupeNarrativeRhythmMemory } from "../prompts/chapter-planning-context";
 import { buildFoundationPrompt } from "../prompts/foundation";
 import { buildFoundationReviewPrompt } from "../prompts/foundation-review";
-import { getReviewFocus } from "../prompts/chapter-review";
+import { getReviewFocus, toReview } from "../prompts/chapter-review";
 import Ajv from "ajv";
 import { buildStoryArcChaptersPrompt, buildStoryArcPlanningContextSections, buildStoryArcPrompt, buildStoryArcRebasePrompt, buildStoryArcReviewPrompt, buildStoryArcRevisionPrompt, storyArcBundleSchema } from "../prompts/story-arc";
-import { WRITER_HARD_CONSTRAINTS } from "../prompts/writer-rules";
 
 describe("long-form prompt contracts", () => {
   it("keeps prose constraints short and leaves chapter length to natural completion", () => {
-    expect(WRITER_HARD_CONSTRAINTS).toContain("只输出正文");
-    expect(WRITER_HARD_CONSTRAINTS).toContain("允许安静、铺陈、关系、内省和余波自然展开");
-    expect(WRITER_HARD_CONSTRAINTS).not.toContain("3000");
-    expect(WRITER_HARD_CONSTRAINTS).not.toContain("narrativeScale");
-    expect(WRITER_HARD_CONSTRAINTS).not.toContain("必须有新鲜贡献");
+    const prompt = buildChapterDraftPromptPackage({
+      intent: { id: "intent-1", projectId: "p", source: "chapter-review", objective: "完成章节", createdAt: 1, idempotencyKey: "intent-1" },
+      blueprint: { id: "blueprint-1", baseRevision: 0, commitPolicy: "human-only", tasks: [], budget: { maxInputTokens: 10000, maxOutputTokens: 1000 } } as never,
+      memory: { id: "memory-1", claims: [], conflicts: [], missingFacets: [], narrativeRhythm: undefined } as never,
+      skills: { id: "skills-1", skills: [], resolution: { bundleId: "skills-1", fingerprint: "skills", executionPoint: "chapter.drafting", skills: [] } } as never,
+      workflowId: "workflow-1",
+      system: "系统",
+    }).instruction;
+    expect(prompt).toContain("只输出连续的小说正文");
+    expect(prompt).toContain("状态可以保持稳定");
+    expect(prompt).not.toContain("3000");
+    expect(prompt).not.toContain("narrativeScale");
+    expect(prompt).not.toContain("必须有新鲜贡献");
   });
 
   it("renders useful foundation projections without forcing them into chapter fields", () => {
@@ -211,20 +217,6 @@ describe("long-form prompt contracts", () => {
       target: {
         arcId: "arc-1",
         executionStatus: "active",
-        currentArc: {
-          title: "当前弧",
-          objective: "保留既有因果并补齐阶段责任",
-          entryState: "入口",
-          centralConflict: "冲突",
-          development: [],
-          resolution: "阶段结果",
-          exitState: "出口",
-          plotThreadRefs: ["thread-1"],
-          threadResponsibilities: [{ threadRef: "thread-1", responsibility: "保持压力", nextAdvance: "出现新证据" }],
-          foreshadowingRefs: [],
-          expectedChapterCount: 2,
-          phases: [],
-        },
         approvedArc: {
           title: "第一弧",
           objective: "保留既有因果并修复边界",
@@ -233,8 +225,7 @@ describe("long-form prompt contracts", () => {
           development: [],
           resolution: "阶段结果",
           exitState: "出口",
-          plotThreadRefs: [],
-          threadResponsibilities: [],
+          threadResponsibilities: [{ threadRef: "thread-1", responsibility: "保持压力", nextAdvance: "出现新证据" }],
           foreshadowingRefs: [],
           expectedChapterCount: 2,
           phases: [],
@@ -247,17 +238,16 @@ describe("long-form prompt contracts", () => {
           globalOrder: 1,
           title: "第一章",
           revisionId: "revision-1",
-          approvedPlan: { sceneEvents: [], continuityConstraints: [], setupRefs: [], payoffRefs: [] },
+          chapterMemory: { summary: "历史章节", keyEvents: [], characterStates: [], unresolvedThreads: [] },
           authoritativeFacts: [],
         }],
-        legacyArcContractGaps: ["threadResponsibilities"],
       },
     });
     expect(prompt).toContain("不是下一批次生成");
     expect(prompt).toContain("batch.batchIndex=1");
     expect(prompt).toContain("只读输入 envelope");
-    expect(prompt).toContain("currentArc 与当前输出 bundle.arc 才是本次待审的弧级契约");
-    expect(prompt).toContain("legacyArcContractGaps");
+    expect(prompt).toContain("approvedArc 必须已经符合当前故事弧契约");
+    expect(prompt).not.toContain("legacyArcContractGaps");
     expect(prompt).toContain("不得原样复制到输出");
   });
 
@@ -272,7 +262,6 @@ describe("long-form prompt contracts", () => {
         development: [],
         resolution: "阶段结果",
         exitState: "出口",
-        plotThreadRefs: [],
         threadResponsibilities: [],
         foreshadowingRefs: [],
         expectedChapterCount: 1,
@@ -303,7 +292,6 @@ describe("long-form prompt contracts", () => {
         development: ["rest"],
         resolution: "recovered",
         exitState: "ready",
-        plotThreadRefs: [],
         threadResponsibilities: [],
         foreshadowingRefs: [],
         expectedChapterCount: 1,
@@ -326,7 +314,7 @@ describe("long-form prompt contracts", () => {
 
   it("declares canonical review vocabulary instead of leaving provider aliases ambiguous", () => {
     const prompt = buildStoryArcReviewPrompt({
-      arc: { title: "arc", objective: "objective", entryState: "entry", centralConflict: "conflict", development: [], resolution: "resolution", exitState: "exit", plotThreadRefs: [], threadResponsibilities: [], foreshadowingRefs: [], expectedChapterCount: 1, phases: [] },
+      arc: { title: "arc", objective: "objective", entryState: "entry", centralConflict: "conflict", development: [], resolution: "resolution", exitState: "exit", threadResponsibilities: [], foreshadowingRefs: [], expectedChapterCount: 1, phases: [] },
       batch: { batchIndex: 1, startChapterIndex: 1, complete: false },
       chapters: [{ index: 1, title: "chapter", stateTransition: { before: "before", after: "after", evidence: "evidence" }, scenes: [{ title: "scene", participants: ["person"], situation: "situation", observableActions: ["action"], outcome: "outcome" }], continuityConstraints: [] }],
     }, "context");
@@ -336,10 +324,14 @@ describe("long-form prompt contracts", () => {
   });
 
   it("puts scene experience and applicability into draft and three-role review contracts", () => {
-    const draft = buildChapterDraftPrompt({
-      blueprint: { id: "blueprint-1", baseRevision: 0, commitPolicy: "manual", tasks: [] },
-      instructionsOnly: true,
-    } as never);
+    const draft = buildChapterDraftPromptPackage({
+      intent: { id: "intent-1", projectId: "p", source: "chapter-review", objective: "完成章节", createdAt: 1, idempotencyKey: "intent-1" },
+      blueprint: { id: "blueprint-1", baseRevision: 0, commitPolicy: "human-only", tasks: [], budget: { maxInputTokens: 10000, maxOutputTokens: 1000 } } as never,
+      memory: { id: "memory-1", claims: [], conflicts: [], missingFacets: [], narrativeRhythm: undefined } as never,
+      skills: { id: "skills-1", skills: [], resolution: { bundleId: "skills-1", fingerprint: "skills", executionPoint: "chapter.drafting", skills: [] } } as never,
+      workflowId: "workflow-1",
+      system: "系统",
+    }).instruction;
     expect(draft).toContain("完成当前章节执行合同");
     expect(draft).toContain("状态可以保持稳定");
     expect(draft).not.toContain("人物此刻想要什么");
@@ -347,5 +339,28 @@ describe("long-form prompt contracts", () => {
     expect(getReviewFocus("character-reviewer")).toContain("D3 群像与 D4 感情线");
     expect(getReviewFocus("prose-reviewer")).toContain("D5 幽默");
     expect(getReviewFocus("prose-reviewer")).toContain("专业化、制度化或理论化术语");
+  });
+
+  it("preserves reviewer issues and score without exact excerpt matching", () => {
+    const review = toReview({
+      artifact: { id: "artifact-1", projectId: "p1", taskId: "task-1", attemptId: "attempt-1", kind: "draft", contentHash: "hash", baseRevision: 0, createdAt: 1, fingerprint: "fp-1" },
+      identity: "independent",
+      role: "prose-reviewer",
+      output: {
+        verdict: "revise",
+        score: 3.2,
+        issues: [{
+          severity: "major",
+          title: "场景承载不足",
+          description: "关键情绪被摘要带过。",
+          excerpt: "审核模型概括的现场证据，不要求逐字相同",
+          revisionRanges: [{ start: 2, end: 2 }],
+          rule: "关键变化需要由场景过程承载。",
+          suggestion: "补足动作和即时反馈。",
+        }],
+      },
+    });
+
+    expect(review).toMatchObject({ verdict: "revise", score: 3.2, issues: [{ title: "场景承载不足" }] });
   });
 });

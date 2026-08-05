@@ -100,7 +100,7 @@ function facetsFor(intent: NovelIntent, snapshot: PreflightProjectSnapshot, task
   // - fact：drafting/revision/planning/review 都必填（fact 是跨章节一致性的最小单元）
   // - entity/thread/foreshadowing：drafting 时 required=false。
   //   原因：早期章节（前 5 章）的 entities/threads/foreshadowings 表可能尚未填充——
-  //   fact-extraction 不一定每次都产出 narrativeElements，character enrichment 逐步建立 entities。
+  //   fact-extraction 的 narrativeElements 可以是空集合，character enrichment 逐步建立 entities。
   //   强制 required 会阻塞早期章节生成。仍尝试召回（required=false），有数据就用，没有就不阻塞。
   // - chapter-memory/relation：见下方单独处理
   const facets: RetrievalFacet[] = [

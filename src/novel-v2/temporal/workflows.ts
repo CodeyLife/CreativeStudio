@@ -1,4 +1,4 @@
-import { defineSignal, proxyActivities, setHandler, condition, patched } from "@temporalio/workflow";
+import { CancellationScope, condition, defineSignal, isCancellation, patched, proxyActivities, setHandler } from "@temporalio/workflow";
 import type { ApprovalEvidence, Artifact, CommitResult, ContextManifest, CreativeReview, CreativeRun, CreativeReviewGate, CreativeWorkItem, ExecutionBlueprint, FactApprovalSummary, MemoryBundle, MemoryClaim, NovelIntent, PreflightPlan, PreflightProjectSnapshot, Review, ReviewIssue, RuntimeLearningAssessmentV2, SkillBundle, TaskAttemptRecord } from "../protocol";
 import type { ChapterPlanningContext, StoryArcBundle } from "../application/story-arc";
 import type { ManuscriptStructuralReport } from "../application/manuscript-structure";
@@ -12,6 +12,7 @@ import { assertCompleteChapterReviewEvidence } from "../application/chapter-appr
 import { buildRevisionDirection } from "../application/revision-brief";
 import { detectNamedEntityDrift } from "./revision-policy";
 import { requiresFoundationAuthorConfirmation } from "../application/project-plan";
+import { runReviewersConcurrently } from "../application/review-concurrency";
 
 function failureMessage(error: unknown): string {
   let current: unknown = error;
@@ -34,7 +35,7 @@ function failureMessage(error: unknown): string {
  * 1. 加载项目快照 → 创建 preflight → 检索记忆 → 解析技能 → 加载全书规划产出(foundation artifacts) → 编译蓝图
  *    - drafting/revision 任务校验 foundation artifacts 包含必填 taskKey,缺失则抛 ApplicationFailure.nonRetryable
  * 2. 草稿生成(注入全书规划上下文到 prompt)
- * 3. 5 种 reviewer 并行审校（style/character/continuity/plot/reader）
+ * 3. 3 种 reviewer 并行审校（structure/character/prose）
  * 4. 多轮修订循环（最多 maxAutoRevisions=2 轮）
  * 5. 事实提取
  * 6. Learning assessment
@@ -91,6 +92,7 @@ export interface NovelWorkflowActivities {
   approveStoryArcAutomatically(input: { projectId: string; arcId: string; artifactId: string; reviewArtifactId: string }): Promise<unknown>;
   failStoryArc(input: { projectId: string; arcId: string; reason: string }): Promise<void>;
   failStoryArcBatch(input: { projectId: string; arcId: string; batchIndex: number; reason: string }): Promise<void>;
+  recoverStoryArcAfterWorkflowCancellation(input: { projectId: string; arcId: string }): Promise<unknown>;
   recordWorkflowSignal(input: { workflowId: string; taskId: string; signal: string; payload?: Record<string, unknown> }): Promise<unknown>;
   loadApprovalEvidence(input: { workflowId: string; approvalEvidenceId: string }): Promise<ApprovalEvidence>;
   updateTaskAttempt(input: { id: string; workflowRunId?: string; taskId: string; status: TaskAttemptRecord["status"]; payload?: Record<string, unknown> }): Promise<unknown>;
@@ -163,9 +165,6 @@ const activities = proxyActivities<NovelWorkflowActivities>({
 /**
  * 三类 reviewer role 与 identity 的映射。
  */
-const INTERNAL_REVIEWERS: ReviewerRole[] = ["structure-reviewer"];
-const INDEPENDENT_REVIEWERS: ReviewerRole[] = ["character-reviewer", "prose-reviewer"];
-
 /**
  * 运行所有 3 种 reviewer 并返回 Review 列表。
  *
@@ -179,14 +178,7 @@ async function runAllReviewers(params: { workflowId: string; blueprintId: string
   const { workflowId, blueprintId } = params;
   await activities.updateTaskAttempt({ id: `${blueprintId}:review:attempt-${Date.now()}`, workflowRunId: workflowId, taskId: `${blueprintId}:review`, status: "running", payload: { taskKind: "review" } });
 
-  const internalResults = await Promise.allSettled(
-    INTERNAL_REVIEWERS.map((role) => params.runReview(role, "internal")),
-  );
-  const independentResults = await Promise.allSettled(
-    INDEPENDENT_REVIEWERS.map((role) => params.runReview(role, "independent")),
-  );
-
-  const allResults = [...internalResults, ...independentResults];
+  const allResults = await runReviewersConcurrently(params.runReview);
   const reviews: Review[] = [];
   let lastError: unknown;
   for (const result of allResults) {
@@ -861,7 +853,7 @@ export async function storyArcPlanningWorkflow(params: StoryArcPlanningWorkflowI
   const routingSnapshot = await activities.getStoryArcRoutingSnapshot();
   await activities.updateWorkflowStatus({ workflowId: params.workflowId, status: "running", payload: { arcId: params.arcId, mode: params.mode, reviewPolicy, routingSnapshotId: routingSnapshot.id } });
   const runStoryArcLearning = async (current: { artifact: Artifact }, reviewed: { artifact: Artifact; review: StoryArcReviewOutput }, candidateStartIndex?: number): Promise<void> => {
-    if (!reviewed.review.issues.some((issue) => issue.severity === "blocker" || issue.severity === "major")) return;
+    if (!reviewed.review.issues.length) return;
     const generated = await storyArcModelActivities.assessStoryArcLearning({ projectId: params.projectId, workflowId: params.workflowId, artifact: current.artifact, reviewArtifact: reviewed.artifact, review: reviewed.review, routingSnapshot, candidateStartIndex });
     if (generated.kind === "completed") return;
     await activities.materializeExternalStoryArcLearning({ modelTaskId: generated.task.id, projectId: params.projectId, workflowId: params.workflowId, artifact: current.artifact, reviewArtifact: reviewed.artifact, review: reviewed.review, value: (await waitForExternal(generated.task)).value });
@@ -930,6 +922,17 @@ export async function storyArcPlanningWorkflow(params: StoryArcPlanningWorkflowI
       });
     }
   } catch (error) {
+    if (isCancellation(error)) {
+      await CancellationScope.nonCancellable(async () => {
+        if (params.batchIndex) {
+          await activities.failStoryArcBatch({ projectId: params.projectId, arcId: params.arcId, batchIndex: params.batchIndex, reason: "故事弧工作流已取消" });
+        } else {
+          await activities.recoverStoryArcAfterWorkflowCancellation({ projectId: params.projectId, arcId: params.arcId });
+        }
+        await activities.updateWorkflowStatus({ workflowId: params.workflowId, status: "cancelled", payload: { arcId: params.arcId, reasonCode: "workflow-cancelled" } });
+      });
+      return;
+    }
     const reason = failureMessage(error);
     if (params.batchIndex) await activities.failStoryArcBatch({ projectId: params.projectId, arcId: params.arcId, batchIndex: params.batchIndex, reason });
     else await activities.failStoryArc({ projectId: params.projectId, arcId: params.arcId, reason });

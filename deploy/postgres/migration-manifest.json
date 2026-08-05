@@ -4,5 +4,18 @@
       "version": "014_migrate_v1_skills.sql",
       "reason": "历史数据库已应用的 V1 Skill seed migration，当前代码由 017_migrate_v1_skills.sql 取代"
     }
+  ],
+  "checksumAliases": [
+    {
+      "version": "017_migrate_v1_skills.sql",
+      "checksum": "fa3cbaf764b157f574329f7754a8b622f72b6152df70af3ae503dafefc037d56",
+      "reason": "017 seed migration 已改为只补缺失 Skill，接受已应用的旧覆盖式 SQL checksum"
+    }
+  ],
+  "schemaSubtractions": [
+    {
+      "version": "041_workflow_subtraction.sql",
+      "reason": "收敛 Novel V2 故事弧、章节工作区、事实提取、快照和 reviewer 运行契约"
+    }
   ]
 }

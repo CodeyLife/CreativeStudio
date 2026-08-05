@@ -198,7 +198,7 @@ function payloadStageKey(payload: Record<string, unknown>): WorkflowStage | unde
 function artifactStage(artifact: NovelArtifactSummary): WorkflowStage | undefined {
   if (artifact.kind === "chapter-blueprint") return "blueprint";
   if (artifact.kind === "draft") return "draft";
-  if (artifact.kind === "review" || artifact.kind === "summary") return "review";
+  if (artifact.kind === "review") return "review";
   if (artifact.kind === "revision") return "revision";
   if (artifact.kind === "fact-extraction") return "fact-extraction";
   return normalizeStageKey(artifact.taskId);
@@ -363,7 +363,7 @@ function parseIssues(value: unknown): QualityIssue[] {
 export function deriveQuality(run: NovelRunState | undefined, artifacts: NovelArtifactSummary[], reviews: NovelReviewSummary[] = []): QualityData {
   const latestReviewedArtifact = artifacts.find((artifact) => reviews.some((review) => review.artifactId === artifact.id));
   const currentReviews = latestReviewedArtifact ? reviews.filter((review) => review.artifactId === latestReviewedArtifact.id) : reviews;
-  const reviewArtifacts = artifacts.filter((a) => a.kind === "review" || a.kind === "summary");
+  const reviewArtifacts = artifacts.filter((a) => a.kind === "review");
   const issues: QualityIssue[] = [];
   let overallFromArtifact: number | null = null;
 
@@ -393,7 +393,7 @@ export function deriveQuality(run: NovelRunState | undefined, artifacts: NovelAr
 export function artifactsForStage(stage: string, artifacts: NovelArtifactSummary[]): NovelArtifactSummary[] {
   if (stage === "blueprint" || stage === "blueprint-approval") return artifacts.filter((artifact) => artifact.kind === "chapter-blueprint");
   if (stage === "draft") return artifacts.filter((artifact) => artifact.kind === "draft");
-  if (stage === "review") return artifacts.filter((artifact) => artifact.kind === "review" || artifact.kind === "summary");
+  if (stage === "review") return artifacts.filter((artifact) => artifact.kind === "review");
   if (stage === "revision") return artifacts.filter((artifact) => artifact.kind === "revision");
   if (stage === "manuscript-approval") {
     const latest = artifacts.find((artifact) => artifact.kind === "revision") ?? artifacts.find((artifact) => artifact.kind === "draft");
@@ -1103,8 +1103,7 @@ function WorkflowInspector({
 function ChapterInfoPanel({ projectId, documentId, workspace }: { projectId: string; documentId?: string; workspace?: NovelChapterWorkspace }) {
   const versions = useChapterVersionActions(projectId, documentId);
   if (!workspace) return <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无章节信息" />;
-  const blueprint = workspace.spec.blueprint;
-  const purpose = typeof blueprint.chapterPurpose === "string" ? blueprint.chapterPurpose : workspace.spec.chapterGoal;
+  const purpose = workspace.spec.chapterGoal;
   return <div className="pb-context-info">
     <dl><div><dt>章节目标</dt><dd>{purpose || "未填写"}</dd></div><div><dt>POV</dt><dd>{workspace.document.povCharacterId ?? "未指定"}</dd></div><div><dt>正文版本</dt><dd>{workspace.content ? `r${workspace.content.revision}` : "尚无正文"}</dd></div><div><dt>结构指纹</dt><dd><code>{workspace.spec.blueprintFingerprint ? workspace.spec.blueprintFingerprint.slice(0, 12) : "未绑定"}</code></dd></div></dl>
     <section><header><HistoryOutlined /> 恢复版本</header>{workspace.versions.map((version) => <div key={version.id}><span>{version.label ?? (version.retentionClass === "named" ? "命名版本" : version.retentionClass === "rolling" ? "自动保存" : "工作流定稿")}</span><strong>r{version.revision}</strong>{version.current ? <Tag color="green">当前</Tag> : <Popconfirm title={`恢复到 r${version.revision}？`} description="恢复会创建新的正文版本，当前内容不会立即删除。" onConfirm={() => versions.restore.mutate(version.id)}><Button size="small" type="text" loading={versions.restore.isPending}>恢复</Button></Popconfirm>}{version.retentionClass !== "named" && <Button size="small" type="text" loading={versions.name.isPending} onClick={() => versions.name.mutate({ revisionId: version.id, label: `保留版本 r${version.revision}` })}>长期保留</Button>}<small>{new Date(version.createdAt).toLocaleString()}</small></div>)}</section>
@@ -1254,7 +1253,7 @@ export default function NovelProductionWorkspace({
 
   const quality = useMemo(() => deriveQuality(run, artifacts, reviews), [run, artifacts, reviews]);
   const diagnosticArtifacts = diagnosticArtifactsQ.data ?? [];
-  const signal = useSignalHumanDecision(projectId, mainWorkflowId);
+  const signal = useSignalHumanDecision(projectId, mainWorkflowId, selectedDocId);
   const replacePendingArtifact = useReplacePendingArtifact(projectId, mainWorkflowId);
   const gateDecisionRef = useRef<string | undefined>(undefined);
   const cancelRun = useCancelNovelRun(projectId, mainWorkflowId);

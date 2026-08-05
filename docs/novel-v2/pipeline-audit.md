@@ -50,13 +50,13 @@
 - 长线是否有负责卷、下一次责任和交汇/退出/转化条件；
 - hidden、notDesigned、open 信息是否被区分。
 
-它不检查正文句式、章节长度、事件数量或文学风格。故事弧蓝图通过 `threadResponsibilities` 承载每条 `plotThreadRefs` 在本弧的责任和下一次可验证推进；这不是逐章兑现清单。架构问题的修复顺序是 Foundation 编辑/作者确认 → 活动 Story Arc rebase → 弧级审核；只有局部正文证据仍失败时，才进入正式 chapterReviewWorkflow。
+它不检查正文句式、章节长度、事件数量或文学风格。故事弧蓝图只通过 `threadResponsibilities[].threadRef` 承载剧情线引用、本弧责任和下一次可验证推进；这不是逐章兑现清单。架构问题的修复顺序是 Foundation 编辑/作者确认 → 活动 Story Arc rebase → 弧级审核；只有局部正文证据仍失败时，才进入正式 chapterReviewWorkflow。
 
-重基线审校使用三类弧级输入：当前待审 `currentArc`/蓝图、经过兼容投影的 `approvedArc`，以及旧批准记录缺少新字段时的 `legacyArcContractGaps`。后者只表示 schema 演进造成的证据缺口；审核必须检查当前蓝图自己的 `plotThreadRefs`/`threadResponsibilities` 覆盖，不能把旧记录的空数组直接解释成当前弧或正文的退化。兼容投影只影响弧级对照视图，不覆盖章节冻结证据。
+重基线审校使用符合当前契约的 `approvedArc`、历史章节提交包和事实证据。旧批准记录若缺少 `threadResponsibilities`，迁移后标记为 stale，不能被运行时静默补全，需显式重新生成和审核。章节冻结证据仍由 revision、`chapterMemory` 和 authoritative facts 提供。
 
 本次项目运行 `novel-create-wanfa-20260801` 的架构审计结果：6 卷、估计 670 章、6 名核心人物、3 条长线，`passed=true` 且结构问题为空。四个被补强的 Foundation section 已完成独立审核和作者确认；原有 6 个 final 章节未被该修复重写。迁移后的正式 rebase、Story Arc 审核与作者确认均已完成：当前 blueprint 为 `85957d3f-20c1-473e-bddb-a892d33767d5`，review artifact 为 `9855c6e0-e316-4bcc-a4b3-4ab2f96921f1`，弧级审核 `passed` 且无 blocking issue，当前弧为 `approved/active`。
 
-弧级审核证据账本区分历史规划与当前架构：`frozenEvidence` 只说明历史批准蓝图的冻结边界，`candidateClaims` 由当前候选蓝图确定性投影，二者不是同一份正文快照；定稿事实以 `committedMemory`、`authoritativeFacts` 和正文 revision 为权威。这样可以修正陈旧的章节规划而不把规划修正误报为正文修订，也不让模型回显动态路径的遗漏伪装成完整审核。
+弧级审核证据账本区分历史规划与当前架构：`frozenEvidence` 只说明历史批准蓝图的冻结边界，`candidateClaims` 由当前候选蓝图确定性投影，二者不是同一份正文快照；定稿事实以 `chapterMemory`、`authoritativeFacts` 和正文 revision 为权威。这样可以修正陈旧的章节规划而不把规划修正误报为正文修订，也不让模型回显动态路径的遗漏伪装成完整审核。
 
 ### 2.2 Story Arc
 
@@ -102,13 +102,13 @@ renderChapterExecutionContract 是 draft、review、revision 共享的单一蓝�
 | character-reviewer | independent | chapter.review.character |
 | prose-reviewer | independent | chapter.review.prose |
 
-reviewer schema 只输出 verdict、score、issues。issue 必须有当前正文 evidence/excerpt 和 revisionRanges；rewriteExample、dimensionScores 和 applicableReviewDimensions 不再是活动输出。
+reviewer schema 只输出 verdict、score、issues。issue 必须有 evidence/excerpt 说明和 revisionRanges；evidence/excerpt 不与当前正文做逐字匹配校验，也不会因无法匹配而从审核结果中删除。rewriteExample、dimensionScores 和 applicableReviewDimensions 不再是活动输出。
 
 REVIEW_COVERAGE 作为内部映射覆盖 D1 世界观、D2 故事性、D3 群像、D4 感情线、D5 幽默，但模型不被要求逐项填表。
 
 ### 2.6 Revision / Commit
 
-修订以 grounded evidence 为入口，只修改目标范围；人物的专业化/制度化/理论化认知可以保留，但若连续抽象表达替代身体、环境或即时判断，修订必须回到可观察依据，而不是只替换术语。revision policy 保留：
+修订以审核 evidence 和明确目标范围为入口，只修改目标范围；人物的专业化/制度化/理论化认知可以保留，但若连续抽象表达替代身体、环境或即时判断，修订必须回到可观察依据，而不是只替换术语。revision policy 保留：
 
 - blocker/major 阻断；
 - 总体改善阈值；
@@ -193,7 +193,7 @@ git diff --check
 | Foundation 阶段 | src/novel-v2/application/project-plan.ts |
 | 章节蓝图 | src/novel-v2/application/story-arc.ts |
 | 上下文合同 | src/novel-v2/prompts/chapter-planning-context.ts |
-| 正文 prompt | src/novel-v2/prompts/chapter-draft.ts、writer-rules.ts |
+| 正文 prompt | src/novel-v2/prompts/chapter-draft.ts（StagePromptPackage） |
 | 审核 prompt/schema | src/novel-v2/prompts/chapter-review.ts、schemas.ts |
 | 正式 workflow | src/novel-v2/temporal/workflows.ts、activities.ts |
 | 修订和 commit gate | src/novel-v2/temporal/revision-policy.ts、commit-service.ts |

@@ -327,9 +327,6 @@ export interface NarrativeStateSnapshot {
   arcId?: string;
   chapterBlueprintId?: string;
   arcPhase?: string;
-  chapterSummary: string;
-  keyEvents: string[];
-  characterStates: Array<{ characterId: string; stateSnapshot: string }>;
   openThreads: string[];
   openForeshadowings: Array<{ id: string; description: string; expectedPayoffWindow: string }>;
   openPromises: Array<{ id: string; promiser: string; promisee: string; statement: string }>;
@@ -543,7 +540,7 @@ export interface Artifact {
   projectId: string;
   taskId: string;
   attemptId: string;
-  kind: "draft" | "review" | "revision" | "fact-extraction" | "summary" | "foundation" | "arc-plan" | "chapter-blueprint";
+  kind: "draft" | "review" | "revision" | "fact-extraction" | "foundation" | "chapter-blueprint";
   contentHash: string;
   objectKey?: string;
   structuredData?: Record<string, unknown>;

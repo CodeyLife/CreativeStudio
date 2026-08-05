@@ -150,4 +150,39 @@ describe("V2 repository management APIs", () => {
     const { repository } = createRepository();
     await expect(repository.deleteProject("p1")).resolves.toEqual({ deleted: true, projectId: "p1" });
   });
+
+  it("projects the chapter blueprint from chapters.payload instead of the production spec", async () => {
+    const { repository, calls } = createRepository([
+      {
+        rows: [{
+          id: "doc-1",
+          project_id: "p1",
+          title: "第一章",
+          narrative_order: 1,
+          pov_character_id: null,
+          current_revision_id: null,
+          status: "planned",
+          created_at: new Date(0),
+          updated_at: new Date(0),
+          revision: null,
+          content_hash: null,
+          object_key: null,
+          byte_length: null,
+          chapter_goal: "保持作者明确目标",
+          chapter_payload: { title: "来自章节表", beats: [] },
+          chapter_blueprint_fingerprint: null,
+          spec_updated_at: null,
+          review_id: null,
+        }],
+        rowCount: 1,
+      },
+      { rows: [], rowCount: 0 },
+      { rows: [], rowCount: 0 },
+    ]);
+
+    const workspace = await repository.getChapterWorkspace("p1", "doc-1");
+    expect(workspace?.spec).toMatchObject({ chapterGoal: "保持作者明确目标", blueprint: { title: "来自章节表", beats: [] } });
+    expect(calls[0].sql).toContain("ch.payload AS chapter_payload");
+    expect(calls[0].sql).not.toContain("cps.blueprint");
+  });
 });

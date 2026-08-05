@@ -18,16 +18,14 @@ const structuralReport = inspectManuscript({ text: "正文" });
 
 function createService() {
   const commits: Array<Record<string, unknown>> = [];
-  const payoffWrites: Array<Record<string, unknown>> = [];
   const narrativeWrites: Array<Record<string, unknown>> = [];
   const result: CommitResult = { revisionId: "revision-1", revision: 1, contentHash: "hash-1", outboxEventId: 7 };
   const repository = {
     commitRevision: async (input: Record<string, unknown>) => { commits.push(input); return result; },
-    recordPayoffCurve: async (input: Record<string, unknown>) => { payoffWrites.push(input); return 1; },
     recordNarrativeElements: async (input: Record<string, unknown>) => { narrativeWrites.push(input); return { foreshadowings: 1, promises: 0, payoffs: 0 }; },
   } as unknown as NovelPostgresRepository;
   const objects = { putText: async () => ({ hash: "hash-1", key: "objects/hash-1", bytes: 12 }), getText: async () => "正文" } as unknown as ContentObjectStore;
-  return { service: new CommitService(repository, objects), commits, payoffWrites, narrativeWrites, result };
+  return { service: new CommitService(repository, objects), commits, narrativeWrites, result };
 }
 
 describe("V2 CommitService", () => {
@@ -49,24 +47,6 @@ describe("V2 CommitService", () => {
     await expect(service.commit({ projectId: "p1", documentId: "doc-1", artifact, reviews, structuralReport, baseRevision: 0, idempotencyKey: "k1", text: "正文" })).resolves.toEqual(result);
     expect(commits).toHaveLength(1);
     expect(commits[0]).toMatchObject({ contentHash: "hash-1", objectKey: "objects/hash-1", revisionId: expect.any(String) });
-  });
-
-  it("records payoff provenance with the committed manuscript revision id", async () => {
-    const { service, payoffWrites } = createService();
-    await service.commit({
-      projectId: "p1",
-      documentId: "doc-1",
-      artifact,
-      reviews,
-      structuralReport,
-      baseRevision: 0,
-      idempotencyKey: "k-payoff",
-      text: "正文",
-      narrativeOrder: 3,
-      payoffMoments: [{ payoffType: "emotional", intensity: 4, description: "关系得到回应", evidence: "她终于点了头。" }],
-    });
-    expect(payoffWrites).toEqual([expect.objectContaining({ revisionId: "revision-1", narrativeOrder: 3 })]);
-    expect(payoffWrites[0]?.revisionId).not.toBe(artifact.id);
   });
 
   it("records narrative elements with the same committed revision provenance", async () => {

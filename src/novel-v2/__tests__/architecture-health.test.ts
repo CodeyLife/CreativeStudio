@@ -50,7 +50,7 @@ describe("architecture health lifecycle", () => {
 
 describe("story arc approval architecture gate", () => {
   const blueprint: Artifact = {
-    id: "blueprint-1", projectId: "project-1", taskId: "story-arc", attemptId: "attempt-1", kind: "arc-plan",
+    id: "blueprint-1", projectId: "project-1", taskId: "story-arc", attemptId: "attempt-1", kind: "chapter-blueprint",
     contentHash: "hash", baseRevision: 0, createdAt: 1, fingerprint: "fingerprint",
     structuredData: {
       arc: { title: "第一弧", objective: "验证审批门禁" },

@@ -93,7 +93,6 @@ try {
       await client.query("UPDATE story_arc_batches SET start_chapter_index=start_chapter_index-100005,end_chapter_index=end_chapter_index-100005,payload=jsonb_set(payload,'{startChapterIndex}',to_jsonb((payload->>'startChapterIndex')::integer-100005),true),updated_at=now() WHERE project_id=$1 AND arc_id=$2", [projectId, replanArcId]);
 
       await client.query("UPDATE chapter_memories SET narrative_start=CASE WHEN narrative_start BETWEEN 11 AND 15 THEN narrative_start-5 ELSE narrative_start END,narrative_end=CASE WHEN narrative_end BETWEEN 11 AND 15 THEN narrative_end-5 ELSE narrative_end END WHERE project_id=$1", [projectId]);
-      await client.query("UPDATE payoff_curve SET narrative_order=narrative_order-5 WHERE project_id=$1 AND narrative_order BETWEEN 11 AND 15", [projectId]);
       await client.query("UPDATE foreshadowing SET narrative_order=narrative_order-5 WHERE project_id=$1 AND narrative_order BETWEEN 11 AND 15", [projectId]);
       await client.query("UPDATE facts SET narrative_start=CASE WHEN narrative_start BETWEEN 11 AND 15 THEN narrative_start-5 ELSE narrative_start END,narrative_end=CASE WHEN narrative_end BETWEEN 11 AND 15 THEN narrative_end-5 ELSE narrative_end END WHERE project_id=$1", [projectId]);
       await client.query("UPDATE memory_claims SET narrative_start=CASE WHEN narrative_start BETWEEN 11 AND 15 THEN narrative_start-5 ELSE narrative_start END,narrative_end=CASE WHEN narrative_end BETWEEN 11 AND 15 THEN narrative_end-5 ELSE narrative_end END WHERE project_id=$1", [projectId]);

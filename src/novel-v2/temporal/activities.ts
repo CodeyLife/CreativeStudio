@@ -16,11 +16,11 @@ import { CommitService } from "../commit-service";
 import type { MemoryIndex } from "../qdrant-memory";
 import { assessRuntimeLearningWithModel, reviewIssuesForLearning, buildRuntimeLearningPrompt, parseRuntimeLearningAssessmentV2, runtimeLearningAssessmentSchema } from "../learning-assessment";
 import { buildChapterDraftPromptPackage } from "../prompts/chapter-draft";
-import { buildChapterReviewPromptPackage, getReviewFocus, groundReviewForText, groundReviewerIssues, reviewExecutionPoint, selectReviewerMemory, selectReviewerSkills, toReview, type ReviewerRole } from "../prompts/chapter-review";
-import { applyRevisionWindows, applyTargetedRevisionReplacements, authorRevisionAlignmentSchema, buildAuthorRevisionRepairPrompt, buildFullChapterRevisionPromptPackage, buildRevisionWindowPrompt, buildTargetedRevisionBatchPrompt, planRevisionWindows, revisionWindowsCoverAllIssues, sanitizeRevisionOutput, shouldUseRevisionWindows, splitChapterParagraphs, TargetedRevisionContractError, targetedRevisionBatchSchema, type AuthorRevisionAlignment, type RevisionAttempt, type TargetedRevisionReplacement } from "../prompts/chapter-revision";
+import { buildChapterReviewPromptPackage, getReviewFocus, reviewExecutionPoint, selectReviewerMemory, selectReviewerSkills, toReview, type ReviewerRole } from "../prompts/chapter-review";
+import { applyRevisionWindows, applyTargetedRevisionReplacements, authorRevisionAlignmentSchema, buildAuthorRevisionRepairPromptPackage, buildFullChapterRevisionPromptPackage, buildRevisionWindowPromptPackage, buildTargetedRevisionBatchPromptPackage, planRevisionWindows, revisionWindowsCoverAllIssues, sanitizeRevisionOutput, shouldUseRevisionWindows, splitChapterParagraphs, TargetedRevisionContractError, targetedRevisionBatchSchema, type AuthorRevisionAlignment, type RevisionAttempt, type TargetedRevisionReplacement } from "../prompts/chapter-revision";
 import { chapterStateDeltaSchema, reviewerSchema, type ChapterStateDelta, type FactExtractionOutput, type FoundationOutput, type ReviewerOutput } from "../prompts/schemas";
 import { extractFactsWithStats, projectFactExtractionOutput } from "../fact-extraction";
-import { enrichCharactersFromChapter, parseCharacterEnrichmentOutput, persistCharacterEnrichment, validateCharacterEnrichmentOutput } from "../character-enrichment";
+import { enrichCharactersFromChapter, parseCharacterEnrichmentOutput } from "../character-enrichment";
 import { characterEnrichmentSchema } from "../prompts/schemas";
 import { buildFactExtractionPrompt } from "../fact-extraction/prompt";
 import { createCraftRuleCandidate } from "../craft-rule";
@@ -432,7 +432,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
             promptContext: promptPackage.manifest,
           });
         const review = {
-          ...toReview({ artifact: input.artifact, identity: input.identity, role: input.role, output: generated.value, text: input.text }),
+          ...toReview({ artifact: input.artifact, identity: input.identity, role: input.role, output: generated.value }),
           modelProvenance: {
             ...generated.provenance,
             skillBundleId: roleSkills.id,
@@ -458,17 +458,10 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
     revise: async (input: { workflowId: string; intent: NovelIntent; artifact: Artifact; text: string; reviews: Review[]; directedIssues?: ReviewIssue[]; strictRevisionWindows?: boolean; authorInstruction?: string; memory: MemoryBundle; blueprint: ExecutionBlueprint; skills: SkillBundle; routingSnapshot: ModelRoutingSnapshot; candidateStartIndex?: number; planningContext?: ChapterPlanningContext; revisionHistory?: RevisionAttempt[] }): Promise<GeneratedTextResult> => {
       const currentSkills = await resolveCurrentSkills({ projectId: input.intent.projectId, executionPoint: "chapter.revision", role: "reviser", memory: input.memory, preflightId: input.blueprint.preflightId });
       input = { ...input, skills: currentSkills };
-      // Reviewer records can outlive the exact candidate text they were written
-      // against. Re-ground them before revision so stale excerpts from an older
-      // candidate cannot drive new revision windows or quality rollback.
-      const groundedReviews = input.text ? input.reviews.map((review) => groundReviewForText(review, input.text)) : input.reviews;
-      const groundedDirectedIssues = input.text && input.directedIssues
-        ? groundReviewerIssues(input.directedIssues, input.text).issues
-        : input.directedIssues;
-      const revisionEvidence = classifyRevisionEvidence(groundedReviews);
-      const revisionBrief = buildRevisionBrief(groundedReviews, groundedDirectedIssues, {
+      const revisionEvidence = classifyRevisionEvidence(input.reviews);
+      const revisionBrief = buildRevisionBrief(input.reviews, input.directedIssues, {
         includeWarnings: revisionEvidence === "quality-warning",
-        includeDirectedReviewEvidence: Boolean(groundedDirectedIssues?.length),
+        includeDirectedReviewEvidence: Boolean(input.directedIssues?.length),
       });
       const hasAuthorInstruction = Boolean(input.authorInstruction?.trim());
       if (shouldBlockRevisionForConflicts(revisionBrief.conflicts, hasAuthorInstruction)) {
@@ -525,25 +518,20 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
           const targetSourceCharacters = revisionWindows.reduce((total, window) => total + paragraphs.slice(window.start, window.end + 1).join("\n\n").length, 0);
           const batchMaxTokens = Math.min(input.blueprint.budget.maxOutputTokens, Math.max(4_096, targetSourceCharacters * 2));
           try {
-            const targetedRevisionPackage = compileStageContext({
+            const targetedRevisionPackage = buildTargetedRevisionBatchPromptPackage({
               projectId: input.intent.projectId,
               workflowId: input.workflowId,
-              purpose: "writing.revision",
-              stage: "revision",
               system,
               goal: stageGoal,
-              schema: targetedRevisionBatchSchema as unknown as Record<string, unknown>,
               maxInputTokens: input.blueprint.budget.maxInputTokens,
-              reservedOutputTokens: batchMaxTokens,
-              skillManifest: input.skills.resolution,
-              sections: [{
-                id: "targeted-revision-batch",
-                kind: "manuscript",
-                title: "共享上下文与局部修订窗口",
-                text: buildTargetedRevisionBatchPrompt({ text: input.text, windows: revisionWindows, memory: input.memory, skills: input.skills, planningContext: input.planningContext, authorInstruction: input.authorInstruction, revisionHistory: input.revisionHistory }),
-                priority: "critical",
-                provenanceRefs: [input.artifact.id, input.memory.id, input.skills.id, input.blueprint.id],
-              }, ...buildSkillContextSections(input.skills, "chapter.revision", "修订 Skill")],
+              maxOutputTokens: batchMaxTokens,
+              text: input.text,
+              windows: revisionWindows,
+              memory: input.memory,
+              skills: input.skills,
+              planningContext: input.planningContext,
+              authorInstruction: input.authorInstruction,
+              revisionHistory: input.revisionHistory,
             });
             const generated = await model.generateStructured<TargetedRevisionBatchOutput>({
               purpose: "writing.revision",
@@ -587,8 +575,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
         }
         for (const window of revisionWindows) {
           const source = paragraphs.slice(window.start, window.end + 1).join("\n\n");
-          const windowPrompt = buildRevisionWindowPrompt({ text: input.text, window, memory: input.memory, skills: input.skills, planningContext: input.planningContext, authorInstruction: input.authorInstruction, revisionHistory: input.revisionHistory });
-          const windowPackage = compileStageContext({ projectId: input.intent.projectId, workflowId: input.workflowId, purpose: "writing.revision", stage: "revision", system, goal: stageGoal, maxInputTokens: input.blueprint.budget.maxInputTokens, reservedOutputTokens: Math.min(4096, Math.max(1024, source.length * 2)), skillManifest: input.skills.resolution, sections: [{ id: `revision-window:${window.start + 1}-${window.end + 1}`, kind: "manuscript", title: "局部修订任务、约束与正文", text: windowPrompt, priority: "critical", provenanceRefs: [input.artifact.id, input.memory.id, input.skills.id, input.blueprint.id] }, ...buildSkillContextSections(input.skills, "chapter.revision", "修订 Skill")] });
+          const windowPackage = buildRevisionWindowPromptPackage({ projectId: input.intent.projectId, workflowId: input.workflowId, system, goal: stageGoal, maxInputTokens: input.blueprint.budget.maxInputTokens, maxOutputTokens: Math.min(4096, Math.max(1024, source.length * 2)), text: input.text, window, memory: input.memory, skills: input.skills, planningContext: input.planningContext, authorInstruction: input.authorInstruction, revisionHistory: input.revisionHistory });
           const generated = await model.generateText({
             purpose: "writing.revision",
             system,
@@ -658,17 +645,21 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
             authorAlignmentHistory.push(alignment.value);
             fullRevisionProvenance.push(alignment.provenance);
             if (!alignment.value.satisfied) {
-              const repairPackage = compileStageContext({
+              const repairPackage = buildAuthorRevisionRepairPromptPackage({
                 projectId: input.intent.projectId,
                 workflowId: input.workflowId,
-                purpose: "writing.revision",
-                stage: "revision",
                 system,
                 goal: stageGoal,
+                sourceArtifactId: input.artifact.id,
                 maxInputTokens: input.blueprint.budget.maxInputTokens,
-                reservedOutputTokens: input.blueprint.budget.maxOutputTokens,
-                skillManifest: input.skills.resolution,
-                sections: [{ id: "author-alignment-repair", kind: "manuscript", title: "作者目标未满足项、证据与待修正文", text: buildAuthorRevisionRepairPrompt({ original: input.text, candidate: revisedText, authorInstruction: input.authorInstruction!, alignment: alignment.value, memory: input.memory, planningContext: input.planningContext }), priority: "critical", provenanceRefs: [input.artifact.id, input.memory.id, input.blueprint.id, stageGoal?.id ?? ""] }, ...buildSkillContextSections(input.skills, "chapter.revision", "修订 Skill")],
+                maxOutputTokens: input.blueprint.budget.maxOutputTokens,
+                original: input.text,
+                candidate: revisedText,
+                authorInstruction: input.authorInstruction!,
+                alignment: alignment.value,
+                memory: input.memory,
+                skills: input.skills,
+                planningContext: input.planningContext,
               });
               const repaired = await model.generateText({
                 purpose: "writing.revision",
@@ -711,23 +702,21 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
               unmetRequirements: [input.authorInstruction!],
               evidence: ["API 执行器无法完成作者目标语义验收，禁止跳过该门禁。"],
             };
-            const externalGoalPackage = compileStageContext({
+            const externalGoalPackage = buildAuthorRevisionRepairPromptPackage({
               projectId: input.intent.projectId,
               workflowId: input.workflowId,
-              purpose: error.purpose,
-              stage: "revision",
               system,
               goal: stageGoal,
+              sourceArtifactId: input.artifact.id,
               maxInputTokens: input.blueprint.budget.maxInputTokens,
-              reservedOutputTokens: input.blueprint.budget.maxOutputTokens,
-              sections: [{
-                id: "external-author-goal-continuation",
-                kind: "manuscript",
-                title: "作者目标语义验收与必要修订",
-                text: buildAuthorRevisionRepairPrompt({ original: input.text, candidate: revisedText, authorInstruction: input.authorInstruction!, alignment: unresolvedAlignment, memory: input.memory, planningContext: input.planningContext }),
-                priority: "critical",
-                provenanceRefs: [input.artifact.id, input.memory.id, input.blueprint.id, ...(stageGoal ? [stageGoal.id] : [])],
-              }],
+              maxOutputTokens: input.blueprint.budget.maxOutputTokens,
+              original: input.text,
+              candidate: revisedText,
+              authorInstruction: input.authorInstruction!,
+              alignment: unresolvedAlignment,
+              memory: input.memory,
+              skills: input.skills,
+              planningContext: input.planningContext,
             });
             const task = await externalTask({
               workflowId: input.workflowId,
@@ -753,17 +742,19 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
         const strictRevisionWindows = Boolean(input.strictRevisionWindows && windows.length && windowsCoverAllIssues);
         if (input.strictRevisionWindows && !windowsCoverAllIssues && !hasAuthorInstruction) throw new Error("目标意见无法解析出安全修订窗口");
         const useTargetedExternal = strictRevisionWindows && shouldUseRevisionWindows({ requiresFullRevision: false, authorInstruction: input.authorInstruction });
-        const targetedRevisionPackage = useTargetedExternal ? compileStageContext({
+        const targetedRevisionPackage = useTargetedExternal ? buildTargetedRevisionBatchPromptPackage({
           projectId: input.intent.projectId,
           workflowId: input.workflowId,
-          purpose: "writing.revision",
-          stage: "revision",
           system,
           goal: stageGoal,
-          schema: targetedRevisionBatchSchema as unknown as Record<string, unknown>,
           maxInputTokens: input.blueprint.budget.maxInputTokens,
-          reservedOutputTokens: input.blueprint.budget.maxOutputTokens,
-          sections: [{ id: "targeted-revision-batch", kind: "manuscript", title: "局部修订任务、约束与正文", text: buildTargetedRevisionBatchPrompt({ text: input.text, windows, memory: input.memory, skills: input.skills, planningContext: input.planningContext, authorInstruction: input.authorInstruction }), priority: "critical", provenanceRefs: [input.artifact.id, input.memory.id, input.skills.id, input.blueprint.id] }, ...buildSkillContextSections(input.skills, "chapter.revision", "修订 Skill")],
+          maxOutputTokens: input.blueprint.budget.maxOutputTokens,
+          text: input.text,
+          windows,
+          memory: input.memory,
+          skills: input.skills,
+          planningContext: input.planningContext,
+          authorInstruction: input.authorInstruction,
         }) : undefined;
         const task = targetedRevisionPackage
           ? await externalTask({ workflowId: input.workflowId, taskId: `${input.artifact.taskId}:revise:targeted`, purpose: "writing.revision", candidateIndex: error.candidateIndex, routingSnapshot: input.routingSnapshot, outputKind: "structured", system, instruction: targetedRevisionPackage.instruction, schema: targetedRevisionBatchSchema as unknown as Record<string, unknown>, schemaName: "targeted-chapter-revision", baseRevision: input.artifact.baseRevision, contextRefs: { artifactId: input.artifact.id, blueprintId: input.blueprint.id, memoryBundleId: input.memory.id, skillBundleId: input.skills.id, goalContract: stageGoal ? JSON.stringify(stageGoal) : "" }, promptContext: targetedRevisionPackage.manifest })
@@ -794,8 +785,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       const task = await deps.repository.getModelTask(input.modelTaskId);
       const validate = new Ajv({ allErrors: true, strict: false }).compile(reviewerSchema);
       if (!task || task.status !== "submitted" || !validate(input.value)) throw new Error(`外部审核结果无效：${validate.errors?.map((item) => item.message).join("；") ?? "任务未提交"}`);
-      const text = input.artifact.objectKey ? await objects.getText(input.artifact.objectKey) : undefined;
-      const review = { ...toReview({ artifact: input.artifact, identity: input.identity, role: input.role, output: input.value as ReviewerOutput, text }), modelProvenance: { routeSnapshotId: task.configRevision, purpose: task.purpose, candidateIndex: task.candidateIndex, executor: "external-mcp" as const, model: "external-mcp", promptFingerprint: task.workPackage.inputFingerprint, skillBundleId: task.workPackage.contextRefs.skillBundleId, skillBundleFingerprint: task.workPackage.contextRefs.skillBundleFingerprint, contextManifestId: task.workPackage.contextRefs.contextManifestId } };
+      const review = { ...toReview({ artifact: input.artifact, identity: input.identity, role: input.role, output: input.value as ReviewerOutput }), modelProvenance: { routeSnapshotId: task.configRevision, purpose: task.purpose, candidateIndex: task.candidateIndex, executor: "external-mcp" as const, model: "external-mcp", promptFingerprint: task.workPackage.inputFingerprint, skillBundleId: task.workPackage.contextRefs.skillBundleId, skillBundleFingerprint: task.workPackage.contextRefs.skillBundleFingerprint, contextManifestId: task.workPackage.contextRefs.contextManifestId } };
       await deps.repository.putReview(review, { refreshChapterSnapshot: !input.suppressChapterSnapshotPromotion });
       return review;
     },
@@ -811,9 +801,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
         // Phase 3.1: 提取 claims 与正文修订派生数据；派生数据等待 commit 取得真实 revisionId 后落库。
         const result = await extractFactsWithStats({ projectId: input.projectId, artifact: factArtifact, text: input.text, model, existingClaimsDigest: extractionContext.claimsDigest, existingContentHashes: extractionContext.contentHashes, existingClaimsIndex: extractionContext.claimsIndex, openNarrativeElements, narrativeOrder: input.narrativeOrder, routingSnapshot: input.routingSnapshot, candidateStartIndex: input.candidateStartIndex, workflowRunId: input.workflowId, taskId: `${input.artifact.taskId}:facts:model`, skillBundle: currentSkills });
         await deps.repository.recordFactExtraction({ projectId: input.projectId, artifact: factArtifact, claims: result.claims, lifecycleStatus: "staged", documentId: input.documentId, workflowId: input.workflowId, narrativeOrder: input.narrativeOrder });
-        // 爽点是正文 revision 的派生记录。此阶段尚未创建 manuscript revision，
-        // 只把提取结果随 artifact 返回，统一由 CommitService 在 commit 后落库。
-        return { kind: "completed", artifact: { ...factArtifact, structuredData: { ...factArtifact.structuredData, narrativeElements: result.narrativeElements, payoffMoments: result.payoffMoments ?? [], chapterMemory: result.chapterMemory, characterDeltas: result.characterDeltas } } };
+        return { kind: "completed", artifact: { ...factArtifact, structuredData: { ...factArtifact.structuredData, narrativeElements: result.narrativeElements } } };
       } catch (error) {
         if (!(error instanceof ExternalMcpRequiredError)) throw error;
         const extractionContext = await deps.repository.getFactExtractionContext(input.projectId, input.narrativeOrder === undefined ? undefined : input.narrativeOrder - 1);
@@ -834,7 +822,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       const extractionContext = await deps.repository.getFactExtractionContext(input.projectId, input.narrativeOrder === undefined ? undefined : input.narrativeOrder - 1);
       const projected = projectFactExtractionOutput({ projectId: input.projectId, artifact: input.artifact, text: input.text, existingClaimsDigest: extractionContext.claimsDigest, existingContentHashes: extractionContext.contentHashes, existingClaimsIndex: extractionContext.claimsIndex, narrativeOrder: input.narrativeOrder }, task.result!.value as ChapterStateDelta);
       await deps.repository.recordFactExtraction({ projectId: input.projectId, artifact: input.artifact, claims: projected.claims, lifecycleStatus: "staged", documentId: input.documentId, workflowId: task.workflowRunId, narrativeOrder: input.narrativeOrder });
-      return { ...input.artifact, structuredData: { ...input.artifact.structuredData, narrativeElements: projected.narrativeElements, payoffMoments: projected.payoffMoments ?? [], chapterMemory: projected.chapterMemory, characterDeltas: projected.characterDeltas } };
+      return { ...input.artifact, structuredData: { ...input.artifact.structuredData, narrativeElements: projected.narrativeElements } };
     },
     approveFacts: (input: { workflowId: string; projectId: string; artifact: Artifact }) =>
       deps.repository.recordFactApprovalPolicy({ workflowId: input.workflowId, projectId: input.projectId, artifactId: input.artifact.id }),
@@ -904,7 +892,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
     },
     commit: async (input: { projectId: string; documentId: string; artifact: Artifact; factArtifact?: Artifact; narrativeOrder?: number; text: string; reviews: Review[]; structuralReport: ManuscriptStructuralReport; baseRevision: number; idempotencyKey: string }) => {
       const chapterMemorySkills = await resolveCurrentSkills({ projectId: input.projectId, executionPoint: "chapter.fact-extraction", role: "fact-extractor", preflightId: input.artifact.taskId });
-      return commitService.commit({ ...input, chapterMemorySkills, factArtifactId: input.factArtifact?.id, narrativeElements: input.factArtifact?.structuredData?.narrativeElements as FactExtractionOutput["narrativeElements"] | undefined, payoffMoments: input.factArtifact?.structuredData?.payoffMoments as FactExtractionOutput["payoffMoments"] | undefined, chapterMemoryDelta: input.factArtifact?.structuredData?.chapterMemory as ChapterStateDelta["chapterMemory"] });
+      return commitService.commit({ ...input, chapterMemorySkills, factArtifactId: input.factArtifact?.id, narrativeElements: input.factArtifact?.structuredData?.narrativeElements as FactExtractionOutput["narrativeElements"] | undefined });
     },
     loadApprovalEvidence: async (input: { workflowId: string; approvalEvidenceId: string }) => {
       const evidence = await deps.repository.getApprovalEvidence(input.workflowId, input.approvalEvidenceId);
@@ -913,7 +901,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
     },
     commitAuthorApproved: async (input: { projectId: string; documentId: string; artifact: Artifact; factArtifact?: Artifact; narrativeOrder?: number; text: string; reviews: Review[]; structuralReport: ManuscriptStructuralReport; baseRevision: number; idempotencyKey: string; approvalEvidenceId: string }) => {
       const chapterMemorySkills = await resolveCurrentSkills({ projectId: input.projectId, executionPoint: "chapter.fact-extraction", role: "fact-extractor", preflightId: input.artifact.taskId });
-      return commitService.commitAuthorApproved({ ...input, chapterMemorySkills, factArtifactId: input.factArtifact?.id, narrativeElements: input.factArtifact?.structuredData?.narrativeElements as FactExtractionOutput["narrativeElements"] | undefined, payoffMoments: input.factArtifact?.structuredData?.payoffMoments as FactExtractionOutput["payoffMoments"] | undefined, chapterMemoryDelta: input.factArtifact?.structuredData?.chapterMemory as ChapterStateDelta["chapterMemory"] });
+      return commitService.commitAuthorApproved({ ...input, chapterMemorySkills, factArtifactId: input.factArtifact?.id, narrativeElements: input.factArtifact?.structuredData?.narrativeElements as FactExtractionOutput["narrativeElements"] | undefined });
     },
     /** P0 #1: 人工事实审批门通过后，批量批准 pending 事实候选（candidate → approved）。
      *  内部同时写回 Qdrant 向量索引，与 recordFactExtraction 模式一致；
@@ -943,26 +931,8 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
     enrichCharacters: async (input: { workflowId: string; projectId: string; documentId: string; revisionId: string; narrativeOrder: number; artifact: Artifact; factArtifact?: Artifact; text: string; routingSnapshot: ModelRoutingSnapshot; candidateStartIndex?: number }): Promise<{ kind: "completed"; result: { entityUpdates: number; knowledgeClaims: number; relationRecords: number } } | { kind: "external"; task: ModelTaskRecord }> => {
       let currentSkills: SkillBundle | undefined;
       try {
-        const extractedCharacters = input.factArtifact?.structuredData?.characterDeltas;
-        let result;
-        if (Array.isArray(extractedCharacters)) {
-          const output = { characters: extractedCharacters };
-          try {
-            validateCharacterEnrichmentOutput(output);
-          } catch (validationError) {
-            console.warn(`[character-enrichment] ChapterStateDelta 无效，回退独立提取：${(validationError as Error).message}`);
-          }
-          if (new Ajv({ allErrors: true, strict: false }).compile(characterEnrichmentSchema)(output)) {
-            result = await persistCharacterEnrichment(
-              { projectId: input.projectId, documentId: input.documentId, revisionId: input.revisionId, narrativeOrder: input.narrativeOrder, artifact: input.artifact },
-              { repository: deps.repository, objects, memoryIndex: deps.memoryIndex },
-              output.characters,
-            );
-          }
-        }
-        if (!result) {
-          currentSkills = await resolveCurrentSkills({ projectId: input.projectId, executionPoint: "character.enrichment", role: "character-enricher" });
-          result = await enrichCharactersFromChapter(
+        currentSkills = await resolveCurrentSkills({ projectId: input.projectId, executionPoint: "character.enrichment", role: "character-enricher" });
+        const result = await enrichCharactersFromChapter(
           {
             projectId: input.projectId,
             documentId: input.documentId,
@@ -979,7 +949,6 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
           },
           { repository: deps.repository, objects, memoryIndex: deps.memoryIndex },
         );
-        }
         return { kind: "completed", result: { entityUpdates: result.entityUpdates, knowledgeClaims: result.knowledgeClaims.length, relationRecords: result.relationRecords } };
       } catch (error) {
         if (!(error instanceof ExternalMcpRequiredError)) throw error;
@@ -1732,6 +1701,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
     approveStoryArcAutomatically: async (input: { projectId: string; arcId: string; artifactId: string; reviewArtifactId: string }) => deps.repository.approveStoryArc(input.projectId, input.arcId, input.artifactId, input.reviewArtifactId, "external-reviewer"),
     failStoryArc: async (input: { projectId: string; arcId: string; reason: string }) => deps.repository.failStoryArc(input.projectId, input.arcId, input.reason),
     failStoryArcBatch: async (input: { projectId: string; arcId: string; batchIndex: number; reason: string }) => deps.repository.failStoryArcBatch(input.projectId, input.arcId, input.batchIndex, input.reason),
+    recoverStoryArcAfterWorkflowCancellation: async (input: { projectId: string; arcId: string }) => deps.repository.recoverStoryArcAfterWorkflowCancellation(input.projectId, input.arcId),
 
     /**
      * 生成架构产出（foundation artifact）。

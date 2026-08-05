@@ -5,17 +5,15 @@ import { ContentObjectStore, type ObjectStoreAdapter } from "./object-store";
 import type { ModelGateway } from "./model-gateway";
 import type { ModelRoutingSnapshot } from "./model-routing";
 import type { MemoryIndex } from "./qdrant-memory";
-import { createChapterMemoryFromRevision, persistChapterMemoryOutput, validateChapterMemoryOutput } from "./chapter-memory";
+import { createChapterMemoryFromRevision } from "./chapter-memory";
 import { evaluateCommitGate } from "./temporal/revision-policy";
-import type { ChapterStateDelta, FactExtractionOutput } from "./prompts/schemas";
+import type { FactExtractionOutput } from "./prompts/schemas";
 import { inspectManuscript, type ManuscriptStructuralReport } from "./application/manuscript-structure";
 
 type CommitDerivedData = {
   structuralReport: ManuscriptStructuralReport;
-  payoffMoments?: FactExtractionOutput["payoffMoments"];
   narrativeElements?: FactExtractionOutput["narrativeElements"];
   narrativeOrder?: number;
-  chapterMemoryDelta?: ChapterStateDelta["chapterMemory"];
   factArtifactId?: string;
   chapterMemorySkills?: SkillBundle;
 };
@@ -113,20 +111,6 @@ export class CommitService {
       }
     }
 
-    if (input.payoffMoments?.length && input.narrativeOrder !== undefined) {
-      try {
-        await this.repository.recordPayoffCurve({
-          projectId: input.projectId,
-          documentId: input.documentId,
-          revisionId: result.revisionId,
-          narrativeOrder: input.narrativeOrder,
-          payoffMoments: input.payoffMoments,
-        });
-      } catch (error) {
-        console.warn(`[commit-service] 爽点曲线写入失败（正文 revision 已提交）：${(error as Error).message}`);
-      }
-    }
-
     // chapter memory 创建：失败不阻塞 commit（revision 已落库），记录到 learning 闭环
     // 设计依据：AGENTS.md「不阻塞 commit」契约 + Phase 1.2 chapter memory 闭环
     // 失败处理：构造 RuntimeLearningAssessmentV2(conclusion=no-shared-learning) 让 learning 闭环感知症状
@@ -143,17 +127,7 @@ export class CommitService {
             artifact: input.artifact,
             skills: input.chapterMemorySkills,
         };
-        let chapterMemoryDelta = input.chapterMemoryDelta;
-        if (chapterMemoryDelta) {
-          try { validateChapterMemoryOutput(chapterMemoryDelta); }
-          catch (error) {
-            console.warn(`[commit-service] ChapterStateDelta 的章节记忆无效，回退独立提取：${(error as Error).message}`);
-            chapterMemoryDelta = undefined;
-          }
-        }
-        chapterMemory = chapterMemoryDelta
-          ? await persistChapterMemoryOutput(memoryInput, { repository: this.repository, objects: this.objects, memoryIndex: this.chapterMemoryDeps.memoryIndex }, chapterMemoryDelta)
-          : await createChapterMemoryFromRevision(
+        chapterMemory = await createChapterMemoryFromRevision(
           {
             ...memoryInput,
             model: this.chapterMemoryDeps.model,

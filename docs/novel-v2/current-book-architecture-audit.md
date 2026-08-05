@@ -42,9 +42,9 @@
 
 三条长线均记录推动者、负责卷、下一次责任、交汇/转化条件和终结条件；`hidden`、`notDesigned`、`open` 三类信息分开保存。长线允许延迟兑现，也允许作者保留未来设计空间。
 
-故事弧层新增 `threadResponsibilities`，把已解析的 `plotThreadRefs` 投影为本弧责任和下一次可验证推进条件。该字段只解决“长线引用存在但弧内没有责任”的阶段传递缺口，不要求每章兑现长线，也不改变正文表达自由。
+故事弧层只保留 `threadResponsibilities`；每条 `threadRef` 同时是剧情线规范 ID、本弧责任和下一次可验证推进条件。该字段只解决“长线引用存在但弧内没有责任”的阶段传递缺口，不要求每章兑现长线，也不改变正文表达自由。
 
-重基线还区分当前待审弧契约与历史批准基线：`currentArc`/当前 blueprint 是弧级审核对象，`approvedArc` 是用于弧级对照的兼容投影，章节权威仍由历史章节证据恢复；历史 artifact 若在契约引入前缺少 `threadResponsibilities`，通过 `legacyArcContractGaps` 标明并投影该缺口，不能把旧空字段误判为当前弧丢失。
+重基线使用符合当前契约的 `approvedArc` 作为弧级审核对象，章节权威仍由历史章节证据恢复；历史 artifact 若缺少 `threadResponsibilities`，迁移后标记为 stale，不能静默推断，必须重新生成并审核。
 
 本轮审计还补上了跨章节状态连续性检查。弧级审核会逆向核对相邻章节之间持续存在的物件、伤势、资源、关系、知识和限制；如果状态从“持有/知道/受伤”跳变为“没有/重新获得/未知”，却没有记录丢失、转移、消耗、恢复或新证据，则作为弧级连续性问题报告。该检查约束可验证的状态转化，不把普通名词扩张成逐章清单，也不要求重写正文。
 
@@ -72,7 +72,7 @@ Foundation 变更会使正在执行的故事弧标记为 `stale`，这是防止�
 
 随后通过正式作者确认入口完成审批。预览中的 6 个冲突均对应已有 final 正文，因而没有创建或更新章节；确认后当前弧为 `approved/active`，第一批次为 `approved`。6 个 final 文档及其 revision 身份保持不变（revision 17-22，最新仍为第 6 章 revision 22）；本轮没有启动正文章节重审，也没有新增正文 revision。当前模型路由已将通过结构化探针的候选优先用于 `review.arc`，并保留其余候选作为回退。
 
-审核 artifact 中的 `authorityChecks.frozenEvidence` 表示历史批准蓝图的冻结基线，`candidateClaims` 表示由当前弧级蓝图确定性投影出的候选覆盖；二者不是同一份正文快照。定稿章节的实际事实仍以 `committedMemory`、`authoritativeFacts` 和正文 revision 身份为准，允许作者在弧级架构层修正陈旧规划而不隐式改写正文；若修正需要改变正文表达，才另行进入正式章节审校闭环。
+审核 artifact 中的 `authorityChecks.frozenEvidence` 表示历史批准蓝图的冻结基线，`candidateClaims` 表示由当前弧级蓝图确定性投影出的候选覆盖；二者不是同一份正文快照。定稿章节的实际事实仍以 `chapterMemory`、`authoritativeFacts` 和正文 revision 身份为准，允许作者在弧级架构层修正陈旧规划而不隐式改写正文；若修正需要改变正文表达，才另行进入正式章节审校闭环。
 
 ## 5. 后续判定规则
 

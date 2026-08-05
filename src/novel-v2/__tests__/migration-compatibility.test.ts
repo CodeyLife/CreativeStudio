@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { Pool } from "pg";
 import { describe, expect, it } from "vitest";
 import { afterAll, beforeAll } from "vitest";
-import { NovelPostgresRepository, V1_MIGRATED_SKILL_IDS, hasCompatibleV1SkillSet } from "../postgres-repository";
+import { isTransientPostgresStartupError, NovelPostgresRepository, V1_MIGRATED_SKILL_IDS, hasCompatibleV1SkillSet } from "../postgres-repository";
 
 const EXPLICIT_TEST_DB_URL = process.env.TEST_DATABASE_URL;
 const TEST_DB_URL = EXPLICIT_TEST_DB_URL ?? "postgresql://ymcp:ymcp@127.0.0.1:5432/ymcp_test";
@@ -57,13 +57,14 @@ describe("017 migration replay", () => {
       await isolated.query("INSERT INTO skill_definitions(skill_id,version,prompt_sections) VALUES($1,'1.0.0','{}'::jsonb)", [`custom-skill-${randomUUID()}`]);
       const before = await isolated.query<{ count: string }>("SELECT count(*)::text AS count FROM skill_definitions");
       expect(before.rows[0].count).toBe("31");
-      await isolated.query("INSERT INTO schema_migrations(version,checksum) VALUES('017_migrate_v1_skills.sql','legacy-checksum')");
+      await isolated.query("INSERT INTO schema_migrations(version,checksum) VALUES('014_migrate_v1_skills.sql','legacy-checksum')");
 
       repository = new NovelPostgresRepository(TEST_DB_URL).forSchema(schemaName);
       await repository.migrate();
       available = true;
     } catch (error) {
-      if (EXPLICIT_TEST_DB_URL) throw error;
+      const cause = error instanceof Error && error.cause ? error.cause : error;
+      if (EXPLICIT_TEST_DB_URL || !isTransientPostgresStartupError(cause)) throw error;
       console.warn(`[migration-compatibility.test] Postgres unavailable: ${(error as Error).message}`);
     }
   }, 30_000);

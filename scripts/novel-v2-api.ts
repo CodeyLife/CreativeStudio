@@ -1041,7 +1041,26 @@ const server = createServer(async (request, response) => {
       if (action === "abandon") {
         const reason = asString(input.reason);
         if (!reason) return send(response, 400, { error: "放弃故事弧必须填写原因" });
-        return send(response, 200, { arc: await repository.abandonStoryArc(projectId, arcId, reason, "web-author") });
+        const result = await repository.withStoryArcWorkflowLock(projectId, arcId, async () => {
+          const activeWorkflowIds = await repository.listActiveStoryArcWorkflowIds(projectId, arcId);
+          const arc = await repository.abandonStoryArc(projectId, arcId, reason, "web-author");
+          const warnings: string[] = [];
+          for (const workflowId of activeWorkflowIds) {
+            try {
+              await temporal.workflow.getHandle(workflowId).cancel();
+            } catch (error) {
+              warnings.push("Temporal 工作流 " + workflowId + " 取消失败，运行时状态已标记为 cancelled");
+              console.warn("[story-arc-abandon] temporal cancel failed", workflowId, error);
+            }
+            await repository.updateWorkflowRunStatus(workflowId, "cancelled", {
+              error: "所属故事弧已放弃",
+              reasonCode: "story-arc-abandoned",
+            }).catch(() => undefined);
+            await repository.expireWorkflowModelTasks(workflowId, "所属故事弧已放弃").catch(() => undefined);
+          }
+          return { arc, cancelledWorkflowIds: activeWorkflowIds, warnings };
+        });
+        return send(response, 200, result);
       }
       const preview = await repository.previewStoryArcApproval(projectId, arcId);
       if (input.confirm !== true) return send(response, 200, { preview });

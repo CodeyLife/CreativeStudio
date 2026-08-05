@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { normalizeStoryArcRebaseBundle, parseStoryArcBundle, projectChapterForExecution, projectLegacyArcContractForReview, validateStoryArcExecutionContracts, validateStoryArcPlanContracts, validateStoryArcRebaseBundle, type StoryArcBundle, type StoryArcRebaseTarget } from "../application/story-arc";
+import { normalizeStoryArcRebaseBundle, parseStoryArcBundle, projectChapterForExecution, validateStoryArcExecutionContracts, validateStoryArcPlanContracts, validateStoryArcRebaseBundle, type StoryArcBundle, type StoryArcRebaseTarget } from "../application/story-arc";
 import { normalizeStoryArcReviewAuthority, validateStoryArcReview } from "../application/story-arc-review-policy";
 
 const bundle: StoryArcBundle = {
@@ -11,7 +11,7 @@ const bundle: StoryArcBundle = {
     development: ["抵达", "试探"],
     resolution: "确认旧案仍在影响当下",
     exitState: "决定继续查证",
-    plotThreadRefs: [],
+    threadResponsibilities: [],
     foreshadowingRefs: [],
     expectedChapterCount: 1,
     phases: [],
@@ -44,23 +44,10 @@ describe("story arc blueprint subtraction contract", () => {
     expect(projection.scenes[0].opposition).toBeUndefined();
   });
 
-  it("requires every referenced plot thread to carry an arc-level responsibility", () => {
-    const arc = { ...bundle.arc, plotThreadRefs: ["thread-a"], threadResponsibilities: [{ threadRef: "thread-a", responsibility: "保持线索压力并观察新的证据", nextAdvance: "出现与旧证据矛盾的可验证信息" }] };
+  it("validates arc responsibilities as the sole source of referenced plot threads", () => {
+    const arc = { ...bundle.arc, threadResponsibilities: [{ threadRef: "thread-a", responsibility: "保持线索压力并观察新的证据", nextAdvance: "出现与旧证据矛盾的可验证信息" }] };
     expect(() => validateStoryArcPlanContracts(arc)).not.toThrow();
-    expect(() => validateStoryArcPlanContracts({ ...arc, threadResponsibilities: [] })).toThrow("缺少剧情线阶段责任");
-  });
-
-  it("projects a newly introduced arc contract into a legacy review baseline without changing chapter authority", () => {
-    const currentArc = {
-      ...bundle.arc,
-      plotThreadRefs: ["thread:current"],
-      threadResponsibilities: [{ threadRef: "thread:current", responsibility: "保持阶段压力", nextAdvance: "出现可验证的新证据" }],
-    };
-    const approvedArc = { ...bundle.arc, title: "历史批准弧", plotThreadRefs: ["旧版剧情线名称"] };
-    const projected = projectLegacyArcContractForReview({ approvedArc, currentArc, legacyArcContractGaps: ["threadResponsibilities"] });
-    expect(projected.title).toBe("历史批准弧");
-    expect(projected.plotThreadRefs).toEqual(["thread:current"]);
-    expect(projected.threadResponsibilities).toEqual(currentArc.threadResponsibilities);
+    expect(() => validateStoryArcPlanContracts({ ...arc, threadResponsibilities: [{ ...arc.threadResponsibilities[0], threadRef: "" }] })).toThrow("threadRef");
   });
 
   it("preserves legacy frozen scene shape during rebase without weakening new candidates", () => {
@@ -81,7 +68,7 @@ describe("story arc blueprint subtraction contract", () => {
         title: "历史场景",
         revisionId: "revision-1",
         committedBlueprint: legacyFrozen,
-        approvedPlan: { sceneEvents: [], continuityConstraints: [], setupRefs: [], payoffRefs: [] },
+        chapterMemory: { summary: "history", keyEvents: [], characterStates: [], unresolvedThreads: ["ledger boundary"] },
         authoritativeFacts: [],
       }],
     };
@@ -105,8 +92,7 @@ describe("story arc blueprint subtraction contract", () => {
         title: "旧宅夜谈",
         revisionId: "revision-1",
         committedBlueprint: bundle.chapters[0],
-        approvedPlan: { sceneEvents: [], continuityConstraints: [], setupRefs: [], payoffRefs: [] },
-        committedMemory: { summary: "history", keyEvents: [], characterStates: [], unresolvedThreads: ["ledger boundary"] },
+        chapterMemory: { summary: "history", keyEvents: [], characterStates: [], unresolvedThreads: ["ledger boundary"] },
         authoritativeFacts: [],
       }],
     };

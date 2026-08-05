@@ -3,7 +3,7 @@ import type { ChapterPlanningContext } from "../application/story-arc";
 import { dedupeNarrativeRhythmMemory, memoryClaimPriority, renderChapterExecutionContract, renderExecutionMemoryClaim, renderNarrativeRhythm } from "./chapter-planning-context";
 import { buildBlueprintSummary } from "./chapter-review";
 import { compileStageContext } from "../stage-context";
-import { buildSkillContextSections, skillPromptSection } from "../skill-runtime";
+import { buildSkillContextSections } from "../skill-runtime";
 
 export interface DraftPromptInput {
   intent: NovelIntent;
@@ -13,7 +13,6 @@ export interface DraftPromptInput {
   planningContext?: ChapterPlanningContext;
   /** 历史调用可继续传入；新的正文提示词不消费全书规划全文。 */
   foundationArtifacts?: Artifact[];
-  instructionsOnly?: boolean;
 }
 
 function renderFoundationValue(value: unknown): string {
@@ -66,23 +65,6 @@ export function buildFoundationContextMarkdown(foundationArtifacts: Artifact[]):
   }).join("\n\n");
 }
 
-function renderMemory(memory: MemoryBundle): string {
-  const projected = dedupeNarrativeRhythmMemory(memory);
-  if (!projected.claims.length) return "- 暂无冻结记忆。";
-  return projected.claims.map((claim) => {
-    const source = claim.sourceRevisionIds.length ? ` 来源：${claim.sourceRevisionIds.join(",")}` : "";
-    return `- [${claim.authority}/${claim.kind}] ${renderExecutionMemoryClaim(claim).title}：${renderExecutionMemoryClaim(claim).text}${source}`;
-  }).join("\n");
-}
-
-function renderSkills(skills: SkillBundle): string {
-  if (!skills.skills.length) return "- 无额外写作技能。";
-  return skills.skills.map((skill) => {
-    const section = skillPromptSection(skill, "chapter.drafting");
-    return section ? `### ${skill.skillId}@${skill.version}\n${section}` : "";
-  }).filter(Boolean).join("\n\n") || "- 无额外写作技能。";
-}
-
 function renderIntent(intent: NovelIntent): string {
   return [
     `创作目标：${intent.objective.trim() || "完成当前章节"}`,
@@ -100,34 +82,6 @@ function buildWritingContract(): string {
   ].join("\n");
 }
 
-export function buildChapterDraftPrompt(input: DraftPromptInput): string {
-  const sections = [
-    buildWritingContract(),
-    "",
-    "## 当前章节执行合同",
-    input.planningContext ? renderChapterExecutionContract(input.planningContext) : "未提供章节合同；只依据冻结事实和作者目标写作。",
-    "",
-    "## 工作流蓝图引用",
-    buildBlueprintSummary(input.blueprint, input.planningContext),
-  ];
-  if (input.instructionsOnly) return sections.join("\n");
-  sections.push(
-    "",
-    "## 作者目标",
-    renderIntent(input.intent),
-    "",
-    "## 冻结事实与记忆",
-    renderMemory(input.memory),
-    "",
-    "## 连续章节位置",
-    renderNarrativeRhythm(input.memory.narrativeRhythm),
-    "",
-    "## 写作技能",
-    renderSkills(input.skills),
-  );
-  return sections.join("\n");
-}
-
 export function dedupeDraftMemory(input: DraftPromptInput): MemoryBundle {
   const rhythmMemory = dedupeNarrativeRhythmMemory(input.memory);
   const directArtifactIds = new Set((input.foundationArtifacts ?? []).map((artifact) => artifact.id));
@@ -141,6 +95,7 @@ export function buildChapterDraftPromptPackage(input: DraftPromptInput & { workf
   const instruction = buildWritingContract();
   const sections = [
     { id: "draft-contract", kind: "goal" as const, title: "正文写作契约", text: instruction, priority: "critical" as const, provenanceRefs: [input.intent.id] },
+    { id: "author-intent", kind: "goal" as const, title: "作者目标", text: renderIntent(input.intent), priority: "required" as const, provenanceRefs: [input.intent.id] },
     ...(input.planningContext ? [{ id: "execution-contract", kind: "planning" as const, title: "章节执行合同", text: renderChapterExecutionContract(input.planningContext), priority: "required" as const, provenanceRefs: [input.planningContext.fingerprint] }] : []),
     { id: "blueprint", kind: "blueprint" as const, title: "工作流蓝图引用", text: buildBlueprintSummary(input.blueprint, input.planningContext), priority: "normal" as const, provenanceRefs: [input.blueprint.id] },
     ...memory.claims.map((claim) => ({ id: `memory:${claim.id}`, kind: "fact" as const, title: `冻结事实：${claim.title}`, text: renderExecutionMemoryClaim(claim).text, priority: memoryClaimPriority(memory, claim), provenanceRefs: [claim.id, ...claim.sourceRevisionIds] })),

@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
 import { auditMigrations, migrationChecksum } from "../migrations";
+
+const subtractionMigration = readFileSync(new URL("../../../deploy/postgres/041_workflow_subtraction.sql", import.meta.url), "utf8");
 
 const files = [
   { version: "001_initial.sql", checksum: migrationChecksum("CREATE TABLE initial;\n") },
@@ -7,6 +10,16 @@ const files = [
 ];
 
 describe("migration audit", () => {
+  it("declares the schema subtraction as an append-only migration", () => {
+    expect(subtractionMigration).toContain("DROP TABLE IF EXISTS payoff_curve");
+    expect(subtractionMigration).toContain("DROP COLUMN IF EXISTS blueprint");
+    expect(subtractionMigration).toContain("DROP COLUMN IF EXISTS blueprint_fingerprint");
+    expect(subtractionMigration).toContain("DROP COLUMN IF EXISTS source_artifact_id");
+    expect(subtractionMigration).toContain("needs-restart");
+    expect(subtractionMigration).toContain("thread-responsibilities-required-after-schema-subtraction");
+    expect(subtractionMigration).toContain("payload - ARRAY");
+  });
+
   it("accepts a declared historical alias without treating it as an unknown migration", () => {
     const result = auditMigrations(files, [
       { version: "001_initial.sql", checksum: files[0].checksum },
@@ -28,6 +41,18 @@ describe("migration audit", () => {
     expect(result.checksumMismatches).toEqual([{ version: "001_initial.sql", expected: files[0].checksum, actual: "changed" }]);
     expect(result.unexpectedApplied).toEqual(["003_unknown.sql"]);
     expect(result.duplicateOrdinals).toEqual([]);
+  });
+
+  it("accepts only an explicitly declared historical checksum alias", () => {
+    const result = auditMigrations(files, [
+      { version: "001_initial.sql", checksum: "historical-checksum" },
+      { version: "002_followup.sql", checksum: files[1].checksum },
+    ], {
+      checksumAliases: [{ version: "001_initial.sql", checksum: "historical-checksum", reason: "approved historical source revision" }],
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.checksumMismatches).toEqual([]);
   });
 
   it("reports missing files without inventing an applied record", () => {

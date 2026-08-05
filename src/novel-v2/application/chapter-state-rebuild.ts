@@ -68,8 +68,8 @@ export class ChapterStateRebuildService {
       taskId: factArtifact.taskId,
       skillBundle,
     });
-    const chapterMemorySkills = extracted.chapterMemory ? undefined : await resolveStageSkillBundle({ projectId, provider: this.deps.skillProvider, executionPoint: "chapter.fact-extraction", role: "fact-extractor", preflightId: `${workflowId}:chapter-memory` });
-    const chapterMemoryOutput = extracted.chapterMemory ?? await generateChapterMemoryOutput({
+    const chapterMemorySkills = await resolveStageSkillBundle({ projectId, provider: this.deps.skillProvider, executionPoint: "chapter.fact-extraction", role: "fact-extractor", preflightId: `${workflowId}:chapter-memory` });
+    const chapterMemoryOutput = await generateChapterMemoryOutput({
       projectId,
       documentId,
       revisionId: source.sourceRevisionId,
@@ -95,7 +95,6 @@ export class ChapterStateRebuildService {
       artifact: factArtifact,
       narrativeOrder: source.narrativeOrder,
       narrativeElements: extracted.narrativeElements,
-      payoffMoments: extracted.payoffMoments,
       chapterMemory,
     });
 

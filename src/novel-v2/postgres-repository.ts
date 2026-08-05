@@ -56,7 +56,7 @@ import type { ObjectStoreIdentity } from "./object-store";
 import { normalizeManuscriptStructuralReview } from "./application/manuscript-structure";
 import { auditNamedReferences, auditStoryArcBatchRanges, canonicalReferenceId, normalizeThreadResponsibilityReferences, resolveNamedReference, type NamedReferenceCandidate, type StoryArcIntegrityIssue } from "./application/story-arc-integrity";
 import { auditFullBookArchitecture } from "./application/full-book-architecture";
-import { CHAPTER_NARRATIVE_FUNCTIONS, canGenerateNextStoryArcBatch, compileChapterPlanValidationReport, normalizeChapterPlanningContext, parseStoryArcBundle, parseStoryArcPlan, planningContextFingerprint, projectLegacyArcContractForReview, validateStoryArcPlanContracts, type ArcPlanningStatus, type ChapterBlueprint, type ChapterBlueprintRecord, type ChapterPlanningContext, type ChapterSceneBlueprint, type NarrativeArcPlan, type StoryArcBatchRecord, type StoryArcBundle, type StoryArcContextReceipt, type StoryArcRebaseTarget, type StoryArcRecord } from "./application/story-arc";
+import { CHAPTER_NARRATIVE_FUNCTIONS, canGenerateNextStoryArcBatch, compileChapterPlanValidationReport, normalizeChapterPlanningContext, parseStoryArcBundle, parseStoryArcPlan, planningContextFingerprint, validateStoryArcPlanContracts, type ArcPlanningStatus, type ChapterBlueprint, type ChapterBlueprintRecord, type ChapterPlanningContext, type ChapterSceneBlueprint, type NarrativeArcPlan, type StoryArcBatchRecord, type StoryArcBundle, type StoryArcContextReceipt, type StoryArcRebaseTarget, type StoryArcRecord } from "./application/story-arc";
 import type { StoryArcReviewOutput } from "./prompts/story-arc";
 import { aggregateChapterReviews, reviewIssueFingerprint, type ChapterReviewIssueStatus } from "./chapter-review-snapshot";
 import {
@@ -358,6 +358,52 @@ export class NovelPostgresRepository {
       ...this.connectionConfig,
       options: `-c search_path=${schemaName},pg_catalog`,
     });
+  }
+
+  /**
+   * Serialize every planning/review/next-batch admission for one story arc.
+   * The lock is held through workflow registration and Temporal start so a
+   * second request cannot pass the status check while the first is in flight.
+   */
+  async withStoryArcWorkflowLock<T>(projectId: string, arcId: string, callback: () => Promise<T>): Promise<T> {
+    const client = await this.pool.connect();
+    const lockKey = `ymcp-novel-v2:story-arc:${projectId}:${arcId}`;
+    try {
+      await client.query("SELECT pg_advisory_lock(hashtext($1))", [lockKey]);
+      return await callback();
+    } finally {
+      await client.query("SELECT pg_advisory_unlock(hashtext($1))", [lockKey]).catch(() => undefined);
+      client.release();
+    }
+  }
+
+  async listActiveStoryArcWorkflowIds(projectId: string, arcId: string): Promise<string[]> {
+    const result = await this.pool.query<{ temporal_workflow_id: string }>(
+      `SELECT temporal_workflow_id
+       FROM workflow_runs
+       WHERE project_id=$1
+         AND workflow_type='story-arc-planning'
+         AND payload->>'arcId'=$2
+         AND status IN ('accepted','running','waiting-external','manual-review-required')
+       ORDER BY updated_at DESC, temporal_workflow_id`,
+      [projectId, arcId],
+    );
+    return result.rows.map((row) => row.temporal_workflow_id);
+  }
+
+  private async assertNoActiveStoryArcWorkflow(client: Pool | PoolClient, projectId: string, arcId: string): Promise<void> {
+    const result = await client.query<{ temporal_workflow_id: string }>(
+      `SELECT temporal_workflow_id
+       FROM workflow_runs
+       WHERE project_id=$1
+         AND workflow_type='story-arc-planning'
+         AND payload->>'arcId'=$2
+         AND status IN ('accepted','running','waiting-external','manual-review-required')
+       ORDER BY updated_at DESC
+       LIMIT 1`,
+      [projectId, arcId],
+    );
+    if (result.rowCount) throw new Error(`故事弧已有活动工作流：${result.rows[0].temporal_workflow_id}`);
   }
 
   async migrate(migrationsDir = process.env.NOVEL_V2_MIGRATIONS_DIR ?? join(process.cwd(), "deploy", "postgres")) {
@@ -1400,18 +1446,15 @@ export class NovelPostgresRepository {
     }));
   }
 
-  async upsertChapterProductionSpec(input: { projectId: string; documentId: string; chapterGoal?: string; blueprint?: Record<string, unknown>; blueprintFingerprint?: string; sourceArtifactId?: string }) {
+  async upsertChapterProductionSpec(input: { projectId: string; documentId: string; chapterGoal?: string }) {
     const result = await this.pool.query(`
-      INSERT INTO chapter_production_specs(document_id,project_id,chapter_goal,blueprint,blueprint_fingerprint,source_artifact_id)
-      VALUES($1,$2,$3,$4,$5,$6)
+      INSERT INTO chapter_production_specs(document_id,project_id,chapter_goal)
+      VALUES($1,$2,$3)
       ON CONFLICT(document_id) DO UPDATE SET
-        chapter_goal=CASE WHEN $7::boolean THEN EXCLUDED.chapter_goal ELSE chapter_production_specs.chapter_goal END,
-        blueprint=CASE WHEN $8::boolean THEN EXCLUDED.blueprint ELSE chapter_production_specs.blueprint END,
-        blueprint_fingerprint=CASE WHEN $8::boolean THEN EXCLUDED.blueprint_fingerprint ELSE chapter_production_specs.blueprint_fingerprint END,
-        source_artifact_id=CASE WHEN $8::boolean THEN EXCLUDED.source_artifact_id ELSE chapter_production_specs.source_artifact_id END,
+        chapter_goal=CASE WHEN $4::boolean THEN EXCLUDED.chapter_goal ELSE chapter_production_specs.chapter_goal END,
         updated_at=now()
-      RETURNING document_id,project_id,chapter_goal,blueprint,blueprint_fingerprint,source_artifact_id,updated_at
-    `, [input.documentId, input.projectId, input.chapterGoal ?? "", JSON.stringify(input.blueprint ?? {}), input.blueprintFingerprint ?? "", input.sourceArtifactId ?? null, input.chapterGoal !== undefined, input.blueprint !== undefined]);
+      RETURNING document_id,project_id,chapter_goal,updated_at
+    `, [input.documentId, input.projectId, input.chapterGoal ?? "", input.chapterGoal !== undefined]);
     return result.rows[0];
   }
 
@@ -1419,13 +1462,15 @@ export class NovelPostgresRepository {
     const document = await this.pool.query(`
       SELECT d.id,d.project_id,d.title,d.narrative_order,d.pov_character_id,d.current_revision_id,d.status,d.created_at,d.updated_at,
         mr.revision,mr.content_hash,cb.object_key,cb.byte_length,
-        cps.chapter_goal,cps.blueprint,cps.blueprint_fingerprint,cps.updated_at AS spec_updated_at,
+        cps.chapter_goal,ch.payload AS chapter_payload,ba.fingerprint AS chapter_blueprint_fingerprint,cps.updated_at AS spec_updated_at,
         crs.id AS review_id,crs.revision_id AS reviewed_revision_id,crs.reviewed_content_hash,crs.artifact_fingerprint,
         crs.source_workflow_id,crs.verdict,crs.complete,crs.overall_score,crs.dimension_scores,crs.reviewer_roles,crs.reviewed_at
       FROM manuscript_documents d
       LEFT JOIN manuscript_revisions mr ON mr.id=d.current_revision_id
       LEFT JOIN content_blobs cb ON cb.content_hash=mr.content_hash
       LEFT JOIN chapter_production_specs cps ON cps.document_id=d.id
+      LEFT JOIN chapters ch ON ch.document_id=d.id AND ch.project_id=d.project_id
+      LEFT JOIN artifacts ba ON ba.id=ch.source_artifact_id
       LEFT JOIN chapter_review_snapshots crs ON crs.document_id=d.id
       WHERE d.project_id=$1 AND d.id=$2
     `, [projectId, documentId]);
@@ -1450,7 +1495,7 @@ export class NovelPostgresRepository {
         createdAt: iso(row.created_at), updatedAt: iso(row.updated_at),
       },
       content: row.current_revision_id ? { revisionId: row.current_revision_id, revision: Number(row.revision), contentHash: row.content_hash, objectKey: row.object_key, byteLength: Number(row.byte_length ?? 0) } : undefined,
-      spec: { chapterGoal: row.chapter_goal ?? "", blueprint: row.blueprint ?? {}, blueprintFingerprint: row.blueprint_fingerprint ?? "", updatedAt: row.spec_updated_at ? iso(row.spec_updated_at) : undefined },
+      spec: { chapterGoal: row.chapter_goal ?? "", blueprint: row.chapter_payload ?? {}, blueprintFingerprint: row.chapter_blueprint_fingerprint ?? canonicalSha256(row.chapter_payload ?? {}), updatedAt: row.spec_updated_at ? iso(row.spec_updated_at) : undefined },
       review: row.review_id ? {
         id: row.review_id, revisionId: row.reviewed_revision_id ?? undefined, reviewedContentHash: row.reviewed_content_hash,
         artifactFingerprint: row.artifact_fingerprint, sourceWorkflowId: row.source_workflow_id ?? undefined, verdict: row.verdict,
@@ -2680,7 +2725,7 @@ export class NovelPostgresRepository {
       const ordinalResult = await client.query<{ ordinal: number }>("SELECT COALESCE(MAX(ordinal),0)+1 AS ordinal FROM arcs WHERE project_id=$1", [input.projectId]);
       const ordinal = Number(ordinalResult.rows[0]?.ordinal ?? 1);
       arcId = randomUUID();
-      const payload = { title: `故事弧 ${ordinal}`, objective: input.authorIntent || "依据当前宏观规划和已定稿故事状态，形成一个完整的小故事", entryState: "", centralConflict: "", development: [], resolution: "", exitState: "", plotThreadRefs: [], threadResponsibilities: [], foreshadowingRefs: [], expectedChapterCount: 0, phases: [], workflowId: input.workflowId };
+      const payload = { title: `故事弧 ${ordinal}`, objective: input.authorIntent || "依据当前宏观规划和已定稿故事状态，形成一个完整的小故事", entryState: "", centralConflict: "", development: [], resolution: "", exitState: "", threadResponsibilities: [], foreshadowingRefs: [], expectedChapterCount: 0, phases: [], workflowId: input.workflowId };
       await client.query(
         `INSERT INTO arcs(id,volume_id,project_id,title,ordinal,planning_status,execution_status,payload)
          VALUES($1,$2,$3,$4,$5,'generating','planned',$6)`,
@@ -2865,7 +2910,12 @@ export class NovelPostgresRepository {
     const threadCandidates: NamedReferenceCandidate[] = threads.rows.map((row) => ({ id: row.id, labels: [row.title, ...labels(row.payload)] }));
     const foreshadowingCandidates: NamedReferenceCandidate[] = foreshadowing.rows.map((row) => ({ id: row.id, labels: labels(row.payload) }));
     const referenceReports = arcs.rows.map((arc) => {
-      const plotThreadAudit = auditNamedReferences(Array.isArray(arc.payload?.plotThreadRefs) ? arc.payload.plotThreadRefs.filter((value): value is string => typeof value === "string") : [], threadCandidates);
+      const plotThreadAudit = auditNamedReferences(
+        Array.isArray(arc.payload?.threadResponsibilities)
+          ? arc.payload.threadResponsibilities.flatMap((value) => value && typeof value === "object" && !Array.isArray(value) && typeof (value as unknown as Record<string, unknown>).threadRef === "string" ? [(value as unknown as Record<string, unknown>).threadRef as string] : [])
+          : [],
+        threadCandidates,
+      );
       const foreshadowingAudit = auditNamedReferences(Array.isArray(arc.payload?.foreshadowingRefs) ? arc.payload.foreshadowingRefs.filter((value): value is string => typeof value === "string") : [], foreshadowingCandidates);
       return {
         arcId: arc.id,
@@ -2975,9 +3025,12 @@ export class NovelPostgresRepository {
         return [...new Set(result)];
       };
       const payload = arcResult.rows[0].payload ?? {};
+      const rawPayload = payload as unknown as Record<string, unknown>;
       const threadCandidates = threads.rows.map((row) => ({ id: row.id, labels: [row.title, ...labels(row.payload)] }));
-      const plotThreadRefs = await normalize("thread", Array.isArray(payload.plotThreadRefs) ? payload.plotThreadRefs : [], threadCandidates);
       const originalResponsibilities = Array.isArray(payload.threadResponsibilities) ? payload.threadResponsibilities : [];
+      if (Object.prototype.hasOwnProperty.call(rawPayload, "plotThreadRefs")) {
+        throw new Error("故事弧仍包含已删除的 plotThreadRefs；请按当前契约重新生成并审核故事弧");
+      }
       const threadResponsibilities = normalizeThreadResponsibilityReferences(
         originalResponsibilities,
         threadCandidates,
@@ -2989,8 +3042,8 @@ export class NovelPostgresRepository {
         }
       });
       const foreshadowingRefs = await normalize("foreshadowing", Array.isArray(payload.foreshadowingRefs) ? payload.foreshadowingRefs : [], foreshadowing.rows.map((row) => ({ id: row.id, labels: labels(row.payload) })));
-      const normalizedPayload = { ...payload, plotThreadRefs, threadResponsibilities, foreshadowingRefs };
-      validateStoryArcPlanContracts(normalizedPayload);
+      const normalizedPayload = { ...rawPayload, threadResponsibilities, foreshadowingRefs };
+      validateStoryArcPlanContracts(parseStoryArcPlan(normalizedPayload));
       await client.query("UPDATE arcs SET payload=$3,updated_at=now() WHERE id=$1 AND project_id=$2", [arcId, projectId, normalizedPayload]);
       await client.query(
         "INSERT INTO audit_records(project_id,actor,action,aggregate_type,aggregate_id,payload) VALUES($1,$2,'story-arc.references-normalized','story-arc',$3,$4)",
@@ -3260,7 +3313,6 @@ export class NovelPostgresRepository {
           await client.query("UPDATE promises SET status='open' WHERE id IN (SELECT promise_id FROM payoffs WHERE revision_id=ANY($1::text[]) AND promise_id IS NOT NULL)", [removedRevisionIds]);
           await client.query("UPDATE foreshadowing SET status='open',payoff_revision_id=NULL WHERE project_id=$1 AND payoff_revision_id=ANY($2::text[])", [projectId, removedRevisionIds]);
           await client.query("DELETE FROM payoffs WHERE revision_id=ANY($1::text[])", [removedRevisionIds]);
-          await client.query("DELETE FROM payoff_curve WHERE project_id=$1 AND (document_id=ANY($2::text[]) OR revision_id=ANY($3::text[]))", [projectId, documentIds, removedRevisionIds]);
           await client.query("DELETE FROM foreshadowing WHERE project_id=$1 AND planted_revision_id=ANY($2::text[])", [projectId, removedRevisionIds]);
           await client.query("DELETE FROM promises WHERE project_id=$1 AND source_revision_id=ANY($2::text[])", [projectId, removedRevisionIds]);
           await client.query("DELETE FROM timeline_events WHERE project_id=$1 AND source_revision_id=ANY($2::text[])", [projectId, removedRevisionIds]);
@@ -3305,6 +3357,7 @@ export class NovelPostgresRepository {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
+      await this.assertNoActiveStoryArcWorkflow(client, projectId, arcId);
       const arc = await client.query<ArcRow>("SELECT * FROM arcs WHERE id=$1 AND project_id=$2 FOR UPDATE", [arcId, projectId]);
       if (!arc.rowCount || arc.rows[0].planning_status !== "approved" || arc.rows[0].execution_status !== "active") throw new Error("故事弧当前不可生成下一批次");
       const batches = await client.query<StoryArcBatchRow>("SELECT * FROM story_arc_batches WHERE arc_id=$1 ORDER BY batch_index FOR UPDATE", [arcId]);
@@ -3340,6 +3393,7 @@ export class NovelPostgresRepository {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
+      await this.assertNoActiveStoryArcWorkflow(client, projectId, arcId);
       const arc = await client.query<ArcRow>("SELECT * FROM arcs WHERE id=$1 AND project_id=$2 FOR UPDATE", [arcId, projectId]);
       if (!arc.rowCount || arc.rows[0].planning_status !== "approved" || arc.rows[0].execution_status !== "active") throw new Error("故事弧当前不可重试批次");
       const batches = await client.query<StoryArcBatchRow>("SELECT * FROM story_arc_batches WHERE arc_id=$1 AND project_id=$2 ORDER BY batch_index FOR UPDATE", [arcId, projectId]);
@@ -3431,28 +3485,16 @@ export class NovelPostgresRepository {
         const documentId = randomUUID();
         await client.query("INSERT INTO manuscript_documents(id,project_id,title,narrative_order,pov_character_id,status) VALUES($1,$2,$3,$4,$5,'planned')", [documentId, projectId, blueprint.title, blueprint.globalOrder, blueprint.povCharacterId ?? null]);
         await client.query("UPDATE chapters SET document_id=$2,updated_at=now() WHERE id=$1", [blueprint.id, documentId]);
-        const source = blueprint.sourceArtifactId ? await client.query<{ fingerprint: string }>("SELECT fingerprint FROM artifacts WHERE id=$1", [blueprint.sourceArtifactId]) : { rows: [] };
-        await client.query(`INSERT INTO chapter_production_specs(document_id,project_id,chapter_goal,blueprint,blueprint_fingerprint,source_artifact_id)
-          VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(document_id) DO UPDATE SET chapter_goal=EXCLUDED.chapter_goal,blueprint=EXCLUDED.blueprint,blueprint_fingerprint=EXCLUDED.blueprint_fingerprint,source_artifact_id=EXCLUDED.source_artifact_id,updated_at=now()`,
-        [documentId, projectId, blueprint.stateTransition.evidence, chapter.rows[0].payload, source.rows[0]?.fingerprint ?? "", blueprint.sourceArtifactId ?? null]);
       }
       for (const item of preview.updates) {
         const chapter = await client.query<ChapterBlueprintRow>("SELECT id,arc_id,project_id,document_id,title,ordinal,status,payload,source_artifact_id,blueprint_revision FROM chapters WHERE id=$1", [item.chapterId]);
         const blueprint = chapterBlueprintFromRow(chapter.rows[0]);
         await client.query("UPDATE manuscript_documents SET title=$3,pov_character_id=$4,updated_at=now() WHERE id=$1 AND project_id=$2 AND status='planned' AND current_revision_id IS NULL", [item.documentId, projectId, blueprint.title, blueprint.povCharacterId ?? null]);
-        const source = blueprint.sourceArtifactId ? await client.query<{ fingerprint: string }>("SELECT fingerprint FROM artifacts WHERE id=$1", [blueprint.sourceArtifactId]) : { rows: [] };
-        await client.query(`INSERT INTO chapter_production_specs(document_id,project_id,chapter_goal,blueprint,blueprint_fingerprint,source_artifact_id)
-          VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(document_id) DO UPDATE SET chapter_goal=EXCLUDED.chapter_goal,blueprint=EXCLUDED.blueprint,blueprint_fingerprint=EXCLUDED.blueprint_fingerprint,source_artifact_id=EXCLUDED.source_artifact_id,updated_at=now()`,
-        [item.documentId, projectId, blueprint.stateTransition.evidence, chapter.rows[0].payload, source.rows[0]?.fingerprint ?? "", blueprint.sourceArtifactId ?? null]);
       }
       for (const item of preview.conflicts) {
         const chapter = await client.query<ChapterBlueprintRow>("SELECT id,arc_id,project_id,document_id,title,ordinal,status,payload,source_artifact_id,blueprint_revision FROM chapters WHERE id=$1", [item.chapterId]);
         const blueprint = chapterBlueprintFromRow(chapter.rows[0]);
         await client.query("UPDATE manuscript_documents SET title=$3,pov_character_id=$4,updated_at=now() WHERE id=$1 AND project_id=$2", [item.documentId, projectId, blueprint.title, blueprint.povCharacterId ?? null]);
-        const source = blueprint.sourceArtifactId ? await client.query<{ fingerprint: string }>("SELECT fingerprint FROM artifacts WHERE id=$1", [blueprint.sourceArtifactId]) : { rows: [] };
-        await client.query(`INSERT INTO chapter_production_specs(document_id,project_id,chapter_goal,blueprint,blueprint_fingerprint,source_artifact_id)
-          VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(document_id) DO UPDATE SET chapter_goal=EXCLUDED.chapter_goal,blueprint=EXCLUDED.blueprint,blueprint_fingerprint=EXCLUDED.blueprint_fingerprint,source_artifact_id=EXCLUDED.source_artifact_id,updated_at=now()`,
-        [item.documentId, projectId, blueprint.stateTransition.evidence, chapter.rows[0].payload, source.rows[0]?.fingerprint ?? "", blueprint.sourceArtifactId ?? null]);
       }
       await client.query("UPDATE arcs SET planning_status='approved',execution_status=CASE WHEN execution_status='completed' THEN 'completed' ELSE 'active' END,context_fingerprint=$3,review_artifact_id=$4,review_fingerprint=$5,approved_at=now(),updated_at=now() WHERE id=$1 AND project_id=$2", [arcId, projectId, contextFingerprint, reviewArtifactId, reviewArtifact.fingerprint]);
       await client.query("UPDATE story_arc_batches SET status='approved',approved_at=now(),updated_at=now() WHERE arc_id=$1 AND project_id=$2 AND status='awaiting-review'", [arcId, projectId]);
@@ -3475,6 +3517,7 @@ export class NovelPostgresRepository {
   }
 
   async markStoryArcGenerating(projectId: string, arcId: string, actor: string, options: { workflowId?: string } = {}) {
+    await this.assertNoActiveStoryArcWorkflow(this.pool, projectId, arcId);
     const payloadPatch = {
       ...(options.workflowId ? { workflowId: options.workflowId } : {}),
     };
@@ -3628,10 +3671,9 @@ export class NovelPostgresRepository {
       approved_blueprint: Record<string, unknown> | null;
     }>(
       `SELECT c.id AS chapter_id,c.document_id,c.ordinal AS global_order,d.title AS document_title,
-              d.current_revision_id,cps.blueprint AS approved_blueprint
+              d.current_revision_id,c.payload AS approved_blueprint
        FROM chapters c
        JOIN manuscript_documents d ON d.id=c.document_id AND d.project_id=c.project_id
-       LEFT JOIN chapter_production_specs cps ON cps.document_id=d.id AND cps.project_id=d.project_id
        WHERE c.project_id=$1 AND c.arc_id=$2
        ORDER BY c.ordinal`,
       [projectId, arcId],
@@ -3672,13 +3714,9 @@ export class NovelPostgresRepository {
       && !Array.isArray((approvedArtifact.structuredData as Record<string, unknown>).arc)
       ? (approvedArtifact.structuredData as Record<string, unknown>).arc as Record<string, unknown>
       : undefined;
-    const legacyArcContractGaps = approvedStructuredArc
-      && arc.arc.plotThreadRefs.length > 0
-      && arc.arc.threadResponsibilities?.length
-      && !Object.prototype.hasOwnProperty.call(approvedStructuredArc, "threadResponsibilities")
-      ? ["threadResponsibilities"]
-      : [];
-    const reviewApprovedArc = projectLegacyArcContractForReview({ approvedArc, currentArc: arc.arc, legacyArcContractGaps });
+    if (approvedStructuredArc && !Object.prototype.hasOwnProperty.call(approvedStructuredArc, "threadResponsibilities")) {
+      throw new Error("故事弧批准记录缺少 threadResponsibilities，已标记为 stale；请重新生成并审核故事弧");
+    }
     const batch = arc.batches[0];
     const startChapterIndex = batch?.startChapterIndex ?? Number(rows.rows[0].global_order);
 
@@ -3694,8 +3732,6 @@ export class NovelPostgresRepository {
           chapters: [row.approved_blueprint],
         }).chapters[0]
         : undefined;
-      const blueprint = plannedBlueprint ?? committedBlueprint ?? row.approved_blueprint ?? {};
-      const scenes = Array.isArray(blueprint.scenes) ? blueprint.scenes : [];
       return {
         chapterId: row.chapter_id,
         documentId: row.document_id,
@@ -3704,18 +3740,7 @@ export class NovelPostgresRepository {
         revisionId: row.current_revision_id ?? undefined,
         plannedBlueprint,
         committedBlueprint,
-        approvedPlan: {
-          summary: typeof blueprint.stateTransition === "object" && blueprint.stateTransition && "evidence" in blueprint.stateTransition ? String(blueprint.stateTransition.evidence) : undefined,
-          sceneEvents: scenes.flatMap((scene) => {
-            if (!scene || typeof scene !== "object" || Array.isArray(scene)) return [];
-            const item = scene as Record<string, unknown>;
-            return [item.situation, item.outcome].filter((value): value is string => typeof value === "string" && Boolean(value.trim()));
-          }),
-          continuityConstraints: Array.isArray(blueprint.continuityConstraints) ? blueprint.continuityConstraints.filter((value): value is string => typeof value === "string") : [],
-          setupRefs: [],
-          payoffRefs: [],
-        },
-        committedMemory: currentMemory ? {
+        chapterMemory: currentMemory ? {
           summary: currentMemory.summary,
           keyEvents: currentMemory.keyEvents,
           characterStates: currentMemory.characterStates,
@@ -3731,9 +3756,7 @@ export class NovelPostgresRepository {
     return {
       arcId,
       executionStatus: arc.executionStatus,
-      currentArc: arc.arc,
-      approvedArc: reviewApprovedArc,
-      legacyArcContractGaps,
+      approvedArc,
       batchIndex: batch?.batchIndex ?? 1,
       startChapterIndex,
       chapters,
@@ -3799,9 +3822,6 @@ export class NovelPostgresRepository {
       arcId: planning?.arcId,
       chapterBlueprintId: planning?.chapterBlueprintId,
       arcPhase: phaseIndex >= 0 ? phases[phaseIndex]?.title : undefined,
-      chapterSummary: input.chapterMemory.summary,
-      keyEvents: input.chapterMemory.keyEvents,
-      characterStates: input.chapterMemory.characterStates,
       openThreads: [...new Set([
         ...input.chapterMemory.unresolvedThreads,
         ...threads.rows.map((thread) => `${thread.id} ${thread.title}`),
@@ -3846,7 +3866,9 @@ export class NovelPostgresRepository {
         "SELECT payload FROM narrative_state_snapshots WHERE project_id=$1 AND narrative_order<=$2 ORDER BY narrative_order DESC,created_at DESC LIMIT 1",
         [projectId, narrativeCutoff],
       );
-    return result.rows[0]?.payload;
+    const payload = result.rows[0]?.payload;
+    if (!payload) return undefined;
+    return payload;
   }
 
   async getNarrativeStatePinnedClaims(input: { projectId: string; documentId?: string; narrativeCutoff?: number; povCharacterId?: string }): Promise<MemoryHit[]> {
@@ -3854,20 +3876,24 @@ export class NovelPostgresRepository {
       this.getLatestNarrativeStateSnapshot(input.projectId, input.narrativeCutoff),
       this.getChapterMemories({ projectId: input.projectId, narrativeCutoff: input.narrativeCutoff, limit: 4 }),
     ]);
+    const latestMemory = snapshot
+      ? memories.find((memory) => memory.narrativeRange.end === snapshot.narrativeOrder)
+      : undefined;
     const hits: MemoryHit[] = [];
     const push = (claim: Omit<MemoryHit, "score" | "reason" | "semanticRank">) => hits.push({ ...claim, score: 1, reason: "pinned-narrative-state", semanticRank: 1 });
     if (snapshot) {
       const content = [
         `当前弧阶段：${snapshot.arcPhase || "未记录"}`,
-        `角色状态：${snapshot.characterStates.map((item) => `${item.characterId}=${item.stateSnapshot}`).join("；") || "无"}`,
+        `角色状态：${latestMemory?.characterStates.map((item) => `${item.characterId}=${item.stateSnapshot}`).join("；") || "无"}`,
         `开放线索：${snapshot.openThreads.join("；") || "无"}`,
         `开放伏笔 ID（详细内容按需检索）：${snapshot.openForeshadowings.map((item) => item.id).join("、") || "无"}`,
         `开放承诺 ID（详细内容按需检索）：${snapshot.openPromises.map((item) => item.id).join("、") || "无"}`,
         `已兑现：${snapshot.fulfilledNodes.join("；") || "无"}`,
         `禁止提前消费：${snapshot.prohibitedEarlyConsumption.filter((item) => !item.startsWith("故事弧退出状态：")).join("；") || "无"}`,
       ].join("\n");
-      push({ id: snapshot.id, projectId: input.projectId, kind: "hierarchical", title: `第${snapshot.narrativeOrder}章叙事状态账本`, content, subjectRefs: snapshot.characterStates.map((item) => item.characterId), narrativeRange: { start: snapshot.narrativeOrder, end: snapshot.narrativeOrder }, knowledgeScope: "author", authority: "derived", confidence: 1, sourceRevisionIds: [snapshot.revisionId], contentHash: snapshot.fingerprint, supersedes: [], matchedFacet: "thread", matchedFacets: ["thread", "entity"] });
-      const povState = snapshot.characterStates.find((item) => item.characterId === input.povCharacterId);
+      const subjectRefs = latestMemory?.characterStates.map((item) => item.characterId) ?? [];
+      push({ id: snapshot.id, projectId: input.projectId, kind: "hierarchical", title: `第${snapshot.narrativeOrder}章叙事状态账本`, content, subjectRefs, narrativeRange: { start: snapshot.narrativeOrder, end: snapshot.narrativeOrder }, knowledgeScope: "author", authority: "derived", confidence: 1, sourceRevisionIds: [snapshot.revisionId], contentHash: snapshot.fingerprint, supersedes: [], matchedFacet: "thread", matchedFacets: ["thread", "entity"] });
+      const povState = latestMemory?.characterStates.find((item) => item.characterId === input.povCharacterId);
       if (povState && input.povCharacterId) {
         push({ id: `${snapshot.id}:pov:${input.povCharacterId}`, projectId: input.projectId, kind: "working", title: `POV角色章末状态：${input.povCharacterId}`, content: povState.stateSnapshot, subjectRefs: [input.povCharacterId], narrativeRange: { start: snapshot.narrativeOrder, end: snapshot.narrativeOrder }, knowledgeScope: { characterId: input.povCharacterId }, authority: "derived", confidence: 1, sourceRevisionIds: [snapshot.revisionId], contentHash: createHash("sha256").update(`${snapshot.fingerprint}:${input.povCharacterId}:${povState.stateSnapshot}`).digest("hex"), supersedes: [], matchedFacet: "entity" });
       }
@@ -4607,7 +4633,6 @@ export class NovelPostgresRepository {
       await client.query("DELETE FROM payoffs WHERE revision_id=$1", [revisionId]);
       await client.query("DELETE FROM foreshadowing WHERE project_id=$1 AND planted_revision_id=$2", [projectId, revisionId]);
       await client.query("DELETE FROM promises WHERE project_id=$1 AND source_revision_id=$2", [projectId, revisionId]);
-      await client.query("DELETE FROM payoff_curve WHERE project_id=$1 AND document_id=$2 AND revision_id=$3", [projectId, documentId, revisionId]);
       await client.query("DELETE FROM narrative_state_snapshots WHERE project_id=$1 AND document_id=$2 AND revision_id<>$3", [projectId, documentId, revisionId]);
       if (ownsTransaction) await client.query("COMMIT");
     } catch (error) {
@@ -4627,7 +4652,6 @@ export class NovelPostgresRepository {
     artifact: Artifact;
     narrativeOrder: number;
     narrativeElements?: FactExtractionOutput["narrativeElements"];
-    payoffMoments?: FactExtractionOutput["payoffMoments"];
     chapterMemory: ChapterMemory;
   }): Promise<{ removedClaimIds: string[]; activatedClaims: MemoryClaim[]; narrativeState: NarrativeStateSnapshot }> {
     const client = await this.pool.connect();
@@ -4649,15 +4673,6 @@ export class NovelPostgresRepository {
           revisionId: input.revisionId,
           narrativeOrder: input.narrativeOrder,
           narrativeElements: input.narrativeElements,
-        }, client);
-      }
-      if (input.payoffMoments?.length) {
-        await this.recordPayoffCurve({
-          projectId: input.projectId,
-          documentId: input.documentId,
-          revisionId: input.revisionId,
-          narrativeOrder: input.narrativeOrder,
-          payoffMoments: input.payoffMoments,
         }, client);
       }
       await this.createChapterMemory(input.chapterMemory, client);
@@ -4919,10 +4934,12 @@ export class NovelPostgresRepository {
       content_hash: string | null; object_key: string | null;
     }>(`
       SELECT p.title AS project_title,d.id AS document_id,d.title AS current_title,d.narrative_order,
-        cps.chapter_goal,cps.blueprint,cps.blueprint_fingerprint,mr.content_hash,cb.object_key
+        cps.chapter_goal,ch.payload AS blueprint,ba.fingerprint AS blueprint_fingerprint,mr.content_hash,cb.object_key
       FROM manuscript_documents d
       JOIN novel_projects p ON p.id=d.project_id
       LEFT JOIN chapter_production_specs cps ON cps.document_id=d.id
+      LEFT JOIN chapters ch ON ch.document_id=d.id AND ch.project_id=d.project_id
+      LEFT JOIN artifacts ba ON ba.id=ch.source_artifact_id
       LEFT JOIN manuscript_revisions mr ON mr.id=d.current_revision_id
       LEFT JOIN content_blobs cb ON cb.content_hash=mr.content_hash
       WHERE d.project_id=$1 AND d.id=$2
@@ -4936,7 +4953,7 @@ export class NovelPostgresRepository {
       narrativeOrder: Number(row.narrative_order),
       chapterGoal: row.chapter_goal ?? "",
       blueprint: row.blueprint ?? {},
-      blueprintFingerprint: row.blueprint_fingerprint ?? "",
+      blueprintFingerprint: row.blueprint_fingerprint ?? canonicalSha256(row.blueprint ?? {}),
       contentHash: row.content_hash ?? undefined,
       objectKey: row.object_key ?? undefined,
     };
@@ -4951,10 +4968,12 @@ export class NovelPostgresRepository {
         chapter_goal: string | null; blueprint: Record<string, unknown> | null; blueprint_fingerprint: string | null; content_hash: string | null;
       }>(`
         SELECT p.title AS project_title,d.id AS document_id,d.title AS current_title,d.narrative_order,
-          cps.chapter_goal,cps.blueprint,cps.blueprint_fingerprint,mr.content_hash
+          cps.chapter_goal,ch.payload AS blueprint,ba.fingerprint AS blueprint_fingerprint,mr.content_hash
         FROM manuscript_documents d
         JOIN novel_projects p ON p.id=d.project_id
         LEFT JOIN chapter_production_specs cps ON cps.document_id=d.id
+        LEFT JOIN chapters ch ON ch.document_id=d.id AND ch.project_id=d.project_id
+        LEFT JOIN artifacts ba ON ba.id=ch.source_artifact_id
         LEFT JOIN manuscript_revisions mr ON mr.id=d.current_revision_id
         WHERE d.project_id=$1 AND d.id=$2
         FOR UPDATE OF d,p
@@ -4967,7 +4986,7 @@ export class NovelPostgresRepository {
         currentTitle: row.current_title,
         narrativeOrder: Number(row.narrative_order),
         chapterGoal: row.chapter_goal ?? "",
-        blueprintFingerprint: row.blueprint_fingerprint ?? "",
+        blueprintFingerprint: row.blueprint_fingerprint ?? canonicalSha256(row.blueprint ?? {}),
         contentHash: row.content_hash ?? undefined,
       });
       if (currentFingerprint !== input.sourceFingerprint) {
@@ -5067,147 +5086,6 @@ export class NovelPostgresRepository {
     }));
 
     return { foreshadowings, promises };
-  }
-
-  /**
-   * Phase 3.2 写入爽点曲线（payoff_curve 表）。
-   *
-   * 设计依据：Phase 3.2 计划 + AGENTS.md「reusable contracts over case-specific rules」。
-   * 由 extractFacts activity 在写入 claims/narrativeElements 后调用，把 LLM 提取的
-   * payoffMoments 持久化到 payoff_curve 表，供连续章节事实与叙事审计使用。
-   *
-   * 失败不阻塞 fact-extraction（claims/narrativeElements 已写入），只记录警告。
-   *
-   * payoff_type 是通用爽感维度（achievement/recognition/reversal/emotional/mystery），
-   * 非 Phase 3.3 已移除的金手指/系统流特化——任何题材的爽感剧情都可用同一维度衡量。
-   */
-  async recordPayoffCurve(input: {
-    projectId: string;
-    documentId: string;
-    revisionId: string;
-    narrativeOrder: number;
-    payoffMoments: NonNullable<FactExtractionOutput["payoffMoments"]>;
-  }, connection: Pool | PoolClient = this.pool): Promise<number> {
-    const { projectId, documentId, revisionId, narrativeOrder, payoffMoments } = input;
-    let recorded = 0;
-    for (const moment of payoffMoments) {
-      const id = `payoff-curve:${projectId}:${createHash("sha256").update(`${revisionId}:${moment.payoffType}:${moment.description}`).digest("hex").slice(0, 12)}`;
-      await connection.query(
-        `INSERT INTO payoff_curve(id, project_id, document_id, revision_id, narrative_order, payoff_type, intensity, setup_revision_id, payoff_description, evidence, setup_description)
-         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-         ON CONFLICT(id) DO UPDATE SET intensity=EXCLUDED.intensity, payoff_description=EXCLUDED.payoff_description, evidence=COALESCE(EXCLUDED.evidence, payoff_curve.evidence), setup_description=COALESCE(EXCLUDED.setup_description, payoff_curve.setup_description)`,
-        [
-          id,
-          projectId,
-          documentId,
-          revisionId,
-          narrativeOrder,
-          moment.payoffType,
-          moment.intensity,
-          null, // setup_revision_id 暂留空（fact-extraction 阶段无前章铺垫映射）
-          moment.description,
-          // P2-G4: 落库 evidence（正文逐字证据）和 setupDescription（铺垫描述）
-          // 设计依据：AGENTS.md「reusable contracts」——evidence 是审校/learning 根因分析
-          // 的事实依据，不允许只存描述不存证据。setupDescription 可为空（LLM 可选返回）。
-          moment.evidence ?? null,
-          moment.setupDescription ?? null,
-        ],
-      );
-      recorded += 1;
-    }
-    return recorded;
-  }
-
-  /**
-   * Phase 3.2 查询最近 N 章的兑现统计，供连续章节审计使用。
-   *
-   * 设计依据：连续章节审计需要可追溯的兑现事实，
-   * 不允许 LLM 凭感觉判断。本方法返回结构化数据，由 review activity 注入 prompt。
-   *
-   * 返回值：
-   * - recentChapters：最近 N 章的爽点分布（按章聚合，intensity 之和）
-   * - consecutiveNoPayoff：连续无爽点的章数（从最新章向前数）
-   * - totalPayoffs：最近 N 章的爽点总数
-   * - byType：按 payoff_type 分组的爽点数（用于检查某类型爽点长期缺失）
-   */
-  async getRecentPayoffStats(input: {
-    projectId: string;
-    /** 截止章节（不含），通常是当前审校章节的 narrative_order */
-    narrativeCutoff: number;
-    /** 回溯章节数，默认 5 */
-    windowSize?: number;
-  }): Promise<{
-    recentChapters: Array<{ narrativeOrder: number; payoffCount: number; maxIntensity: number; totalIntensity: number; types: string[] }>;
-    consecutiveNoPayoff: number;
-    totalPayoffs: number;
-    byType: Record<string, number>;
-  }> {
-    const { projectId, narrativeCutoff, windowSize = 5 } = input;
-    const startOrder = Math.max(1, narrativeCutoff - windowSize);
-    const result = await this.pool.query<{
-      narrative_order: number;
-      payoff_type: string;
-      intensity: number;
-    }>(
-      `SELECT narrative_order, payoff_type, intensity FROM payoff_curve
-       WHERE project_id=$1 AND narrative_order >= $2 AND narrative_order < $3
-       ORDER BY narrative_order ASC, intensity DESC`,
-      [projectId, startOrder, narrativeCutoff],
-    );
-
-    // 按章聚合
-    const byChapter = new Map<number, { payoffCount: number; maxIntensity: number; totalIntensity: number; types: Set<string> }>();
-    const byType: Record<string, number> = {};
-    for (const row of result.rows) {
-      const order = Number(row.narrative_order);
-      const entry = byChapter.get(order) ?? { payoffCount: 0, maxIntensity: 0, totalIntensity: 0, types: new Set<string>() };
-      entry.payoffCount += 1;
-      entry.maxIntensity = Math.max(entry.maxIntensity, Number(row.intensity));
-      entry.totalIntensity += Number(row.intensity);
-      entry.types.add(row.payoff_type);
-      byChapter.set(order, entry);
-      byType[row.payoff_type] = (byType[row.payoff_type] ?? 0) + 1;
-    }
-
-    // P2-G3: consecutiveNoPayoff 不截断——独立查询无爽点后缀长度
-    // 设计依据：AGENTS.md「root-cause analysis」——原实现只在 windowSize=5 内数连续无爽点，
-    // 统计上限只用于界面和审计负载控制，不能改变事实记录本身。
-    // 修复：consecutiveNoPayoff 单独查询，从 cutoff-1 向前数到第一章有爽点或 chapter 1，
-    // 不受 windowSize 限制。recentChapters 仍保留 windowSize 截断（避免 prompt 过长）。
-    let consecutiveNoPayoff = 0;
-    if (narrativeCutoff > 1) {
-      // 查询 cutoff 之前所有「有爽点」的章节的最大 narrative_order，
-      // consecutiveNoPayoff = (cutoff - 1) - that_max，若不存在则为 cutoff - 1
-      const droughtResult = await this.pool.query<{ max_order: number | null }>(
-        `SELECT MAX(narrative_order) AS max_order FROM payoff_curve
-         WHERE project_id=$1 AND narrative_order < $2`,
-        [projectId, narrativeCutoff],
-      );
-      const lastPayoffOrder = droughtResult.rows[0]?.max_order;
-      if (lastPayoffOrder === null || lastPayoffOrder === undefined) {
-        // cutoff 之前从未有爽点 → 干旱 = cutoff - 1（从第 1 章到 cutoff-1 章全无爽点）
-        consecutiveNoPayoff = narrativeCutoff - 1;
-      } else {
-        consecutiveNoPayoff = Math.max(0, narrativeCutoff - 1 - Number(lastPayoffOrder));
-      }
-    }
-
-    const recentChapters = Array.from(byChapter.entries())
-      .map(([order, entry]) => ({
-        narrativeOrder: order,
-        payoffCount: entry.payoffCount,
-        maxIntensity: entry.maxIntensity,
-        totalIntensity: entry.totalIntensity,
-        types: [...entry.types],
-      }))
-      .sort((a, b) => a.narrativeOrder - b.narrativeOrder);
-
-    return {
-      recentChapters,
-      consecutiveNoPayoff,
-      totalPayoffs: result.rowCount ?? 0,
-      byType,
-    };
   }
 
   /**

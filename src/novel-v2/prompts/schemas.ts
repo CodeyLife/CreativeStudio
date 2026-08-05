@@ -69,7 +69,7 @@ export interface ReviewerOutput {
 export const factExtractionSchema = {
   type: "object",
   additionalProperties: false,
-  required: ["facts", "narrativeElements", "payoffMoments"],
+  required: ["facts", "narrativeElements"],
   properties: {
     facts: {
       type: "array",
@@ -118,17 +118,7 @@ export const factExtractionSchema = {
         },
       },
     },
-    /**
-     * Phase 3.1 叙事元素：伏笔 / 承诺 / 兑现。
-     *
-     * 设计依据：Phase 3.1 计划——激活 foreshadowing/promises/payoffs 表。
-     * 与 facts 互补：facts 是细粒度事实陈述，narrativeElements 是章节级叙事装置。
-     *
-     * 三类元素的语义：
-     * - foreshadowing：本章埋设的伏笔（暗示未来事件，未兑现）
-     * - promise：本章作出的承诺（谁对谁承诺什么，未兑现）
-     * - payoff：本章兑现的伏笔/承诺（关联到对应的 foreshadowing/promise）
-     */
+    /** facts 之外的章节级叙事装置：伏笔、承诺和兑现。 */
     narrativeElements: {
       type: "object",
       additionalProperties: false,
@@ -194,42 +184,6 @@ export const factExtractionSchema = {
         },
       },
     },
-    /**
-     * Phase 3.2 爽点曲线：本章的爽点时刻。
-     *
-     * 设计依据：Phase 3.2 计划 + 用户要求「爽感剧情还是要有」。
-     * payoff_type 是通用爽感维度（非金手指/系统流特化），覆盖网文核心爽感类型：
-     * - achievement：成就型（突破、获得、达成目标）
-     * - recognition：认可型（被肯定、被敬畏、地位提升）
-     * - reversal：反转型（逆境翻盘、真相揭露、打脸）
-     * - emotional：情感型（羁绊深化、虐心释放、温情时刻）
-     * - mystery：悬疑型（谜团揭开、伏笔兑现、真相浮现）
-     *
-     * 由事实与叙事记录保留连续章节的兑现信息，供审校者按当前章节功能判断。
-     */
-    payoffMoments: {
-      type: "array",
-      items: {
-        type: "object",
-        additionalProperties: false,
-        required: ["payoffType", "intensity", "description", "setupDescription", "evidence"],
-        properties: {
-          payoffType: {
-            enum: ["achievement", "recognition", "reversal", "emotional", "mystery"],
-            description: "爽点类型（通用爽感维度，非金手指特化）",
-          },
-          intensity: {
-            type: "integer",
-            minimum: 0,
-            maximum: 5,
-            description: "爽点强度（0=没有可靠判断，1=轻描淡写，3=明显推进，5=高潮爆发）",
-          },
-          description: { type: "string", minLength: 1, description: "爽点内容描述" },
-          setupDescription: { type: "string", description: "铺垫描述（若有铺垫，简述哪一章哪些事件铺垫了这个爽点）" },
-          evidence: { type: "string", minLength: 1, description: "正文逐字证据" },
-        },
-      },
-    },
   },
 } as const;
 
@@ -237,8 +191,6 @@ export const factExtractionSchema = {
  * V2 事实提取输出类型。
  */
 export interface FactExtractionOutput {
-  /** Legacy application field; new model output no longer requests it. */
-  summary?: string;
   facts: Array<{
     subject: { kind: string; id: string };
     predicate: string;
@@ -247,19 +199,12 @@ export interface FactExtractionOutput {
     truthStatus: "objective" | "claim" | "contested" | "open-question";
     humanReadable: string;
     evidence: string;
-    /** Legacy application metadata; narrative scoping uses the chapter order instead. */
-    paragraph?: number;
     confidence: number;
     novelty: "new" | "update" | "duplicate";
     conflict: boolean;
   }>;
-  /**
-   * Phase 3.1 叙事元素（伏笔/承诺/兑现）。
-   *
-   * 可选字段——LLM 可能不返回（旧 schema 兼容），但建议返回。
-   * 由 postgres-repository.recordNarrativeElements 写入对应表。
-   */
-  narrativeElements?: {
+  /** 由 postgres-repository.recordNarrativeElements 写入对应表。 */
+  narrativeElements: {
     foreshadowings: Array<{
       description: string;
       triggerKeywords: string[];
@@ -283,20 +228,6 @@ export interface FactExtractionOutput {
       evidence: string;
     }>;
   };
-  /**
-   * Phase 3.2 爽点时刻（本章的爽点列表）。
-   *
-   * 可选字段——LLM 可能不返回（旧 schema 兼容）。
-   * 由 postgres-repository.recordPayoffCurve 写入 payoff_curve 表。
-   * payoff_type 是通用爽感维度（非金手指/系统流特化）。
-   */
-  payoffMoments?: Array<{
-    payoffType: "achievement" | "recognition" | "reversal" | "emotional" | "mystery";
-    intensity: number;
-    description: string;
-    setupDescription?: string;
-    evidence: string;
-  }>;
 }
 
 /**
@@ -450,15 +381,8 @@ export interface CharacterEnrichmentOutput {
   }>;
 }
 
-/**
- * A single extraction result consumed by facts, commit, chapter-memory and
- * character-enrichment handlers. Optional derived fields preserve the
- * per-handler fallback path for older runs and incomplete model output.
- */
-export interface ChapterStateDelta extends FactExtractionOutput {
-  chapterMemory?: ChapterMemoryOutput;
-  characterDeltas?: CharacterEnrichmentOutput["characters"];
-}
+/** Facts and narrative elements are the complete fact-extraction contract. */
+export type ChapterStateDelta = FactExtractionOutput;
 
 /** Strict model boundary for fact extraction; chapter memory and character deltas use independent calls. */
 export interface FactExtractionModelOutput {
@@ -488,13 +412,6 @@ export interface FactExtractionModelOutput {
       evidence: string;
     }>;
   };
-  payoffMoments: Array<{
-    payoffType: "achievement" | "recognition" | "reversal" | "emotional" | "mystery";
-    intensity: number;
-    description: string;
-    setupDescription: string;
-    evidence: string;
-  }>;
 }
 
 export const chapterStateDeltaSchema = factExtractionSchema;

@@ -10,7 +10,7 @@ const baseBundle: StoryArcBundle = {
     development: ["抵达", "试探", "发现"],
     resolution: "确认旧案仍在影响当下",
     exitState: "归乡者决定继续查证",
-    plotThreadRefs: [],
+    threadResponsibilities: [],
     foreshadowingRefs: [],
     expectedChapterCount: 1,
     phases: [],

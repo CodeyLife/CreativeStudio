@@ -256,7 +256,7 @@ describe("Novel command workspace", () => {
   it("uses persisted reviewer scores and issues for the concrete quality report", () => {
     const quality = deriveQuality(
       { workflowId: "wf-review", status: "completed", record: { ...runs[2], payload: { finalScore: 4.2 } } },
-      [{ id: "summary-1", projectId: "p1", taskId: "draft:reflection", kind: "summary", structuredData: { critique: { issues: [{ severity: "major", dimension: "plot", title: "因果跳步" }] } } }],
+      [{ id: "review-1", projectId: "p1", taskId: "draft:reflection", kind: "review", structuredData: { critique: { issues: [{ severity: "major", dimension: "plot", title: "因果跳步" }] } } }],
       [
         { id: "rv-prose", artifactId: "a1", reviewerId: "independent-prose", identity: "independent", verdict: "passed", role: "prose-reviewer", score: 4.5, issues: [], createdAt: 1 },
         { id: "rv-structure", artifactId: "a1", reviewerId: "internal-structure", identity: "internal", verdict: "revise", role: "structure-reviewer", score: 3.5, issues: [{ severity: "major", title: "因果跳步" }], createdAt: 2 },
@@ -271,7 +271,7 @@ describe("Novel command workspace", () => {
   it("shows only artifacts related to the selected workflow stage", () => {
     const artifacts = [
       { id: "draft", projectId: "p1", taskId: "bp:draft", kind: "draft" },
-      { id: "review", projectId: "p1", taskId: "bp:draft:reflection", kind: "summary" },
+      { id: "review", projectId: "p1", taskId: "bp:draft:reflection", kind: "review" },
       { id: "revision", projectId: "p1", taskId: "bp:draft:revise", kind: "revision" },
     ];
     expect(artifactsForStage("review", artifacts).map((item) => item.id)).toEqual(["review"]);

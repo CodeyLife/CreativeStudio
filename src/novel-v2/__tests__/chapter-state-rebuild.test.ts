@@ -25,6 +25,7 @@ describe("ChapterStateRebuildService", () => {
       getFinalDocumentContentRef: vi.fn(async () => ({ title: "第一章", status: "final", narrativeOrder: 7, revision: 3, sourceRevisionId: "revision-3", artifactId: "draft-3", contentHash: "content-3", objectKey: "objects/content-3" })),
       assertChapterStateRebuildHead: vi.fn(async () => undefined),
       getFactExtractionContext: vi.fn(async () => ({ claimsDigest: "- prior", contentHashes: new Set<string>(), claimsIndex: new Map<string, string[]>() })),
+      getChapterMemories: vi.fn(async () => []),
       recordFactExtraction: vi.fn(async () => { calls.push("record-facts"); return []; }),
       recordFactApprovalPolicy: vi.fn(async () => { calls.push("approve-facts"); return {}; }),
       applyCommittedChapterStateRebuild: vi.fn(async () => { calls.push("apply-state"); return { removedClaimIds: ["old-claim"], activatedClaims: [], narrativeState: {} }; }),
@@ -32,16 +33,17 @@ describe("ChapterStateRebuildService", () => {
       recordProjectionFailure: vi.fn(),
     };
     const output = {
-      summary: "事实提取完成",
       facts: [{ subject: { kind: "entity", id: "hero" }, predicate: "所在", object: { kind: "string", value: "旧站台" }, polarity: "affirmed", truthStatus: "objective", humanReadable: "主角仍在旧站台", evidence: "主角停在旧站台的雨棚下面没有离开。", confidence: 0.95, novelty: "new", conflict: false }],
       narrativeElements: { foreshadowings: [], promises: [], payoffs: [] },
-      payoffMoments: [],
-      chapterMemory: { summary: "本章围绕旧站台上的等待展开，主角在雨声与迟迟未到的列车之间确认自己仍需留下，并保留了尚未解决的去向问题。这个状态为后续章节提供了明确的位置、行动边界与情绪连续性，也没有提前推断正文未呈现的结果。", keyEvents: ["主角留在旧站台等待"], characterStates: [{ characterId: "hero", stateSnapshot: "仍在旧站台，尚未决定离开" }], unresolvedThreads: ["列车何时抵达"], emotionalArc: "从焦躁转为克制等待" },
     };
     const service = new ChapterStateRebuildService({
       repository: repository as never,
       objects: { getText: vi.fn(async () => "主角停在旧站台的雨棚下面没有离开。"), putText: vi.fn() } as never,
-      model: { generateStructured: vi.fn(async () => ({ value: output, usage: { inputTokens: 1, outputTokens: 1 }, provenance: { routeSnapshotId: "route", purpose: "facts.extract", candidateIndex: 0, executor: "api", model: "test" } })) } as never,
+      model: {
+        generateStructured: vi.fn()
+          .mockResolvedValueOnce({ value: output, usage: { inputTokens: 1, outputTokens: 1 }, provenance: { routeSnapshotId: "route", purpose: "facts.extract", candidateIndex: 0, executor: "api", model: "test" } })
+          .mockResolvedValueOnce({ value: { summary: "主角在旧站台的雨棚下等待，确认列车仍未抵达，并在离开与继续停留之间选择继续等待。这个选择保留了未决去向，也让焦躁逐步转为克制，站台上的雨声和空无一人的轨道继续把等待具体化。", keyEvents: ["主角继续在旧站台等待"], characterStates: [{ characterId: "hero", stateSnapshot: "仍在等待" }], unresolvedThreads: ["列车何时抵达"], emotionalArc: "由焦躁转为克制" }, usage: { inputTokens: 1, outputTokens: 1 }, provenance: { routeSnapshotId: "route", purpose: "chapter-memory.create", candidateIndex: 0, executor: "api", model: "test" } }),
+      } as never,
       skillProvider: { list: async () => [factExtractionSkill] },
     });
 
@@ -54,7 +56,7 @@ describe("ChapterStateRebuildService", () => {
     expect(result).toMatchObject({ projectId: "p1", documentId: "d1", revisionId: "revision-3", removedClaimIds: ["old-claim"] });
   });
 
-  it("generates chapter memory through the existing fallback before replacing sources", async () => {
+  it("generates chapter memory independently before replacing sources", async () => {
     const calls: string[] = [];
     const repository = {
       getFinalDocumentContentRef: vi.fn(async () => ({ title: "第一章", status: "final", narrativeOrder: 1, revision: 1, sourceRevisionId: "revision-1", artifactId: "draft-1", contentHash: "content-1", objectKey: "objects/content-1" })),
@@ -67,7 +69,7 @@ describe("ChapterStateRebuildService", () => {
       refreshChapterMemoryRollup: vi.fn(async () => ({ id: "rollup", projectId: "p1", kind: "hierarchical", title: "汇总", content: "汇总", subjectRefs: [], knowledgeScope: "author", authority: "derived", confidence: 1, sourceRevisionIds: [], contentHash: "rollup", supersedes: [] })),
       recordProjectionFailure: vi.fn(),
     };
-    const factsWithoutMemory = { summary: "完成", facts: [], narrativeElements: { foreshadowings: [], promises: [], payoffs: [] }, payoffMoments: [] };
+    const factsWithoutMemory = { facts: [], narrativeElements: { foreshadowings: [], promises: [], payoffs: [] } };
     const fallbackMemory = { summary: "本章建立了主角在雨中等待的具体处境。他观察站台、确认列车仍未抵达，并在离开与继续停留之间选择等待。正文没有解决最终去向，只让人物从焦躁转为克制，同时保留列车何时抵达以及他之后前往何处两个连续问题，为下一章提供了可验证的位置、选择和情绪状态。", keyEvents: ["主角在雨中等待"], characterStates: [{ characterId: "hero", stateSnapshot: "仍在等待" }], unresolvedThreads: ["去向未定"], emotionalArc: "由焦躁转为克制" };
     const generateStructured = vi.fn()
       .mockResolvedValueOnce({ value: factsWithoutMemory, usage: { inputTokens: 1, outputTokens: 1 }, provenance: { routeSnapshotId: "route", purpose: "facts.extract", candidateIndex: 0, executor: "api", model: "test" } })

@@ -249,13 +249,13 @@ describe("fact-extraction classifyFactRisk maps to risk tiers", () => {
 describe("fact-extraction extractFactsWithStats orchestration", () => {
   it("states the model output contract instead of leaving providers to infer it", () => {
     const prompt = buildFactExtractionPrompt({ artifact, text: "正文略。" });
-    expect(prompt).toContain("顶层必须始终输出 facts、narrativeElements、payoffMoments");
-    expect(prompt).toContain("chapterMemory 和 characterDeltas 不属于本次输出");
-    expect(chapterStateDeltaSchema.required).toEqual(["facts", "narrativeElements", "payoffMoments"]);
+    expect(prompt).toContain("顶层必须始终输出 facts 和 narrativeElements");
+    expect(prompt).not.toContain("chapterMemory 和 characterDeltas");
+    expect(chapterStateDeltaSchema.required).toEqual(["facts", "narrativeElements"]);
   });
 
   it("binds chapter facts to narrativeOrder instead of the evidence paragraph", () => {
-    const output: ChapterStateDelta = { facts: [fact()] };
+    const output: ChapterStateDelta = { facts: [fact()], narrativeElements: { foreshadowings: [], promises: [], payoffs: [] } };
     const result = projectFactExtractionOutput({ projectId: "p1", artifact, text: "正文略。", narrativeOrder: 12 }, output);
 
     expect(result.claims[0].narrativeRange).toEqual({ start: 12, end: 12 });
@@ -267,7 +267,7 @@ describe("fact-extraction extractFactsWithStats orchestration", () => {
     expect(() => scopeClaimsToChapter([claim], 1.5)).toThrow(/narrativeOrder/);
   });
 
-  it("returns narrative elements and payoff moments from the same extraction", async () => {
+  it("returns narrative elements from the same extraction", async () => {
     const output: ChapterStateDelta = {
       facts: [fact()],
       narrativeElements: {
@@ -275,11 +275,9 @@ describe("fact-extraction extractFactsWithStats orchestration", () => {
         promises: [],
         payoffs: [],
       },
-      payoffMoments: [{ payoffType: "recognition", intensity: 2, description: "角色得到有限认可", setupDescription: "", evidence: "他终于听见对方承认自己的判断。" }],
     };
     const result = await extractFactsWithStats({ projectId: "p1", artifact, text: "正文略。", model: new InMemoryModelGateway(() => output) });
-    expect(result.narrativeElements?.payoffs).toEqual([]);
-    expect(result.payoffMoments?.[0].payoffType).toBe("recognition");
+    expect(result.narrativeElements.payoffs).toEqual([]);
   });
 
   it("returns claims and stats end-to-end through the model gateway", async () => {
@@ -291,7 +289,6 @@ describe("fact-extraction extractFactsWithStats orchestration", () => {
         fact({ humanReadable: "主角持有古剑承影" }), // 被 L1 丢弃
       ],
       narrativeElements: { foreshadowings: [], promises: [], payoffs: [] },
-      payoffMoments: [],
     };
     const model = new InMemoryModelGateway(() => output);
     const result = await extractFactsWithStats({
@@ -308,7 +305,7 @@ describe("fact-extraction extractFactsWithStats orchestration", () => {
   });
 
   it("returns an empty claim list when the model produces nothing", async () => {
-    const model = new InMemoryModelGateway(() => ({ facts: [], narrativeElements: { foreshadowings: [], promises: [], payoffs: [] }, payoffMoments: [] }));
+    const model = new InMemoryModelGateway(() => ({ facts: [], narrativeElements: { foreshadowings: [], promises: [], payoffs: [] } }));
     const result = await extractFactsFromText({ projectId: "p1", artifact, text: "正文略。", model });
     expect(result).toEqual([] satisfies MemoryClaim[]);
   });
@@ -316,6 +313,16 @@ describe("fact-extraction extractFactsWithStats orchestration", () => {
   it("rejects model output that fails schema validation", async () => {
     const model = new InMemoryModelGateway(() => ({ summary: "缺字段" }));
     await expect(extractFactsWithStats({ projectId: "p1", artifact, text: "x", model })).rejects.toThrow(/InMemoryModelGateway structured|facts/);
+  });
+
+  it("rejects removed fact-extraction fields at the structured boundary", async () => {
+    const model = new InMemoryModelGateway(() => ({
+      facts: [],
+      narrativeElements: { foreshadowings: [], promises: [], payoffs: [] },
+      payoffMoments: [],
+      chapterMemory: { summary: "不应进入事实提取输出", keyEvents: [], characterStates: [], unresolvedThreads: [], emotionalArc: "无" },
+    }));
+    await expect(extractFactsWithStats({ projectId: "p1", artifact, text: "x", model })).rejects.toThrow(/InMemoryModelGateway structured|payoffMoments|additional/iu);
   });
 
   it("computeClaimContentHash is stable across calls with the same claim", () => {

@@ -81,7 +81,6 @@ const ARTIFACT_KIND_META: Record<string, { label: string; icon: ReactNode }> = {
   review: { label: "审核", icon: <AuditOutlined /> },
   revision: { label: "修订稿", icon: <EditOutlined /> },
   "fact-extraction": { label: "事实抽取", icon: <DatabaseOutlined /> },
-  summary: { label: "摘要", icon: <FileSearchOutlined /> },
   foundation: { label: "基础设定", icon: <FundProjectionScreenOutlined /> },
   blueprint: { label: "执行蓝图", icon: <FundProjectionScreenOutlined /> },
   context: { label: "上下文包", icon: <FileSearchOutlined /> },
@@ -115,11 +114,6 @@ export function artifactPreview(kind: string | undefined, structuredData: Record
     case "fact-extraction": {
       const source = str(d.sourceArtifactId);
       return source ? `事实抽取 · 来源 ${shortId(source, 8)}` : "事实抽取产物";
-    }
-    case "summary": {
-      const critique = str(d.critique);
-      if (critique) return critique.length > 60 ? `反思：${critique.slice(0, 60)}…` : `反思：${critique}`;
-      return "反思摘要";
     }
     case "foundation": {
       const taskKey = str(d.taskKey);
