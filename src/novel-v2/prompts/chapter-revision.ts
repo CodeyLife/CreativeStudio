@@ -674,10 +674,54 @@ export function buildTargetedRevisionBatchPromptPackage(input: RevisionWindowPro
   });
 }
 
+function normalizeParagraph(value: string): string {
+  return value.replace(/\s+/gu, "");
+}
+
+/**
+ * 替换边界重复检测：修订模型在替换窗口时可能把相邻原文段落复制进替换文本，
+ * 导致替换后正文出现硬重复（完全重复段，或"前邻段全文 + 追加句"的前缀复制段）。
+ * 这两类重复不是修辞复沓，而是拼接错误，必须在应用窗口时剔除。
+ *
+ * 规则（保守，避免误删正常复沓）：
+ * 1. 替换首段与窗口前邻段去空白后完全相等 → 丢弃首段；
+ * 2. 替换首段以前邻段全文为前缀（前邻段 ≥ 30 字，正常承接不会整段复制前文，
+ *    "整段复制 + 追加"几乎必是拼接错误）→ 丢弃首段（前邻段已承载全部信息）；
+ * 3. 替换末段与窗口后邻段去空白后完全相等 → 丢弃末段。
+ * 边界守卫差异（有意取舍）：before 侧（规则 1/2）要求前邻段 ≥ 30 字才判定，
+ * 短段整段复制可能是正常短句承接，保守不剔除；after 侧（规则 3）无长度守卫，
+ * 单段替换恰好等于后邻段时整段丢弃，调用方对空结果保留原文（原文只含该
+ * 邻段一次），正文不会出现硬重复。
+ * 只处理相邻完全相等与"整段前缀复制"两类可判定的拼接错误，
+ * 不处理开头局部重合（那可能是正常承接），避免误删有效文本。
+ */
+const SERIAL_PREFIX_MIN_CHARS = 30; // TODO P3: 边界重复检测的最小前缀长度，应可配置
+
+function dedupeReplacementBoundary(replacementParagraphs: string[], before: string | undefined, after: string | undefined): string[] {
+  let result = [...replacementParagraphs];
+  if (before) {
+    const beforeNorm = normalizeParagraph(before);
+    if (beforeNorm.length >= SERIAL_PREFIX_MIN_CHARS) {
+      const firstNorm = normalizeParagraph(result[0] ?? "");
+      const isExactDuplicate = firstNorm === beforeNorm;
+      const isPrefixCopy = firstNorm.startsWith(beforeNorm);
+      if (isExactDuplicate || isPrefixCopy) result = result.slice(1);
+    }
+  }
+  if (after) {
+    const lastNorm = normalizeParagraph(result.at(-1) ?? "");
+    const afterNorm = normalizeParagraph(after);
+    if (lastNorm === afterNorm) result = result.slice(0, -1);
+  }
+  return result;
+}
+
 export function applyRevisionWindows(text: string, replacements: Array<{ window: RevisionWindow; text: string }>): string {
   const paragraphs = splitChapterParagraphs(text);
   for (const replacement of [...replacements].sort((left, right) => right.window.start - left.window.start)) {
-    const replacementParagraphs = splitChapterParagraphs(sanitizeRevisionOutput(replacement.text));
+    const before = replacement.window.start > 0 ? paragraphs[replacement.window.start - 1] : undefined;
+    const after = replacement.window.end + 1 < paragraphs.length ? paragraphs[replacement.window.end + 1] : undefined;
+    const replacementParagraphs = dedupeReplacementBoundary(splitChapterParagraphs(sanitizeRevisionOutput(replacement.text)), before, after);
     if (!replacementParagraphs.length) continue;
     paragraphs.splice(replacement.window.start, replacement.window.end - replacement.window.start + 1, ...replacementParagraphs);
   }

@@ -557,7 +557,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
 
   {
     name: "novel_chapter_review_issue_add",
-    description: "向当前章节完整审核快照追加一条作者/架构审校意见。只写入 pending issue，不直接修改正文；随后可用 novel_chapter_review(mode=targeted) 复用正式定向修订闭环。",
+    description: "向当前章节完整审核快照追加一条作者/架构审校意见。只写入 pending issue，不直接修改正文；随后可用 novel_chapter_review(mode=targeted) 复用正式定向修订闭环。同一机制多处时用 revisionRanges 数组一次覆盖全部段落，避免只修首段导致问题残留；paragraph 与 revisionRanges 二选一。",
     inputSchema: {
       type: "object",
       properties: {
@@ -567,7 +567,8 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
         title: { type: "string", minLength: 1 },
         description: { type: "string" },
         evidenceQuote: { type: "string", minLength: 1, description: "正文中的可核对证据；不填写时使用 title" },
-        paragraph: { type: "integer", minimum: 1 },
+        paragraph: { type: "integer", minimum: 1, description: "单个目标段落（1-based）；与 revisionRanges 二选一" },
+        revisionRanges: { type: "array", minItems: 1, items: { type: "object", required: ["start", "end"], additionalProperties: false, properties: { start: { type: "integer", minimum: 1 }, end: { type: "integer", minimum: 1 } } }, description: "多段落修订范围（1-based，1<=start<=end）；同机制多处时全部列出" },
         suggestion: { type: "string" },
       },
       required: ["projectId", "documentId", "severity", "title"],

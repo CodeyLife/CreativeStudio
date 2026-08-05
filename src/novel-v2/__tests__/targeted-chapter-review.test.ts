@@ -103,6 +103,22 @@ describe("targeted chapter review issues", () => {
     expect(targeted.issues[0]).toMatchObject({ title: "人物反应太直白", paragraph: 2, revisionRanges: [{ start: 2, end: 2 }], suggestion: "改为动作和环境反馈" });
   });
 
+  it("adds author review notes with multi-paragraph revision ranges covering every occurrence", async () => {
+    if (!available) return;
+    const created = await repository.addChapterReviewIssue({
+      projectId,
+      documentId,
+      severity: "major",
+      title: "同机制多处重述",
+      evidenceQuote: "同一状态以相近措辞重复出现",
+      revisionRanges: [{ start: 2, end: 2 }, { start: 4, end: 5 }],
+      suggestion: "每处补可观察增量",
+    });
+    expect(created.revisionRanges).toEqual([{ start: 2, end: 2 }, { start: 4, end: 5 }]);
+    const targeted = await repository.getTargetedChapterReviewIssues({ projectId, documentId, issueIds: [created.id] });
+    expect(targeted.issues[0].revisionRanges).toEqual([{ start: 2, end: 2 }, { start: 4, end: 5 }]);
+  });
+
   it("records targeted diagnostic reviews without promoting the chapter snapshot", async () => {
     if (!available) return;
     const workflowId = `targeted-diagnostic-${suffix}`;
@@ -270,6 +286,24 @@ describe("targeted chapter review issues", () => {
     });
   });
 
+  it("rejects invalid revision ranges instead of silently dropping them", async () => {
+    if (!available) return;
+    await expect(repository.addChapterReviewIssue({
+      projectId,
+      documentId,
+      severity: "major",
+      title: "非法范围",
+      revisionRanges: [{ start: 9, end: 2 }],
+    })).rejects.toThrow(/1<=start<=end/);
+    await expect(repository.addChapterReviewIssue({
+      projectId,
+      documentId,
+      severity: "major",
+      title: "非整数范围",
+      revisionRanges: [{ start: 1.5, end: 2 }],
+    })).rejects.toThrow(/1<=start<=end/);
+  });
+
   it("rejects a snapshot after the current manuscript hash changes", async () => {
     if (!available) return;
     const nextHash = `next-${contentHash}`;
@@ -278,5 +312,30 @@ describe("targeted chapter review issues", () => {
     await repository.pool.query("INSERT INTO manuscript_revisions(id,project_id,document_id,revision,base_revision,content_hash) VALUES($1,$2,$3,2,1,$4)", [nextRevisionId, projectId, documentId, nextHash]);
     await repository.pool.query("UPDATE manuscript_documents SET current_revision_id=$1 WHERE id=$2", [nextRevisionId, documentId]);
     await expect(repository.getTargetedChapterReviewIssues({ projectId, documentId, issueIds: [pendingIssueId] })).rejects.toThrow(/已过期/);
+  });
+
+  it("reports an active chapter review on a different document of the same project as a concurrency guard", async () => {
+    if (!available) return;
+    const otherDocumentId = `other-doc-${suffix}`;
+    const otherWorkflowId = `other-review-${suffix}`;
+    // 清理前序测试遗留的活跃 chapter-review workflow_run，隔离本测试。
+    await repository.pool.query("DELETE FROM workflow_runs WHERE project_id=$1 AND workflow_type='chapter-review'", [projectId]);
+    await repository.pool.query("INSERT INTO manuscript_documents(id,project_id,title,narrative_order,status) VALUES($1,$2,'第二章',2,'final')", [otherDocumentId, projectId]);
+    await repository.putWorkflowRun({
+      id: otherWorkflowId,
+      workflowType: "chapter-review",
+      projectId,
+      temporalWorkflowId: otherWorkflowId,
+      status: "running",
+      payload: { documentId: otherDocumentId, reasonCode: "targeted-manuscript-approval" },
+    });
+
+    const preflight = await repository.getChapterReviewPreflight(projectId, otherDocumentId);
+    expect(preflight?.projectActiveReviewWorkflowId).toBeUndefined();
+    expect(preflight?.activeWorkflowId).toBe(otherWorkflowId);
+
+    // 另一文档的活跃审校 → 同项目并发守卫命中
+    const otherPreflight = await repository.getChapterReviewPreflight(projectId, documentId);
+    expect(otherPreflight?.projectActiveReviewWorkflowId).toBe(otherWorkflowId);
   });
 });

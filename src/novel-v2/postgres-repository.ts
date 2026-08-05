@@ -64,7 +64,7 @@ import { auditNamedReferences, auditStoryArcBatchRanges, canonicalReferenceId, n
 import { auditFullBookArchitecture } from "./application/full-book-architecture";
 import { CHAPTER_NARRATIVE_FUNCTIONS, canGenerateNextStoryArcBatch, compileChapterPlanValidationReport, normalizeChapterPlanningContext, parseStoryArcBundle, parseStoryArcPlan, planningContextFingerprint, validateStoryArcPlanContracts, type ArcPlanningStatus, type ChapterBlueprint, type ChapterBlueprintRecord, type ChapterPlanningContext, type ChapterSceneBlueprint, type NarrativeArcPlan, type StoryArcBatchRecord, type StoryArcBundle, type StoryArcContextReceipt, type StoryArcRebaseTarget, type StoryArcRecord } from "./application/story-arc";
 import type { StoryArcReviewOutput } from "./prompts/story-arc";
-import { aggregateChapterReviews, reviewIssueFingerprint, type ChapterReviewIssueStatus } from "./chapter-review-snapshot";
+import { aggregateChapterReviews, markEvidenceUnverified, reviewIssueFingerprint, type ChapterReviewIssueStatus } from "./chapter-review-snapshot";
 import {
   bookSynopsisSourceFingerprint,
   bookTitleSourceFingerprint,
@@ -1357,14 +1357,14 @@ export class NovelPostgresRepository {
     return result.rows;
   }
 
-  async putReview(review: Review, options: { refreshChapterSnapshot?: boolean } = {}) {
+  async putReview(review: Review, options: { refreshChapterSnapshot?: boolean; plainText?: string } = {}) {
     review = normalizeManuscriptStructuralReview(review);
     // pg 对 JS 数组使用 PostgreSQL array literal 序列化（{elem1,elem2}），而非 JSON。
     // issues 是 JS 对象数组，直接传给 jsonb 列会导致 "invalid input syntax for type json" 错误。
     // 修复：显式 JSON.stringify，让 pg 以字符串参数发送，PostgreSQL 再解析为 jsonb。
     // modelProvenance 是对象，pg 本身会正确序列化为 JSON，但显式 stringify 保持一致性。
     await this.pool.query("INSERT INTO reviews(id,project_id,artifact_id,reviewer_id,identity,verdict,artifact_fingerprint,issues,model_provenance,score,role,dimension_scores) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT(id) DO NOTHING", [review.id, review.projectId, review.artifactId, review.reviewerId, review.identity, review.verdict, review.artifactFingerprint, JSON.stringify(review.issues), review.modelProvenance ? JSON.stringify(review.modelProvenance) : null, review.score ?? null, review.role ?? null, JSON.stringify({})]);
-    if (options.refreshChapterSnapshot !== false) await this.refreshChapterReviewSnapshot(review.artifactId);
+    if (options.refreshChapterSnapshot !== false) await this.refreshChapterReviewSnapshot(review.artifactId, undefined, options.plainText);
     return review;
   }
 
@@ -1534,6 +1534,12 @@ export class NovelPostgresRepository {
     description?: string;
     evidenceQuote?: string;
     paragraph?: number;
+    /**
+     * 多段落修订范围（1-based）。同机制多处时用数组一次覆盖全部位置，
+     * 避免 targeted 修订只修首个段落导致同一问题反复残留（AGENTS.md「revisionRanges
+     * 必须覆盖每一处承载同一机制且可安全修改的范围」）。
+     */
+    revisionRanges?: Array<{ start: number; end: number }>;
     suggestion?: string;
   }) {
     const title = input.title.trim();
@@ -1550,6 +1556,17 @@ export class NovelPostgresRepository {
     const current = snapshot.rows[0];
     if (!current?.complete) throw new Error("当前章节没有完整审核快照");
     if (!current.current_content_hash || current.reviewed_content_hash !== current.current_content_hash) throw new Error("审核快照已过期，请先重新审校当前正文");
+    const explicitRanges = input.revisionRanges?.length
+      ? input.revisionRanges.map((range) => {
+          if (!Number.isInteger(range.start) || !Number.isInteger(range.end) || range.start < 1 || range.end < range.start) {
+            throw new Error("revisionRanges 的 start/end 必须是满足 1<=start<=end 的整数");
+          }
+          return range;
+        }).sort((left, right) => left.start - right.start)
+      : [];
+    const revisionRanges = explicitRanges.length
+      ? explicitRanges
+      : input.paragraph ? [{ start: input.paragraph, end: input.paragraph }] : [];
     const issue: ReviewIssue = {
       severity: input.severity,
       title,
@@ -1557,7 +1574,7 @@ export class NovelPostgresRepository {
       evidence: evidenceQuote,
       excerpt: evidenceQuote,
       paragraph: input.paragraph,
-      revisionRanges: input.paragraph ? [{ start: input.paragraph, end: input.paragraph }] : [],
+      revisionRanges,
       suggestion,
       rule: "author-review-note",
     };
@@ -1766,11 +1783,11 @@ export class NovelPostgresRepository {
     return { runsCompacted, artifactsDeleted, orphanedObjects: orphaned.rows.map((row) => ({ contentHash: row.content_hash, objectKey: row.object_key })) };
   }
 
-  async refreshChapterReviewSnapshot(artifactId: string, revisionId?: string): Promise<boolean> {
+  async refreshChapterReviewSnapshot(artifactId: string, revisionId?: string, plainText?: string): Promise<boolean> {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
-      const refreshed = await this.refreshChapterReviewSnapshotTx(client, artifactId, revisionId);
+      const refreshed = await this.refreshChapterReviewSnapshotTx(client, artifactId, revisionId, plainText);
       await client.query("COMMIT");
       return refreshed;
     } catch (error) {
@@ -1781,7 +1798,7 @@ export class NovelPostgresRepository {
     }
   }
 
-  private async refreshChapterReviewSnapshotTx(client: PoolClient, artifactId: string, revisionId?: string): Promise<boolean> {
+  private async refreshChapterReviewSnapshotTx(client: PoolClient, artifactId: string, revisionId?: string, plainText?: string): Promise<boolean> {
     const subject = await client.query<{
       project_id: string; content_hash: string; fingerprint: string; workflow_id: string | null; document_id: string | null;
     }>(`
@@ -1837,10 +1854,13 @@ export class NovelPostgresRepository {
     `, [snapshotId, target.document_id, target.project_id, revisionId ?? null, target.content_hash, target.fingerprint, target.workflow_id, snapshot.verdict, snapshot.overallScore ?? null, JSON.stringify({}), snapshot.reviewerRoles, reviewedAt]);
     await client.query("DELETE FROM chapter_review_snapshot_issues WHERE snapshot_id=$1", [snapshotId]);
     for (const issue of snapshot.issues) {
+      // P0-C4: evidence 正文包含性软校验——审校 issue 的 evidence 在正文零命中时
+      // 附 evidence-unverified 标记（作者 issue 不做校验），供人工决策识别回显误报。
+      const marked = plainText ? markEvidenceUnverified(issue, plainText) : issue;
       await client.query(`
         INSERT INTO chapter_review_snapshot_issues(id,snapshot_id,issue_fingerprint,dimension,severity,title,description,evidence_quote,paragraph,revision_ranges,rule,suggestion,reader_reconstruction,source_roles,status)
         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
-      `, [issue.id, snapshotId, issue.fingerprint, null, issue.severity, issue.title, issue.description ?? null, issue.evidenceQuote, issue.paragraph ?? null, JSON.stringify(issue.revisionRanges), issue.rule ?? null, issue.suggestion ?? null, issue.readerReconstruction ?? null, issue.sourceRoles, issue.status]);
+      `, [marked.id, snapshotId, marked.fingerprint, marked.dimension ?? null, marked.severity, marked.title, marked.description ?? null, marked.evidenceQuote, marked.paragraph ?? null, JSON.stringify(marked.revisionRanges), marked.rule ?? null, marked.suggestion ?? null, marked.readerReconstruction ?? null, marked.sourceRoles, marked.status]);
     }
     return true;
   }
@@ -4445,17 +4465,38 @@ export class NovelPostgresRepository {
     }
   }
 
-  async getChapterReviewPreflight(projectId: string, documentId: string): Promise<{ status: string; baseRevision: number; activeWorkflowId?: string; hasBlueprint: boolean } | undefined> {
+  async getChapterReviewPreflight(projectId: string, documentId: string): Promise<{ status: string; baseRevision: number; activeWorkflowId?: string; projectActiveReviewWorkflowId?: string; hasBlueprint: boolean } | undefined> {
     const document = await this.pool.query<{ status: string; current_revision: string | number }>(
       `SELECT d.status,p.current_revision FROM manuscript_documents d JOIN novel_projects p ON p.id=d.project_id WHERE d.project_id=$1 AND d.id=$2`,
       [projectId, documentId],
     );
     if (!document.rowCount) return undefined;
-    const [activeWorkflowId, blueprint] = await Promise.all([
+    const [activeWorkflowId, projectActiveReviewWorkflowId, blueprint] = await Promise.all([
       this.findActiveChapterReview(projectId, documentId),
+      this.findActiveProjectChapterReview(projectId, documentId),
       this.findHistoricalBlueprintForDocument(projectId, documentId),
     ]);
-    return { status: document.rows[0].status, baseRevision: Number(document.rows[0].current_revision), activeWorkflowId, hasBlueprint: Boolean(blueprint) };
+    return { status: document.rows[0].status, baseRevision: Number(document.rows[0].current_revision), activeWorkflowId, projectActiveReviewWorkflowId, hasBlueprint: Boolean(blueprint) };
+  }
+
+  /**
+   * 查找同项目其他章节的活跃 chapter-review 工作流。
+   *
+   * 设计依据：并发审校同一项目的不同章节时，前一个工作流 commit 会提升项目
+   * current_revision，使后一个工作流 commit 因"正式稿基线已变化"整体失败。
+   * 这是项目级串行约束（基线是项目级的），不是单章节约束；启动时检测并提示，
+   * 让调用方决定串行等待，避免事后失败。
+   */
+  async findActiveProjectChapterReview(projectId: string, documentId: string): Promise<string | undefined> {
+    const result = await this.pool.query<{ temporal_workflow_id: string }>(
+      `SELECT temporal_workflow_id FROM workflow_runs
+       WHERE project_id=$1 AND workflow_type='chapter-review'
+         AND (payload->>'documentId') IS DISTINCT FROM $2
+         AND status IN ('accepted','running','manual-review-required')
+       ORDER BY updated_at DESC LIMIT 1`,
+      [projectId, documentId],
+    );
+    return result.rows[0]?.temporal_workflow_id;
   }
 
   async findActiveChapterReview(projectId: string, documentId: string): Promise<string | undefined> {
@@ -5843,7 +5884,9 @@ export class NovelPostgresRepository {
       const previousRevisionId = currentDocument.rows[0]?.current_revision_id ?? null;
       if (previousRevisionId) await client.query("UPDATE manuscript_revisions SET retention_class='rolling',expires_at=COALESCE(expires_at,now()+interval '30 days') WHERE id=$1 AND retention_class<>'named'", [previousRevisionId]);
       await client.query("INSERT INTO manuscript_revisions(id,project_id,document_id,revision,base_revision,content_hash,artifact_id) VALUES($1,$2,$3,$4,$5,$6,$7)", [input.revisionId, input.projectId, input.documentId, revision, input.baseRevision, input.contentHash, input.artifact.id]);
-      await this.refreshChapterReviewSnapshotTx(client, input.artifact.id, input.revisionId);
+      // P0-C4 修订：传提交正文作为 plainText，使 refresh 重算 evidence 软标记时
+      // 不因缺少正文而抹掉已落库的 evidence-unverified 标记（与 putReview 路径一致）。
+      await this.refreshChapterReviewSnapshotTx(client, input.artifact.id, input.revisionId, input.text);
       await client.query("UPDATE manuscript_documents SET current_revision_id=$1,status='final',updated_at=now() WHERE id=$2 AND project_id=$3", [input.revisionId, input.documentId, input.projectId]);
       await this.syncFinalChapterBlueprintStatusTx(client, input.projectId, input.documentId);
 

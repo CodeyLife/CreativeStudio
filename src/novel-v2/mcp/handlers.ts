@@ -825,6 +825,12 @@ const novel_chapter_review: ToolHandler = async (args, ctx) => {
   if (preflight.status !== "final") throw new Error("章节审校仅对已定稿章节开放");
   if (preflight.activeWorkflowId) throw new Error(`该章节已有活跃审校工作流：${preflight.activeWorkflowId}`);
   if (!preflight.hasBlueprint) throw new Error("找不到该章节的历史 blueprint artifact，无法启动章节审校");
+  // 项目级串行约束：同项目其他章节的活跃 chapter-review 会先 commit 提升项目基线，
+  // 使本工作流 commit 失败（"正式稿基线已变化"）。启动时提示调用方串行等待。
+  const projectActiveReviewWorkflowId = preflight.projectActiveReviewWorkflowId;
+  if (projectActiveReviewWorkflowId) {
+    throw new Error(`该项目已有其他章节的活跃审校工作流（${projectActiveReviewWorkflowId}），并发审校会因项目基线变化导致提交失败；请等待其完成后再启动本审校`);
+  }
 
   const workflowId = `chapter-review-${documentId}-${idempotencyKey.replace(/[^a-zA-Z0-9_-]/g, "-")}`.slice(0, 200);
   const params = { projectId, documentId, instruction, workflowId, mode: mode as "full" | "targeted", targetIssueIds: mode === "targeted" ? targetIssueIds : undefined };
@@ -832,7 +838,16 @@ const novel_chapter_review: ToolHandler = async (args, ctx) => {
   // （updateTaskAttempt / draft / review / revise / externalTask），task_attempts.workflow_run_id 有 FK→workflow_runs.id。
   // 若 id=randomUUID() 而 workflow 用 workflowId，FK 会失败。与 novelIntentWorkflow 对齐。
   await ctx.repository.putWorkflowRun({ id: workflowId, workflowType: "chapter-review", projectId, temporalWorkflowId: workflowId, status: "accepted", payload: { documentId, instruction, idempotencyKey, mode, targetIssueIds: mode === "targeted" ? targetIssueIds : [] } });
-  const handle = await ctx.temporal.workflow.start("chapterReviewWorkflow", { args: [params], taskQueue: ctx.taskQueue ?? "novel-v2", workflowId });
+  let handle;
+  try {
+    handle = await ctx.temporal.workflow.start("chapterReviewWorkflow", { args: [params], taskQueue: ctx.taskQueue ?? "novel-v2", workflowId });
+  } catch (error) {
+    // accepted 记录会被单文档与项目级审校查询视为活跃；若 start 失败而记录
+    // 悬挂，该章节乃至整个项目的审校启动都会被永久阻塞（工作流从未运行，
+    // 没有路径会把它转终态）。因此 start 失败时必须把记录转 failed 释放占用。
+    await ctx.repository.updateWorkflowRunStatus(workflowId, "failed", { reason: "workflow.start 失败", error: (error as Error)?.message ?? String(error) }).catch(() => undefined);
+    throw error;
+  }
   return { workflowId, temporalRunId: handle.firstExecutionRunId, documentId, instruction, mode, targetIssueIds: mode === "targeted" ? targetIssueIds : [], status: "accepted", nextAction: "调用 novel_workflow_get({ workflowId }) 查询审校进度" };
 };
 
@@ -845,6 +860,17 @@ const novel_chapter_review_issue_add: ToolHandler = async (args, ctx) => {
   if (severity !== "blocker" && severity !== "major" && severity !== "warning") throw new Error("severity 必须是 blocker/major/warning");
   const paragraph = asNumber(args.paragraph);
   if (paragraph !== undefined && (!Number.isInteger(paragraph) || paragraph < 1)) throw new Error("paragraph 必须是正整数");
+  const rawRanges = args.revisionRanges;
+  const revisionRanges = Array.isArray(rawRanges)
+    ? rawRanges.map((range) => {
+        if (!range || typeof range !== "object" || Array.isArray(range)) throw new Error("revisionRanges 每项必须是 {start,end} 对象");
+        const start = asNumber((range as Record<string, unknown>).start);
+        const end = asNumber((range as Record<string, unknown>).end);
+        if (start === undefined || end === undefined || !Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start) throw new Error("revisionRanges 的 start/end 必须是满足 1<=start<=end 的整数");
+        return { start, end };
+      })
+    : undefined;
+  if (revisionRanges?.length && paragraph !== undefined) throw new Error("paragraph 与 revisionRanges 不能同时提供，使用 revisionRanges 表达多段落范围");
   const issue = await ctx.repository.addChapterReviewIssue({
     projectId,
     documentId,
@@ -853,6 +879,7 @@ const novel_chapter_review_issue_add: ToolHandler = async (args, ctx) => {
     description: asString(args.description) || undefined,
     evidenceQuote: asString(args.evidenceQuote) || undefined,
     paragraph,
+    revisionRanges,
     suggestion: asString(args.suggestion) || undefined,
   });
   return { issue };

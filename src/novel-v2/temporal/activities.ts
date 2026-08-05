@@ -469,7 +469,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
             contextManifestId: promptPackage.manifest.id,
           },
         };
-        await deps.repository.putReview(review, { refreshChapterSnapshot: !input.suppressChapterSnapshotPromotion });
+        await deps.repository.putReview(review, { refreshChapterSnapshot: !input.suppressChapterSnapshotPromotion, plainText: input.text });
         return { kind: "completed", review };
       } catch (error) {
         if (!(error instanceof ExternalMcpRequiredError)) throw error;
@@ -815,7 +815,14 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       const validate = new Ajv({ allErrors: true, strict: false }).compile(reviewerSchema);
       if (!task || task.status !== "submitted" || !validate(input.value)) throw new Error(`外部审核结果无效：${validate.errors?.map((item) => item.message).join("；") ?? "任务未提交"}`);
       const review = { ...toReview({ artifact: input.artifact, identity: input.identity, role: input.role, output: input.value as ReviewerOutput }), modelProvenance: { routeSnapshotId: task.configRevision, purpose: task.purpose, candidateIndex: task.candidateIndex, executor: "external-mcp" as const, model: "external-mcp", promptFingerprint: task.workPackage.inputFingerprint, skillBundleId: task.workPackage.contextRefs.skillBundleId, skillBundleFingerprint: task.workPackage.contextRefs.skillBundleFingerprint, contextManifestId: task.workPackage.contextRefs.contextManifestId } };
-      await deps.repository.putReview(review, { refreshChapterSnapshot: !input.suppressChapterSnapshotPromotion });
+      // 与内部审校路径（plainText: input.text）对齐：外部路径从被审 artifact 的
+      // objectKey 解析正文，供 evidence 软校验落库时确定性标记；存储不可用时报
+      // 级降级为不标记（软标记仅作人工参考，不影响审校落库）。
+      let plainText: string | undefined;
+      if (input.artifact.objectKey) {
+        try { plainText = await objects.getText(input.artifact.objectKey); } catch { plainText = undefined; }
+      }
+      await deps.repository.putReview(review, { refreshChapterSnapshot: !input.suppressChapterSnapshotPromotion, plainText });
       return review;
     },
     extractFacts: async (input: { workflowId: string; projectId: string; artifact: Artifact; text: string; blueprint: ExecutionBlueprint; routingSnapshot: ModelRoutingSnapshot; candidateStartIndex?: number; documentId?: string; narrativeOrder?: number }): Promise<GeneratedArtifactResult> => {

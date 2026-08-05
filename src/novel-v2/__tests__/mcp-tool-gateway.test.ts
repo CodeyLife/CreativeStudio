@@ -327,6 +327,29 @@ describe("executeTool error paths", () => {
     }));
   });
 
+  it("novel_chapter_review marks the run failed when workflow.start throws, so the lock is released", async () => {
+    // accepted 悬挂会被单文档/项目级审校查询视为活跃并永久阻塞；start 失败必须转 failed。
+    const putWorkflowRun = vi.fn().mockResolvedValue(undefined);
+    const updateWorkflowRunStatus = vi.fn().mockResolvedValue(undefined);
+    const start = vi.fn().mockRejectedValue(new Error("Temporal 暂时不可用"));
+    const result = await executeTool(
+      "novel_chapter_review",
+      { projectId: "p1", documentId: "d1", idempotencyKey: "review-fail-1" },
+      {
+        repository: {
+          getChapterReviewPreflight: vi.fn().mockResolvedValue({ status: "final", baseRevision: 1, hasBlueprint: true }),
+          putWorkflowRun,
+          updateWorkflowRunStatus,
+        } as never,
+        temporal: { workflow: { start } } as never,
+        taskQueue: "novel-v2",
+      },
+    );
+    expect(result.isError).toBe(true);
+    expect(start).toHaveBeenCalledOnce();
+    expect(updateWorkflowRunStatus).toHaveBeenCalledWith(expect.any(String), "failed", expect.objectContaining({ reason: "workflow.start 失败" }));
+  });
+
   it("novel_chapter_review_issue_add persists an author issue without mutating the manuscript", async () => {
     const addChapterReviewIssue = vi.fn().mockResolvedValue({ id: "issue-1", status: "pending" });
     const result = await executeTool(

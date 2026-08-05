@@ -24,6 +24,51 @@ describe("chapter revision", () => {
       .toBe("等待。\n\n上方传来脚步。\n\n等待。");
   });
 
+  it("drops a replacement that copies the prior neighbor paragraph in full plus an appendage", () => {
+    // 修订模型把窗口前邻段整段复制进替换文本并追加一句（ch5 段17 复制的拼接错误）。
+    const text = "陈渊早已算准了扑击路线，侧身避开利齿，右手顺势向下握住了金属残片。\n\n那是一片不知什么年代断裂的武器部件，异常锋利。\n\n水鼠扑了个空，陈渊左手按住它的后颈皮。";
+    const window = { start: 1, end: 1, issues: [] };
+    const replacement = "陈渊早已算准了扑击路线，侧身避开利齿，右手顺势向下握住了金属残片。与此同时，他握紧那片暗蓝色的金属，直接刺向水鼠的脖颈。";
+    const result = applyRevisionWindows(text, [{ window, text: replacement }]);
+    // 前邻段全文被复制为替换首段前缀 → 整段丢弃，窗口内容保留原文。
+    expect(result).not.toContain("与此同时，他握紧那片暗蓝色的金属，直接刺向水鼠的脖颈。");
+    expect(result.split("\n\n")).toHaveLength(3);
+  });
+
+  it("drops a replacement tail that exactly duplicates the next neighbor paragraph", () => {
+    // 修订模型把窗口后邻段复制进替换文本末段（ch5 段19 完全重复的拼接错误）。
+    const text = "甲握住残片。\n\n旧窗口段。\n\n水鼠扑了个空，陈渊左手按住它的后颈皮，爪甲划破了他的手腕。\n\n痛感让陈渊清醒到顶峰。";
+    const window = { start: 1, end: 1, issues: [] };
+    const replacement = "新窗口段。\n\n水鼠扑了个空，陈渊左手按住它的后颈皮，爪甲划破了他的手腕。";
+    const result = applyRevisionWindows(text, [{ window, text: replacement }]);
+    expect(result).toBe("甲握住残片。\n\n新窗口段。\n\n水鼠扑了个空，陈渊左手按住它的后颈皮，爪甲划破了他的手腕。\n\n痛感让陈渊清醒到顶峰。");
+  });
+
+  it("drops a single-paragraph replacement that exactly duplicates the next neighbor", () => {
+    // 单段窗口替换恰好等于后邻段全文（与 before 分支对称的边界回显故障）：
+    // 整段丢弃后窗口保留原文，正文不出现硬重复段。
+    const text = "甲握住残片。\n\n旧窗口段。\n\n水鼠扑了个空，陈渊左手按住它的后颈皮。\n\n痛感让陈渊清醒到顶峰。";
+    const window = { start: 1, end: 1, issues: [] };
+    const result = applyRevisionWindows(text, [{ window, text: "水鼠扑了个空，陈渊左手按住它的后颈皮。" }]);
+    expect(result).toBe("甲握住残片。\n\n旧窗口段。\n\n水鼠扑了个空，陈渊左手按住它的后颈皮。\n\n痛感让陈渊清醒到顶峰。");
+  });
+
+  it("throws a contract error when the only targeted replacement is fully deduped", () => {
+    // targeted 路径中窗口改动被完全剔除 → 无实际修改 → 契约错误，由调用方回退整章修订。
+    const text = "甲握住残片。\n\n旧窗口段。\n\n水鼠扑了个空，陈渊左手按住它的后颈皮。";
+    const windows = planRevisionWindows(text, [{ severity: "major", title: "目标", evidence: "旧窗口段。", revisionRanges: [{ start: 2, end: 2 }] }]);
+    expect(() => applyTargetedRevisionReplacements(text, windows, [{ start: 2, end: 2, text: "水鼠扑了个空，陈渊左手按住它的后颈皮。" }])).toThrow(TargetedRevisionContractError);
+  });
+
+  it("keeps a legitimate replacement whose opening overlaps the prior paragraph only partially", () => {
+    // 开头局部重合是正常承接，不应误删。
+    const text = "他握紧了那块金属残片。\n\n旧窗口段。\n\n水鼠扑了个空。";
+    const window = { start: 1, end: 1, issues: [] };
+    const replacement = "他握紧残片，把断口抵在指缝里，屏住呼吸。";
+    const result = applyRevisionWindows(text, [{ window, text: replacement }]);
+    expect(result).toContain("他握紧残片，把断口抵在指缝里，屏住呼吸。");
+  });
+
   it("plans evidence windows and preserves unrelated paragraphs", () => {
     const text = "第一段。\n\n第二段。\n\n第三段。\n\n第四段。";
     const issues: ReviewIssue[] = [{ severity: "major", title: "证据问题", evidence: "第二段。", revisionRanges: [{ start: 2, end: 2 }], suggestion: "改变承载方式" }];
@@ -211,5 +256,87 @@ describe("chapter revision", () => {
     expect(generateStructured).toHaveBeenCalledOnce();
     expect(generateText).toHaveBeenCalledTimes(2);
     expect((result as { artifact: Artifact }).artifact.structuredData).not.toMatchObject({ revisionMode: "targeted-batch" });
+  });
+
+  it("resolves the reviewed text for evidence markers on the external review path", async () => {
+    // 外部 MCP 审校路径必须把被审 artifact 的正文传给 putReview，
+    // 否则 refresh 时 evidence 软校验无正文可查，issue 永不附 evidence-unverified 标记。
+    const putReview = vi.fn(async () => undefined);
+    const candidateText = "他握住残片，屏住呼吸。\n\n暗处的光斑晃了一下。";
+    const activities = createNovelWorkflowActivities({
+      repository: {
+        putReview,
+        getModelTask: async () => ({
+          id: "task-1",
+          status: "submitted",
+          configRevision: "route-1",
+          purpose: "writing.review",
+          candidateIndex: 0,
+          workPackage: { inputFingerprint: "fp", contextRefs: {} },
+        }),
+      } as unknown as NovelPostgresRepository,
+      memoryProvider: { search: async () => [] },
+      skillProvider: { list: async () => [] },
+      modelGateway: {} as ModelGateway,
+      objectStore: { getText: vi.fn(async () => candidateText) } as unknown as ContentObjectStore,
+      commitService: {} as CommitService,
+      enableChapterMemory: false,
+    });
+
+    const artifact: Artifact = {
+      id: "artifact-external-review", projectId: "p1", taskId: "chapter-1", attemptId: "attempt-1", kind: "draft",
+      contentHash: "hash", objectKey: "objects/candidate", baseRevision: 0, createdAt: 1, fingerprint: "fp-1",
+    };
+    await activities.materializeExternalReview({
+      modelTaskId: "task-1",
+      artifact,
+      identity: "internal",
+      role: "structure-reviewer",
+      value: { verdict: "passed", score: 4, issues: [] },
+    });
+
+    expect(putReview).toHaveBeenCalledWith(
+      expect.objectContaining({ artifactId: artifact.id }),
+      expect.objectContaining({ refreshChapterSnapshot: true, plainText: candidateText }),
+    );
+  });
+
+  it("degrades to no plainText when the reviewed artifact has no object key", async () => {
+    const putReview = vi.fn(async () => undefined);
+    const getText = vi.fn(async () => "不应被读取");
+    const activities = createNovelWorkflowActivities({
+      repository: {
+        putReview,
+        getModelTask: async () => ({
+          id: "task-2",
+          status: "submitted",
+          configRevision: "route-1",
+          purpose: "writing.review",
+          candidateIndex: 0,
+          workPackage: { inputFingerprint: "fp", contextRefs: {} },
+        }),
+      } as unknown as NovelPostgresRepository,
+      memoryProvider: { search: async () => [] },
+      skillProvider: { list: async () => [] },
+      modelGateway: {} as ModelGateway,
+      objectStore: { getText } as unknown as ContentObjectStore,
+      commitService: {} as CommitService,
+      enableChapterMemory: false,
+    });
+
+    const artifact: Artifact = {
+      id: "artifact-no-object-key", projectId: "p1", taskId: "chapter-1", attemptId: "attempt-1", kind: "draft",
+      contentHash: "hash", baseRevision: 0, createdAt: 1, fingerprint: "fp-2",
+    };
+    await activities.materializeExternalReview({
+      modelTaskId: "task-2",
+      artifact,
+      identity: "internal",
+      role: "structure-reviewer",
+      value: { verdict: "passed", score: 4, issues: [] },
+    });
+
+    expect(getText).not.toHaveBeenCalled();
+    expect(putReview).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ plainText: undefined }));
   });
 });
