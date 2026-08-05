@@ -1,7 +1,8 @@
-import { defineConfig } from "vite";
+import { defineConfig, loadEnv } from "vite";
 import react from "@vitejs/plugin-react";
 import path from "node:path";
 import { readFileSync } from "node:fs";
+import { childRuntimeEnv } from "./scripts/runtime-env.mjs";
 /**
  * 排除 onnxruntime-web 的 wasm 资源被打包进 dist。
  *
@@ -34,79 +35,107 @@ function readDefaultBaseUrl() {
     return match[1];
 }
 const DEV_PROXY_TARGET = new URL(readDefaultBaseUrl()).origin;
-export default defineConfig({
-    plugins: [react(), excludeOnnxWasm()],
-    resolve: {
-        alias: {
-            "@": path.resolve(__dirname, "./src"),
+function runtimeProbePlugin(apiTarget) {
+    return {
+        name: "novel-runtime-probe",
+        configureServer(server) {
+            return () => {
+                server.middlewares.use("/__novel_runtime", async (_request, response) => {
+                    try {
+                        const upstream = await fetch(`${apiTarget}/health`, { cache: "no-store" });
+                        const body = await upstream.text();
+                        response.statusCode = upstream.status;
+                        response.setHeader("content-type", "application/json; charset=utf-8");
+                        response.setHeader("cache-control", "no-store");
+                        response.end(body);
+                    }
+                    catch (error) {
+                        response.statusCode = 503;
+                        response.setHeader("content-type", "application/json; charset=utf-8");
+                        response.end(JSON.stringify({ status: "unready", error: error instanceof Error ? error.message : String(error) }));
+                    }
+                });
+            };
         },
-    },
-    optimizeDeps: {
-        exclude: ["onnxruntime-web"],
-    },
-    server: {
-        port: 5173,
-        proxy: {
-            "/api": {
-                target: DEV_PROXY_TARGET,
-                changeOrigin: true,
-                secure: false,
-                timeout: 600000,
-                proxyTimeout: 600000,
-            },
-            "/ai-proxy": {
-                target: DEV_PROXY_TARGET,
-                changeOrigin: true,
-                secure: false,
-                rewrite: (p) => p.replace(/^\/ai-proxy/, "/v1"),
-                timeout: 600000,
-                proxyTimeout: 600000,
-            },
-            "/v2": {
-                target: process.env.NOVEL_V2_API_URL ?? "http://127.0.0.1:4770",
-                changeOrigin: true,
-                secure: false,
-                timeout: 600000,
-                proxyTimeout: 600000,
-            },
-            // hf-mirror.com 不返回 Access-Control-Allow-Origin，浏览器跨域 fetch 会被 CORS 拦截。
-            // 走同源 /hf-mirror/ 路径由 vite 转发，规避 CORS（与 /api、/ai-proxy 同模式）。
-            // 生产部署需在后端反向代理同样路径，或通过 VITE_HF_MIRROR 指向已开启 CORS 的源。
-            "/hf-mirror": {
-                target: "https://hf-mirror.com",
-                changeOrigin: true,
-                secure: false,
-                rewrite: (p) => p.replace(/^\/hf-mirror/, ""),
-                timeout: 600000,
-                proxyTimeout: 600000,
+    };
+}
+export default defineConfig(({ mode }) => {
+    const env = { ...childRuntimeEnv(__dirname), ...loadEnv(mode, process.cwd(), ""), ...process.env };
+    const novelApiTarget = env.NOVEL_V2_API_URL ?? "http://127.0.0.1:4770";
+    return {
+        plugins: [react(), excludeOnnxWasm(), runtimeProbePlugin(novelApiTarget)],
+        resolve: {
+            alias: {
+                "@": path.resolve(__dirname, "./src"),
             },
         },
-    },
-    build: {
-        target: "esnext",
-        rollupOptions: {
-            output: {
-                manualChunks(id) {
-                    if (!id.includes("node_modules"))
-                        return undefined;
-                    if (/[\\/]node_modules[\\/](\.pnpm[\\/])?(react|react-dom|react-router-dom|scheduler)[\\/]/.test(id)) {
-                        return "vendor-react";
-                    }
-                    if (/[\\/]node_modules[\\/](\.pnpm[\\/])?(antd|@ant-design|rc-[^\\/]+)[\\/]/.test(id)) {
-                        return "vendor-antd";
-                    }
-                    if (id.includes("motion") || id.includes("gsap")) {
-                        return "vendor-motion";
-                    }
-                    if (id.includes("@tanstack")) {
-                        return "vendor-query";
-                    }
-                    if (id.includes("zustand") || id.includes("axios")) {
-                        return "vendor-state";
-                    }
-                    return undefined;
+        optimizeDeps: {
+            exclude: ["onnxruntime-web"],
+        },
+        server: {
+            port: 5173,
+            proxy: {
+                "/api": {
+                    target: DEV_PROXY_TARGET,
+                    changeOrigin: true,
+                    secure: false,
+                    timeout: 600000,
+                    proxyTimeout: 600000,
+                },
+                "/ai-proxy": {
+                    target: DEV_PROXY_TARGET,
+                    changeOrigin: true,
+                    secure: false,
+                    rewrite: (p) => p.replace(/^\/ai-proxy/, "/v1"),
+                    timeout: 600000,
+                    proxyTimeout: 600000,
+                },
+                "/v2": {
+                    target: novelApiTarget,
+                    changeOrigin: true,
+                    secure: false,
+                    timeout: 600000,
+                    proxyTimeout: 600000,
+                },
+                // hf-mirror.com 不返回 Access-Control-Allow-Origin，浏览器跨域 fetch 会被 CORS 拦截。
+                // 走同源 /hf-mirror/ 路径由 vite 转发，规避 CORS（与 /api、/ai-proxy 同模式）。
+                // 生产部署需在后端反向代理同样路径，或通过 VITE_HF_MIRROR 指向已开启 CORS 的源。
+                "/hf-mirror": {
+                    target: "https://hf-mirror.com",
+                    changeOrigin: true,
+                    secure: false,
+                    rewrite: (p) => p.replace(/^\/hf-mirror/, ""),
+                    timeout: 600000,
+                    proxyTimeout: 600000,
                 },
             },
         },
-    },
+        build: {
+            target: "esnext",
+            rollupOptions: {
+                output: {
+                    manualChunks(id) {
+                        if (!id.includes("node_modules"))
+                            return undefined;
+                        if (/[\\/]node_modules[\\/](\.pnpm[\\/])?(react|react-dom|react-router-dom|scheduler)[\\/]/.test(id)) {
+                            return "vendor-react";
+                        }
+                        if (/[\\/]node_modules[\\/](\.pnpm[\\/])?(antd|@ant-design|rc-[^\\/]+)[\\/]/.test(id)) {
+                            return "vendor-antd";
+                        }
+                        if (id.includes("motion") || id.includes("gsap")) {
+                            return "vendor-motion";
+                        }
+                        if (id.includes("@tanstack")) {
+                            return "vendor-query";
+                        }
+                        if (id.includes("zustand") || id.includes("axios")) {
+                            return "vendor-state";
+                        }
+                        return undefined;
+                    },
+                },
+            },
+        },
+    };
 });

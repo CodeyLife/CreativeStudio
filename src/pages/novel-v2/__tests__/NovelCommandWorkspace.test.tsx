@@ -38,6 +38,20 @@ function renderWorkspace(entry = "/novels/p1?view=overview&document=d1&run=wf-re
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   client.setQueryData(novelKeys.project("p1"), project);
   client.setQueryData(novelKeys.runs("p1"), runs);
+  client.setQueryData(novelKeys.modelInvocationErrors("p1"), [{
+    id: 1,
+    workflowRunId: "wf-failed",
+    purpose: "review.prose",
+    candidateIndex: 2,
+    executor: "api",
+    configRevision: "old-revision",
+    isCurrentConfig: false,
+    provider: "deepseek",
+    model: "deepseek-v4-flash",
+    errorCategory: "http-402",
+    errorMessage: "模型服务 HTTP 402: Insufficient Balance",
+    createdAt: "2026-07-29T09:10:00.000Z",
+  }]);
   client.setQueryData(novelKeys.run("wf-review"), { workflowId: "wf-review", status: "manual-review-required", record: runs[2] });
   client.setQueryData(novelKeys.runEvents("wf-review"), []);
   client.setQueryData(novelKeys.runArtifacts("wf-review"), []);
@@ -59,6 +73,22 @@ function renderProduction() {
   client.setQueryData(novelKeys.run("wf-review"), { workflowId: "wf-review", status: "manual-review-required", record: targetedReviewRun });
   client.setQueryData(novelKeys.runEvents("wf-review"), []);
   client.setQueryData(novelKeys.runArtifacts("wf-review"), []);
+  client.setQueryData(novelKeys.runModelInvocations("wf-review"), [{
+    id: 42,
+    workflowRunId: "wf-review",
+    taskId: "review:prose",
+    purpose: "review.prose",
+    candidateIndex: 0,
+    executor: "api",
+    provider: "glm",
+    protocol: "responses",
+    model: "glm-5.2",
+    status: "completed",
+    configRevision: "route-current-123456",
+    isCurrentConfig: true,
+    latencyMs: 812,
+    createdAt: "2026-07-29T08:20:00.000Z",
+  }]);
   client.setQueryData(novelKeys.factCandidates("p1", "d1"), []);
   return renderToStaticMarkup(<QueryClientProvider client={client}><ConfigProvider theme={{ algorithm: antdTheme.darkAlgorithm }}><App><MemoryRouter><NovelProductionWorkspace embedded projectId="p1" documentId="d1" workflowId="wf-review" stage="review" /></MemoryRouter></App></ConfigProvider></QueryClientProvider>);
 }
@@ -260,6 +290,15 @@ describe("Novel command workspace", () => {
     expect(html).toContain("批准并继续");
   });
 
+  it("shows recent model provider failures and their error content on the overview", () => {
+    const html = renderWorkspace();
+    expect(html).toContain("最近 50 条错误");
+    expect(html).toContain("deepseek-v4-flash");
+    expect(html).toContain("Insufficient Balance");
+    expect(html).toContain("http-402");
+    expect(html).toContain("历史路由 old-revi");
+  });
+
   it("renders chapter production inside the unified workspace from URL state", () => {
     const html = renderWorkspace("/novels/p1?view=production&document=d1&run=wf-review&stage=review");
     expect(html).toContain("章节生产");
@@ -273,6 +312,8 @@ describe("Novel command workspace", () => {
     expect(productionHtml).toContain("按当前稿继续修订");
     expect(productionHtml).toContain("放弃本次工作流");
     expect(productionHtml).toContain("查看工作流");
+    expect(productionHtml).toContain("glm · glm-5.2");
+    expect(productionHtml).toContain("当前路由 route-cu");
     expect(productionHtml).not.toContain("运行详情");
     expect(productionHtml).not.toContain("11 阶段");
   });
@@ -312,9 +353,9 @@ describe("Novel command workspace", () => {
     expect(html).toContain("待处理 1 条");
   });
 
-  it("offers whole-chapter rewrite from the blueprint for finalized manuscripts", () => {
+  it("offers whole-chapter review from the blueprint for finalized manuscripts", () => {
     const html = renderFinalProductionWithCreationAction();
-    expect(html).toContain("从蓝图重写");
+    expect(html).toContain("按蓝图重新审校");
     expect(html).toContain("重新审校");
   });
 });

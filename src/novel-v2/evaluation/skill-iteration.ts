@@ -64,14 +64,14 @@ export const skillIterationSchema = {
           promptSections: {
             type: "object",
             additionalProperties: false,
-            minProperties: 1,
+            required: ["foundation", "planning", "drafting", "review", "revision", "fact-extraction"],
             properties: {
-              foundation: { type: "string", minLength: 20, maxLength: 10000 },
-              planning: { type: "string", minLength: 20, maxLength: 10000 },
-              drafting: { type: "string", minLength: 20, maxLength: 10000 },
-              review: { type: "string", minLength: 20, maxLength: 10000 },
-              revision: { type: "string", minLength: 20, maxLength: 10000 },
-              "fact-extraction": { type: "string", minLength: 20, maxLength: 10000 },
+              foundation: { type: "string", maxLength: 10000 },
+              planning: { type: "string", maxLength: 10000 },
+              drafting: { type: "string", maxLength: 10000 },
+              review: { type: "string", maxLength: 10000 },
+              revision: { type: "string", maxLength: 10000 },
+              "fact-extraction": { type: "string", maxLength: 10000 },
             },
           },
           rationale: { type: "string", minLength: 10, maxLength: 1000 },
@@ -86,7 +86,7 @@ export const skillIterationSchema = {
   },
 } as const;
 
-function schemaForSkills(skillIds: string[]): Record<string, unknown> {
+export function schemaForSkills(skillIds: string[]): Record<string, unknown> {
   const schema = structuredClone(skillIterationSchema) as unknown as {
     properties: { iterations: { items: { properties: { skillId: Record<string, unknown> } } } };
   };
@@ -335,7 +335,8 @@ export async function runSkillIteration(input: {
     const skill = skillMap.get(iteration.skillId);
     if (!skill) throw new Error(`skill iteration 返回未知 skillId：${iteration.skillId}`);
 
-    const afterPrompt = serializePromptSections(iteration.promptSections, `skill ${iteration.skillId} 的 promptSections`);
+    const nonEmptyPromptSections = Object.fromEntries(Object.entries(iteration.promptSections).filter(([, text]) => typeof text === "string" && text.trim()));
+    const afterPrompt = serializePromptSections(nonEmptyPromptSections, `skill ${iteration.skillId} 的 promptSections`);
     if (afterPrompt.length < 100) throw new Error(`skill ${iteration.skillId} 的 promptSections 总长度少于 100 字符`);
 
     // beforePrompt 与 afterPrompt 不能相同

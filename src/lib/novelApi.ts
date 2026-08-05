@@ -7,6 +7,7 @@
  * ============================================================ */
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useRef } from "react";
 
 // ---------- API 类型（对齐 scripts/novel-v2-api.ts 返回体） ----------
 export interface NovelDocumentSummary {
@@ -155,6 +156,26 @@ export interface NovelPromptExecution {
   };
 }
 
+export interface NovelModelInvocation {
+  id: number;
+  workflowRunId: string;
+  taskId: string;
+  purpose: string;
+  candidateIndex: number;
+  executor: "api" | "external-mcp";
+  profileId?: string;
+  provider?: string;
+  protocol?: string;
+  model: string;
+  status: "completed" | "failed" | "waiting-external";
+  configRevision: string;
+  isCurrentConfig?: boolean;
+  latencyMs?: number;
+  errorCategory?: string;
+  errorMessage?: string;
+  createdAt: string;
+}
+
 export function novelRunDocumentId(run: NovelWorkflowRunRecord | undefined): string | undefined {
   if (!run) return undefined;
   if (typeof run.payload.documentId === "string") return run.payload.documentId;
@@ -195,6 +216,27 @@ export interface NovelChapterReviewIssue {
   sourceRoles: string[];
   status: "pending" | "ignored" | "resolved";
   updatedAt: string;
+}
+
+export interface NovelModelInvocationError {
+  id: number;
+  workflowRunId?: string;
+  taskId?: string;
+  purpose: string;
+  candidateIndex: number;
+  executor: string;
+  profileId?: string;
+  configRevision: string;
+  isCurrentConfig?: boolean;
+  provider: string;
+  protocol?: string;
+  model: string;
+  errorCategory?: string;
+  errorMessage?: string;
+  createdAt: string;
+  projectId?: string;
+  workflowType?: string;
+  documentId?: string;
 }
 
 export interface NovelChapterWorkspace {
@@ -302,8 +344,32 @@ export interface NovelCraftRuleExperimentResponse {
 }
 
 // ---------- fetch 帮助 ----------
-async function novelFetch<T>(path: string, init?: RequestInit): Promise<T> {
+export interface NovelRuntimeIdentity {
+  profile: string;
+  runtimeId: string;
+  fingerprint: string;
+  taskQueue?: string;
+  temporalNamespace?: string;
+  qdrantCollection?: string;
+  embeddingDimension?: number;
+  objectBackend?: string;
+}
+
+let runtimeIdentity: NovelRuntimeIdentity | undefined;
+
+export function getNovelRuntimeIdentity(): NovelRuntimeIdentity | undefined {
+  return runtimeIdentity;
+}
+
+export async function novelFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, init);
+  const fingerprint = response.headers.get("x-novel-runtime-fingerprint");
+  const profile = response.headers.get("x-novel-runtime-profile");
+  const runtimeId = response.headers.get("x-novel-runtime-id");
+  if (fingerprint && profile && runtimeId) {
+    if (runtimeIdentity && runtimeIdentity.fingerprint !== fingerprint) throw new Error(`运行时身份发生变化：${runtimeIdentity.fingerprint.slice(0, 12)} -> ${fingerprint.slice(0, 12)}，请刷新页面重新加载数据`);
+    runtimeIdentity = { profile, runtimeId, fingerprint };
+  }
   const body = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error((body as { error?: string }).error ?? `请求失败：${response.status}`);
   return body as T;
@@ -316,16 +382,43 @@ export const novelKeys = {
   projects: ["novel", "projects"] as const,
   project: (id: string) => ["novel", "project", id] as const,
   runs: (id: string) => ["novel", "project", id, "runs"] as const,
+  modelInvocationErrors: (id: string) => ["novel", "project", id, "model-invocation-errors"] as const,
   run: (wfId: string) => ["novel", "run", wfId] as const,
   runEvents: (wfId: string) => ["novel", "run", wfId, "events"] as const,
   runArtifacts: (wfId: string) => ["novel", "run", wfId, "artifacts"] as const,
   runReviews: (wfId: string) => ["novel", "run", wfId, "reviews"] as const,
   runPromptExecutions: (wfId: string) => ["novel", "run", wfId, "prompt-executions"] as const,
+  runModelInvocations: (wfId: string) => ["novel", "run", wfId, "model-invocations"] as const,
   docContent: (id: string, docId: string) => ["novel", "doc", id, docId, "content"] as const,
   chapterWorkspace: (id: string, docId: string) => ["novel", "doc", id, docId, "workspace"] as const,
   factCandidates: (id: string, docId: string) => ["novel", "facts", id, docId] as const,
   learningCenter: (id: string) => ["novel", "learning-center", id] as const,
 };
+
+const isTerminalStatus = (status?: string) => Boolean(status) && !isActiveStatus(status);
+
+export function invalidateNovelProject(queryClient: ReturnType<typeof useQueryClient>, projectId: string | undefined, documentId?: string, workflowId?: string): void {
+  if (!projectId) return;
+  void queryClient.invalidateQueries({ queryKey: novelKeys.projects });
+  void queryClient.invalidateQueries({ queryKey: novelKeys.project(projectId) });
+  void queryClient.invalidateQueries({ queryKey: novelKeys.runs(projectId) });
+  void queryClient.invalidateQueries({ queryKey: novelKeys.learningCenter(projectId) });
+  void queryClient.invalidateQueries({ queryKey: novelKeys.modelInvocationErrors(projectId) });
+  void queryClient.invalidateQueries({ queryKey: ["novel", "artifact"] });
+  if (documentId) {
+    void queryClient.invalidateQueries({ queryKey: novelKeys.docContent(projectId, documentId) });
+    void queryClient.invalidateQueries({ queryKey: novelKeys.chapterWorkspace(projectId, documentId) });
+    void queryClient.invalidateQueries({ queryKey: novelKeys.factCandidates(projectId, documentId) });
+  }
+  if (workflowId) {
+    void queryClient.invalidateQueries({ queryKey: novelKeys.run(workflowId) });
+    void queryClient.invalidateQueries({ queryKey: novelKeys.runEvents(workflowId) });
+    void queryClient.invalidateQueries({ queryKey: novelKeys.runArtifacts(workflowId) });
+    void queryClient.invalidateQueries({ queryKey: novelKeys.runReviews(workflowId) });
+    void queryClient.invalidateQueries({ queryKey: novelKeys.runPromptExecutions(workflowId) });
+    void queryClient.invalidateQueries({ queryKey: novelKeys.runModelInvocations(workflowId) });
+  }
+}
 
 // ---------- 读 ----------
 export function useNovelProjects() {
@@ -340,26 +433,51 @@ export function useNovelProject(projectId: string) {
     queryKey: novelKeys.project(projectId),
     queryFn: async () => (await novelFetch<{ project: NovelProjectDetail }>(`/v2/projects/${enc(projectId)}`)).project,
     enabled: Boolean(projectId),
+    refetchInterval: (query) => query.state.data?.latestRuns?.some((run) => isActiveStatus(run.status)) ? 3000 : false,
   });
 }
 
 export function useNovelProjectRuns(projectId: string) {
-  return useQuery({
+  const queryClient = useQueryClient();
+  const previous = useRef(new Map<string, string>());
+  const query = useQuery({
     queryKey: novelKeys.runs(projectId),
     queryFn: async () => (await novelFetch<{ runs: NovelWorkflowRunRecord[] }>(`/v2/projects/${enc(projectId)}/runs`)).runs ?? [],
     enabled: Boolean(projectId),
+    refetchInterval: (current) => current.state.data?.some((run) => isActiveStatus(run.status)) ? 3000 : false,
   });
+  useEffect(() => {
+    for (const run of query.data ?? []) {
+      const previousStatus = previous.current.get(run.temporalWorkflowId);
+      if (previousStatus && isActiveStatus(previousStatus) && isTerminalStatus(run.status)) {
+        invalidateNovelProject(queryClient, run.projectId || projectId, novelRunDocumentId(run), run.temporalWorkflowId);
+      }
+      previous.current.set(run.temporalWorkflowId, run.status);
+    }
+  }, [projectId, query.data, queryClient]);
+  return query;
 }
 
 const isActiveStatus = (status?: string) => status === "running" || status === "waiting-external" || status === "manual-review-required" || status === "paused" || status === "pending" || status === "accepted";
 
 export function useNovelRun(workflowId: string | undefined) {
-  return useQuery({
+  const queryClient = useQueryClient();
+  const previousStatus = useRef<string | undefined>(undefined);
+  const query = useQuery({
     queryKey: novelKeys.run(workflowId ?? "none"),
     queryFn: () => novelFetch<NovelRunState>(`/v2/runs/${enc(workflowId!)}`),
     enabled: Boolean(workflowId),
     refetchInterval: (query) => (isActiveStatus(query.state.data?.status) ? 3000 : false),
   });
+  useEffect(() => {
+    const state = query.data;
+    const status = state?.record?.status ?? state?.status;
+    if (previousStatus.current && isActiveStatus(previousStatus.current) && isTerminalStatus(status)) {
+      invalidateNovelProject(queryClient, state?.record?.projectId, novelRunDocumentId(state?.record), workflowId);
+    }
+    if (status) previousStatus.current = status;
+  }, [query.data, queryClient, workflowId]);
+  return query;
 }
 
 export function useNovelRunEvents(workflowId: string | undefined, active = false) {
@@ -408,7 +526,7 @@ export function useNovelArtifactText(artifactId: string | undefined) {
 export function useSubmitChapterReview(projectId: string, documentId: string | undefined) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: async (input: { proposedText: string; instruction?: string }) => {
+    mutationFn: async (input: { proposedText?: string; instruction?: string }) => {
       return novelFetch<{ workflowId: string; runId?: string }>(`/v2/projects/${enc(projectId)}/documents/${enc(documentId!)}/review`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -419,6 +537,15 @@ export function useSubmitChapterReview(projectId: string, documentId: string | u
       void qc.invalidateQueries({ queryKey: novelKeys.runs(projectId) });
       void qc.invalidateQueries({ queryKey: novelKeys.project(projectId) });
     },
+  });
+}
+
+export function useNovelModelInvocationErrors(projectId: string) {
+  return useQuery({
+    queryKey: novelKeys.modelInvocationErrors(projectId),
+    queryFn: async () => (await novelFetch<{ errors: NovelModelInvocationError[] }>(`/v2/projects/${enc(projectId)}/model-invocation-errors?limit=50`)).errors ?? [],
+    enabled: Boolean(projectId),
+    refetchInterval: 30_000,
   });
 }
 
@@ -510,6 +637,15 @@ export function useNovelRunPromptExecutions(workflowId: string | undefined, acti
   return useQuery({
     queryKey: novelKeys.runPromptExecutions(workflowId ?? "none"),
     queryFn: async () => (await novelFetch<{ executions: NovelPromptExecution[] }>(`/v2/runs/${enc(workflowId!)}/prompt-executions`)).executions ?? [],
+    enabled: Boolean(workflowId),
+    refetchInterval: active ? 3000 : false,
+  });
+}
+
+export function useNovelRunModelInvocations(workflowId: string | undefined, active = false) {
+  return useQuery({
+    queryKey: novelKeys.runModelInvocations(workflowId ?? "none"),
+    queryFn: async () => (await novelFetch<{ invocations: NovelModelInvocation[] }>(`/v2/runs/${enc(workflowId!)}/model-invocations`)).invocations ?? [],
     enabled: Boolean(workflowId),
     refetchInterval: active ? 3000 : false,
   });

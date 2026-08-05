@@ -78,6 +78,10 @@ export interface ModelExecutionProvenance {
   model: string;
   responseId?: string;
   promptFingerprint: string;
+  /** Review-stage context identity used to reproduce a quality decision. */
+  skillBundleId?: string;
+  skillBundleFingerprint?: string;
+  contextManifestId?: string;
 }
 
 export interface ModelWorkPackage {

@@ -19,7 +19,7 @@ import "./knowledge-form.css";
 
 export type KnowledgeFormKind = "planning" | "worldview" | "characters" | "relations" | "timeline" | "facts" | "claims" | "skills";
 
-type FieldType = "text" | "textarea" | "number" | "select" | "switch" | "stringList" | "json";
+type FieldType = "text" | "textarea" | "number" | "select" | "switch" | "stringList" | "json" | "object";
 
 export interface FieldSchema {
   /** 记录在对象中的 dot 路径（支持 payload.xxx 嵌套） */
@@ -35,6 +35,8 @@ export interface FieldSchema {
   help?: string;
   /** 2 = 占满整行，1 = 半行 */
   span?: 1 | 2;
+  /** object 字段的已知子字段；未声明的键仍通过 JSON 保留和编辑 */
+  children?: FieldSchema[];
 }
 
 /** 各知识库类型的字段 schema（领域内在结构，非特例） */
@@ -51,9 +53,44 @@ export const KNOWLEDGE_FORM_SCHEMA: Record<KnowledgeFormKind, FieldSchema[]> = {
   ],
   characters: [
     { path: "name", label: "角色名", type: "text", placeholder: "如：林晚" },
-    { path: "payload.role", label: "定位 / 身份", type: "text", placeholder: "如：拾光者 / 向导" },
+    { path: "payload.role", label: "定位 / 身份", type: "select", options: [
+      { value: "protagonist", label: "主角" },
+      { value: "antagonist", label: "对手" },
+      { value: "ally", label: "盟友" },
+      { value: "rival", label: "竞争者" },
+      { value: "guardian", label: "守护者" },
+      { value: "mentor", label: "引导者" },
+      { value: "wildcard", label: "变量" },
+    ] },
     { path: "payload.motivation", label: "动机", type: "textarea", rows: 3, span: 2, placeholder: "TA 想要什么、害怕什么" },
-    { path: "payload.voiceAnchor", label: "声部锚点", type: "textarea", rows: 3, span: 2, help: "语气 / 用词 / 节奏 / 禁忌，供人物声音一致性" },
+    { path: "payload.fear", label: "核心恐惧", type: "textarea", rows: 2, placeholder: "TA 最害怕失去什么" },
+    { path: "payload.secret", label: "秘密", type: "textarea", rows: 2, placeholder: "尚未公开、但会影响选择的秘密" },
+    {
+      path: "payload.voiceAnchor", label: "声部锚点", type: "object", span: 2, help: "语气 / 用词 / 节奏 / 禁忌，供人物声音一致性",
+      children: [
+        { path: "sentenceLength", label: "句式 / 节奏", type: "textarea", rows: 2 },
+        { path: "vocabulary", label: "词汇 / 用语", type: "textarea", rows: 2 },
+        { path: "directness", label: "表达直率度", type: "textarea", rows: 2 },
+        { path: "avoidance", label: "回避方式", type: "textarea", rows: 2 },
+      ],
+    },
+    {
+      path: "payload.arc", label: "人物弧光", type: "object", span: 2,
+      children: [
+        { path: "start", label: "起点", type: "textarea", rows: 2 },
+        { path: "end", label: "终点", type: "textarea", rows: 2 },
+      ],
+    },
+    {
+      path: "payload.independentAction", label: "独立行动", type: "object", span: 2,
+      children: [
+        { path: "desire", label: "欲望", type: "textarea", rows: 2 },
+        { path: "strategy", label: "策略", type: "textarea", rows: 2 },
+        { path: "choice", label: "选择", type: "textarea", rows: 2 },
+        { path: "cost", label: "代价", type: "textarea", rows: 2 },
+        { path: "knowledgeBoundary", label: "认知边界", type: "textarea", rows: 2 },
+      ],
+    },
   ],
   relations: [
     { path: "subjectId", label: "主体", type: "text", placeholder: "如：林晚" },
@@ -115,6 +152,18 @@ function setPath(obj: unknown, path: string, value: unknown): unknown {
   return root;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function textValue(value: unknown): string {
+  return typeof value === "string" || typeof value === "number" ? String(value) : "";
+}
+
+function isVersionedObject(value: unknown): value is Record<string, unknown> & { latest?: unknown; history?: unknown } {
+  return isRecord(value) && ("latest" in value || "history" in value);
+}
+
 // ---------- 子字段级 JSON 编辑器（允许中间态非法，合法才上抛） ----------
 function JsonField({ value, onChange, rows = 4, placeholder }: { value: unknown; onChange: (v: unknown) => void; rows?: number; placeholder?: string }) {
   const [text, setText] = useState(() => JSON.stringify(value ?? {}, null, 2));
@@ -155,6 +204,88 @@ function JsonField({ value, onChange, rows = 4, placeholder }: { value: unknown;
   );
 }
 
+function ScalarField({ field, value, onChange }: { field: FieldSchema; value: unknown; onChange: (v: unknown) => void }) {
+  if (isVersionedObject(value)) {
+    const history = Array.isArray(value.history) ? value.history.filter((item): item is string => typeof item === "string") : [];
+    return (
+      <div className="krf-history-field">
+        <Input.TextArea
+          value={textValue(value.latest)}
+          rows={field.rows ?? 3}
+          placeholder={field.placeholder}
+          onChange={(event) => onChange({ ...value, latest: event.target.value })}
+        />
+        <span className="krf-history-label">历史值</span>
+        <Select
+          mode="tags"
+          style={{ width: "100%" }}
+          value={history}
+          placeholder="回车添加历史值"
+          onChange={(next) => onChange({ ...value, history: next })}
+          open={false}
+          suffixIcon={null}
+        />
+      </div>
+    );
+  }
+  if (isRecord(value) || Array.isArray(value)) {
+    return <JsonField value={value} onChange={onChange} rows={field.rows ?? 4} placeholder={field.placeholder} />;
+  }
+  if (field.type === "text") {
+    return <Input value={textValue(value)} placeholder={field.placeholder} onChange={(event) => onChange(event.target.value)} />;
+  }
+  return <Input.TextArea value={textValue(value)} rows={field.rows ?? 3} placeholder={field.placeholder} onChange={(event) => onChange(event.target.value)} />;
+}
+
+function ObjectField({ field, value, onChange }: { field: FieldSchema; value: unknown; onChange: (v: unknown) => void }) {
+  const objectValue = isRecord(value) ? value : {};
+  const children = field.children ?? [];
+  const knownKeys = new Set(children.map((child) => child.path.split(".")[0]));
+  const extraValue = Object.fromEntries(Object.entries(objectValue).filter(([key]) => !knownKeys.has(key)));
+
+  return (
+    <div className="krf-object">
+      {children.length > 0 ? (
+        <div className="krf-object-grid">
+          {children.map((child) => {
+            const childValue = getPath(objectValue, child.path);
+            return (
+              <div key={child.path} className={`krf-object-field ${(child.span ?? 1) === 2 ? "is-span2" : ""}`}>
+                <label className="krf-label">{child.label}</label>
+                <FieldControl
+                  field={child}
+                  value={childValue}
+                  onChange={(next) => onChange(setPath(objectValue, child.path, next))}
+                />
+              </div>
+            );
+          })}
+        </div>
+      ) : null}
+      {Object.keys(extraValue).length > 0 ? (
+        <div className="krf-object-extra">
+          <label className="krf-label">其他结构字段</label>
+          <JsonField
+            value={extraValue}
+            onChange={(next) => onChange({ ...objectValue, ...(isRecord(next) ? next : {}) })}
+            rows={5}
+          />
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function FieldControl({ field, value, onChange }: { field: FieldSchema; value: unknown; onChange: (v: unknown) => void }) {
+  if (field.type === "text" || field.type === "textarea") return <ScalarField field={field} value={value} onChange={onChange} />;
+  if (field.type === "json") return <JsonField value={value} onChange={onChange} rows={field.rows ?? 4} placeholder={field.placeholder} />;
+  if (field.type === "object") return <ObjectField field={field} value={value} onChange={onChange} />;
+  if (field.type === "number") return <InputNumber style={{ width: "100%" }} value={typeof value === "number" ? value : undefined} min={field.min} max={field.max} step={field.step} onChange={onChange} />;
+  if (field.type === "select") return <Select style={{ width: "100%" }} value={(value as string) ?? undefined} options={field.options} onChange={onChange} />;
+  if (field.type === "switch") return <Switch checked={value !== false} onChange={onChange} />;
+  return <Select mode="tags" style={{ width: "100%" }} value={Array.isArray(value) ? (value as string[]) : []} placeholder={field.placeholder ?? "回车添加"} onChange={onChange} open={false} suffixIcon={null} />;
+}
+
 export interface KnowledgeRecordFormProps {
   kind: KnowledgeFormKind;
   value: Record<string, unknown>;
@@ -173,15 +304,7 @@ export function KnowledgeRecordForm({ kind, value, onChange }: KnowledgeRecordFo
         return (
           <div key={f.path} className={`krf-field ${span === 2 ? "is-span2" : ""}`}>
             <label className="krf-label">{f.label}</label>
-            {f.type === "text" && <Input value={(v as string) ?? ""} placeholder={f.placeholder} onChange={(e) => update(f.path, e.target.value)} />}
-            {f.type === "textarea" && <Input.TextArea value={(v as string) ?? ""} rows={f.rows ?? 3} placeholder={f.placeholder} onChange={(e) => update(f.path, e.target.value)} />}
-            {f.type === "number" && <InputNumber style={{ width: "100%" }} value={typeof v === "number" ? v : undefined} min={f.min} max={f.max} step={f.step} onChange={(n) => update(f.path, n)} />}
-            {f.type === "select" && <Select style={{ width: "100%" }} value={(v as string) ?? undefined} options={f.options} onChange={(n) => update(f.path, n)} />}
-            {f.type === "switch" && <Switch checked={v !== false} onChange={(n) => update(f.path, n)} />}
-            {f.type === "stringList" && (
-              <Select mode="tags" style={{ width: "100%" }} value={Array.isArray(v) ? (v as string[]) : []} placeholder={f.placeholder ?? "回车添加"} onChange={(n) => update(f.path, n)} open={false} suffixIcon={null} />
-            )}
-            {f.type === "json" && <JsonField value={v} onChange={(n) => update(f.path, n)} rows={f.rows ?? 4} placeholder={f.placeholder} />}
+            <FieldControl field={f} value={v} onChange={(next) => update(f.path, next)} />
             {f.help && <div className="krf-help">{f.help}</div>}
           </div>
         );

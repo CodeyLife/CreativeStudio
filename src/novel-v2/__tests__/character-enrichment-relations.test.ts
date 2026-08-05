@@ -30,6 +30,50 @@ function createDeps() {
   };
 }
 
+function createCanonicalDeps() {
+  const writes: Array<{ sql: string; params: unknown[] }> = [];
+  const pool = {
+    query: async (sql: string, params: unknown[] = []) => {
+      writes.push({ sql, params });
+      if (sql.includes("SELECT id, name, payload FROM entities")) {
+        return { rows: [{ id: "entity:p1:character:char-chen-yuan", name: "char-chen-yuan", payload: {} }], rowCount: 1 };
+      }
+      if (sql.includes("project_plan_sections")) {
+        return { rows: [{ characters: [{ id: "char-chen-yuan", name: "陈渊" }, { id: "char-zhao-xing", name: "赵刑" }] }], rowCount: 1 };
+      }
+      return { rows: [], rowCount: 1 };
+    },
+  };
+  return {
+    writes,
+    deps: { repository: { pool, recordFactExtraction: async (input: { claims: unknown[] }) => input.claims } as unknown as NovelPostgresRepository, objects: {} as never },
+  };
+}
+
+function createLargeCanonicalDeps() {
+  const writes: Array<{ sql: string; params: unknown[] }> = [];
+  const entities = Array.from({ length: 101 }, (_, index) => {
+    const number = index + 1;
+    return {
+      id: `entity:p1:character:char-${number}`,
+      name: `角色${number}`,
+      payload: { canonicalCharacterId: `char-${number}`, displayName: `角色${number}` },
+    };
+  });
+  const pool = {
+    query: async (sql: string, params: unknown[] = []) => {
+      writes.push({ sql, params });
+      if (sql.includes("SELECT id, name, payload FROM entities")) return { rows: entities, rowCount: entities.length };
+      if (sql.includes("project_plan_sections")) return { rows: [], rowCount: 0 };
+      return { rows: [], rowCount: 1 };
+    },
+  };
+  return {
+    writes,
+    deps: { repository: { pool, recordFactExtraction: async (input: { claims: unknown[] }) => input.claims } as unknown as NovelPostgresRepository, objects: {} as never },
+  };
+}
+
 describe("character enrichment relation integrity", () => {
   it("asks extraction to preserve epistemic status instead of promoting interpretation to fact", () => {
     const prompt = buildCharacterEnrichmentPrompt({ artifact, text: "来客说北门已经封了，主角没有回答。" });
@@ -75,5 +119,33 @@ describe("character enrichment relation integrity", () => {
     await persistCharacterEnrichment({ projectId: "p1", documentId: "d1", revisionId: "r2", narrativeOrder: 2, artifact }, deps, [delta("旅人", "船夫")]);
     const entityIds = writes.filter((write) => write.sql.includes("INSERT INTO entities")).map((write) => write.params[0]);
     expect(entityIds).toEqual(expect.arrayContaining(["entity:p1:character:旅人", "entity:p1:character:船夫"]));
+  });
+
+  it("persists foundation display names while keeping canonical ids for references", async () => {
+    const { deps, writes } = createCanonicalDeps();
+    await persistCharacterEnrichment({ projectId: "p1", documentId: "d1", revisionId: "r1", narrativeOrder: 1, artifact }, deps, [delta("char-chen-yuan", "char-zhao-xing")]);
+
+    const entityWrites = writes.filter((write) => write.sql.includes("INSERT INTO entities"));
+    expect(entityWrites[0]?.params.slice(0, 4)).toEqual([
+      "entity:p1:character:char-chen-yuan",
+      "p1",
+      "陈渊",
+      expect.objectContaining({ canonicalCharacterId: "char-chen-yuan", displayName: "陈渊", displayNameStatus: "identified" }),
+    ]);
+    expect(entityWrites[1]?.params.slice(0, 4)).toEqual([
+      "entity:p1:character:char-zhao-xing",
+      "p1",
+      "赵刑",
+      expect.objectContaining({ canonicalCharacterId: "char-zhao-xing", displayName: "赵刑", displayNameStatus: "identified" }),
+    ]);
+  });
+
+  it("resolves an existing character beyond the prompt digest budget without duplicating it", async () => {
+    const { deps, writes } = createLargeCanonicalDeps();
+    await persistCharacterEnrichment({ projectId: "p1", documentId: "d1", revisionId: "r101", narrativeOrder: 101, artifact }, deps, [delta("char-101", "char-101")]);
+
+    const entityWrites = writes.filter((write) => write.sql.includes("INSERT INTO entities(id, project_id, kind, name, payload)"));
+    expect(entityWrites[0]?.params[0]).toBe("entity:p1:character:char-101");
+    expect(writes.some((write) => write.sql.includes("LIMIT 100"))).toBe(false);
   });
 });

@@ -1,5 +1,5 @@
 /**
- * V2 MCP 工具定义：29 个工具的 inputSchema（JSON Schema draft-07）。
+ * V2 MCP 工具定义：32 个工具的 inputSchema（JSON Schema draft-07）。
  *
  * 设计依据：AGENTS.md 架构阶段和 V2 MCP 工具契约。
  *
@@ -7,12 +7,12 @@
  * - v1 含 novel_foundation_export，v2 替换为 novel_closed_loop_run（评估闭环）
  * - v2 全部基于 Postgres，inputSchema 严格校验入参
  *
- * 工具分组（29 个）：
+ * 工具分组（32 个）：
  * - Run / Action 主体（7）
  * - Catalog / Receipt（3）
  * - Craft Rule 候选演进（7）
  * - 项目生命周期（3）
- * - 一键流程（5）
+ * - 一键流程（6）
  * - 评估闭环（1，v2 新增）
  */
 import type { ToolDefinition } from "./types";
@@ -132,12 +132,15 @@ export const TOOL_NAMES = [
   "novel_project_create",
   "novel_project_list",
   "novel_project_delete",
-  // 一键流程（3）
+  // 规划与创作（6）
   "novel_bootstrap_run",
   "novel_chapter_review",
+  "novel_chapter_review_issue_add",
   "novel_chapter_generate",
   "novel_story_arc_start",
   "novel_story_arc_get",
+  "novel_story_arc_review",
+  "novel_story_arc_batch_start",
   // 评估闭环（1，v2 新增）
   "novel_closed_loop_run",
   // Workflow 查询（2，新增）
@@ -199,7 +202,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
 
   {
     name: "novel_action_execute",
-    description: "执行 CreativeRun action（work.start/accept/revise/retry/recover/review.request/review.submit/run.pause/resume/cancel/work.enqueue）。",
+    description: "执行 CreativeRun action（work.start/accept/revise/retry/recover/review.request/review.submit/run.pause/resume/cancel/work.enqueue）。review.request 只返回只读审核预览；必须显式 review.submit 才会落库并参与门禁。",
     inputSchema: {
       type: "object",
       properties: {
@@ -534,16 +537,38 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
 
   {
     name: "novel_chapter_review",
-    description: "启动章节审校工作流（从 review 阶段半截启动，复用正式生成的 review→revision→fact-extraction→commit 闭环）。",
+    description: "启动章节审校工作流（从 review 阶段半截启动，复用正式生成的 review→revision→fact-extraction→commit 闭环）。默认 full 审校；targeted 模式按已有完整审核快照中的 issue 定向修订，仍经过正式审核、事实提取和提交门禁。",
     inputSchema: {
       type: "object",
       properties: {
         projectId: { type: "string", minLength: 1 },
         documentId: { type: "string", minLength: 1 },
         instruction: { type: "string" },
+        mode: { type: "string", enum: ["full", "targeted"], default: "full", description: "可选，full=完整审校；targeted=只修复 targetIssueIds 指定的当前快照意见" },
+        targetIssueIds: { type: "array", items: { type: "string", minLength: 1 }, minItems: 1, description: "targeted 模式必填，来自当前章节完整审核快照的 issue id" },
         idempotencyKey: { type: "string", minLength: 1 },
       },
       required: ["projectId", "documentId", "idempotencyKey"],
+      additionalProperties: false,
+    },
+  },
+
+  {
+    name: "novel_chapter_review_issue_add",
+    description: "向当前章节完整审核快照追加一条作者/架构审校意见。只写入 pending issue，不直接修改正文；随后可用 novel_chapter_review(mode=targeted) 复用正式定向修订闭环。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectId: { type: "string", minLength: 1 },
+        documentId: { type: "string", minLength: 1 },
+        severity: { type: "string", enum: ["blocker", "major", "warning"] },
+        title: { type: "string", minLength: 1 },
+        description: { type: "string" },
+        evidenceQuote: { type: "string", minLength: 1, description: "正文中的可核对证据；不填写时使用 title" },
+        paragraph: { type: "integer", minimum: 1 },
+        suggestion: { type: "string" },
+      },
+      required: ["projectId", "documentId", "severity", "title"],
       additionalProperties: false,
     },
   },
@@ -574,6 +599,35 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     name: "novel_story_arc_get",
     description: "查询项目故事弧列表或指定故事弧、章节蓝图及当前审核状态。",
     inputSchema: { type: "object", properties: { projectId: { type: "string", minLength: 1 }, arcId: { type: "string" } }, required: ["projectId"], additionalProperties: false },
+  },
+  {
+    name: "novel_story_arc_review",
+    description: "对已有故事弧蓝图启动正式审核；失败但保留蓝图的故事弧会先通过 retry 状态转换恢复为 awaiting-review，不重新生成蓝图。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectId: { type: "string", minLength: 1 },
+        arcId: { type: "string", minLength: 1 },
+        reviewPolicy: { type: "string", enum: ["manual", "auto"], default: "auto" },
+      },
+      required: ["projectId", "arcId"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "novel_story_arc_batch_start",
+    description: "为当前已批准且仍在执行的故事弧规划下一批章节，或显式重试没有章节投影的失败批次；复用正式故事弧规划、审核和批次区间校验，不能跳过当前弧继续生成正文。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectId: { type: "string", minLength: 1 },
+        arcId: { type: "string", minLength: 1 },
+        reviewPolicy: { type: "string", enum: ["manual", "auto"], default: "auto" },
+        retryFailed: { type: "boolean", default: false, description: "仅当最近批次为 failed 且没有章节投影时重试原区间" },
+      },
+      required: ["projectId", "arcId"],
+      additionalProperties: false,
+    },
   },
 
   // ===== 评估闭环（1，v2 新增）=====

@@ -206,13 +206,14 @@
 .nwc-overview {
   display: grid;
   grid-template-columns: repeat(12, minmax(0, 1fr));
-  grid-template-rows: minmax(168px, auto) minmax(260px, auto);
+  grid-template-rows: minmax(168px, auto) minmax(260px, auto) minmax(280px, auto);
   grid-auto-flow: dense;
   gap: 10px;
 }
 .nwc-priority,
 .nwc-health,
-.nwc-recent {
+.nwc-recent,
+.nwc-model-errors {
   min-width: 0;
   border: 1px solid #27272a;
   border-radius: 8px;
@@ -221,6 +222,7 @@
 .nwc-health { grid-column: 1 / -1; grid-row: 1; }
 .nwc-priority { grid-column: span 7; grid-row: 2; }
 .nwc-recent { grid-column: span 5; grid-row: 2; }
+.nwc-model-errors { grid-column: 1 / -1; grid-row: 3; }
 .nwc-section-head {
   display: flex;
   align-items: center;
@@ -273,6 +275,32 @@
 .nwc-metric-grid > div:last-child { border-right: 0; }
 .nwc-metric-grid strong { color: #f4f4f5; font-family: var(--font-display, var(--font-sans)); font-size: 25px; font-variant-numeric: tabular-nums; }
 .nwc-metric-grid span { color: #71717a; font-size: 10px; }
+.nwc-model-error-list { max-height: 344px; overflow-y: auto; }
+.nwc-model-error-row {
+  display: grid;
+  grid-template-columns: 8px minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 12px;
+  width: 100%;
+  min-height: 72px;
+  padding: 10px 14px;
+  border: 0;
+  border-bottom: 1px solid #222226;
+  background: transparent;
+  color: #d4d4d8;
+  cursor: pointer;
+  text-align: left;
+}
+.nwc-model-error-row:hover { background: #1b1b1f; }
+.nwc-model-error-row:disabled { cursor: default; }
+.nwc-model-error-signal { width: 7px; height: 7px; margin-top: 5px; border-radius: 50%; background: #ef4444; box-shadow: 0 0 0 4px rgba(239, 68, 68, 0.1); }
+.nwc-model-error-copy { display: flex; min-width: 0; flex-direction: column; gap: 4px; }
+.nwc-model-error-copy strong { display: flex; min-width: 0; align-items: baseline; gap: 8px; font-size: 12px; }
+.nwc-model-error-copy strong span { overflow: hidden; color: #f4f4f5; text-overflow: ellipsis; white-space: nowrap; }
+.nwc-model-error-copy strong em { overflow: hidden; color: #a1a1aa; font-family: var(--font-display, var(--font-mono)); font-size: 10px; font-style: normal; text-overflow: ellipsis; white-space: nowrap; }
+.nwc-model-error-copy small { overflow: hidden; color: #71717a; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.nwc-model-error-copy p { display: -webkit-box; overflow: hidden; margin: 0; color: #fca5a5; font-family: var(--font-mono); font-size: 10px; line-height: 1.5; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.nwc-model-error-status { max-width: 150px; overflow: hidden; color: #f87171; font-family: var(--font-mono); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .nwc-filters { display: grid; grid-template-columns: minmax(0, 1fr) 118px; gap: 8px; padding: 10px 12px; border-bottom: 1px solid #27272a; }
 .nwc-chapter-table { max-height: 292px; overflow-y: auto; }
 .nwc-chapter-table > button {

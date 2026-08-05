@@ -16,6 +16,13 @@ export interface TargetedRevisionReplacement {
   text: string;
 }
 
+export class TargetedRevisionContractError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TargetedRevisionContractError";
+  }
+}
+
 type RevisionWindowPromptInput = {
   text: string;
   memory: MemoryBundle;
@@ -142,14 +149,26 @@ export function sanitizeRevisionOutput(text: string): string {
   // 4. 再次剥离可能因前缀清理暴露的 Markdown 围栏
   cleaned = cleaned.replace(/^```[^\n]*\n?/u, "").replace(/\n?```\s*$/u, "");
 
+  // 局部修订模型有时会把相邻原文段落重复回显。只折叠相邻的完全重复段落，
+  // 保留非连续或有实际变化的复沓，避免用作品/提示词短语黑名单干预正常修辞。
+  const paragraphs = cleaned.split(/\n{2,}/u).map((paragraph) => paragraph.trim()).filter(Boolean);
+  const deduplicated: string[] = [];
+  for (const paragraph of paragraphs) {
+    const previous = deduplicated.at(-1);
+    if (previous && previous.replace(/\s+/gu, " ") === paragraph.replace(/\s+/gu, " ")) continue;
+    deduplicated.push(paragraph);
+  }
+  cleaned = deduplicated.join("\n\n");
+
   return cleaned.trim();
 }
 
 function locatedRanges(issue: ReviewIssue, paragraphs: string[]): Array<{ start: number; end: number }> {
   if (issue.revisionRanges?.length) {
-    return issue.revisionRanges
-      .map((range) => ({ start: Math.max(0, range.start - 1), end: Math.min(paragraphs.length - 1, range.end - 1) }))
-      .filter((range) => range.start <= range.end);
+    const ranges = issue.revisionRanges
+      .filter((range) => Number.isInteger(range.start) && Number.isInteger(range.end) && range.start >= 1 && range.end >= range.start && range.end <= paragraphs.length)
+      .map((range) => ({ start: range.start - 1, end: range.end - 1 }));
+    if (ranges.length) return ranges;
   }
   if (typeof issue.paragraph === "number" && issue.paragraph >= 1 && issue.paragraph <= paragraphs.length) {
     return [{ start: issue.paragraph - 1, end: issue.paragraph - 1 }];
@@ -239,6 +258,9 @@ function renderRevisionInterpretationGuide(strictWindows: boolean): string {
     "审核问题描述的是可核对的文本问题，不是需要逐项遵守的文学公式。",
     "先根据 evidence、excerpt 和 revisionRanges 定位问题机制，再决定改变哪些文本。",
     "修订必须解决问题本身，同时保留原段承担的事实、因果、人物选择和有效表达；不要用抽象解释、无关润色或新增设定替代修复。",
+    "若问题涉及现场感、抽象表达或叙述距离，先检查候选是否提供至少两类相互独立的可观察锚点：具体身体/感官状态，以及接触、阻力、空间关系或动作后的状态变化。抽象判断可以保留为 POV 声部，但不能独自承担体验或选择；技术认知应建立在已经发生的感官或动作之上，并导向下一步即时判断。",
+    "修订完成后按窗口自检：读者能否仅凭正文复原人物身处何处、身体或物件发生了什么、这如何改变下一步动作？若不能，继续补足现场证据，而不是再换一组抽象词。",
+    "章末未解列表是冻结边界：局部修订不得删除、回答或合并其中的问题；若目标段承载未解线索，只能在保留其未解状态的前提下具象化表达。",
     "如果审核者给出的事实或动机与冻结事实、规划上下文或原文线索冲突，优先核对来源；无法确认时保持原文事实，不创造新值。",
     ...(strictWindows ? [
       "",
@@ -461,7 +483,8 @@ export function buildFullChapterRevisionPrompt(input: {
       "3. 不得新增冻结事实和原文都未建立的人物、关系、线索或事件。",
       "4. 修改幅度由作者目标决定；既不能用局部同义替换敷衍结构性要求，也不能无依据重写与目标无关的内容。",
       "5. 最小改动原则：只改动与审核问题直接相关的句子，不重写未触及的段落。修复一个问题时不得引入新问题。",
-      "6. 一致性约束处理：标注为[一致性约束]的审核问题，修订方向是统一为已建立设定值，不是创造新值或更换名称。审核者给出的值可能不准确，必须通过真值确认流程独立验证后再统一。无法确认时保持原值不变。",
+      "6. 章末未解列表是冻结边界：不得因局部修订删除、回答或合并其中的问题；若目标段承载未解线索，只能在保留未解状态的前提下具象化表达。",
+      "7. 一致性约束处理：标注为[一致性约束]的审核问题，修订方向是统一为已建立设定值，不是创造新值或更换名称。审核者给出的值可能不准确，必须通过真值确认流程独立验证后再统一。无法确认时保持原值不变。",
     ].join("\n"),
   ].join("\n\n");
 }
@@ -541,9 +564,10 @@ function revisionWindowSharedSections(input: RevisionWindowPromptInput): string[
       "2. 必须实际改写问题证据，不得原样返回；根据问题机制自行组织文字，不得套用审核者拟写的句子。",
       "3. 不得新增原文、冻结事实和相邻段落中都不存在的人物、物件、关系、线索或事件。",
       "4. 不得重写或复述相邻段落，不得解释修订过程，不得输出标题、编号、Markdown 或评语。",
-      "5. 用可观察动作、感官和必要对白承载体验，避免作者式结论；保持自然中文韵律和原有叙述距离。",
+      "5. 用至少两类相互独立的可观察证据承载体验：具体身体/感官状态，加上接触、阻力、空间关系或动作后的状态变化。保持自然中文韵律和原有叙述距离。若问题涉及专业化、制度化或理论化抽象表达过密，保留人物的认知特色，但让重复的抽象解释收束为当前身体反应、环境阻力或即时行动依据，不要只把一组术语替换成另一组术语。",
       "6. 作者反馈用于明确本轮取舍；不得借反馈越过目标段落或新增未建立事实。",
-      "7. 最小改动原则：只改动与审核问题直接相关的句子。标注为[一致性约束]的问题，修订方向是统一为已建立设定值，不是创造新值或更换名称。审核者给出的值可能不准确，必须通过真值确认流程独立验证（事实边界 > 规划上下文 > 原文线索 > 保持原值不变）。",
+      "7. 章末未解列表是冻结边界：不得因局部修订删除、回答或合并其中的问题；若目标段承载未解线索，只能在保留未解状态的前提下具象化表达。",
+      "8. 最小改动原则：只改动与审核问题直接相关的句子。标注为[一致性约束]的问题，修订方向是统一为已建立设定值，不是创造新值或更换名称。审核者给出的值可能不准确，必须通过真值确认流程独立验证（事实边界 > 规划上下文 > 原文线索 > 保持原值不变）。",
     ].join("\n"),
   ];
 }
@@ -622,20 +646,20 @@ export function applyRevisionWindows(text: string, replacements: Array<{ window:
 }
 
 export function applyTargetedRevisionReplacements(text: string, windows: RevisionWindow[], replacements: TargetedRevisionReplacement[]): string {
-  if (!windows.length) throw new Error("目标意见无法解析出安全修订窗口");
+  if (!windows.length) throw new TargetedRevisionContractError("目标意见无法解析出安全修订窗口");
   const allowed = new Map(windows.map((window) => [`${window.start + 1}:${window.end + 1}`, window]));
   const seen = new Set<string>();
   const accepted: Array<{ window: RevisionWindow; text: string }> = [];
   for (const replacement of replacements) {
     const key = `${replacement.start}:${replacement.end}`;
     const window = allowed.get(key);
-    if (!window || seen.has(key)) throw new Error(`返回内容不属于目标修订窗口：${replacement.start}-${replacement.end}`);
+    if (!window || seen.has(key)) throw new TargetedRevisionContractError(`返回内容不属于目标修订窗口：${replacement.start}-${replacement.end}`);
     seen.add(key);
     if (replacement.text.trim()) accepted.push({ window, text: replacement.text });
   }
-  if (seen.size !== allowed.size) throw new Error("AI 未返回全部目标修订窗口");
-  if (!accepted.length) throw new Error("AI 未返回有效的目标段落修改");
+  if (seen.size !== allowed.size) throw new TargetedRevisionContractError("AI 未返回全部目标修订窗口");
+  if (!accepted.length) throw new TargetedRevisionContractError("AI 未返回有效的目标段落修改");
   const revised = applyRevisionWindows(text, accepted);
-  if (revised === text) throw new Error("AI 未实际修改目标段落");
+  if (revised === text) throw new TargetedRevisionContractError("AI 未实际修改目标段落");
   return revised;
 }

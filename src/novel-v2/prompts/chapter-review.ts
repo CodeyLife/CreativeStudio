@@ -18,7 +18,7 @@ export const REVIEW_ROLE_EXECUTION_POINTS: Record<ReviewerRole, SkillExecutionPo
 const DEFAULT_REVIEW_FOCUS: Record<ReviewerRole, string> = {
   "structure-reviewer": "覆盖 D1 世界观与 D2 故事性：以冻结事实、规划上下文和正文证据审视章节功能、目标/阻力/选择/代价/结果、世界规则与制度压力、时间线、人物知识边界、伏笔/承诺证据和选择后果。区分可验证的连续性或因果问题与审美偏好，不要求每章重复设定、反转或不可逆变化。",
   "character-reviewer": "覆盖 D3 群像与 D4 感情线：检查人物是否有独立欲望和能动选择，行动与对白是否符合处境、价值、恐惧和知识边界，声部是否可区分，关系是否通过互动、边界、误解、让步、伤害、照料或共同后果承载。只在正文实际承担相关内容且存在具体问题时报告，不要求每章安排关系变化或感情结论。",
-  "prose-reviewer": "覆盖 D2 故事性中的体验承载与 D5 幽默：以正文证据审视场景是否可感、语言是否具体、叙述距离和 POV 是否稳定、关键情绪/选择是否被摘要跳过、句式与节奏是否形成疲劳、幽默是否来自人物/处境且保留后果。只报告已经造成空泛、重复、跳跃、声部不一致或阅读阻滞的问题，不用固定句式、关键词、字数或章尾形式判定。",
+  "prose-reviewer": "覆盖 D2 故事性中的体验承载与 D5 幽默：以正文证据审视场景是否可感、语言是否具体、叙述距离和 POV 是否稳定、关键情绪/选择是否被摘要跳过、句式与节奏是否形成疲劳、幽默是否来自人物/处境且保留后果。专业化、制度化或理论化术语可以构成人物声部，但当连续抽象表达替代身体、环境或即时判断时，检查它是否拉开叙事距离。只报告已经造成空泛、重复、跳跃、声部不一致或阅读阻滞的问题，不用固定句式、关键词、字数或章尾形式判定。",
 };
 
 export function reviewExecutionPoint(role: ReviewerRole): SkillExecutionPoint {
@@ -109,12 +109,12 @@ function reviewInstruction(input: ReviewPromptInput, memory: MemoryBundle): stri
   const lines = [
     "你是长篇小说的章节审校者。先理解当前章节的执行边界，再阅读正文；只报告已经发生且可以由正文或冻结来源证明的问题。",
     "",
-    "## 当前职责",
-    getReviewFocus(input.role),
+    "## 当前审核角色",
+    input.role,
     "",
     "## 输出契约",
-    "给本角色负责的整体质量打 0-5 分。没有可定位的问题时返回 passed 和空 issues；问题只在确实影响当前章节功能、事实可靠性或阅读体验时报告。",
-    "先判断本角色负责的质量维度在当前章节是否适用；不适用或已经有效时不要为了凑覆盖制造问题。每个 issue 必须引用当前正文中的逐字 excerpt，并给出最小 revisionRanges；无法安全定位时不要报告。description 说明实际损害，rule 描述通用问题机制，suggestion 只给修复方向，不写改写示例。",
+    "只输出一个对象，键只能是 verdict、score、issues。verdict 必须是字符串 passed、revise 或 blocked：没有可定位问题时用 passed；存在已经影响正文的可修复问题时用 revise；只有审核无法继续或存在硬阻塞时用 blocked。score 必须是 0 到 5 的数字，不要输出 passed 布尔字段，也不要把分数写入 verdict。issues 必须是数组。每个 issue 的 severity 只能是 warning、major 或 blocker：warning 表示局部且不阻塞提交的质量问题，major 表示已经实质影响当前章节并需要修订的问题，blocker 表示违反事实、因果、POV 或硬执行合同而不能接受的问题；不要使用 medium、minor、critical 等其他等级。",
+    "先判断本角色负责的质量维度在当前章节是否适用；不适用或已经有效时不要为了凑覆盖制造问题。每个 issue 必须引用当前正文中的逐字 excerpt，并给出最小 revisionRanges；revisionRanges 的 start/end 是从 1 开始计数的正文段落编号，不是字符位置、token 位置或字节偏移。若描述的是重复或连续机制，revisionRanges 必须覆盖每一处承载同一机制且可安全修改的范围，不能只给一个代表段再把局部修订当作全局修复；无法安全定位时不要报告。description 说明实际损害，rule 描述通用问题机制，suggestion 只给修复方向，不写改写示例。",
     "结构角色优先寻找状态/因果/功能/世界规则/知识边界证据；人物角色优先寻找欲望、能动性、声部、关系行为和情感变化证据；文风角色优先寻找 POV、具体细节、场景承载、节奏疲劳和幽默后果证据。不要把同一偏好复制成三个 issue。",
     "不要把篇幅、章节必须有新事件、固定钩子、反转、主题、感情线或幽默的出现与否单独当作问题。",
     "",
@@ -166,6 +166,6 @@ export function buildChapterReviewPromptPackage(input: ReviewPromptInput & { wor
 
 export function toReview(params: { artifact: Artifact; identity: "internal" | "independent"; role: ReviewerRole; output: ReviewerOutput; text?: string }): Review {
   const grounded = params.text === undefined ? { issues: params.output.issues, discardedCount: 0 } : groundReviewerIssues(params.output.issues, params.text);
-  const issues: ReviewIssue[] = grounded.issues.map((issue) => ({ severity: issue.severity, title: issue.title, description: issue.description, evidence: issue.excerpt ?? issue.description, excerpt: issue.excerpt, paragraph: issue.paragraph, revisionRanges: issue.revisionRanges, rule: issue.rule, sourceId: issue.sourceId, suggestion: issue.suggestion }));
+  const issues: ReviewIssue[] = grounded.issues.map((issue) => ({ severity: issue.severity, title: issue.title, description: issue.description, evidence: issue.excerpt ?? issue.description, excerpt: issue.excerpt, paragraph: issue.paragraph ?? issue.revisionRanges[0]?.start, revisionRanges: issue.revisionRanges, rule: issue.rule, sourceId: issue.sourceId, suggestion: issue.suggestion }));
   return { id: randomUUID(), projectId: params.artifact.projectId, artifactId: params.artifact.id, reviewerId: params.identity + "-" + params.role, identity: params.identity, role: params.role, verdict: grounded.discardedCount > 0 && issues.length === 0 ? "passed" : params.output.verdict, issues, score: grounded.discardedCount > 0 && issues.length === 0 ? undefined : params.output.score, createdAt: Date.now(), artifactFingerprint: params.artifact.fingerprint };
 }

@@ -1,3 +1,4 @@
+import Ajv from "ajv";
 import { foundationSchema, type FoundationOutput } from "../prompts/schemas";
 
 export const FOUNDATION_TASK_CONTRACTS: Record<string, {
@@ -66,12 +67,21 @@ export const FOUNDATION_TASK_CONTRACTS: Record<string, {
     requiredPaths: [
       "plotStrategy.narrativePromises",
       "plotStrategy.characterDestinations",
+      "plotStrategy.longHorizonThreads",
+      "plotStrategy.informationBoundaries",
       "plotStrategy.endingEnvelope",
       "plotStrategy.nonNegotiables",
     ],
     qualityFocus: ["长期承诺", "人物终点区间", "终局边界", "适应性修订触发器"],
   },
 };
+
+export function foundationRequiredFields(taskKey: string): string[] {
+  const contract = FOUNDATION_TASK_CONTRACTS[taskKey];
+  if (!contract) return [];
+  const prefix = `${contract.dataRoot}.`;
+  return contract.requiredPaths.map((path) => path.startsWith(prefix) ? path.slice(prefix.length) : path);
+}
 
 type JsonSchema = Record<string, unknown>;
 
@@ -189,25 +199,59 @@ const foundationDataSchemas: Record<string, JsonSchema> = {
 };
 
 /**
- * Add task-specific shape constraints to the shared Foundation envelope.
- * The semantic validator remains authoritative for cross-field rules; this
- * schema makes the model repair loop see the expected data root early.
+ * Keep the provider-facing envelope compact. Task-specific data schemas are
+ * applied after JSON decoding by validateFoundationTaskContract, because
+ * native provider schemas do not share one safe vocabulary for nested data.
  */
 export function foundationSchemaForTask(taskKey: string): JsonSchema {
   const contract = FOUNDATION_TASK_CONTRACTS[taskKey];
-  const taskDataSchema = foundationDataSchemas[taskKey];
-  if (!contract || !taskDataSchema) return foundationSchema as unknown as JsonSchema;
-  const structuredData = foundationSchema.properties?.structuredData as JsonSchema;
+  if (!contract) return foundationSchema as unknown as JsonSchema;
   return {
     ...foundationSchema,
+    description: `Foundation ${taskKey} native output; structuredData is JSON text rooted at ${contract.dataRoot}`,
     properties: {
       ...foundationSchema.properties,
       structuredData: {
-        ...structuredData,
-        required: [contract.dataRoot],
-        properties: { ...(structuredData.properties as Record<string, unknown> | undefined), [contract.dataRoot]: taskDataSchema },
+        ...(foundationSchema.properties?.structuredData as JsonSchema),
+        description: `JSON text whose root object contains ${contract.dataRoot}`,
       },
     },
+  };
+}
+
+/** Decode the compact native boundary without changing the persisted contract. */
+export function normalizeFoundationModelOutput(value: unknown): FoundationOutput {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Foundation 输出必须是对象");
+  const source = value as Record<string, unknown>;
+  const structuredData = typeof source.structuredData === "string"
+    ? (() => {
+      try {
+        const parsed = JSON.parse(source.structuredData);
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("structuredData JSON 根必须是对象");
+        return parsed as Record<string, unknown>;
+      } catch (error) {
+        throw new Error(`Foundation structuredData JSON 无法解析：${error instanceof Error ? error.message : String(error)}`);
+      }
+    })()
+    : source.structuredData && typeof source.structuredData === "object" && !Array.isArray(source.structuredData)
+      ? source.structuredData as Record<string, unknown>
+      : undefined;
+  if (!structuredData) throw new Error("Foundation structuredData 缺失");
+  return {
+    title: typeof source.title === "string" ? source.title : "",
+    summary: typeof source.summary === "string" ? source.summary : "",
+    sections: Array.isArray(source.sections) ? source.sections.map((section) => {
+      const item = section && typeof section === "object" && !Array.isArray(section) ? section as Record<string, unknown> : {};
+      return {
+        heading: typeof item.heading === "string" ? item.heading : "",
+        content: typeof item.content === "string" ? item.content : "",
+        items: Array.isArray(item.items) ? item.items.map((entry) => {
+          const row = entry && typeof entry === "object" && !Array.isArray(entry) ? entry as Record<string, unknown> : {};
+          return { label: typeof row.label === "string" ? row.label : "", detail: typeof row.detail === "string" ? row.detail : "", ...(row.attributes && typeof row.attributes === "object" && !Array.isArray(row.attributes) ? { attributes: row.attributes as Record<string, unknown> } : {}) };
+        }) : [],
+      };
+    }) : [],
+    structuredData,
   };
 }
 
@@ -305,6 +349,23 @@ export function validateFoundationTaskContract(value: FoundationOutput, taskKey:
   if (!contract) return [];
   const errors: string[] = [];
   const structuredData = value.structuredData ?? {};
+  const taskDataSchema = foundationDataSchemas[taskKey];
+  if (taskDataSchema) {
+    const validate = new Ajv({ allErrors: true, strict: false }).compile({
+      type: "object",
+      additionalProperties: true,
+      required: [contract.dataRoot],
+      properties: { [contract.dataRoot]: taskDataSchema },
+    });
+    for (const issue of validate.errors ?? []) {
+      const missingRoot = issue.keyword === "required"
+        && issue.instancePath === ""
+        && (issue.params as { missingProperty?: string }).missingProperty === contract.dataRoot;
+      if (missingRoot) continue;
+      const location = issue.instancePath || `.${contract.dataRoot}`;
+      errors.push(`structuredData${location} ${issue.message ?? "结构不符合任务契约"}`);
+    }
+  }
   for (const path of contract.requiredPaths) {
     if (!meaningful(valueAt(structuredData, path))) errors.push(`${path} 不能为空`);
   }

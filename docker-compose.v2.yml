@@ -1,6 +1,8 @@
+name: creative-studio
+
 services:
   postgres:
-    image: postgres:17
+    image: postgres:17.10
     environment:
       POSTGRES_DB: ymcp
       POSTGRES_USER: ymcp
@@ -15,7 +17,7 @@ services:
     restart: unless-stopped
 
   temporal:
-    image: temporalio/auto-setup:latest
+    image: temporalio/auto-setup@sha256:9be7b8d98f60d00f4f2ff74731c071a17848d8182bbc8429e314a24c94ea105b
     environment:
       DB: postgres12
       DB_PORT: 5432
@@ -34,7 +36,7 @@ services:
     restart: unless-stopped
 
   temporal-ui:
-    image: temporalio/ui:latest
+    image: temporalio/ui@sha256:b839b5c798770896c78058db1647d325a19b3acef7fa1fbd9a23fabb1dd7feb2
     environment:
       TEMPORAL_ADDRESS: temporal:7233
     depends_on:
@@ -44,13 +46,18 @@ services:
     restart: unless-stopped
 
   qdrant:
-    image: qdrant/qdrant:latest
+    image: qdrant/qdrant@sha256:0bd98fa7977f1e75694779359ca4e212822e5a71334e28421182f72f209d5286
     ports: ["6333:6333", "6334:6334"]
     volumes: ["ymcp-qdrant:/qdrant/storage"]
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/6333"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
     restart: unless-stopped
 
   minio:
-    image: minio/minio:latest
+    image: minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-ymcp}
@@ -87,10 +94,15 @@ services:
     restart: unless-stopped
 
   api:
+    profiles: ["container"]
     build: .
     command: ["node", "--import", "tsx", "scripts/novel-v2-api.ts"]
     environment: &runtime-env
       DATABASE_URL: postgresql://ymcp:${POSTGRES_PASSWORD:-ymcp}@postgres:5432/ymcp
+      NOVEL_RUNTIME_PROFILE: ${NOVEL_RUNTIME_PROFILE:-local-hybrid}
+      NOVEL_RUNTIME_ID: ${NOVEL_RUNTIME_ID:-creative-studio-local-hybrid}
+      NOVEL_PROJECT_ROOT: /app
+      NOVEL_V2_MIGRATIONS_DIR: /app/deploy/postgres
       TEMPORAL_ADDRESS: temporal:7233
       QDRANT_URL: http://qdrant:6333
       QDRANT_COLLECTION: novel-memory-current
@@ -112,7 +124,7 @@ services:
       postgres: { condition: service_healthy }
       temporal: { condition: service_healthy }
       minio: { condition: service_healthy }
-      qdrant: { condition: service_started }
+      qdrant: { condition: service_healthy }
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4770/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 15s
@@ -121,6 +133,7 @@ services:
     restart: unless-stopped
 
   worker:
+    profiles: ["container"]
     build: .
     command: ["node", "--import", "tsx", "scripts/novel-v2-worker.ts"]
     environment:
@@ -134,7 +147,7 @@ services:
       postgres: { condition: service_healthy }
       temporal: { condition: service_healthy }
       minio: { condition: service_healthy }
-      qdrant: { condition: service_started }
+      qdrant: { condition: service_healthy }
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4771/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 15s
@@ -143,6 +156,7 @@ services:
     restart: unless-stopped
 
   web:
+    profiles: ["container"]
     build: .
     command: ["pnpm", "dev:web", "--host", "0.0.0.0"]
     environment:
@@ -154,6 +168,10 @@ services:
 
 volumes:
   ymcp-postgres:
+    name: ${NOVEL_POSTGRES_VOLUME:-creative_studio_novel_postgres}
   ymcp-qdrant:
+    name: ${NOVEL_QDRANT_VOLUME:-creative_studio_novel_qdrant}
   ymcp-minio:
+    name: ${NOVEL_MINIO_VOLUME:-creative_studio_novel_minio}
   ymcp-tei-cache:
+    name: ${NOVEL_TEI_VOLUME:-creative_studio_novel_tei_cache}

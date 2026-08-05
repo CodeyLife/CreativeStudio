@@ -60,7 +60,8 @@ export function parseRuntimeLearningAssessmentV2(value: unknown, base: {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("learning assessment 必须是对象");
   const raw = value as Record<string, unknown>;
   if (raw.conclusion === "no-shared-learning") {
-    if (raw.candidate !== undefined) throw new Error("no-shared-learning 不能携带 candidate");
+    const candidate = raw.candidate;
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate) || (candidate as Record<string, unknown>).targetKind !== "none") throw new Error("no-shared-learning 的 candidate.targetKind 必须是 none");
     return {
       id: base.id ?? `learning:${randomUUID()}`,
       projectId: base.projectId,
@@ -127,43 +128,32 @@ export function parseRuntimeLearningAssessmentV2(value: unknown, base: {
 export const runtimeLearningAssessmentSchema = {
   type: "object",
   additionalProperties: false,
-  required: ["conclusion"],
+  required: ["conclusion", "symptom", "failingLayer", "underlyingMechanism", "affectedInputClass", "boundaries", "regressionRisks", "candidate"],
   properties: {
     conclusion: { enum: ["no-shared-learning", "propose-improvement"] },
     symptom: { type: "string" },
     failingLayer: { type: "string" },
-    underlyingMechanism: { type: "string", minLength: 10 },
-    affectedInputClass: { type: "string", minLength: 5 },
-    boundaries: { type: "string", minLength: 10 },
-    regressionRisks: { type: "array", items: { type: "string", minLength: 5 }, minItems: 1 },
+    underlyingMechanism: { type: "string" },
+    affectedInputClass: { type: "string" },
+    boundaries: { type: "string" },
+    regressionRisks: { type: "array", items: { type: "string" } },
     candidate: {
       type: "object",
       additionalProperties: false,
-      required: ["targetKind", "targetId", "rationale", "afterText"],
+      required: ["targetKind", "targetId", "rationale", "afterText", "applicableGenres"],
       properties: {
-        targetKind: { enum: ["skill", "system-prompt"] },
+        targetKind: { enum: ["none", "skill", "system-prompt"] },
         targetId: { type: "string" },
-        rationale: { type: "string", minLength: 10 },
-        afterText: { type: "string", minLength: 100 },
-        // P0-C1: 题材适用性（可选，仅 targetKind="skill" 时有意义）
+        rationale: { type: "string" },
+        afterText: { type: "string" },
         applicableGenres: {
           type: "array",
-          items: { type: "string", minLength: 1 },
-          description: "题材适用性（仅 targetKind=skill 时有意义）。留空数组表示题材无关；非空数组表示仅适用于列出的 genre（如 ['玄幻','仙侠']）。不内置固定题材枚举。",
+          items: { type: "string" },
+          description: "题材适用性；没有限制时为空数组。",
         },
       },
     },
   },
-  anyOf: [
-    {
-      properties: { conclusion: { const: "no-shared-learning" } },
-      required: ["conclusion"],
-    },
-    {
-      properties: { conclusion: { const: "propose-improvement" } },
-      required: ["conclusion", "symptom", "failingLayer", "underlyingMechanism", "affectedInputClass", "boundaries", "regressionRisks", "candidate"],
-    },
-  ],
 } as const;
 
 export function buildRuntimeLearningPrompt(input: {
@@ -213,7 +203,7 @@ targetKind=system-prompt 时，targetId 格式为 "<projectId>:<templateId>"，�
 - candidate.applicableGenres（仅 targetKind=skill 时有意义）：若改进只适用于特定题材，填写题材标签数组（如 ["玄幻","仙侠"]）；若题材无关则留空数组。不内置固定题材枚举，由你根据 affectedInputClass 推断。
 - 不要把具体书名、人物名、章节号、固定句子或本次样例当成规则。
 
-输出 JSON，必须匹配 schema。conclusion=propose-improvement 时所有 mechanism 字段必填。`;
+输出 JSON，必须匹配 schema。所有字段都必须返回；conclusion=no-shared-learning 时将 candidate.targetKind 设为 none，其余无关字段使用空字符串或空数组；conclusion=propose-improvement 时所有 mechanism 字段和 candidate 内容必须真实完整。`;
 }
 
 function validateSkillCandidatePatch(

@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Modal, Spin, Typography, Tag, Space, Empty } from "antd";
 import { FileTextOutlined } from "@ant-design/icons";
 import { artifactKindMeta, artifactPreview, relativeTime, shortId } from "./presentation";
+import { novelFetch } from "../../lib/novelApi";
 
 /**
  * 产物内容查看器。
@@ -38,10 +39,7 @@ interface ArtifactContentResponse {
 }
 
 async function fetchArtifactContent(artifactId: string): Promise<ArtifactContentResponse> {
-  const response = await fetch(`/v2/artifacts/${encodeURIComponent(artifactId)}/content`);
-  const body = await response.json();
-  if (!response.ok) throw new Error((body as { error?: string }).error ?? "产物内容读取失败");
-  return body as ArtifactContentResponse;
+  return novelFetch<ArtifactContentResponse>(`/v2/artifacts/${encodeURIComponent(artifactId)}/content`);
 }
 
 export default function ArtifactContentModal({ artifact, open, onClose }: ArtifactContentModalProps) {

@@ -436,8 +436,9 @@ export async function recordCraftRuleEvidence(
 /**
  * 基础任务评估输出 schema。LLM 返回结构化结果，用于对比 before/after prompt 的质量。
  */
-const foundationEvaluationSchema: Record<string, unknown> = {
+export const foundationEvaluationSchema: Record<string, unknown> = {
   type: "object",
+  additionalProperties: false,
   properties: {
     qualityScore: { type: "number", minimum: 0, maximum: 100, description: "整体质量评分（0-100），越高越好" },
     blockerCount: { type: "number", minimum: 0, description: "阻塞性问题数量" },

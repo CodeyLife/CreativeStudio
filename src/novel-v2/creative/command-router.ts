@@ -18,7 +18,7 @@
  * - work.revise → work-item.reviseWork
  * - work.retry → work-item.retryWork
  * - work.recover → work-item.recoverWork
- * - review.request → defaultReviewer 生成内部审核（调用 ModelGateway.generateStructured）
+ * - review.request → defaultReviewer 生成只读预览（不落库、不通过门禁）
  * - review.submit → review-gate.submitReview；若 reviewGate="auto" 且 gate.passed → 自动 acceptWork
  */
 import type {
@@ -42,6 +42,7 @@ import {
 import {
   acceptWork,
   recoverWork,
+  getWorkItem,
   reviseWork,
   retryWork,
   startWork,
@@ -345,6 +346,7 @@ function buildResult(params: {
   workStatus?: CreativeActionResult["workStatus"];
   artifactRefs?: string[];
   reviewId?: string;
+  reviewPreview?: CreativeReviewInput;
   reviewGate?: CreativeActionResult["reviewGate"];
   summary: string;
 }): CreativeActionResult {
@@ -356,6 +358,7 @@ function buildResult(params: {
     workStatus: params.workStatus,
     artifactRefs: params.artifactRefs ?? [],
     reviewId: params.reviewId,
+    reviewPreview: params.reviewPreview,
     reviewGate: params.reviewGate,
     summary: params.summary,
   };
@@ -523,17 +526,9 @@ export async function executeCreativeCommand(
       if (!model) {
         throw new Error("review.request 需要 model（LLM 网关），但 executeCreativeCommand 未传入");
       }
-      const reviewInput = await defaultReviewer(repository, command.workItemId, model);
-      const review = await submitReview(repository, command.workItemId, reviewInput);
-      // 若 reviewGate="auto"，检查 gate 是否通过，通过则自动 acceptWork
-      let workItem: CreativeWorkItem | undefined;
-      let gate = undefined;
-      if (run.policy.reviewGate === "auto") {
-        gate = await checkGate(repository, command.workItemId, run.policy);
-        if (gate.passed) {
-          workItem = await acceptWork(repository, command.workItemId);
-        }
-      }
+      const reviewPreview = await defaultReviewer(repository, command.workItemId, model);
+      const workItem = await getWorkItem(repository, command.workItemId);
+      if (!workItem) throw new Error(`Work item 不存在：${command.workItemId}`);
       result = buildResult({
         runId,
         commandType: command.type,
@@ -541,9 +536,8 @@ export async function executeCreativeCommand(
         workItemId: command.workItemId,
         workStatus: workItem?.status,
         artifactRefs: workItem?.artifactRefs ?? [],
-        reviewId: review.id,
-        reviewGate: gate,
-        summary: `Review ${review.id} requested (verdict=${review.verdict})`,
+        reviewPreview,
+        summary: `Read-only review preview generated (verdict=${reviewPreview.verdict}); submit explicitly to affect the gate`,
       });
       break;
     }

@@ -15,7 +15,7 @@ import { describe, expect, it, beforeAll, afterAll, beforeEach } from "vitest";
 import { randomUUID } from "node:crypto";
 import { NovelPostgresRepository } from "../postgres-repository";
 import { InMemoryModelGateway } from "../model-gateway";
-import { defaultReviewer } from "../creative/command-router";
+import { defaultReviewer, executeCreativeCommand } from "../creative/command-router";
 import type { ReviewerOutput } from "../prompts/schemas";
 
 // ===== 测试夹具 =====
@@ -272,5 +272,30 @@ describe("defaultReviewer integration", () => {
     const model = makeModelReturning(makeReviewerOutput());
     await expect(defaultReviewer(repository, workItemId, model))
       .rejects.toThrow(/无关联 artifact/);
+  });
+
+  it("review.request 只返回预览，不写 review、不自动接受 work item", async () => {
+    if (!postgresAvailable) return;
+
+    const projectId = `test-dr-preview-${randomUUID().slice(0, 8)}`;
+    const { workItemId } = await setupFullEnvironment(projectId);
+    await repository.pool.query("UPDATE creative_work_items SET status='running' WHERE id=$1", [workItemId]);
+    const run = await repository.pool.query<{ run_id: string }>("SELECT run_id FROM creative_work_items WHERE id=$1", [workItemId]);
+    const before = await repository.pool.query<{ count: string }>("SELECT COUNT(*)::text AS count FROM creative_reviews WHERE work_item_id=$1", [workItemId]);
+    const model = makeModelReturning(makeReviewerOutput({ verdict: "passed" }));
+
+    const result = await executeCreativeCommand(repository, {
+      type: "review.request",
+      runId: run.rows[0].run_id,
+      workItemId,
+      idempotencyKey: `preview-${randomUUID()}`,
+    }, model);
+
+    const after = await repository.pool.query<{ count: string }>("SELECT COUNT(*)::text AS count FROM creative_reviews WHERE work_item_id=$1", [workItemId]);
+    const work = await repository.pool.query<{ status: string }>("SELECT status FROM creative_work_items WHERE id=$1", [workItemId]);
+    expect(result.reviewPreview?.verdict).toBe("passed");
+    expect(result.reviewId).toBeUndefined();
+    expect(after.rows[0].count).toBe(before.rows[0].count);
+    expect(work.rows[0].status).toBe("running");
   });
 });

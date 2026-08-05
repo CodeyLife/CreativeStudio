@@ -43,6 +43,7 @@ import {
   useGenerateChapterTitle,
   useNovelProject,
   useNovelProjectRuns,
+  useNovelModelInvocationErrors,
   useNovelRun,
   useNovelRunArtifacts,
   useNovelRunEvents,
@@ -52,6 +53,7 @@ import {
   isChapterWorkflowRun,
   novelRunDocumentId,
   type NovelDocumentInput,
+  type NovelModelInvocationError,
   type NovelWorkflowRunRecord,
 } from "@/lib/novelApi";
 import { documentStatusMeta, projectDisplayTitle, relativeTime, statusMeta, workflowTypeMeta } from "./novel-v2/presentation";
@@ -106,6 +108,7 @@ export default function NovelV2Studio() {
 
   const projectQ = useNovelProject(projectId);
   const runsQ = useNovelProjectRuns(projectId);
+  const modelErrorsQ = useNovelModelInvocationErrors(projectId);
   const project = projectQ.data;
   const runs = runsQ.data ?? project?.latestRuns ?? [];
   const chapterRuns = useMemo(() => runs.filter(isChapterWorkflowRun), [runs]);
@@ -214,7 +217,7 @@ export default function NovelV2Studio() {
   }, [project?.documents, runs]);
 
   async function refreshAll() {
-    await Promise.all([projectQ.refetch(), runsQ.refetch(), selectedRunQ.refetch(), eventsQ.refetch(), artifactsQ.refetch(), factsQ.refetch()]);
+    await Promise.all([projectQ.refetch(), runsQ.refetch(), modelErrorsQ.refetch(), selectedRunQ.refetch(), eventsQ.refetch(), artifactsQ.refetch(), factsQ.refetch()]);
   }
 
   async function saveChapter(values: NovelDocumentInput) {
@@ -232,13 +235,10 @@ export default function NovelV2Studio() {
   }
 
   async function startChapterCreation(document: NonNullable<typeof selectedDocument>) {
-    const rewritingFinalChapter = document.status === "final";
-    const objective = rewritingFinalChapter
-      ? `从已批准章节蓝图重新生成第 ${document.narrativeOrder} 章《${document.title}》的完整正文，作为整章重写候选；不要基于当前正文做审校式局部修补，必须重新经历蓝图、草稿、审核、事实提取与提交闭环。`
-      : `完成第 ${document.narrativeOrder} 章《${document.title}》的正式创作，遵循已批准的章节规格与故事弧约束。`;
+    const objective = `完成第 ${document.narrativeOrder} 章《${document.title}》的正式创作，遵循已批准的章节规格与故事弧约束。`;
     const result = await submitIntent.mutateAsync({ objective, documentId: document.id, factApprovalMode: "auto" });
     updateLocation({ view: "production", document: document.id, run: result.workflowId });
-    message.success(rewritingFinalChapter ? "已从蓝图重新发起整章重写" : "章节创作已开始");
+    message.success("章节创作已开始");
   }
 
   async function startChapterTitleGeneration() {
@@ -343,6 +343,37 @@ export default function NovelV2Studio() {
             <div><strong>{metrics.failed}</strong><span>异常</span></div>
             <div><strong>{metrics.active}</strong><span>运行中</span></div>
             <div><strong>{metrics.blocking}</strong><span>质量阻塞</span></div>
+          </div>
+        </section>
+
+        <section className="nwc-model-errors" aria-label="大模型调用错误">
+          <header className="nwc-section-head">
+            <div><span className="nwc-kicker">模型调用</span><h2>最近 50 条错误</h2></div>
+            <span className="nwc-count">{modelErrorsQ.data?.length ?? 0}</span>
+          </header>
+          <div className="nwc-model-error-list">
+            {modelErrorsQ.data?.length === 0 && <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="最近没有大模型调用错误" />}
+            {(modelErrorsQ.data ?? []).map((error: NovelModelInvocationError) => {
+              const message = error.errorMessage ?? error.errorCategory ?? "未记录错误内容";
+              const routeState = error.isCurrentConfig === false ? "历史路由" : error.isCurrentConfig === true ? "当前路由" : "版本未知";
+              const routeRevision = error.configRevision ? error.configRevision.slice(0, 8) : "未知版本";
+              return <button
+                key={error.id}
+                type="button"
+                className="nwc-model-error-row"
+                disabled={!error.workflowRunId}
+                title={error.workflowRunId ? "查看对应工作流" : "该错误没有关联工作流"}
+                onClick={() => updateLocation({ view: "production", document: error.documentId ?? selectedDocumentId, run: error.workflowRunId })}
+              >
+                <span className="nwc-model-error-signal" />
+                <span className="nwc-model-error-copy">
+                  <strong><span>{error.provider}</span><em>{error.model}</em></strong>
+                  <small>{error.purpose} · 候选 {error.candidateIndex + 1} · {routeState} {routeRevision} · {relativeTime(error.createdAt)}</small>
+                  <p title={message}>{message}</p>
+                </span>
+                <span className="nwc-model-error-status">{error.errorCategory ?? "failed"}</span>
+              </button>;
+            })}
           </div>
         </section>
 

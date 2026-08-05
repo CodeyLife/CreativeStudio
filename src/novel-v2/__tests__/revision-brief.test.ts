@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildRevisionBrief, buildRevisionDirection } from "../application/revision-brief";
+import { buildRevisionBrief, buildRevisionDirection, shouldBlockRevisionForConflicts } from "../application/revision-brief";
 import type { Review, ReviewIssue } from "../protocol";
 
 const issue = (title: string, evidence = "他停住了。"): ReviewIssue => ({
@@ -42,5 +42,21 @@ describe("revision brief", () => {
     });
     expect(direction.authorInstruction).toContain("保留沉默感");
     expect(direction.strictRevisionWindows).toBe(true);
+  });
+
+  it("lets explicit author direction discard conflicting reviewer directives", () => {
+    const preserve: ReviewIssue = {
+      ...issue("术语处理"),
+      suggestion: "保留抽象术语。",
+    };
+    const remove: ReviewIssue = {
+      ...issue("术语处理"),
+      suggestion: "删除抽象术语。",
+    };
+    const brief = buildRevisionBrief([review("structure", [preserve]), review("prose", [remove])]);
+
+    expect(brief.conflicts).toHaveLength(1);
+    expect(shouldBlockRevisionForConflicts(brief.conflicts, false)).toBe(true);
+    expect(shouldBlockRevisionForConflicts(brief.conflicts, true)).toBe(false);
   });
 });

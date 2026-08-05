@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import Ajv from "ajv";
-import { foundationSchemaForTask, validateFoundationTaskContract } from "../application/foundation-contract";
+import { foundationSchemaForTask, normalizeFoundationModelOutput, validateFoundationTaskContract } from "../application/foundation-contract";
 import type { FoundationOutput } from "../prompts/schemas";
 
 const output = (structuredData: Record<string, unknown>): FoundationOutput => ({
@@ -49,10 +49,16 @@ describe("foundation task semantic contracts", () => {
     ]));
   });
 
-  it("enforces the task data root during structured-output validation", () => {
+  it("keeps the native envelope compact and validates task data after decoding", () => {
     const validate = new Ajv({ allErrors: true, strict: false }).compile(foundationSchemaForTask("architecture"));
     const base = { title: "架构", summary: "这是一段足够长的规划摘要，用于说明结构决策、冲突来源、人物方向、信息释放、卷级职责、视角边界、时间跨度和后续修订边界。", sections: [] };
-    expect(validate({ ...base, structuredData: { structure: "三卷递进", volumes: ["寻找"], povStrategy: "限知", timeSpan: "两年" } })).toBe(false);
-    expect(validate({ ...base, structuredData: { architecture: { structure: "三卷递进", volumes: [{ name: "寻找", theme: "查明", function: "建立问题", entryState: "未知", exitState: "开始追查", pressures: ["制度追责"], promiseWindows: [] }], povStrategy: "限知", timeSpan: "两年" } } })).toBe(true);
+    expect(validate({ ...base, structuredData: { architecture: {} } })).toBe(false);
+
+    const validStructuredData = { architecture: { structure: "三卷递进", volumes: [{ name: "寻找", theme: "查明", function: "建立问题", entryState: "未知", exitState: "开始追查", pressures: ["制度追责"], promiseWindows: [] }], povStrategy: "限知", timeSpan: "两年" } };
+    expect(validate({ ...base, structuredData: JSON.stringify(validStructuredData) })).toBe(true);
+    expect(validateFoundationTaskContract(normalizeFoundationModelOutput({ ...base, structuredData: JSON.stringify(validStructuredData) }), "architecture")).toEqual([]);
+
+    const wrongRoot = normalizeFoundationModelOutput({ ...base, structuredData: JSON.stringify({ positioning: validStructuredData.architecture }) });
+    expect(validateFoundationTaskContract(wrongRoot, "architecture")).toContain("architecture.structure 不能为空");
   });
 });

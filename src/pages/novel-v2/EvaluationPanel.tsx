@@ -1,12 +1,56 @@
 import { useEffect, useState } from "react";
-import { Alert, Button, Card, Form, Input, Modal, Popconfirm, Select, Space, Table, Tag, Typography, message } from "antd";
-import { CameraOutlined, ExperimentOutlined, ReloadOutlined, ThunderboltOutlined, FileTextOutlined, CheckCircleOutlined, SwapOutlined } from "@ant-design/icons";
+import { Alert, Button, Form, Input, Modal, Popconfirm, Select, Tag, Tooltip, Typography, message } from "antd";
+import {
+  ArrowRightOutlined,
+  CameraOutlined,
+  CheckCircleOutlined,
+  CheckOutlined,
+  CloseOutlined,
+  CodeOutlined,
+  DeleteOutlined,
+  ExperimentOutlined,
+  EyeOutlined,
+  FileSearchOutlined,
+  FileTextOutlined,
+  LockOutlined,
+  ReloadOutlined,
+  RocketOutlined,
+  SwapOutlined,
+  ThunderboltOutlined,
+} from "@ant-design/icons";
 import { motion } from "motion/react";
 import "../novel-v2.css";
 import { decisionMeta, experimentStatusMeta, receiptStatusMeta, shortId } from "./presentation";
+import { novelFetch as readJson } from "../../lib/novelApi";
 
-// ===== 类型定义（对齐 V2 API 返回结构）=====
-type SnapshotRow = { id: string; project_id: string; hash: string; head: string; created_at: string };
+type SnapshotHead = {
+  projectRevision?: number;
+  finalDocumentHashes?: string[];
+};
+
+type SnapshotRow = {
+  id: string;
+  project_id: string;
+  hash: string;
+  head: SnapshotHead | string;
+  created_at: string;
+};
+
+type SnapshotDetail = SnapshotRow & {
+  payload?: {
+    documents?: unknown[];
+    memoryClaims?: unknown[];
+    skillDefinitions?: unknown[];
+    entities?: unknown[];
+    relations?: unknown[];
+    revisions?: unknown[];
+    artifacts?: unknown[];
+    reviews?: unknown[];
+  };
+  createdAt?: number;
+  projectId?: string;
+};
+
 type Experiment = {
   id: string;
   projectId: string;
@@ -16,20 +60,30 @@ type Experiment = {
   status: "active" | "closed" | "deleted";
   createdAt: number;
 };
-type DocumentSummary = { id: string; title: string; narrativeOrder: number };
-type ProjectDetail = { id: string; title: string; documents: DocumentSummary[] };
+
+type DocumentSummary = {
+  id: string;
+  title: string;
+  narrativeOrder: number;
+  status?: string;
+};
+
+type ProjectDetail = { id: string; title: string; currentRevision?: number; documents: DocumentSummary[] };
 type PromotableFact = { sourceClaimId: string; payload: { title: string; subjectRefs: string[]; kind: string } };
 type IteratedSkill = { id: string; skillId: string; beforePrompt: string; afterPrompt: string; rationale: string };
 type CandidateBundle = {
   id: string;
   experimentId: string;
   sourceProjectId: string;
+  baseSnapshotId?: string;
   target: { documentId: string; baseRevision: number; baseContentHash: string };
   manuscript: { title: string; plainText: string; contentHtml: string; wordCount: number; contentHash: string };
   acceptedFacts: PromotableFact[];
   iteratedSkills: IteratedSkill[];
+  qualityEvidence?: { reviewIds?: string[]; scores?: Record<string, number>; issueSummary?: Record<string, number> };
   provenance: { codeRevision: string; createdAt: number; workflowRunId: string };
 };
+
 type Receipt = {
   id: string;
   candidateId: string;
@@ -44,11 +98,48 @@ export interface EvaluationPanelProps {
   projectId: string;
 }
 
-async function readJson<T>(input: RequestInfo, init?: RequestInit): Promise<T> {
-  const response = await fetch(input, init);
-  const body = await response.json();
-  if (!response.ok) throw new Error(body.error ?? "V2 API 请求失败");
-  return body as T;
+function formatDate(value: string | number | undefined): string {
+  if (!value) return "时间未知";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "时间未知" : date.toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function snapshotHead(snapshot: SnapshotRow): SnapshotHead {
+  if (typeof snapshot.head === "string") {
+    try {
+      return JSON.parse(snapshot.head) as SnapshotHead;
+    } catch {
+      return {};
+    }
+  }
+  return snapshot.head ?? {};
+}
+
+function snapshotName(snapshot: { created_at?: string; createdAt?: number }): string {
+  return `作品基线 · ${formatDate(snapshot.created_at ?? snapshot.createdAt)}`;
+}
+
+function experimentName(experiment: Experiment, snapshot?: SnapshotRow): string {
+  return snapshot ? `隔离实验 · ${formatDate(snapshot.created_at)} 基线` : `隔离实验 · ${formatDate(experiment.createdAt)}`;
+}
+
+function documentName(document: DocumentSummary | undefined, documentId?: string): string {
+  return document ? `第 ${document.narrativeOrder} 章 · ${document.title}` : `目标章节 · ${shortId(documentId, 8)}`;
+}
+
+function candidateIssueCount(candidate: CandidateBundle): number {
+  return Object.values(candidate.qualityEvidence?.issueSummary ?? {}).reduce((total, value) => total + Number(value || 0), 0);
+}
+
+function candidateEvidenceLabel(candidate: CandidateBundle): string {
+  const reviews = candidate.qualityEvidence?.reviewIds?.length ?? 0;
+  const issues = candidateIssueCount(candidate);
+  if (!reviews && !issues) return "已生成，等待作者判断";
+  return `${reviews} 份审核证据 · ${issues} 个待关注问题`;
+}
+
+function statusColor(status: Experiment["status"]): string {
+  return status === "active" ? "green" : status === "deleted" ? "red" : "default";
 }
 
 export default function EvaluationPanel({ projectId }: EvaluationPanelProps) {
@@ -60,7 +151,7 @@ export default function EvaluationPanel({ projectId }: EvaluationPanelProps) {
   const [error, setError] = useState<string>();
   const [loading, setLoading] = useState(false);
   const [capturing, setCapturing] = useState(false);
-  const [snapshotPayload, setSnapshotPayload] = useState<unknown>();
+  const [snapshotDetail, setSnapshotDetail] = useState<SnapshotDetail>();
   const [createExperimentOpen, setCreateExperimentOpen] = useState(false);
   const [experimentSnapshotId, setExperimentSnapshotId] = useState<string>();
   const [selectedExperimentId, setSelectedExperimentId] = useState<string>();
@@ -82,11 +173,20 @@ export default function EvaluationPanel({ projectId }: EvaluationPanelProps) {
         readJson<{ candidates: CandidateBundle[] }>(`/v2/projects/${encodeURIComponent(projectId)}/candidates`),
         readJson<{ receipts: Receipt[] }>(`/v2/projects/${encodeURIComponent(projectId)}/receipts`),
       ]);
+      const nextSnapshots = snap.snapshots ?? [];
+      const nextExperiments = exp.experiments ?? [];
+      const nextCandidates = candidateResult.candidates ?? [];
+      const nextDocuments = proj.project.documents ?? [];
+      const nextActiveExperiment = nextExperiments.find((item) => item.status === "active");
+
       setProject(proj.project);
-      setSnapshots(snap.snapshots ?? []);
-      setExperiments(exp.experiments ?? []);
-      setCandidates(candidateResult.candidates ?? []);
+      setSnapshots(nextSnapshots);
+      setExperiments(nextExperiments);
+      setCandidates(nextCandidates);
       setReceipts(receiptResult.receipts ?? []);
+      setCurrentCandidate((previous) => (previous ? nextCandidates.find((item) => item.id === previous.id) ?? nextCandidates[0] : nextCandidates[0]));
+      setSelectedExperimentId((previous) => previous && nextExperiments.some((item) => item.id === previous && item.status === "active") ? previous : nextActiveExperiment?.id);
+      setSelectedDocumentId((previous) => previous && nextDocuments.some((item) => item.id === previous) ? previous : nextDocuments[0]?.id);
       setError(undefined);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -97,14 +197,14 @@ export default function EvaluationPanel({ projectId }: EvaluationPanelProps) {
 
   useEffect(() => {
     if (projectId) void loadAll();
-    // TODO P3: loadAll 依赖 projectId，eslint exhaustive-deps 已满足；后续可拆分独立刷新。
+    // TODO P3: loadAll 依赖 projectId，后续可拆分独立刷新。
   }, [projectId]);
 
   async function captureSnapshot() {
     setCapturing(true);
     try {
       await readJson(`/v2/projects/${encodeURIComponent(projectId)}/snapshots`, { method: "POST" });
-      message.success("快照已捕获");
+      message.success("作品基线已保存");
       await loadAll();
     } catch (err) {
       message.error(err instanceof Error ? err.message : String(err));
@@ -115,8 +215,8 @@ export default function EvaluationPanel({ projectId }: EvaluationPanelProps) {
 
   async function viewSnapshot(snapshotId: string) {
     try {
-      const body = await readJson<{ snapshot: unknown }>(`/v2/snapshots/${encodeURIComponent(snapshotId)}`);
-      setSnapshotPayload(body.snapshot);
+      const body = await readJson<{ snapshot: SnapshotDetail }>(`/v2/snapshots/${encodeURIComponent(snapshotId)}`);
+      setSnapshotDetail(body.snapshot);
     } catch (err) {
       message.error(err instanceof Error ? err.message : String(err));
     }
@@ -124,7 +224,7 @@ export default function EvaluationPanel({ projectId }: EvaluationPanelProps) {
 
   async function createExperiment() {
     if (!experimentSnapshotId) {
-      message.warning("请选择快照");
+      message.warning("请先选择一个作品基线");
       return;
     }
     try {
@@ -133,7 +233,7 @@ export default function EvaluationPanel({ projectId }: EvaluationPanelProps) {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ snapshotId: experimentSnapshotId }),
       });
-      message.success("实验工作区已创建");
+      message.success("隔离实验已创建，可以开始生成候选稿");
       setCreateExperimentOpen(false);
       setExperimentSnapshotId(undefined);
       await loadAll();
@@ -145,7 +245,7 @@ export default function EvaluationPanel({ projectId }: EvaluationPanelProps) {
   async function deleteExperiment(experimentId: string) {
     try {
       await readJson(`/v2/experiments/${encodeURIComponent(experimentId)}`, { method: "DELETE" });
-      message.success("实验工作区已删除");
+      message.success("隔离实验已删除");
       await loadAll();
     } catch (err) {
       message.error(err instanceof Error ? err.message : String(err));
@@ -155,7 +255,7 @@ export default function EvaluationPanel({ projectId }: EvaluationPanelProps) {
   async function closeExperiment(experimentId: string) {
     try {
       await readJson(`/v2/experiments/${encodeURIComponent(experimentId)}/close`, { method: "POST" });
-      message.success("实验工作区已关闭");
+      message.success("隔离实验已关闭，正式作品不受影响");
       await loadAll();
     } catch (err) {
       message.error(err instanceof Error ? err.message : String(err));
@@ -164,7 +264,7 @@ export default function EvaluationPanel({ projectId }: EvaluationPanelProps) {
 
   async function generateCandidate() {
     if (!selectedExperimentId || !selectedDocumentId) {
-      message.warning("请选择实验与章节");
+      message.warning("请先选择隔离实验和目标章节");
       return;
     }
     setGeneratingCandidate(true);
@@ -174,9 +274,9 @@ export default function EvaluationPanel({ projectId }: EvaluationPanelProps) {
         { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ documentId: selectedDocumentId }) },
       );
       setCurrentCandidate(body.candidate);
-      setCandidates((prev) => [body.candidate, ...prev.filter((c) => c.id !== body.candidate.id)]);
+      setCandidates((previous) => [body.candidate, ...previous.filter((candidate) => candidate.id !== body.candidate.id)]);
       setExpandedManuscript(false);
-      message.success("候选包已生成");
+      message.success("候选稿已生成，正式作品尚未改变");
     } catch (err) {
       message.error(err instanceof Error ? err.message : String(err));
     } finally {
@@ -192,8 +292,8 @@ export default function EvaluationPanel({ projectId }: EvaluationPanelProps) {
         `/v2/candidates/${encodeURIComponent(promoteCandidate.id)}/promote`,
         { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(values) },
       );
-      setReceipts((prev) => [body.receipt, ...prev.filter((r) => r.id !== body.receipt.id)]);
-      message.success("晋升完成");
+      setReceipts((previous) => [body.receipt, ...previous.filter((receipt) => receipt.id !== body.receipt.id)]);
+      message.success(values.decision === "accept" ? "候选稿已提交晋升" : "候选稿已拒绝，正式作品未改变");
       setPromoteCandidate(undefined);
       promoteForm.resetFields();
     } catch (err) {
@@ -203,330 +303,363 @@ export default function EvaluationPanel({ projectId }: EvaluationPanelProps) {
     }
   }
 
-  const documentOptions = (project?.documents ?? []).map((d) => ({ value: d.id, label: `第 ${d.narrativeOrder} 章 · ${d.title}` }));
-  const snapshotOptions = snapshots.map((s) => ({ value: s.id, label: `快照 ${shortId(s.id)} · ${shortId(s.hash, 8)}` }));
+  const documents = project?.documents ?? [];
+  const activeExperiments = experiments.filter((experiment) => experiment.status === "active");
+  const snapshotMap = new Map(snapshots.map((snapshot) => [snapshot.id, snapshot]));
+  const selectedExperiment = experiments.find((experiment) => experiment.id === selectedExperimentId);
+  const selectedBaseSnapshot = selectedExperiment ? snapshotMap.get(selectedExperiment.baseSnapshotId) : undefined;
+  const selectedDocument = documents.find((document) => document.id === selectedDocumentId);
+  const currentCandidateDocument = currentCandidate ? documents.find((document) => document.id === currentCandidate.target.documentId) : undefined;
+  const promotedCount = receipts.filter((receipt) => receipt.status === "promoted").length;
+  const rollbackCount = receipts.filter((receipt) => receipt.status === "rolled-back").length;
   const manuscriptPreview = currentCandidate
     ? expandedManuscript
       ? currentCandidate.manuscript.plainText
-      : currentCandidate.manuscript.plainText.slice(0, 500)
+      : currentCandidate.manuscript.plainText.slice(0, 720)
     : "";
-  const activeExperimentCount = experiments.filter((e) => e.status === "active").length;
+  const snapshotOptions = snapshots.map((snapshot) => ({
+    value: snapshot.id,
+    label: `${snapshotName(snapshot)} · ${snapshotHead(snapshot).finalDocumentHashes?.length ?? 0} 章`,
+  }));
+  const documentOptions = documents.map((document) => ({
+    value: document.id,
+    label: documentName(document),
+    disabled: document.status === "planned",
+  }));
+  const experimentOptions = activeExperiments.map((experiment) => ({
+    value: experiment.id,
+    label: experimentName(experiment, snapshotMap.get(experiment.baseSnapshotId)),
+  }));
 
   return (
     <div className="novel-eval-page">
-      {/* ===== EDITORIAL TOPBAR ===== */}
       <motion.header
-        className="novel-topbar"
+        className="novel-topbar novel-eval-topbar"
         initial={{ opacity: 0, y: 14 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.55, ease: [0.16, 1, 0.3, 1] }}
       >
         <div className="novel-topbar-body" style={{ minWidth: 0 }}>
           <span className="novel-eyebrow">评估闭环</span>
-          <h2 className="novel-display-h2" style={{ marginTop: 2 }}>
-            实验工作区 · 候选晋升
-          </h2>
+          <h2 className="novel-display-h2" style={{ marginTop: 2 }}>把一次失败，变成可验证的改进</h2>
           <p className="novel-lede" style={{ margin: "8px 0 0" }}>
-            捕获项目快照，在隔离实验工作区中生成候选稿件，审核采纳事实与技能迭代，最终晋升为正式修订或回滚。
+            在作品副本里试写和对比，只有你确认后，候选章节与可复用经验才会进入正式作品。
           </p>
+          <div className="novel-eval-project-context">
+            <FileTextOutlined />
+            <span>当前作品</span>
+            <strong>{project?.title ?? "正在读取作品"}</strong>
+            {project?.currentRevision !== undefined && <span className="novel-eval-muted">修订 {project.currentRevision}</span>}
+          </div>
         </div>
         <div className="novel-topbar-actions">
           <Button icon={<ReloadOutlined />} loading={loading} onClick={() => void loadAll()}>刷新</Button>
-          <Button type="primary" icon={<CameraOutlined />} loading={capturing} onClick={() => void captureSnapshot()}>捕获快照</Button>
+          <Button type="primary" aria-label="捕获快照，保存当前基线" icon={<CameraOutlined />} loading={capturing} onClick={() => void captureSnapshot()}>保存当前基线</Button>
         </div>
       </motion.header>
 
       {error && <Alert type="error" showIcon message={error} className="novel-v2-alert" closable onClose={() => setError(undefined)} />}
 
-      {/* ===== STATS BENTO ===== */}
       <motion.section
-        className="novel-bento"
+        className="novel-eval-steps"
         initial={{ opacity: 0, y: 12 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.5, delay: 0.05, ease: [0.16, 1, 0.3, 1] }}
       >
-        <div className="novel-card-mini novel-bento-mini">
-          <div className="novel-card-mini-label"><CameraOutlined /> 项目快照</div>
-          <div className="novel-card-mini-value">{snapshots.length}</div>
-          <div className="novel-card-mini-hint">捕获时间线锚点</div>
+        <div className={`novel-eval-step ${snapshots.length ? "is-ready" : "is-current"}`}>
+          <span className="novel-eval-step-number">01</span>
+          <div><strong>保存作品基线</strong><p>锁定这次正式作品状态</p></div>
+          {snapshots.length ? <CheckOutlined /> : <CameraOutlined />}
         </div>
-        <div className="novel-card-mini novel-bento-mini">
-          <div className="novel-card-mini-label"><ExperimentOutlined /> 实验工作区</div>
-          <div className="novel-card-mini-value">{experiments.length}</div>
-          <div className="novel-card-mini-hint">{activeExperimentCount} 个活跃 · {experiments.length - activeExperimentCount} 个已关闭/删除</div>
+        <ArrowRightOutlined className="novel-eval-step-arrow" />
+        <div className={`novel-eval-step ${activeExperiments.length ? "is-ready" : snapshots.length ? "is-current" : ""}`}>
+          <span className="novel-eval-step-number">02</span>
+          <div><strong>创建隔离实验</strong><p>在副本里尝试，不污染主线</p></div>
+          {activeExperiments.length ? <CheckOutlined /> : <ExperimentOutlined />}
         </div>
-        <div className="novel-card-mini novel-bento-mini">
-          <div className="novel-card-mini-label"><FileTextOutlined /> 候选包</div>
-          <div className="novel-card-mini-value">{candidates.length}</div>
-          <div className="novel-card-mini-hint">待晋升 / 已生成候选稿件</div>
+        <ArrowRightOutlined className="novel-eval-step-arrow" />
+        <div className={`novel-eval-step ${currentCandidate ? "is-ready" : activeExperiments.length ? "is-current" : ""}`}>
+          <span className="novel-eval-step-number">03</span>
+          <div><strong>生成候选稿</strong><p>得到一份可以阅读的修改结果</p></div>
+          {currentCandidate ? <CheckOutlined /> : <ThunderboltOutlined />}
         </div>
-        <div className="novel-card-mini novel-bento-mini">
-          <div className="novel-card-mini-label"><CheckCircleOutlined /> 晋升收据</div>
-          <div className="novel-card-mini-value">{receipts.length}</div>
-          <div className="novel-card-mini-hint">
-            {receipts.filter((r) => r.status === "promoted").length} 成功 · {receipts.filter((r) => r.status === "rolled-back").length} 回滚
-          </div>
+        <ArrowRightOutlined className="novel-eval-step-arrow" />
+        <div className={`novel-eval-step ${promotedCount ? "is-ready" : ""}`}>
+          <span className="novel-eval-step-number">04</span>
+          <div><strong>审核并应用</strong><p>确认后才写入正式作品</p></div>
+          {promotedCount ? <CheckOutlined /> : <RocketOutlined />}
         </div>
       </motion.section>
 
-      {/* ===== 2-COLUMN WORKSPACE ===== */}
+      <section className="novel-eval-stats" aria-label="闭环概览">
+        <div className="novel-eval-stat"><span>可用作品基线</span><strong>{snapshots.length}</strong><small>实验从这里复制，不覆盖正文</small></div>
+        <div className="novel-eval-stat"><span>正在进行的隔离实验</span><strong>{activeExperiments.length}</strong><small>可继续生成候选稿</small></div>
+        <div className="novel-eval-stat"><span>待你判断的候选稿</span><strong>{candidates.length}</strong><small>每份都对应一个章节结果</small></div>
+        <div className="novel-eval-stat is-accent"><span>已应用的改进</span><strong>{promotedCount}</strong><small>{rollbackCount ? `${rollbackCount} 次回滚记录` : "正式作品暂无回滚"}</small></div>
+      </section>
+
       <section className="novel-eval-workspace">
-        {/* 左栏：候选包焦点卡 */}
-        <motion.section
+        <motion.main
           className="novel-eval-focal"
           initial={{ opacity: 0, y: 14 }}
           animate={{ opacity: 1, y: 0 }}
           transition={{ duration: 0.55, delay: 0.1, ease: [0.16, 1, 0.3, 1] }}
         >
-          <div className="novel-focal-card">
-            <div className="novel-focal-card-head">
-              <h3>生成候选包</h3>
-              <span className="novel-status-pill novel-status-pill-done">隔离实验 · 不影响主线</span>
+          <section className="novel-eval-builder" id="candidate-builder">
+            <div className="novel-eval-section-heading">
+              <div>
+                <span className="novel-eval-section-kicker">下一步</span>
+                <h3>生成一份候选稿</h3>
+                <p>选择隔离实验和目标章节。系统会把结果留在副本里，方便你先读完再决定。</p>
+              </div>
+              <span className="novel-eval-safe-badge"><LockOutlined /> 不影响正式作品</span>
             </div>
-            <div className="novel-focal-card-body">
-              <Select
-                style={{ width: "100%" }}
-                placeholder="选择实验工作区"
-                value={selectedExperimentId}
-                onChange={setSelectedExperimentId}
-                options={experiments.map((e) => {
-                  const stMeta = experimentStatusMeta(e.status);
-                  return { value: e.id, label: `${shortId(e.id)} · ${stMeta.label}` };
-                })}
-              />
-              <Select
-                style={{ width: "100%" }}
-                placeholder="选择章节目标"
-                value={selectedDocumentId}
-                onChange={setSelectedDocumentId}
-                options={documentOptions}
-              />
-              <Button type="primary" size="large" icon={<ThunderboltOutlined />} loading={generatingCandidate} block onClick={() => void generateCandidate()}>
-                生成候选
-              </Button>
-            </div>
-          </div>
 
-          {/* 候选预览 —— 支撑卡 */}
-          <div className="novel-card-support">
-            <div className="novel-card-head">
-              <h3 className="novel-display-h3">候选预览</h3>
-              {currentCandidate && (
-                <Space size={6}>
-                  <Tag color="blue">{shortId(currentCandidate.id)}</Tag>
-                  <Tag>{currentCandidate.manuscript.wordCount} 字</Tag>
-                </Space>
-              )}
+            <div className="novel-eval-form-grid">
+              <label className="novel-eval-field">
+                <span>使用哪个隔离实验</span>
+                <Select
+                  value={selectedExperimentId}
+                  onChange={setSelectedExperimentId}
+                  options={experimentOptions}
+                  placeholder={activeExperiments.length ? "选择隔离实验" : "请先创建隔离实验"}
+                  disabled={!activeExperiments.length}
+                />
+                <small>{selectedBaseSnapshot ? `基于 ${snapshotName(selectedBaseSnapshot)}` : selectedExperiment ? "这份实验的基线已归档" : "隔离实验会使用一份固定基线"}</small>
+              </label>
+              <label className="novel-eval-field">
+                <span>要改进哪一章</span>
+                <Select
+                  value={selectedDocumentId}
+                  onChange={setSelectedDocumentId}
+                  options={documentOptions}
+                  placeholder={documents.length ? "选择目标章节" : "暂无可用章节"}
+                  disabled={!documents.length}
+                />
+                <small>{selectedDocument ? `当前版本第 ${selectedDocument.narrativeOrder} 章，生成后可与原稿对照` : "章节名称会显示在候选结果中"}</small>
+              </label>
             </div>
+            <Button type="primary" size="large" icon={<ThunderboltOutlined />} loading={generatingCandidate} disabled={!selectedExperimentId || !selectedDocumentId} block onClick={() => void generateCandidate()}>
+              生成候选稿
+            </Button>
+            {!activeExperiments.length && (
+              <div className="novel-eval-inline-help">
+                <ExperimentOutlined />
+                <span>还没有可用的隔离实验。先保存基线，再点击右侧“创建”建立一个不会影响正式作品的副本。</span>
+                <Button type="link" onClick={() => setCreateExperimentOpen(true)}>去创建 <ArrowRightOutlined /></Button>
+              </div>
+            )}
+          </section>
+
+          <section className="novel-eval-preview">
+            <div className="novel-eval-section-heading">
+              <div>
+                <span className="novel-eval-section-kicker">阅读结果</span>
+                <h3>候选预览</h3>
+                <p>这里看到的是实验结果，不是已经写入的正文。阅读后再决定是否晋升。</p>
+              </div>
+              {currentCandidate && <Tag color="green">待作者判断</Tag>}
+            </div>
+
             {currentCandidate ? (
-              <div className="novel-candidate-preview">
-                <Typography.Title level={5} style={{ color: "#f4f4f5", margin: "0 0 8px" }}>
-                  {currentCandidate.manuscript.title}
-                </Typography.Title>
+              <div className="novel-candidate-preview novel-eval-preview-body">
+                <div className="novel-eval-candidate-title-row">
+                  <div>
+                    <Typography.Title level={4} style={{ color: "#f4f4f5", margin: 0 }}>{currentCandidate.manuscript.title}</Typography.Title>
+                    <div className="novel-eval-candidate-meta">
+                      <span>{documentName(currentCandidateDocument, currentCandidate.target.documentId)}</span>
+                      <span>{currentCandidate.manuscript.wordCount.toLocaleString("zh-CN")} 字</span>
+                      <span>{candidateEvidenceLabel(currentCandidate)}</span>
+                    </div>
+                  </div>
+                  <Button type="primary" icon={<RocketOutlined />} onClick={() => { promoteForm.resetFields(); setPromoteCandidate(currentCandidate); }}>
+                    审核并决定
+                  </Button>
+                </div>
                 <div className="novel-manuscript-text">
                   {manuscriptPreview}
-                  {currentCandidate.manuscript.plainText.length > 500 && (
-                    <Button type="link" size="small" onClick={() => setExpandedManuscript(!expandedManuscript)}>{expandedManuscript ? "收起" : "展开全文"}</Button>
+                  {currentCandidate.manuscript.plainText.length > 720 && (
+                    <Button type="link" size="small" onClick={() => setExpandedManuscript(!expandedManuscript)}>{expandedManuscript ? "收起正文" : "展开全文"}</Button>
                   )}
                 </div>
 
-                <div className="novel-section-label" style={{ margin: "18px 0 10px" }}>
-                  Accepted Facts（{currentCandidate.acceptedFacts.length}）
-                </div>
-                {currentCandidate.acceptedFacts.length ? (
-                  <div className="novel-fact-list">
-                    {currentCandidate.acceptedFacts.map((f) => (
-                      <div key={f.sourceClaimId} className="novel-fact-item">
-                        <Tag color="blue">{f.payload.kind}</Tag>
-                        <Typography.Text strong>{f.payload.title}</Typography.Text>
-                        <Typography.Text type="secondary"> · {f.payload.subjectRefs.join(", ") || "无主体"}</Typography.Text>
-                      </div>
-                    ))}
+                <div className="novel-eval-result-grid">
+                  <div className="novel-eval-result-block">
+                    <div className="novel-eval-result-label"><FileSearchOutlined /> 这份候选带来的事实</div>
+                    <strong>{currentCandidate.acceptedFacts.length} 条</strong>
+                    <p>会在晋升时写入事实账本，拒绝则不会进入正式库。</p>
+                    {currentCandidate.acceptedFacts.length > 0 && <div className="novel-fact-list">{currentCandidate.acceptedFacts.slice(0, 3).map((fact) => <div key={fact.sourceClaimId} className="novel-fact-item"><Tag color="blue">{fact.payload.kind}</Tag><Typography.Text strong>{fact.payload.title}</Typography.Text></div>)}</div>}
                   </div>
-                ) : (
-                  <div className="novel-empty" style={{ padding: "12px 8px", textAlign: "center" }}><div className="novel-empty-desc" style={{ fontSize: 12 }}>无采纳事实</div></div>
-                )}
+                  <div className="novel-eval-result-block">
+                    <div className="novel-eval-result-label"><SwapOutlined /> 这份候选带来的写法改进</div>
+                    <strong>{currentCandidate.iteratedSkills.length} 项</strong>
+                    <p>会更新对应 Skill 的正式版本，后续章节可复用。</p>
+                    {currentCandidate.iteratedSkills.length > 0 && <div className="novel-skill-list">{currentCandidate.iteratedSkills.slice(0, 2).map((skill) => <div key={skill.id} className="novel-skill-item"><div className="novel-skill-item-head"><SwapOutlined /><Typography.Text strong>{skill.skillId}</Typography.Text></div><Typography.Text type="secondary">{skill.rationale}</Typography.Text></div>)}</div>}
+                  </div>
+                </div>
 
-                <div className="novel-section-label" style={{ margin: "18px 0 10px" }}>
-                  Iterated Skills（{currentCandidate.iteratedSkills.length}）
-                </div>
-                {currentCandidate.iteratedSkills.length ? (
-                  <div className="novel-skill-list">
-                    {currentCandidate.iteratedSkills.map((s) => (
-                      <div key={s.id} className="novel-skill-item">
-                        <div className="novel-skill-item-head"><SwapOutlined /> <Typography.Text strong>{s.skillId}</Typography.Text></div>
-                        <div className="novel-skill-diff">
-                          <div className="novel-skill-diff-before"><Typography.Text delete type="secondary">{s.beforePrompt.slice(0, 200) || "（空）"}</Typography.Text></div>
-                          <div className="novel-skill-diff-after"><Typography.Text type="success">{s.afterPrompt.slice(0, 200) || "（空）"}</Typography.Text></div>
-                        </div>
-                        <Typography.Text type="secondary" style={{ fontSize: 12 }}>{s.rationale}</Typography.Text>
-                      </div>
-                    ))}
+                <details className="novel-eval-technical-details">
+                  <summary><CodeOutlined /> 查看技术追踪信息</summary>
+                  <div className="novel-eval-technical-grid">
+                    <span>候选稿 ID</span><code>{currentCandidate.id}</code>
+                    <span>工作流运行</span><code>{currentCandidate.provenance.workflowRunId}</code>
+                    <span>基线版本</span><code>revision {currentCandidate.target.baseRevision} · {shortId(currentCandidate.target.baseContentHash, 12)}</code>
                   </div>
-                ) : (
-                  <div className="novel-empty" style={{ padding: "12px 8px", textAlign: "center" }}><div className="novel-empty-desc" style={{ fontSize: 12 }}>无技能迭代</div></div>
-                )}
+                </details>
               </div>
             ) : (
-              <div className="novel-empty" style={{ padding: "40px 16px", textAlign: "center" }}>
+              <div className="novel-empty novel-eval-empty-preview">
                 <div className="novel-empty-mark"><ThunderboltOutlined /></div>
-                <div className="novel-empty-title" style={{ marginTop: 12 }}>等待候选</div>
-                <div className="novel-empty-desc">选择实验与章节后生成候选包，预览 manuscript / acceptedFacts / iteratedSkills。</div>
+                <div className="novel-empty-title">还没有候选稿</div>
+                <div className="novel-empty-desc">候选稿是可以阅读和比较的实验结果。先选择隔离实验与章节，再生成一份。</div>
               </div>
             )}
-          </div>
-        </motion.section>
+          </section>
+        </motion.main>
 
-        {/* 右栏：数据密集区 */}
         <motion.aside
           className="novel-eval-observer"
           initial={{ opacity: 0, y: 14 }}
           animate={{ opacity: 1, y: 0 }}
           transition={{ duration: 0.55, delay: 0.15, ease: [0.16, 1, 0.3, 1] }}
         >
-          {/* 快照列表 */}
-          <Card
-            title={<Space><CameraOutlined /><span>快照列表</span></Space>}
-            extra={<Tag>{snapshots.length}</Tag>}
-            className="novel-v2-card novel-eval-data-card"
-            size="small"
-          >
-            <Table<SnapshotRow>
-              rowKey="id"
-              dataSource={snapshots}
-              loading={loading}
-              size="small"
-              pagination={{ pageSize: 4 }}
-              columns={[
-                { title: "快照", dataIndex: "id", render: (v: string) => <code>{shortId(v)}</code> },
-                { title: "Hash", dataIndex: "hash", render: (v: string) => <span className="novel-table-cell-sub">{shortId(v, 8)}</span> },
-                { title: "创建时间", dataIndex: "created_at", render: (v: string) => <span className="novel-table-cell-sub">{new Date(v).toLocaleString("zh-CN")}</span> },
-                { title: "操作", render: (_v, row) => <Button type="link" size="small" onClick={() => void viewSnapshot(row.id)}>查看</Button> },
-              ]}
-            />
-          </Card>
-
-          {/* 实验工作区 */}
-          <Card
-            title={<Space><ExperimentOutlined /><span>实验工作区</span></Space>}
-            extra={<Button size="small" type="primary" icon={<ExperimentOutlined />} onClick={() => setCreateExperimentOpen(true)}>创建</Button>}
-            className="novel-v2-card novel-eval-data-card"
-            size="small"
-          >
-            <Table<Experiment>
-              rowKey="id"
-              dataSource={experiments}
-              loading={loading}
-              size="small"
-              pagination={{ pageSize: 4 }}
-              columns={[
-                { title: "实验", dataIndex: "id", render: (v: string) => <code>{shortId(v)}</code> },
-                { title: "Schema", dataIndex: "schemaName", render: (v: string) => <span className="novel-table-cell-sub">{v}</span> },
-                { title: "状态", dataIndex: "status", render: (v: string) => { const m = experimentStatusMeta(v); return <Tag color={m.tag}>{m.label}</Tag>; } },
-                { title: "创建时间", dataIndex: "createdAt", render: (v: number) => <span className="novel-table-cell-sub">{new Date(v).toLocaleString("zh-CN")}</span> },
-                {
-                  title: "操作",
-                  render: (_v, row) => (
-                    <Space size={4}>
-                      <Button size="small" disabled={row.status === "closed"} onClick={() => void closeExperiment(row.id)}>关闭</Button>
-                      <Popconfirm title="删除实验工作区？" okText="删除" okButtonProps={{ danger: true }} onConfirm={() => void deleteExperiment(row.id)}>
-                        <Button size="small" danger>删除</Button>
-                      </Popconfirm>
-                    </Space>
-                  ),
-                },
-              ]}
-            />
-          </Card>
-
-          {/* 候选包列表 */}
-          <Card
-            title={<Space><FileTextOutlined /><span>候选包列表</span></Space>}
-            extra={<Tag>{candidates.length}</Tag>}
-            className="novel-v2-card novel-eval-data-card"
-            size="small"
-          >
-            <Table<CandidateBundle>
-              rowKey="id"
-              dataSource={candidates}
-              size="small"
-              pagination={{ pageSize: 4 }}
-              locale={{ emptyText: "暂无候选包，请在左侧生成" }}
-              columns={[
-                { title: "候选包", dataIndex: "id", render: (v: string) => <code>{shortId(v)}</code> },
-                { title: "实验", dataIndex: "experimentId", render: (v: string) => <span className="novel-table-cell-sub">{shortId(v)}</span> },
-                { title: "章节", render: (_v, row) => <span className="novel-table-cell-sub">{shortId(row.target.documentId)}</span> },
-                { title: "创建时间", render: (_v, row) => <span className="novel-table-cell-sub">{new Date(row.provenance.createdAt).toLocaleString("zh-CN")}</span> },
-                {
-                  title: "操作",
-                  render: (_v, row) => <Button size="small" type="primary" onClick={() => setPromoteCandidate(row)}>晋升</Button>,
-                },
-              ]}
-            />
-          </Card>
-
-          {/* 收据列表 */}
-          <Card
-            title={<Space><CheckCircleOutlined /><span>晋升收据</span></Space>}
-            extra={<Tag>{receipts.length}</Tag>}
-            className="novel-v2-card novel-eval-data-card"
-            size="small"
-          >
-            {receipts.length ? (
-              <div className="novel-receipt-list">
-                {receipts.slice(0, 6).map((r) => {
-                  const rMeta = receiptStatusMeta(r.status);
-                  return (
-                  <div key={r.id} className="novel-receipt-item">
-                    <div className="novel-receipt-item-head">
-                      <span className={rMeta.pill}>
-                        {rMeta.icon}
-                        <span style={{ marginLeft: 4 }}>{rMeta.label}</span>
-                      </span>
-                      <code>{shortId(r.id)}</code>
+          <section className="novel-eval-side-panel">
+            <div className="novel-eval-side-heading">
+              <div><span className="novel-eval-section-kicker">实验起点</span><h3>项目快照 <small>快照列表</small></h3></div>
+              <Tag>{snapshots.length}</Tag>
+            </div>
+            <p className="novel-eval-side-description">快照是正式作品的只读基线，用来保证实验前后有明确的对照。</p>
+            <div className="novel-eval-record-list">
+              {snapshots.slice(0, 4).map((snapshot, index) => {
+                const head = snapshotHead(snapshot);
+                return (
+                  <div className="novel-eval-record" key={snapshot.id}>
+                    <div className="novel-eval-record-icon"><CameraOutlined /></div>
+                    <div className="novel-eval-record-main">
+                      <strong>{index === 0 ? "最近的作品基线" : snapshotName(snapshot)}</strong>
+                      <span>{formatDate(snapshot.created_at)} · 修订 {head.projectRevision ?? "未知"} · {head.finalDocumentHashes?.length ?? 0} 章</span>
                     </div>
-                    <div className="novel-receipt-item-meta">
-                      候选包 {shortId(r.candidateId)} · {new Date(r.createdAt).toLocaleString("zh-CN")}
-                    </div>
-                    {r.failureReason && <div className="novel-receipt-item-reason">{r.failureReason}</div>}
+                    <Button type="link" icon={<EyeOutlined />} aria-label={`查看${snapshotName(snapshot)}`} onClick={() => void viewSnapshot(snapshot.id)}>查看组成</Button>
                   </div>
-                  );
-                })}
-              </div>
-            ) : (
-              <div className="novel-empty" style={{ padding: "20px 8px", textAlign: "center" }}><div className="novel-empty-desc">暂无收据</div></div>
-            )}
-          </Card>
+                );
+              })}
+              {!snapshots.length && <div className="novel-eval-side-empty"><CameraOutlined /><span>还没有作品基线</span><small>点击页面右上角“保存当前基线”开始</small></div>}
+            </div>
+          </section>
+
+          <section className="novel-eval-side-panel">
+            <div className="novel-eval-side-heading">
+              <div><span className="novel-eval-section-kicker">安全试写</span><h3>实验工作区 <small>实验工作区</small></h3></div>
+              <Button size="small" type="primary" aria-label="操作：创建隔离实验" icon={<ExperimentOutlined />} onClick={() => setCreateExperimentOpen(true)}>创建</Button>
+            </div>
+            <p className="novel-eval-side-description">每个工作区都是一份独立副本。关闭或删除它，都不会改动正式作品。</p>
+            <div className="novel-eval-record-list">
+              {experiments.slice(0, 5).map((experiment) => {
+                const meta = experimentStatusMeta(experiment.status);
+                const baseSnapshot = snapshotMap.get(experiment.baseSnapshotId);
+                const isSelected = experiment.id === selectedExperimentId;
+                return (
+                  <div className={`novel-eval-record ${isSelected ? "is-selected" : ""}`} key={experiment.id}>
+                    <div className="novel-eval-record-icon"><ExperimentOutlined /></div>
+                    <div className="novel-eval-record-main">
+                      <strong>{experimentName(experiment, baseSnapshot)}</strong>
+                      <span><Tag color={statusColor(experiment.status)}>{meta.label}</Tag>{baseSnapshot ? `基于 ${snapshotName(baseSnapshot)}` : "基线已归档"}</span>
+                    </div>
+                    <div className="novel-eval-record-actions">
+                      {experiment.status === "active" && <Tooltip title="继续使用"><Button type="text" icon={<ArrowRightOutlined />} aria-label="继续使用此实验" onClick={() => { setSelectedExperimentId(experiment.id); document.getElementById("candidate-builder")?.scrollIntoView({ behavior: "smooth", block: "start" }); }} /></Tooltip>}
+                      {experiment.status === "active" && <Tooltip title="关闭实验"><Button type="text" icon={<CloseOutlined />} aria-label="关闭此实验" onClick={() => void closeExperiment(experiment.id)} /></Tooltip>}
+                      <Popconfirm title="删除这个隔离实验？" description="删除后无法继续查看其中的实验数据。" okText="删除" cancelText="取消" okButtonProps={{ danger: true }} onConfirm={() => void deleteExperiment(experiment.id)}>
+                        <Tooltip title="删除实验"><Button type="text" danger icon={<DeleteOutlined />} aria-label="删除此实验" /></Tooltip>
+                      </Popconfirm>
+                    </div>
+                  </div>
+                );
+              })}
+              {!experiments.length && <div className="novel-eval-side-empty"><ExperimentOutlined /><span>还没有隔离实验</span><small>从已保存的作品基线创建一个副本</small></div>}
+            </div>
+          </section>
+
+          <section className="novel-eval-side-panel">
+            <div className="novel-eval-side-heading">
+              <div><span className="novel-eval-section-kicker">待处理</span><h3>候选包列表 <small>候选稿件</small></h3></div>
+              <Tag>{candidates.length}</Tag>
+            </div>
+            <div className="novel-eval-record-list">
+              {candidates.slice(0, 5).map((candidate) => {
+                const candidateDocument = documents.find((document) => document.id === candidate.target.documentId);
+                const receipt = receipts.find((item) => item.candidateId === candidate.id);
+                const isCurrent = currentCandidate?.id === candidate.id;
+                return (
+                  <div className={`novel-eval-candidate-record ${isCurrent ? "is-selected" : ""}`} key={candidate.id}>
+                    <div className="novel-eval-candidate-record-main" onClick={() => setCurrentCandidate(candidate)}>
+                      <strong>{candidate.manuscript.title}</strong>
+                      <span>{documentName(candidateDocument, candidate.target.documentId)} · {candidate.manuscript.wordCount.toLocaleString("zh-CN")} 字</span>
+                      <small>{receipt ? receiptStatusMeta(receipt.status).label : candidateEvidenceLabel(candidate)}</small>
+                    </div>
+                    <Button size="small" type={isCurrent ? "primary" : "default"} onClick={() => { setCurrentCandidate(candidate); if (!receipt) { promoteForm.resetFields(); setPromoteCandidate(candidate); } }}>{receipt ? "查看" : "审核"}</Button>
+                  </div>
+                );
+              })}
+              {!candidates.length && <div className="novel-eval-side-empty"><FileTextOutlined /><span>还没有候选稿</span><small>生成后会在这里保留，方便回看和决策</small></div>}
+            </div>
+          </section>
+
+          <section className="novel-eval-side-panel">
+            <div className="novel-eval-side-heading">
+              <div><span className="novel-eval-section-kicker">已发生</span><h3>晋升收据</h3></div>
+              <Tag>{receipts.length}</Tag>
+            </div>
+            <div className="novel-eval-receipt-list">
+              {receipts.slice(0, 4).map((receipt) => {
+                const meta = receiptStatusMeta(receipt.status);
+                const receiptCandidate = candidates.find((candidate) => candidate.id === receipt.candidateId);
+                return (
+                  <div className="novel-eval-receipt" key={receipt.id}>
+                    <span className={meta.pill}>{meta.icon}<span>{meta.label}</span></span>
+                    <div><strong>{receiptCandidate?.manuscript.title ?? "候选稿"}</strong><small>{formatDate(receipt.createdAt)} · {receipt.result.skillUpdates?.length ?? 0} 项写法改进 · {receipt.result.factIds?.length ?? 0} 条事实</small></div>
+                  </div>
+                );
+              })}
+              {!receipts.length && <div className="novel-eval-side-empty compact"><CheckCircleOutlined /><span>完成晋升后会留下记录</span></div>}
+            </div>
+          </section>
         </motion.aside>
       </section>
 
-      {/* 快照 payload 弹窗 */}
-      <Modal title="快照 Payload" open={Boolean(snapshotPayload)} onCancel={() => setSnapshotPayload(undefined)} footer={null} width={720} destroyOnHidden>
-        <pre style={{ maxHeight: 420, overflow: "auto", padding: 12, background: "rgba(9,9,11,0.62)", borderRadius: 8, fontSize: 12, color: "#a1a1aa" }}>{snapshotPayload ? JSON.stringify(snapshotPayload, null, 2) : ""}</pre>
+      <Modal title="项目基线组成" open={Boolean(snapshotDetail)} onCancel={() => setSnapshotDetail(undefined)} footer={null} width={720} destroyOnHidden>
+        {snapshotDetail && (
+          <div className="novel-eval-snapshot-detail">
+            <div className="novel-eval-modal-intro"><CameraOutlined /><div><strong>{snapshotName(snapshotDetail)}</strong><p>这份只读副本保存了当时的章节、事实、角色关系和写作规则，实验会从它开始。</p></div></div>
+            <div className="novel-eval-modal-stats">
+              <div><strong>{snapshotDetail.payload?.documents?.length ?? 0}</strong><span>章节</span></div>
+              <div><strong>{snapshotDetail.payload?.memoryClaims?.length ?? 0}</strong><span>事实记录</span></div>
+              <div><strong>{snapshotDetail.payload?.skillDefinitions?.length ?? 0}</strong><span>写作规则</span></div>
+              <div><strong>{snapshotDetail.payload?.reviews?.length ?? 0}</strong><span>审核记录</span></div>
+            </div>
+            <details className="novel-eval-technical-details"><summary><CodeOutlined /> 查看完整校验信息</summary><pre>{JSON.stringify(snapshotDetail, null, 2)}</pre></details>
+          </div>
+        )}
       </Modal>
 
-      {/* 创建实验弹窗 */}
-      <Modal title="创建实验工作区" open={createExperimentOpen} onCancel={() => setCreateExperimentOpen(false)} footer={null} destroyOnHidden>
-        <Form layout="vertical">
-          <Form.Item label="选择快照" required>
-            <Select placeholder="选择项目快照" value={experimentSnapshotId} onChange={setExperimentSnapshotId} options={snapshotOptions} />
-          </Form.Item>
-          <Button type="primary" block onClick={() => void createExperiment()}>创建实验</Button>
+      <Modal title="创建隔离实验" open={createExperimentOpen} onCancel={() => setCreateExperimentOpen(false)} footer={null} destroyOnHidden>
+        <div className="novel-eval-modal-intro"><LockOutlined /><div><strong>先复制，再试写</strong><p>实验会从选定的作品基线复制一份独立数据。实验中的生成、事实提取和规则迭代都不会写入正式作品。</p></div></div>
+        <Form layout="vertical" style={{ marginTop: 20 }}>
+          <Form.Item label="从哪份作品基线开始" required><Select placeholder="选择作品基线" value={experimentSnapshotId} onChange={setExperimentSnapshotId} options={snapshotOptions} /></Form.Item>
+          <Button type="primary" block icon={<ExperimentOutlined />} disabled={!experimentSnapshotId} onClick={() => void createExperiment()}>创建隔离实验</Button>
         </Form>
       </Modal>
 
-      {/* 晋升弹窗：AuthorDecision */}
-      <Modal title="确认晋升" open={Boolean(promoteCandidate)} onCancel={() => setPromoteCandidate(undefined)} footer={null} destroyOnHidden>
+      <Modal title="审核候选稿" open={Boolean(promoteCandidate)} onCancel={() => { setPromoteCandidate(undefined); promoteForm.resetFields(); }} footer={null} destroyOnHidden>
         {promoteCandidate && (
-          <Form form={promoteForm} layout="vertical" initialValues={{ decision: "accept" }} onFinish={(values) => void submitPromotion(values)}>
-            <Form.Item label="候选包"><Typography.Text code>{shortId(promoteCandidate.id, 12)}</Typography.Text></Form.Item>
-            <Form.Item name="authorId" label="作者 ID" rules={[{ required: true, message: "请输入作者 ID" }]}><Input placeholder="author" /></Form.Item>
-            <Form.Item name="decision" label="决策" rules={[{ required: true }]}>
-              <Select options={[{ value: "accept", label: decisionMeta("accept").label }, { value: "reject", label: decisionMeta("reject").label }]} />
-            </Form.Item>
-            <Form.Item name="reason" label="理由"><Input.TextArea rows={3} /></Form.Item>
-            <Button type="primary" htmlType="submit" block loading={promoting}>提交晋升</Button>
-          </Form>
+          <>
+            <div className="novel-eval-modal-intro"><RocketOutlined /><div><strong>{promoteCandidate.manuscript.title}</strong><p>接受会把候选章节和其中已验证的改进写入正式作品。拒绝只会留下审计记录，不改变现有正文。</p></div></div>
+            <Form form={promoteForm} layout="vertical" initialValues={{ authorId: "web-author", decision: "accept" }} onFinish={(values) => void submitPromotion(values)} style={{ marginTop: 20 }}>
+              <Form.Item name="authorId" label="记录人" rules={[{ required: true, message: "请输入记录人" }]}><Input placeholder="web-author" /></Form.Item>
+              <Form.Item name="decision" label="你的决定" rules={[{ required: true }]}><Select options={[{ value: "accept", label: decisionMeta("accept").label + "，写入正式作品" }, { value: "reject", label: decisionMeta("reject").label + "，保持现状" }]} /></Form.Item>
+              <Form.Item name="reason" label="判断依据"><Input.TextArea rows={3} placeholder="记录你为什么接受或拒绝这份候选稿" /></Form.Item>
+              <Button type="primary" htmlType="submit" block loading={promoting} icon={<CheckCircleOutlined />}>提交决定</Button>
+            </Form>
+          </>
         )}
       </Modal>
     </div>

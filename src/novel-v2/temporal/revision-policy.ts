@@ -230,7 +230,11 @@ function extractQuotedNames(text: string): Set<string> {
   for (const pattern of patterns) {
     let match: RegExpExecArray | null;
     while ((match = pattern.exec(text)) !== null) {
-      names.add(match[1].trim());
+      const value = match[1].trim();
+      // 引号也承载内省、疑问和动作概念；只把更接近命名标签的内容纳入漂移检测，
+      // 避免普通叙事短语被误报为专名。该过滤按语言结构分类，不依赖具体作品词表。
+      if (/^[我你他她它这那]|^(?:什|怎|哪|谁|何|为|是否|能否)/u.test(value)) continue;
+      names.add(value);
     }
   }
   return names;

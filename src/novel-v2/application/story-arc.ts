@@ -3,13 +3,6 @@ import { createHash } from "node:crypto";
 export type ArcPlanningStatus = "generating" | "awaiting-review" | "approved" | "stale" | "failed";
 export type ArcExecutionStatus = "planned" | "active" | "completed" | "abandoned";
 
-export interface ThematicQuestion {
-  id: string;
-  question: string;
-  opposingPressures: string;
-  resolutionWindow: string;
-}
-
 export interface StoryArcThreadResponsibility {
   threadRef: string;
   responsibility: string;
@@ -32,9 +25,7 @@ export interface StoryArcPlan {
   threadResponsibilities?: StoryArcThreadResponsibility[];
   foreshadowingRefs: string[];
   expectedChapterCount: number;
-  phases: Array<{ title: string; objective: string; exitCondition: string }>;
-  thematicQuestions?: ThematicQuestion[];
-  authorIntent?: string;
+  phases: Array<{ title: string; objective: string }>;
 }
 export type NarrativeArcPlan = StoryArcPlan;
 
@@ -176,10 +167,39 @@ export interface StoryArcRebaseTargetChapter {
 export interface StoryArcRebaseTarget {
   arcId: string;
   executionStatus: ArcExecutionStatus;
+  /**
+   * The current persisted arc contract being reviewed. This is separate from
+   * the historical approval used to reconstruct chapter authority.
+   */
+  currentArc?: NarrativeArcPlan;
   approvedArc: NarrativeArcPlan;
+  /**
+   * Fields absent from the historical approval because the contract was
+   * introduced later. They are compatibility metadata, not chapter evidence.
+   */
+  legacyArcContractGaps?: string[];
   batchIndex: number;
   startChapterIndex: number;
   chapters: StoryArcRebaseTargetChapter[];
+}
+
+/**
+ * Project a historical approval into the current arc-contract vocabulary for
+ * review only. Missing fields introduced after that approval are not chapter
+ * authority; the current persisted arc supplies the contract view while the
+ * gap remains auditable metadata on the rebase target.
+ */
+export function projectLegacyArcContractForReview(input: {
+  approvedArc: NarrativeArcPlan;
+  currentArc: NarrativeArcPlan;
+  legacyArcContractGaps?: string[];
+}): NarrativeArcPlan {
+  if (!input.legacyArcContractGaps?.includes("threadResponsibilities")) return input.approvedArc;
+  return {
+    ...input.approvedArc,
+    plotThreadRefs: [...input.currentArc.plotThreadRefs],
+    threadResponsibilities: [...(input.currentArc.threadResponsibilities ?? [])],
+  };
 }
 
 export function validateStoryArcRebaseBundle(bundle: StoryArcBundle, target: StoryArcRebaseTarget): void {
@@ -332,6 +352,34 @@ function enumValue<T extends string>(value: unknown, allowed: readonly T[]): T |
   return typeof value === "string" && allowed.includes(value as T) ? value as T : undefined;
 }
 
+export function parseStoryArcPlan(value: unknown): NarrativeArcPlan {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("故事弧计划必须是对象");
+  const source = value as Record<string, unknown>;
+  const title = typeof source.title === "string" ? source.title.trim() : "";
+  const objective = typeof source.objective === "string" ? source.objective.trim() : "";
+  if (!title || !objective) throw new Error("故事弧标题和创作目的不能为空");
+  return {
+    title,
+    objective,
+    entryState: typeof source.entryState === "string" ? source.entryState : "",
+    centralConflict: typeof source.centralConflict === "string" ? source.centralConflict : "",
+    development: strings(source.development),
+    resolution: typeof source.resolution === "string" ? source.resolution : "",
+    exitState: typeof source.exitState === "string" ? source.exitState : "",
+    plotThreadRefs: strings(source.plotThreadRefs),
+    threadResponsibilities: parseThreadResponsibilities(source.threadResponsibilities),
+    foreshadowingRefs: strings(source.foreshadowingRefs),
+    expectedChapterCount: Number.isInteger(source.expectedChapterCount) ? Number(source.expectedChapterCount) : 0,
+    phases: Array.isArray(source.phases) ? source.phases.flatMap((phase) => {
+      if (!phase || typeof phase !== "object" || Array.isArray(phase)) return [];
+      const item = phase as Record<string, unknown>;
+      const phaseTitle = typeof item.title === "string" ? item.title.trim() : "";
+      const phaseObjective = typeof item.objective === "string" ? item.objective.trim() : "";
+      return phaseTitle && phaseObjective ? [{ title: phaseTitle, objective: phaseObjective }] : [];
+    }) : [],
+  };
+}
+
 export function parseChapterSceneExecution(value: unknown): ChapterSceneExecution | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   const item = value as Record<string, unknown>;
@@ -350,10 +398,7 @@ export function parseStoryArcBundle(value: unknown): StoryArcBundle {
   const root = value as Record<string, unknown>;
   const rawArc = root.arc;
   if (!rawArc || typeof rawArc !== "object" || Array.isArray(rawArc)) throw new Error("故事弧缺少 arc");
-  const arcValue = rawArc as Record<string, unknown>;
-  const title = typeof arcValue.title === "string" ? arcValue.title.trim() : "";
-  const objective = typeof arcValue.objective === "string" ? arcValue.objective.trim() : "";
-  if (!title || !objective) throw new Error("故事弧标题和创作目的不能为空");
+  const parsedArc = parseStoryArcPlan(rawArc);
   const rawChapters = Array.isArray(root.chapters) ? root.chapters : [];
   if (!rawChapters.length) throw new Error("故事弧至少需要一个章节蓝图");
   const chapters = rawChapters.map((raw, offset): ChapterBlueprint => {
@@ -389,40 +434,14 @@ export function parseStoryArcBundle(value: unknown): StoryArcBundle {
         };
       }),
       continuityConstraints: strings(chapter.continuityConstraints),
-      unresolvedAtClose: Array.isArray(chapter.unresolvedAtClose) ? strings(chapter.unresolvedAtClose) : undefined,
+      unresolvedAtClose: strings(chapter.unresolvedAtClose),
     };
   });
   const rawBatch = root.batch && typeof root.batch === "object" && !Array.isArray(root.batch) ? root.batch as Record<string, unknown> : {};
   const batchIndex = Number.isInteger(rawBatch.batchIndex) && Number(rawBatch.batchIndex) > 0 ? Number(rawBatch.batchIndex) : 1;
   const startChapterIndex = Number.isInteger(rawBatch.startChapterIndex) && Number(rawBatch.startChapterIndex) > 0 ? Number(rawBatch.startChapterIndex) : 1;
   return {
-    arc: {
-      title,
-      objective,
-      entryState: typeof arcValue.entryState === "string" ? arcValue.entryState : "",
-      centralConflict: typeof arcValue.centralConflict === "string" ? arcValue.centralConflict : "",
-      development: strings(arcValue.development),
-      resolution: typeof arcValue.resolution === "string" ? arcValue.resolution : "",
-      exitState: typeof arcValue.exitState === "string" ? arcValue.exitState : "",
-      plotThreadRefs: strings(arcValue.plotThreadRefs),
-      threadResponsibilities: parseThreadResponsibilities(arcValue.threadResponsibilities),
-      foreshadowingRefs: strings(arcValue.foreshadowingRefs),
-      expectedChapterCount: Math.max(chapters.length, Number.isInteger(arcValue.expectedChapterCount) ? Number(arcValue.expectedChapterCount) : chapters.length),
-      phases: Array.isArray(arcValue.phases) ? arcValue.phases.map((phase) => {
-        const item = phase && typeof phase === "object" && !Array.isArray(phase) ? phase as Record<string, unknown> : {};
-        return { title: String(item.title ?? ""), objective: String(item.objective ?? ""), exitCondition: String(item.exitCondition ?? "") };
-      }).filter((phase) => phase.title && phase.objective) : [],
-      thematicQuestions: Array.isArray(arcValue.thematicQuestions) ? arcValue.thematicQuestions.map((question) => {
-        const item = question && typeof question === "object" && !Array.isArray(question) ? question as Record<string, unknown> : {};
-        return {
-          id: String(item.id ?? "").trim(),
-          question: String(item.question ?? "").trim(),
-          opposingPressures: String(item.opposingPressures ?? "").trim(),
-          resolutionWindow: String(item.resolutionWindow ?? "").trim(),
-        };
-      }).filter((question) => question.id && question.question) : [],
-      authorIntent: typeof arcValue.authorIntent === "string" && arcValue.authorIntent.trim() ? arcValue.authorIntent : undefined,
-    },
+    arc: { ...parsedArc, expectedChapterCount: Math.max(chapters.length, parsedArc.expectedChapterCount || chapters.length) },
     batch: { batchIndex, startChapterIndex, complete: rawBatch.complete === true },
     chapters,
   };
@@ -457,16 +476,8 @@ export function normalizeChapterPlanningContext(value: unknown): ChapterPlanning
       const item = phase as Record<string, unknown>;
       const title = typeof item.title === "string" ? item.title : "";
       const objective = typeof item.objective === "string" ? item.objective : "";
-      return title && objective ? [{ title, objective, exitCondition: typeof item.exitCondition === "string" ? item.exitCondition : "" }] : [];
+      return title && objective ? [{ title, objective }] : [];
     }) : [],
-    thematicQuestions: Array.isArray(arcSource.thematicQuestions) ? arcSource.thematicQuestions.flatMap((question) => {
-      if (!question || typeof question !== "object" || Array.isArray(question)) return [];
-      const item = question as Record<string, unknown>;
-      const id = typeof item.id === "string" ? item.id : "";
-      const text = typeof item.question === "string" ? item.question : "";
-      return id && text ? [{ id, question: text, opposingPressures: typeof item.opposingPressures === "string" ? item.opposingPressures : "", resolutionWindow: typeof item.resolutionWindow === "string" ? item.resolutionWindow : "" }] : [];
-    }) : [],
-    authorIntent: typeof arcSource.authorIntent === "string" ? arcSource.authorIntent : undefined,
   };
   const projectId = typeof source.projectId === "string" ? source.projectId : "";
   const arcId = typeof source.arcId === "string" ? source.arcId : "";

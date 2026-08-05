@@ -151,14 +151,27 @@ pnpm dev:web
 pnpm novel:v2:compose
 ```
 
-该命令会启动 `docker-compose.v2.yml` 中的完整服务集合，Web 默认仍使用 `5173`，API 使用 `4770`。
+该命令会启动 `container` profile 的完整服务集合。它使用独立的 `creative_studio_container_*` 数据卷和 `ymcp-novel-container` bucket，不连接混合开发模式的当前数据。两个模式不能同时占用相同宿主机端口。
+
+### 启动前诊断与迁移审计
+
+```powershell
+pnpm novel:v2:doctor
+pnpm novel:v2:migrations audit
+```
+
+doctor 会检查运行时身份、数据库、迁移头、对象引用、Qdrant alias/维度/点数、Temporal、API 和 Worker。已应用 SQL 的 checksum 漂移不会被静默修复；当前数据的兼容修复只能显式执行：
+
+```powershell
+pnpm novel:v2:migrations repair-compatible
+```
 
 ### 分开运行本机服务
 
 适合调试 API、Worker 或基础设施。先只启动基础设施：
 
 ```powershell
-docker compose -f docker-compose.v2.yml up -d postgres temporal temporal-ui minio qdrant
+docker compose -f docker-compose.v2.yml up --wait postgres temporal temporal-ui minio qdrant
 ```
 
 然后在三个独立终端中分别运行：

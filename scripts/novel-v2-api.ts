@@ -57,6 +57,11 @@ import { ChapterStateRebuildConflictError, ChapterStateRebuildService } from "..
 import { inspectManuscript } from "../src/novel-v2/application/manuscript-structure";
 import { parseCreativeBrief } from "../src/novel-v2/application/creative-brief";
 import { createConfiguredSkillProvider } from "../src/novel-v2/skill-runtime";
+import { loadRuntimeEnv } from "./runtime-env.mjs";
+import { publicRuntimeIdentity, resolveNovelRuntimeConfig } from "../src/novel-v2/runtime-config";
+
+Object.assign(process.env, loadRuntimeEnv(process.cwd()));
+const runtime = resolveNovelRuntimeConfig(process.env);
 
 // 通过 Extract 从 CreativeCommand 联合类型中派生 review.submit 的 review 字段类型，
 // 避免新增 CreativeReviewInput / ReviewIssue 的直接导入。
@@ -64,14 +69,14 @@ type ReviewSubmitCommand = Extract<CreativeCommand, { type: "review.submit" }>;
 type ReviewSubmitInput = ReviewSubmitCommand["review"];
 type ReviewIssueShape = ReviewSubmitInput["issues"][number];
 
-const repository = new NovelPostgresRepository();
-await repository.migrate();
+const repository = new NovelPostgresRepository(runtime.databaseUrl);
+await repository.migrate(runtime.migrationsDir);
 const skillProvider = createConfiguredSkillProvider({ source: process.env.NOVEL_SKILL_SOURCE, databaseList: (projectId) => repository.listSkills(projectId) });
 const objectStore = new ContentObjectStore();
 await bindRuntimeObjectStore(repository, objectStore, "api");
 const { configStore: modelConfigStore, gateway: model } = await createRuntimeModelGateway(repository, objectStore);
-const qdrant = new QdrantClient({ url: process.env.QDRANT_URL ?? "http://127.0.0.1:6333" });
-const qdrantMemory = new QdrantMemoryProvider(qdrant, model, process.env.QDRANT_COLLECTION ?? "novel-memory-current", Number(process.env.NOVEL_EMBEDDING_DIM ?? 1024));
+const qdrant = new QdrantClient({ url: runtime.qdrantUrl });
+const qdrantMemory = new QdrantMemoryProvider(qdrant, model, runtime.qdrantCollection, runtime.embeddingDimension);
 const wordCountBackfill = await repository.backfillMissingContentWordCounts(objectStore);
 if (wordCountBackfill.updated || wordCountBackfill.failed) console.log("[word-count] content blob backfill", wordCountBackfill);
 // API 入口的 commitService 也启用 chapter memory 创建（与 worker 保持一致）
@@ -79,10 +84,10 @@ if (wordCountBackfill.updated || wordCountBackfill.failed) console.log("[word-co
 const commitService = new CommitService(repository, objectStore, { model, memoryIndex: qdrantMemory });
 const chapterStateRebuildService = new ChapterStateRebuildService({ repository, objects: objectStore, model, memoryIndex: qdrantMemory, skillProvider });
 const promotionService = createPromotionService(repository, objectStore);
-const connection = await Connection.connect({ address: process.env.TEMPORAL_ADDRESS ?? "127.0.0.1:7233" });
-const temporal = new Client({ connection, namespace: process.env.TEMPORAL_NAMESPACE ?? "default" });
-const port = Number(process.env.NOVEL_V2_API_PORT ?? 4770);
-const taskQueue = process.env.TEMPORAL_TASK_QUEUE ?? "novel-v2";
+const connection = await Connection.connect({ address: runtime.temporalAddress });
+const temporal = new Client({ connection, namespace: runtime.temporalNamespace });
+const port = runtime.apiPort;
+const taskQueue = runtime.taskQueue;
 const ACTIVE_CHAPTER_INTENT_STATUSES = new Set(["accepted", "pending", "running", "waiting-external", "manual-review-required"]);
 
 function chapterTargetId(target: unknown): string | undefined {
@@ -123,7 +128,7 @@ async function readJson(request: import("node:http").IncomingMessage) {
 }
 
 function send(response: import("node:http").ServerResponse, status: number, value: unknown) {
-  response.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", "access-control-allow-origin": "*", "access-control-allow-methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS", "access-control-allow-headers": "content-type,authorization" });
+  response.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", "access-control-allow-origin": "*", "access-control-allow-methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS", "access-control-allow-headers": "content-type,authorization", "x-novel-runtime-id": runtime.runtimeId, "x-novel-runtime-profile": runtime.profile, "x-novel-runtime-fingerprint": runtime.runtimeFingerprint });
   response.end(status === 204 ? undefined : JSON.stringify(value));
 }
 
@@ -286,13 +291,13 @@ function buildCreativeCommand(input: Record<string, unknown>): CreativeCommand |
 const server = createServer(async (request, response) => {
   try {
     if (request.method === "OPTIONS") return send(response, 204, {});
-    if (request.method === "GET" && request.url === "/live") return send(response, 200, { service: "ymcp-novel-v2", status: "alive" });
+    if (request.method === "GET" && request.url === "/live") return send(response, 200, { service: "ymcp-novel-v2", status: "alive", runtime: publicRuntimeIdentity(runtime) });
     if (request.method === "GET" && (request.url === "/health" || request.url === "/ready")) {
       const dependencies: Record<string, { ok: boolean; detail?: string }> = {};
       try { await repository.health(); dependencies.postgres = { ok: true }; } catch (error) { dependencies.postgres = { ok: false, detail: (error as Error).message }; }
       try { await objectStore.ensureReady(); dependencies.objectStore = { ok: true }; } catch (error) { dependencies.objectStore = { ok: false, detail: (error as Error).message }; }
       try {
-        const qdrantResponse = await fetch(`${process.env.QDRANT_URL ?? "http://127.0.0.1:6333"}/collections`);
+        const qdrantResponse = await fetch(`${runtime.qdrantUrl.replace(/\/+$/u, "")}/collections`);
         dependencies.qdrant = { ok: qdrantResponse.ok, ...(!qdrantResponse.ok ? { detail: `HTTP ${qdrantResponse.status}` } : {}) };
       } catch (error) { dependencies.qdrant = { ok: false, detail: (error as Error).message }; }
       const embeddingIndex = await repository.getRuntimeConfiguration<{ status?: string; model?: string; points?: number }>("embedding-index").catch(() => undefined);
@@ -307,7 +312,7 @@ const server = createServer(async (request, response) => {
       const requiredReady = dependencies.postgres.ok && dependencies.objectStore.ok && dependencies.qdrant.ok && dependencies.temporal.ok;
       const fullyHealthy = requiredReady && dependencies.embedding.ok && dependencies.worker.ok;
       const status = fullyHealthy ? "healthy" : requiredReady ? "degraded" : "unready";
-      return send(response, request.url === "/ready" && !fullyHealthy ? 503 : 200, { service: "ymcp-novel-v2", status, runtime: { protocolVersion: NOVEL_V2_PROTOCOL_VERSION, foundationStageCount: PROJECT_PLAN_STAGES.length, taskQueue }, dependencies });
+      return send(response, request.url === "/ready" && !fullyHealthy ? 503 : 200, { service: "ymcp-novel-v2", status, runtime: { ...publicRuntimeIdentity(runtime), protocolVersion: NOVEL_V2_PROTOCOL_VERSION, foundationStageCount: PROJECT_PLAN_STAGES.length }, dependencies });
     }
     if (request.method === "GET" && request.url === "/v2/model-config") return send(response, 200, { config: modelConfigStore.getMaskedConfig() });
     if (request.method === "PUT" && request.url === "/v2/model-config") {
@@ -483,6 +488,13 @@ const server = createServer(async (request, response) => {
       const requestedStage = input.requestedStage as NovelIntent["requestedStage"];
       const target = input.target as NovelIntent["target"];
       const targetDocumentId = chapterTargetId(target);
+      if (targetDocumentId && requestedStage !== "planning" && requestedStage !== "foundation") {
+        try {
+          await repository.assertChapterGenerationAllowed(input.projectId, targetDocumentId);
+        } catch (error) {
+          return send(response, 400, { error: error instanceof Error ? error.message : String(error) });
+        }
+      }
       if (targetDocumentId && (requestedStage === "drafting" || requestedStage === "revision")) {
         const active = (await repository.listProjectRuns(input.projectId, 50)).find((run) => run.workflowType === "novel-intent"
           && ACTIVE_CHAPTER_INTENT_STATUSES.has(run.status)
@@ -499,7 +511,7 @@ const server = createServer(async (request, response) => {
       // 若 id=stored.id（intent.id）而 workflow 用 workflowId，FK 会失败。
       // 对齐方式：id=workflowId，与 creativeRunWorkflow（id=runId=workflow 实参）保持同一约定。
       await repository.putWorkflowRun({ id: workflowId, workflowType: "novel-intent", projectId: stored.projectId, temporalWorkflowId: workflowId, status: "accepted", payload: { intent: stored, intentId: stored.id } });
-      const handle = await temporal.workflow.start("novelIntentWorkflow", { args: [stored, workflowId], taskQueue: process.env.TEMPORAL_TASK_QUEUE ?? "novel-v2", workflowId });
+      const handle = await temporal.workflow.start("novelIntentWorkflow", { args: [stored, workflowId], taskQueue, workflowId });
       return send(response, 202, { intent: stored, workflowId, runId: handle.firstExecutionRunId });
     }
     if (request.method === "GET" && request.url === "/v2/projects") return send(response, 200, { projects: await repository.listProjects() });
@@ -683,11 +695,15 @@ const server = createServer(async (request, response) => {
       const idempotencyKey = asString(input.idempotencyKey);
       if (!idempotencyKey) return send(response, 400, { error: "idempotencyKey 必填" });
       const objective = asString(input.objective) ?? "完成项目基础设定与全书规划";
+      const reviewGate = input.reviewGate === "auto" || input.reviewGate === "manual" || input.reviewGate === "none" ? input.reviewGate : undefined;
+      const progression = input.progression === "automatic" || input.progression === "user-driven" ? input.progression : undefined;
       const result = await startNovelBootstrap(repository, temporal, {
         projectId,
         objective,
         idempotencyKey,
         includeChapterPlan: typeof input.includeChapterPlan === "boolean" ? input.includeChapterPlan : true,
+        reviewGate,
+        progression,
         taskQueue,
       });
       return send(response, result.reused ? 200 : 202, result);
@@ -1100,6 +1116,14 @@ const server = createServer(async (request, response) => {
     if (request.method === "GET" && runReviewsMatch) return send(response, 200, { reviews: await repository.listRunReviews(decodeURIComponent(runReviewsMatch[1])) });
     const promptExecutionsMatch = request.url?.match(/^\/v2\/runs\/([^/?]+)\/prompt-executions$/);
     if (request.method === "GET" && promptExecutionsMatch) return send(response, 200, { executions: await repository.listPromptExecutions(decodeURIComponent(promptExecutionsMatch[1])) });
+    const modelInvocationsMatch = request.url?.match(/^\/v2\/runs\/([^/?]+)\/model-invocations(?:\?.*)?$/);
+    if (request.method === "GET" && modelInvocationsMatch) {
+      const workflowId = decodeURIComponent(modelInvocationsMatch[1]);
+      const query = new URL(request.url ?? "/", "http://localhost").searchParams;
+      const requestedLimit = Number(query.get("limit") ?? "200");
+      const limit = Number.isFinite(requestedLimit) ? requestedLimit : 200;
+      return send(response, 200, { invocations: await repository.listModelInvocations(workflowId, limit) });
+    }
     const promptSnapshotMatch = request.url?.match(/^\/v2\/prompt-executions\/([^/?]+)\/snapshot$/);
     if (request.method === "GET" && promptSnapshotMatch) {
       const snapshot = await repository.getPromptExecutionSnapshot(decodeURIComponent(promptSnapshotMatch[1]), objectStore);
@@ -1638,6 +1662,15 @@ const server = createServer(async (request, response) => {
       }
     }
 
+    const modelInvocationErrorsMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/model-invocation-errors(?:\?.*)?$/);
+    if (request.method === "GET" && modelInvocationErrorsMatch) {
+      const projectId = decodeURIComponent(modelInvocationErrorsMatch[1]);
+      const query = new URL(request.url ?? "/", "http://localhost").searchParams;
+      const requestedLimit = Number(query.get("limit") ?? "50");
+      const limit = Number.isFinite(requestedLimit) ? requestedLimit : 50;
+      return send(response, 200, { errors: await repository.listModelInvocationErrors(projectId, limit) });
+    }
+
     if (request.method === "GET" && request.url === "/v2/usage") return send(response, 200, { usage: await repository.listModelUsage() });
     if (request.method === "POST" && request.url === "/v2/maintenance/chapter-retention") return send(response, 200, { result: await runRetentionCleanup() });
     const runCancelMatch = request.url?.match(/^\/v2\/runs\/([^/]+)\/cancel$/);
@@ -1688,7 +1721,7 @@ const server = createServer(async (request, response) => {
   } catch (error) { return send(response, 500, { error: error instanceof Error ? error.message : String(error) }); }
 });
 
-const apiHost = process.env.NOVEL_API_HOST ?? "127.0.0.1";
+const apiHost = runtime.apiHost;
 server.listen(port, apiHost, () => {
   console.log(`ymcp novel v2 api listening on http://${apiHost}:${port}`);
   void runRetentionCleanup().catch((error) => console.warn("[retention] cleanup failed", error));

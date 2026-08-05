@@ -1,7 +1,8 @@
-import { defineConfig, type Plugin } from "vite";
+import { defineConfig, loadEnv, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import path from "node:path";
 import { readFileSync } from "node:fs";
+import { childRuntimeEnv } from "./scripts/runtime-env.mjs";
 
 /**
  * 排除 onnxruntime-web 的 wasm 资源被打包进 dist。
@@ -36,8 +37,35 @@ function readDefaultBaseUrl(): string {
 
 const DEV_PROXY_TARGET = new URL(readDefaultBaseUrl()).origin;
 
-export default defineConfig({
-  plugins: [react(), excludeOnnxWasm()],
+function runtimeProbePlugin(apiTarget: string): Plugin {
+  return {
+    name: "novel-runtime-probe",
+    configureServer(server) {
+      return () => {
+        server.middlewares.use("/__novel_runtime", async (_request, response) => {
+          try {
+            const upstream = await fetch(`${apiTarget}/health`, { cache: "no-store" });
+            const body = await upstream.text();
+            response.statusCode = upstream.status;
+            response.setHeader("content-type", "application/json; charset=utf-8");
+            response.setHeader("cache-control", "no-store");
+            response.end(body);
+          } catch (error) {
+            response.statusCode = 503;
+            response.setHeader("content-type", "application/json; charset=utf-8");
+            response.end(JSON.stringify({ status: "unready", error: error instanceof Error ? error.message : String(error) }));
+          }
+        });
+      };
+    },
+  };
+}
+
+export default defineConfig(({ mode }) => {
+  const env = { ...childRuntimeEnv(__dirname), ...loadEnv(mode, process.cwd(), ""), ...process.env };
+  const novelApiTarget = env.NOVEL_V2_API_URL ?? "http://127.0.0.1:4770";
+  return {
+  plugins: [react(), excludeOnnxWasm(), runtimeProbePlugin(novelApiTarget)],
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
@@ -65,7 +93,7 @@ export default defineConfig({
         proxyTimeout: 600000,
       },
       "/v2": {
-        target: process.env.NOVEL_V2_API_URL ?? "http://127.0.0.1:4770",
+        target: novelApiTarget,
         changeOrigin: true,
         secure: false,
         timeout: 600000,
@@ -110,4 +138,5 @@ export default defineConfig({
       },
     },
   },
+  };
 });

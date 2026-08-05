@@ -1,7 +1,7 @@
 import type { Artifact, MemoryClaim, SkillBundle, SkillResolutionManifest } from "../protocol";
 import type { ModelGateway } from "../model-gateway";
 import type { ModelRoutingSnapshot } from "../model-routing";
-import { chapterStateDeltaSchema, type ChapterStateDelta, type FactExtractionOutput } from "../prompts/schemas";
+import { chapterStateDeltaSchema, type ChapterStateDelta, type FactExtractionModelOutput, type FactExtractionOutput } from "../prompts/schemas";
 import { buildFactExtractionPrompt } from "./prompt";
 import { dedupeFactCandidates } from "./dedupe";
 import { classifyFactCandidates } from "./classify";
@@ -117,7 +117,7 @@ export async function extractFactsWithStats(input: ExtractFactsInput): Promise<E
   const skillSections = buildSkillContextSections({ skills: input.skillBundle?.skills ?? input.skills ?? [] }, "chapter.fact-extraction", "事实提取 Skill");
   const promptPackage = compileStageContext({ projectId: input.projectId, workflowId: input.workflowRunId ?? input.artifact.taskId, purpose: "facts.extract", stage: "fact-extraction", system, schema: chapterStateDeltaSchema as unknown as Record<string, unknown>, maxInputTokens: 128_000, reservedOutputTokens: 8_192, skillManifest: input.skillBundle?.resolution ?? input.skillManifest, sections: [{ id: "chapter-state-delta", kind: "manuscript", title: "状态提取任务与章节正文", text: prompt, priority: "critical", provenanceRefs: [input.artifact.id] }, ...skillSections] });
 
-  const generated = await input.model.generateStructured<ChapterStateDelta>({
+  const generated = await input.model.generateStructured<FactExtractionModelOutput>({
     purpose: "facts.extract",
     system,
     prompt: promptPackage.instruction,
@@ -133,9 +133,46 @@ export async function extractFactsWithStats(input: ExtractFactsInput): Promise<E
   return projectFactExtractionOutput(input, generated.value);
 }
 
-export function projectFactExtractionOutput(input: Omit<ExtractFactsInput, "model">, output: ChapterStateDelta): ExtractFactsResult {
+function decodeFactObjectValue(kind: string, value: string): unknown {
+  if (kind !== "number" && kind !== "boolean" && kind !== "json") return value;
+  try { return JSON.parse(value); } catch { return value; }
+}
+
+export function normalizeFactExtractionOutput(output: FactExtractionModelOutput | ChapterStateDelta): ChapterStateDelta {
+  const source = output as FactExtractionModelOutput & Partial<ChapterStateDelta>;
+  return {
+    summary: typeof source.summary === "string" ? source.summary : undefined,
+    facts: source.facts.map((fact) => ({
+      ...fact,
+      object: { ...fact.object, value: decodeFactObjectValue(fact.object.kind, fact.object.value) },
+    })),
+    narrativeElements: source.narrativeElements
+      ? {
+        foreshadowings: source.narrativeElements.foreshadowings,
+        promises: source.narrativeElements.promises,
+        payoffs: source.narrativeElements.payoffs.map((payoff) => ({
+          ...payoff,
+          matchedTriggerKeywords: payoff.matchedTriggerKeywords?.length ? payoff.matchedTriggerKeywords : undefined,
+          matchedForeshadowingIds: payoff.matchedForeshadowingIds?.length ? payoff.matchedForeshadowingIds : undefined,
+          matchedPromiseId: payoff.matchedPromiseId || undefined,
+          matchedPromiser: payoff.matchedPromiser || undefined,
+          intensity: payoff.intensity > 0 ? payoff.intensity : undefined,
+        })),
+      }
+      : undefined,
+    payoffMoments: source.payoffMoments?.map((moment) => ({
+      ...moment,
+      setupDescription: moment.setupDescription || undefined,
+    })),
+    chapterMemory: source.chapterMemory,
+    characterDeltas: source.characterDeltas,
+  };
+}
+
+export function projectFactExtractionOutput(input: Omit<ExtractFactsInput, "model">, output: FactExtractionModelOutput | ChapterStateDelta): ExtractFactsResult {
+  const normalized = normalizeFactExtractionOutput(output);
   const deduped = dedupeFactCandidates({
-    candidates: output.facts,
+    candidates: normalized.facts,
     existingContentHashes: input.existingContentHashes,
   });
 
@@ -160,11 +197,11 @@ export function projectFactExtractionOutput(input: Omit<ExtractFactsInput, "mode
   return {
     claims,
     // Phase 3.1: 透传 narrativeElements 给 activity 层，由其调用 recordNarrativeElements
-    narrativeElements: output.narrativeElements,
+    narrativeElements: normalized.narrativeElements,
     // Phase 3.2: 透传 payoffMoments 给 activity 层，由其调用 recordPayoffCurve
-    payoffMoments: output.payoffMoments,
-    chapterMemory: output.chapterMemory,
-    characterDeltas: output.characterDeltas,
+    payoffMoments: normalized.payoffMoments,
+    chapterMemory: normalized.chapterMemory,
+    characterDeltas: normalized.characterDeltas,
     stats: {
       totalCandidates: deduped.totalCandidates,
       kept: deduped.kept.length,

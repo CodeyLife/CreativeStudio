@@ -1,10 +1,10 @@
 /**
- * V2 MCP 工具处理函数（29 个工具的 handler 实现）。
+ * V2 MCP 工具处理函数（32 个工具的 handler 实现）。
  *
  * 设计依据：AGENTS.md 架构阶段 + Phase B-2 MCP 工具网关。
  *
  * 职责：
- * - 实现 29 个工具的具体调用逻辑
+ * - 实现 32 个工具的具体调用逻辑
  * - 路由到 creative/ + evaluation/ + postgres-repository 模块
  * - 返回标准 JSON-serializable 结果（executeTool 包装为 McpToolResponse）
  *
@@ -31,7 +31,7 @@ import type {
 } from "../protocol";
 import { startNovelBootstrap } from "../application/bootstrap";
 import { provisionalTitle } from "../application/provisional-title";
-import { startStoryArcPlanning } from "../application/story-arc-workflow";
+import { startStoryArcBatchPlanning, startStoryArcPlanning, startStoryArcReview } from "../application/story-arc-workflow";
 import { parseCreativeBrief } from "../application/creative-brief";
 import {
   createCreativeRun,
@@ -231,14 +231,14 @@ const novel_action_execute: ToolHandler = async (args, ctx) => {
   const command = buildCreativeCommand(args, runId, action, idempotencyKey);
   const result = await executeCreativeCommand(ctx.repository, command, ctx.model);
 
-  // review.submit / review.request / work.accept 落库后向 creativeRunWorkflow 发 reviewSubmitted 信号,
+  // review.submit / work.accept 落库后向 creativeRunWorkflow 发 reviewSubmitted 信号。
   // 唤醒 manual-gate 等待循环(与 novel_review_submit 对齐,补齐信号通道)。
   // reviewGate=none/auto 的 run 信号会被静默忽略。workItemId 从 command 提取;
-  // review.request 的 workItemId 在 command 上,review.submit 同理。
+  // review.request 仅返回只读预览，不落库也不能唤醒门禁。
   // work.accept 也需要发信号:外部 accept 命令绕过 gate 直接改状态后,
   // workflow 仍阻塞在 manual-gate while 循环;信号唤醒后 processWorkItem 检查
   // status===accepted 短路返回,让 loop 推进下游 work items。
-  if (action === "review.submit" || action === "review.request" || action === "work.accept") {
+  if (action === "review.submit" || action === "work.accept") {
     const workItemId = asString(args.workItemId);
     if (workItemId) await signalReviewSubmitted(ctx, workItemId);
   }
@@ -701,6 +701,44 @@ const novel_story_arc_get: ToolHandler = async (args, ctx) => {
   return arcId ? { arc: await ctx.repository.getStoryArc(projectId, arcId) } : { arcs: await ctx.repository.listStoryArcs(projectId) };
 };
 
+const novel_story_arc_review: ToolHandler = async (args, ctx) => {
+  const projectId = asString(args.projectId);
+  const arcId = asString(args.arcId);
+  if (!projectId || !arcId) throw new Error("projectId/arcId 必填且非空");
+  if (!ctx.temporal) throw new Error("novel_story_arc_review 需要 Temporal");
+
+  const reviewPolicy = asString(args.reviewPolicy);
+  if (reviewPolicy && reviewPolicy !== "manual" && reviewPolicy !== "auto") {
+    throw new Error("reviewPolicy 必须是 manual 或 auto");
+  }
+  return startStoryArcReview(ctx.repository, ctx.temporal, {
+    projectId,
+    arcId,
+    mode: "mcp",
+    reviewPolicy: reviewPolicy as "manual" | "auto" | undefined,
+    taskQueue: ctx.taskQueue,
+  });
+};
+
+const novel_story_arc_batch_start: ToolHandler = async (args, ctx) => {
+  const projectId = asString(args.projectId);
+  const arcId = asString(args.arcId);
+  if (!projectId || !arcId) throw new Error("projectId/arcId 必填且非空");
+  if (!ctx.temporal) throw new Error("novel_story_arc_batch_start 需要 Temporal");
+  const reviewPolicy = asString(args.reviewPolicy);
+  if (reviewPolicy && reviewPolicy !== "manual" && reviewPolicy !== "auto") {
+    throw new Error("reviewPolicy 必须是 manual 或 auto");
+  }
+  return startStoryArcBatchPlanning(ctx.repository, ctx.temporal, {
+    projectId,
+    arcId,
+    mode: "mcp",
+    reviewPolicy: reviewPolicy as "manual" | "auto" | undefined,
+    retryFailed: args.retryFailed === true,
+    taskQueue: ctx.taskQueue,
+  });
+};
+
 const novel_chapter_generate: ToolHandler = async (args, ctx) => {
   const projectId = asString(args.projectId);
   const idempotencyKey = asString(args.idempotencyKey);
@@ -722,10 +760,8 @@ const novel_chapter_generate: ToolHandler = async (args, ctx) => {
     if (!document) throw new Error("没有已批准故事弧中的待创作章节，请先完成故事弧规划和审核");
     targetDocumentId = document.id;
   } else {
-    // 校验 document 存在且非 final
-    const status = await ctx.repository.getDocumentStatus(projectId, targetDocumentId);
-    if (!status) throw new Error(`章节不存在:${targetDocumentId}`);
-    if (status === "final") throw new Error("章节已定稿,如需重审请使用 novel_chapter_review");
+    // 生成与重审是互斥生命周期；仓储层同时按 status/current revision 防御陈旧蓝图投影。
+    await ctx.repository.assertChapterGenerationAllowed(projectId, targetDocumentId);
   }
   await ctx.repository.getChapterPlanningContext(projectId, targetDocumentId);
 
@@ -776,6 +812,11 @@ const novel_chapter_review: ToolHandler = async (args, ctx) => {
   if (!ctx.temporal) throw new Error("novel_chapter_review 需要 ToolContext.temporal 才能启动 Temporal 工作流");
 
   const instruction = asString(args.instruction) || undefined;
+  const mode = asString(args.mode) || "full";
+  if (mode !== "full" && mode !== "targeted") throw new Error("章节审校 mode 必须为 full 或 targeted");
+  const targetIssueIds = asStringArray(args.targetIssueIds) ?? [];
+  if (mode === "targeted" && !targetIssueIds.length) throw new Error("targeted 章节审校必须提供 targetIssueIds");
+  if (mode === "full" && targetIssueIds.length) throw new Error("full 章节审校不能提供 targetIssueIds，请使用 targeted 模式");
   const idempotencyKey = asString(args.idempotencyKey) ?? `${projectId}:${documentId}:review:${Date.now()}`;
 
   // 校验 document 存在 + status="final"（AGENTS.md 契约：仅对已定稿章节开放重审）
@@ -786,13 +827,35 @@ const novel_chapter_review: ToolHandler = async (args, ctx) => {
   if (!preflight.hasBlueprint) throw new Error("找不到该章节的历史 blueprint artifact，无法启动章节审校");
 
   const workflowId = `chapter-review-${documentId}-${idempotencyKey.replace(/[^a-zA-Z0-9_-]/g, "-")}`.slice(0, 200);
-  const params = { projectId, documentId, instruction, workflowId };
+  const params = { projectId, documentId, instruction, workflowId, mode: mode as "full" | "targeted", targetIssueIds: mode === "targeted" ? targetIssueIds : undefined };
   // workflow_runs.id 必须等于 workflowId：chapterReviewWorkflow 全程用 workflowId 作 workflowRunId
   // （updateTaskAttempt / draft / review / revise / externalTask），task_attempts.workflow_run_id 有 FK→workflow_runs.id。
   // 若 id=randomUUID() 而 workflow 用 workflowId，FK 会失败。与 novelIntentWorkflow 对齐。
-  await ctx.repository.putWorkflowRun({ id: workflowId, workflowType: "chapter-review", projectId, temporalWorkflowId: workflowId, status: "accepted", payload: { documentId, instruction, idempotencyKey } });
+  await ctx.repository.putWorkflowRun({ id: workflowId, workflowType: "chapter-review", projectId, temporalWorkflowId: workflowId, status: "accepted", payload: { documentId, instruction, idempotencyKey, mode, targetIssueIds: mode === "targeted" ? targetIssueIds : [] } });
   const handle = await ctx.temporal.workflow.start("chapterReviewWorkflow", { args: [params], taskQueue: ctx.taskQueue ?? "novel-v2", workflowId });
-  return { workflowId, temporalRunId: handle.firstExecutionRunId, documentId, instruction, status: "accepted", nextAction: "调用 novel_workflow_get({ workflowId }) 查询审校进度" };
+  return { workflowId, temporalRunId: handle.firstExecutionRunId, documentId, instruction, mode, targetIssueIds: mode === "targeted" ? targetIssueIds : [], status: "accepted", nextAction: "调用 novel_workflow_get({ workflowId }) 查询审校进度" };
+};
+
+const novel_chapter_review_issue_add: ToolHandler = async (args, ctx) => {
+  const projectId = asString(args.projectId);
+  const documentId = asString(args.documentId);
+  const severity = asString(args.severity) as "blocker" | "major" | "warning";
+  const title = asString(args.title);
+  if (!projectId || !documentId || !severity || !title) throw new Error("projectId/documentId/severity/title 必填且非空");
+  if (severity !== "blocker" && severity !== "major" && severity !== "warning") throw new Error("severity 必须是 blocker/major/warning");
+  const paragraph = asNumber(args.paragraph);
+  if (paragraph !== undefined && (!Number.isInteger(paragraph) || paragraph < 1)) throw new Error("paragraph 必须是正整数");
+  const issue = await ctx.repository.addChapterReviewIssue({
+    projectId,
+    documentId,
+    severity,
+    title,
+    description: asString(args.description) || undefined,
+    evidenceQuote: asString(args.evidenceQuote) || undefined,
+    paragraph,
+    suggestion: asString(args.suggestion) || undefined,
+  });
+  return { issue };
 };
 
 // ===== 评估闭环（1，v2 新增）=====
@@ -968,12 +1031,15 @@ export const TOOL_HANDLERS: Record<string, ToolHandler> = {
   novel_project_list,
   novel_project_delete,
 
-  // 一键流程（3）
+  // 规划与创作（7）
   novel_bootstrap_run,
   novel_chapter_review,
+  novel_chapter_review_issue_add,
   novel_chapter_generate,
   novel_story_arc_start,
   novel_story_arc_get,
+  novel_story_arc_review,
+  novel_story_arc_batch_start,
 
   // 评估闭环（1）
   novel_closed_loop_run,

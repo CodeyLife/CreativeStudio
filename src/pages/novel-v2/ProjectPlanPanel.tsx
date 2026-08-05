@@ -12,6 +12,7 @@ import {
   SyncOutlined,
 } from "@ant-design/icons";
 import { motion } from "motion/react";
+import { novelFetch as readJson } from "../../lib/novelApi";
 import { projectDisplayTitle } from "./presentation";
 import "../novel-v2.css";
 
@@ -141,13 +142,6 @@ export default function ProjectPlanPanel({ projectId, onProjectTitleChanged }: {
   const [titleCandidatesBaseline, setTitleCandidatesBaseline] = useState<string>();
   const [selectedTitle, setSelectedTitle] = useState<string>();
   const [busy, setBusy] = useState<string>();
-
-  async function readJson<T>(input: RequestInfo, init?: RequestInit): Promise<T> {
-    const response = await fetch(input, init);
-    const body = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error((body as { error?: string }).error ?? `HTTP ${response.status}`);
-    return body as T;
-  }
 
   async function load(silent = false) {
     if (!silent) setLoading(true);

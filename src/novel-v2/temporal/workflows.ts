@@ -8,6 +8,7 @@ import type { RevisionAttempt } from "../prompts/chapter-revision";
 import type { ModelRoutingSnapshot, ModelTaskRecord } from "../model-routing";
 import { finalizeChapterLifecycle, runChapterLifecycle } from "../application/chapter-lifecycle";
 import type { BookSynopsisRecord, BookTitleCandidate, BookTitleCandidatesRecord } from "../application/book-synopsis";
+import { assertCompleteChapterReviewEvidence } from "../application/chapter-approval";
 import { buildRevisionDirection } from "../application/revision-brief";
 import { detectNamedEntityDrift } from "./revision-policy";
 import { requiresFoundationAuthorConfirmation } from "../application/project-plan";
@@ -60,9 +61,10 @@ export interface NovelWorkflowActivities {
    * 设计依据:AGENTS.md「root-cause analysis」——v2 重构后 foundation artifacts 未被章节生成
    * 消费,导致章节生成不基于全书规划。此 activity 供 novelIntentWorkflow 加载规划产出,
    * 用于前置检查(必填 taskKey 清单)与 compileBlueprint/draft 注入。
-   */
+  */
   listFoundationArtifacts(input: { projectId: string }): Promise<Artifact[]>;
   assertRequiredPlanApproved(input: { projectId: string }): Promise<void>;
+  assertChapterGenerationAllowed(input: { projectId: string; documentId: string }): Promise<void>;
   loadChapterPlanningContext(input: { projectId: string; documentId: string }): Promise<ChapterPlanningContext>;
   loadChapterPlanningContextSnapshot(input: { blueprintId: string }): Promise<ChapterPlanningContext | undefined>;
   expireExternalModelTask(input: { modelTaskId: string; reason: string }): Promise<void>;
@@ -76,13 +78,14 @@ export interface NovelWorkflowActivities {
   materializeExternalChapterTitle(input: { modelTaskId: string; value: unknown }): Promise<{ title: string }>;
   persistGeneratedChapterTitle(input: { projectId: string; documentId: string; sourceFingerprint: string; title: string }): Promise<{ title: string }>;
   getStoryArcRoutingSnapshot(): Promise<ModelRoutingSnapshot>;
-  generateStoryArcBundle(input: { workflowId: string; projectId: string; arcId: string; authorIntent?: string; candidateStartIndex?: number; batchIndex?: number; startChapterIndex?: number; rebase?: boolean }): Promise<{ kind: "completed"; artifact: Artifact; bundle: StoryArcBundle } | { kind: "external"; task: ModelTaskRecord }>;
+  generateStoryArcBundle(input: { workflowId: string; projectId: string; arcId: string; authorIntent?: string; routingSnapshot: ModelRoutingSnapshot; candidateStartIndex?: number; batchIndex?: number; startChapterIndex?: number; rebase?: boolean; arcPlan?: Pick<StoryArcBundle, "arc" | "batch"> }): Promise<{ kind: "completed"; artifact: Artifact; bundle: StoryArcBundle } | { kind: "external"; task: ModelTaskRecord }>;
+  materializeExternalStoryArcPlan(input: { modelTaskId: string; value: unknown }): Promise<Pick<StoryArcBundle, "arc" | "batch">>;
   materializeExternalStoryArcBundle(input: { modelTaskId: string; projectId: string; arcId: string; value: unknown; rebase?: boolean }): Promise<{ artifact: Artifact; bundle: StoryArcBundle }>;
   loadStoryArcBundleArtifact(input: { projectId: string; arcId: string; artifactId: string }): Promise<{ artifact: Artifact; bundle: StoryArcBundle }>;
   projectStoryArcBundle(input: { projectId: string; arcId: string; artifact: Artifact; bundle: StoryArcBundle; actor: string; edited?: boolean }): Promise<unknown>;
-  reviewStoryArcBundle(input: { workflowId: string; projectId: string; arcId: string; artifact: Artifact; bundle: StoryArcBundle; candidateStartIndex?: number; rebase?: boolean }): Promise<{ kind: "completed"; artifact: Artifact; review: StoryArcReviewOutput } | { kind: "external"; task: ModelTaskRecord }>;
+  reviewStoryArcBundle(input: { workflowId: string; projectId: string; arcId: string; artifact: Artifact; bundle: StoryArcBundle; routingSnapshot: ModelRoutingSnapshot; candidateStartIndex?: number; rebase?: boolean }): Promise<{ kind: "completed"; artifact: Artifact; review: StoryArcReviewOutput } | { kind: "external"; task: ModelTaskRecord }>;
   materializeExternalStoryArcReview(input: { modelTaskId: string; projectId: string; arcId: string; subjectArtifactId: string; value: unknown; rebase?: boolean }): Promise<{ artifact: Artifact; review: StoryArcReviewOutput }>;
-  reviseStoryArcBundle(input: { workflowId: string; projectId: string; arcId: string; artifact: Artifact; bundle: StoryArcBundle; review: StoryArcReviewOutput; candidateStartIndex?: number; rebase?: boolean }): Promise<{ kind: "completed"; artifact: Artifact; bundle: StoryArcBundle } | { kind: "external"; task: ModelTaskRecord }>;
+  reviseStoryArcBundle(input: { workflowId: string; projectId: string; arcId: string; artifact: Artifact; bundle: StoryArcBundle; review: StoryArcReviewOutput; routingSnapshot: ModelRoutingSnapshot; candidateStartIndex?: number; rebase?: boolean }): Promise<{ kind: "completed"; artifact: Artifact; bundle: StoryArcBundle } | { kind: "external"; task: ModelTaskRecord }>;
   assessStoryArcLearning(input: { projectId: string; workflowId: string; artifact: Artifact; reviewArtifact: Artifact; review: StoryArcReviewOutput; routingSnapshot: ModelRoutingSnapshot; candidateStartIndex?: number }): Promise<{ kind: "completed"; assessment: RuntimeLearningAssessmentV2 } | { kind: "external"; task: ModelTaskRecord }>;
   materializeExternalStoryArcLearning(input: { modelTaskId: string; projectId: string; workflowId: string; artifact: Artifact; reviewArtifact: Artifact; review: StoryArcReviewOutput; value: unknown }): Promise<RuntimeLearningAssessmentV2>;
   approveStoryArcAutomatically(input: { projectId: string; arcId: string; artifactId: string; reviewArtifactId: string }): Promise<unknown>;
@@ -150,7 +153,10 @@ const activities = proxyActivities<NovelWorkflowActivities>({
   startToCloseTimeout: "10 minutes",
   retry: {
     maximumAttempts: 3,
-    nonRetryableErrorTypes: ["NonRetryableModelTransportError"],
+    // Temporal may serialize an Error subclass using its constructor name
+    // instead of the custom `name`; accept both forms so an exhausted model
+    // route reaches the durable failure state instead of lingering in retry.
+    nonRetryableErrorTypes: ["NonRetryableModelTransportError", "ModelTransportError"],
   },
 });
 
@@ -252,6 +258,7 @@ export async function novelIntentWorkflow(intent: NovelIntent, workflowId = `nov
     if (plan.taskClass === "drafting" || plan.taskClass === "revision") {
       await activities.assertRequiredPlanApproved({ projectId: intent.projectId });
       if (!intent.target?.id) throw new Error("章节生成缺少目标 documentId");
+      await activities.assertChapterGenerationAllowed({ projectId: intent.projectId, documentId: intent.target.id });
       planningContext = await activities.loadChapterPlanningContext({ projectId: intent.projectId, documentId: intent.target.id });
     }
     const { blueprint, routingSnapshot } = await activities.compileBlueprint({ intent, plan, memory, skills, snapshot, foundationArtifacts, planningContext });
@@ -764,6 +771,13 @@ export async function chapterTitleWorkflow(params: ChapterTitleWorkflowInput): P
 }
 
 export async function storyArcPlanningWorkflow(params: StoryArcPlanningWorkflowInput): Promise<void> {
+  // model gateway 已在一次 activity 内完成有序候选切换；再次重试整个 activity
+  // 会重复消耗所有候选并把可见的路由失败拖成长时间运行。外部任务仍由
+  // generate/review/revise 自己管理，失败批次通过 MCP retryFailed 显式恢复。
+  const storyArcModelActivities = proxyActivities<NovelWorkflowActivities>({
+    startToCloseTimeout: "10 minutes",
+    retry: { maximumAttempts: 1, nonRetryableErrorTypes: ["NonRetryableModelTransportError", "ModelTransportError"] },
+  });
   const externalResults = new Map<string, Record<string, unknown>>();
   const externalFailures = new Map<string, Record<string, unknown>>();
   let approved = false;
@@ -790,15 +804,24 @@ export async function storyArcPlanningWorkflow(params: StoryArcPlanningWorkflowI
   const generateBundle = async (candidateStartIndex?: number): Promise<{ artifact: Artifact; bundle: StoryArcBundle }> => {
     let nextCandidate = candidateStartIndex;
     while (true) {
-      const generated = await activities.generateStoryArcBundle({ workflowId: params.workflowId, projectId: params.projectId, arcId: params.arcId, authorIntent: params.authorIntent, batchIndex: params.batchIndex, startChapterIndex: params.startChapterIndex, candidateStartIndex: nextCandidate, rebase: params.rebase });
+      const generated = await storyArcModelActivities.generateStoryArcBundle({ workflowId: params.workflowId, projectId: params.projectId, arcId: params.arcId, authorIntent: params.authorIntent, routingSnapshot, batchIndex: params.batchIndex, startChapterIndex: params.startChapterIndex, candidateStartIndex: nextCandidate, rebase: params.rebase });
       if (generated.kind === "completed") return { artifact: generated.artifact, bundle: generated.bundle };
+      let failedTask = generated.task;
       try {
+        if (generated.task.workPackage.contextRefs.outputSegment === "arc-batch") {
+          const plan = await activities.materializeExternalStoryArcPlan({ modelTaskId: generated.task.id, value: (await waitForExternal(generated.task)).value });
+          const chapters = await storyArcModelActivities.generateStoryArcBundle({ workflowId: params.workflowId, projectId: params.projectId, arcId: params.arcId, authorIntent: params.authorIntent, routingSnapshot, candidateStartIndex: undefined, rebase: params.rebase, arcPlan: plan });
+          if (chapters.kind === "completed") return { artifact: chapters.artifact, bundle: chapters.bundle };
+          failedTask = chapters.task;
+          const materializedChapters = await activities.materializeExternalStoryArcBundle({ modelTaskId: chapters.task.id, projectId: params.projectId, arcId: params.arcId, value: (await waitForExternal(chapters.task)).value, rebase: params.rebase });
+          return materializedChapters;
+        }
         const materialized = await activities.materializeExternalStoryArcBundle({ modelTaskId: generated.task.id, projectId: params.projectId, arcId: params.arcId, value: (await waitForExternal(generated.task)).value, rebase: params.rebase });
         if (params.batchIndex && (materialized.bundle.batch.batchIndex !== params.batchIndex || materialized.bundle.batch.startChapterIndex !== params.startChapterIndex)) throw new Error("外部生成结果的故事弧批次位置与请求不一致");
         return materialized;
       } catch (error) {
-        await activities.expireExternalModelTask({ modelTaskId: generated.task.id, reason: failureMessage(error) });
-        nextCandidate = generated.task.candidateIndex + 1;
+        await activities.expireExternalModelTask({ modelTaskId: failedTask.id, reason: failureMessage(error) });
+        nextCandidate = failedTask.candidateIndex + 1;
       }
     }
   };
@@ -806,7 +829,7 @@ export async function storyArcPlanningWorkflow(params: StoryArcPlanningWorkflowI
   const reviewBundle = async (current: { artifact: Artifact; bundle: StoryArcBundle }, candidateStartIndex?: number): Promise<{ artifact: Artifact; review: StoryArcReviewOutput }> => {
     let nextCandidate = candidateStartIndex;
     while (true) {
-      const reviewed = await activities.reviewStoryArcBundle({ workflowId: params.workflowId, projectId: params.projectId, arcId: params.arcId, artifact: current.artifact, bundle: current.bundle, candidateStartIndex: nextCandidate, rebase: params.rebase });
+      const reviewed = await storyArcModelActivities.reviewStoryArcBundle({ workflowId: params.workflowId, projectId: params.projectId, arcId: params.arcId, artifact: current.artifact, bundle: current.bundle, routingSnapshot, candidateStartIndex: nextCandidate, rebase: params.rebase });
       if (reviewed.kind === "completed") return { artifact: reviewed.artifact, review: reviewed.review };
       try {
         return await activities.materializeExternalStoryArcReview({ modelTaskId: reviewed.task.id, projectId: params.projectId, arcId: params.arcId, subjectArtifactId: current.artifact.id, value: (await waitForExternal(reviewed.task)).value, rebase: params.rebase });
@@ -820,7 +843,7 @@ export async function storyArcPlanningWorkflow(params: StoryArcPlanningWorkflowI
   const reviseBundle = async (current: { artifact: Artifact; bundle: StoryArcBundle }, review: StoryArcReviewOutput, candidateStartIndex?: number): Promise<{ artifact: Artifact; bundle: StoryArcBundle }> => {
     let nextCandidate = candidateStartIndex;
     while (true) {
-      const revised = await activities.reviseStoryArcBundle({ workflowId: params.workflowId, projectId: params.projectId, arcId: params.arcId, artifact: current.artifact, bundle: current.bundle, review, candidateStartIndex: nextCandidate, rebase: params.rebase });
+      const revised = await storyArcModelActivities.reviseStoryArcBundle({ workflowId: params.workflowId, projectId: params.projectId, arcId: params.arcId, artifact: current.artifact, bundle: current.bundle, review, routingSnapshot, candidateStartIndex: nextCandidate, rebase: params.rebase });
       if (revised.kind === "completed") return { artifact: revised.artifact, bundle: revised.bundle };
       try {
         const materialized = await activities.materializeExternalStoryArcBundle({ modelTaskId: revised.task.id, projectId: params.projectId, arcId: params.arcId, value: (await waitForExternal(revised.task)).value, rebase: params.rebase });
@@ -835,11 +858,11 @@ export async function storyArcPlanningWorkflow(params: StoryArcPlanningWorkflowI
 
   const reviewPolicy = params.reviewPolicy ?? (params.mode === "mcp" ? "auto" : "manual");
   const reviewStrategy = storyArcReviewStrategy(reviewPolicy);
-  await activities.updateWorkflowStatus({ workflowId: params.workflowId, status: "running", payload: { arcId: params.arcId, mode: params.mode, reviewPolicy } });
   const routingSnapshot = await activities.getStoryArcRoutingSnapshot();
+  await activities.updateWorkflowStatus({ workflowId: params.workflowId, status: "running", payload: { arcId: params.arcId, mode: params.mode, reviewPolicy, routingSnapshotId: routingSnapshot.id } });
   const runStoryArcLearning = async (current: { artifact: Artifact }, reviewed: { artifact: Artifact; review: StoryArcReviewOutput }, candidateStartIndex?: number): Promise<void> => {
     if (!reviewed.review.issues.some((issue) => issue.severity === "blocker" || issue.severity === "major")) return;
-    const generated = await activities.assessStoryArcLearning({ projectId: params.projectId, workflowId: params.workflowId, artifact: current.artifact, reviewArtifact: reviewed.artifact, review: reviewed.review, routingSnapshot, candidateStartIndex });
+    const generated = await storyArcModelActivities.assessStoryArcLearning({ projectId: params.projectId, workflowId: params.workflowId, artifact: current.artifact, reviewArtifact: reviewed.artifact, review: reviewed.review, routingSnapshot, candidateStartIndex });
     if (generated.kind === "completed") return;
     await activities.materializeExternalStoryArcLearning({ modelTaskId: generated.task.id, projectId: params.projectId, workflowId: params.workflowId, artifact: current.artifact, reviewArtifact: reviewed.artifact, review: reviewed.review, value: (await waitForExternal(generated.task)).value });
   };
@@ -1254,7 +1277,7 @@ export async function chapterReviewWorkflow(params: {
 }): Promise<void> {
   const activities = proxyActivities<NovelWorkflowActivities>({
     startToCloseTimeout: "10 minutes",
-    retry: { maximumAttempts: 3, nonRetryableErrorTypes: ["NonRetryableModelTransportError"] },
+    retry: { maximumAttempts: 3, nonRetryableErrorTypes: ["NonRetryableModelTransportError", "ModelTransportError"] },
   });
 
   const workflowId = params.workflowId ?? `chapter-review-${params.documentId}-${Date.now()}`;
@@ -1362,6 +1385,7 @@ export async function chapterReviewWorkflow(params: {
         baseRevision: snapshot.currentRevision,
         documentRevision: documentState.documentRevision,
         wordCount: documentState.wordCount,
+        routingSnapshotId: routingSnapshot.id,
       },
     });
 
@@ -1501,6 +1525,7 @@ export async function chapterReviewWorkflow(params: {
         continue;
       }
 
+      assertCompleteChapterReviewEvidence(decision.decision, lifecycle.commitGate.missingRoles);
       const approvedDraft = await resolveApprovedDraft(currentDraft, decision);
       if (decision.actorSource !== "interactive-web") throw new Error("只有交互式 Web 人工证据可以覆盖章节审核结论");
       const factArtifact = await runFactExtraction(approvedDraft);
@@ -1615,7 +1640,15 @@ export async function chapterReviewWorkflow(params: {
           candidateStartIndex = generated.task.candidateIndex + 1;
           continue;
         }
-        if (strictRevisionWindows) return activities.materializeExternalTargetedRevision({ projectId: params.projectId, modelTaskId: generated.task.id, artifact: current.artifact, text: current.text, issues: directedIssues ?? [] });
+        if (strictRevisionWindows && generated.task.workPackage.outputKind === "structured") {
+          try {
+            return await activities.materializeExternalTargetedRevision({ projectId: params.projectId, modelTaskId: generated.task.id, artifact: current.artifact, text: current.text, issues: directedIssues ?? [] });
+          } catch (error) {
+            await activities.expireExternalModelTask({ modelTaskId: generated.task.id, reason: failureMessage(error) });
+            candidateStartIndex = generated.task.candidateIndex + 1;
+            continue;
+          }
+        }
         const text = typeof external.result?.text === "string" ? external.result.text : undefined;
         if (!text) throw new Error("外部章节修订任务未返回 text");
         return activities.materializeExternalText({ projectId: params.projectId, modelTaskId: generated.task.id, text, kind: "revision", baseRevision: current.artifact.baseRevision });

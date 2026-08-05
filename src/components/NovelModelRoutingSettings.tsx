@@ -58,9 +58,13 @@ type Config = { version: 1; profiles: Profile[]; routes: Record<string, Route>; 
 
 function candidateValue(candidate: Candidate) { return candidate.executor === "external-mcp" ? "external-mcp" : `api:${candidate.profileId}`; }
 function fromCandidateValue(value: string): Candidate { return value === "external-mcp" ? { executor: "external-mcp" } : { executor: "api", profileId: value.slice(4) }; }
-function inheritedRoute(config: Config | undefined, purpose: Purpose): Route {
+function resolveRouteWithSource(config: Config | undefined, purpose: Purpose): { route: Route; source: string } {
   const routes = config?.routes;
-  return routes?.[purpose] ?? routes?.[`${purpose.split(".")[0]}.*`] ?? routes?.["*"] ?? { candidates: [{ executor: "external-mcp" }] };
+  if (routes?.[purpose]) return { route: routes[purpose], source: purpose };
+  const wildcard = `${purpose.split(".")[0]}.*`;
+  if (routes?.[wildcard]) return { route: routes[wildcard], source: wildcard };
+  if (routes?.["*"]) return { route: routes["*"], source: "*" };
+  return { route: { candidates: [{ executor: "external-mcp" }] }, source: "默认" };
 }
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
@@ -209,8 +213,8 @@ export function NovelModelRoutingSettings() {
           { title: "密钥", render: (_, profile) => <Text type={profile.hasSecret || profile.secret ? "success" : "warning"}>{profile.secretHint ?? (profile.secret ? "待保存" : "未配置")}</Text> },
           { title: "状态", dataIndex: "enabled", render: (value) => <Tag color={value ? "success" : "default"}>{value ? "启用" : "禁用"}</Tag> },
           { title: "操作", width: 142, render: (_, profile) => <Space>
-            <Dropdown menu={{ items: profile.capabilities.map((capability) => ({ key: capability, label: `探测 ${capability}` })), onClick: ({ key }) => void probe(profile.id, key as Capability) }} trigger={["click"]}>
-              <Tooltip title="按能力测试"><Button aria-label="按能力测试" icon={<ExperimentOutlined />} loading={probing?.startsWith(`${profile.id}:`)} /></Tooltip>
+            <Dropdown menu={{ items: profile.capabilities.map((capability) => ({ key: capability, label: `探测 provider · ${capability}` })), onClick: ({ key }) => void probe(profile.id, key as Capability) }} trigger={["click"]}>
+              <Tooltip title="仅测试选中的 provider，不验证候选链"><Button aria-label="探测 provider" icon={<ExperimentOutlined />} loading={probing?.startsWith(`${profile.id}:`)} /></Tooltip>
             </Dropdown>
             <Tooltip title="编辑"><Button aria-label="编辑" icon={<EditOutlined />} onClick={() => openProfile(profile)} /></Tooltip>
             <Popconfirm title="删除该接口？" onConfirm={() => setConfig((current) => current ? { ...current, profiles: current.profiles.filter((item) => item.id !== profile.id) } : current)}><Tooltip title="删除"><Button danger aria-label="删除" icon={<DeleteOutlined />} /></Tooltip></Popconfirm>
@@ -220,16 +224,22 @@ export function NovelModelRoutingSettings() {
       </div>
 
       <div className="settings-routing-table-group">
-        <Title level={4} style={{ fontSize: 16 }}>调用位置</Title>
+        <Space align="baseline" size="middle">
+          <Title level={4} style={{ fontSize: 16, marginBottom: 8 }}>调用位置</Title>
+          <Text type="secondary">当前路由快照 {config?.snapshotId?.slice(0, 8) ?? "未加载"}</Text>
+        </Space>
         <div className="settings-table-scroll">
           <Table<Purpose>
           rowKey={(purpose) => purpose} pagination={false} size="small" dataSource={[...PURPOSES]}
           scroll={{ x: 880 }}
           className="settings-table"
           columns={[
-            { title: "用途 / 角色", width: 220, render: (purpose: Purpose) => <Space direction="vertical" size={0}><Text strong>{PURPOSE_LABELS[purpose]}</Text><Text type="secondary" style={{ fontSize: 12 }}>{purpose}</Text></Space> },
+            { title: "用途 / 角色", width: 260, render: (purpose: Purpose) => {
+              const { source } = resolveRouteWithSource(config, purpose);
+              return <Space direction="vertical" size={0}><Space size={6}><Text strong>{PURPOSE_LABELS[purpose]}</Text><Tag color={source === purpose ? "blue" : "default"}>{source === purpose ? "显式" : `继承 ${source}`}</Tag></Space><Text type="secondary" style={{ fontSize: 12 }}>{purpose}</Text></Space>;
+            } },
             { title: "有序候选链", render: (purpose: Purpose) => {
-              const route = inheritedRoute(config, purpose);
+              const { route } = resolveRouteWithSource(config, purpose);
               const requiredCap = PURPOSE_CAPABILITY[purpose];
               const options = [
                 ...(config?.profiles.filter((profile) => profile.enabled).map((profile) => {
@@ -253,7 +263,7 @@ export function NovelModelRoutingSettings() {
               );
             } },
             { title: "上下文", width: 190, render: (purpose) => {
-              const route = inheritedRoute(config, purpose);
+              const { route } = resolveRouteWithSource(config, purpose);
               return purpose.startsWith("writing.") ? <Segmented size="small" value={route.conversationPolicy ?? "stateless"} options={[{ label: "无会话", value: "stateless" }, { label: "任务续接", value: "task-chain" }]} onChange={(value) => setConfig((current) => current ? { ...current, routes: { ...current.routes, [purpose]: { ...route, conversationPolicy: value as Route["conversationPolicy"] } } } : current)} /> : <Tag>隔离</Tag>;
             } },
           ]}
@@ -332,31 +342,36 @@ function CandidateChainEditor({ value, options, incompatibleIds, requiredCap, on
   return (
     <Space direction="vertical" size={4} style={{ width: "100%" }} align="start">
       {values.length > 0 && (
-        <Reorder.Group
-          axis="y"
-          values={values}
-          onReorder={setValues}
-          style={{ listStyle: "none", padding: 0, margin: 0, width: "100%", display: "flex", flexDirection: "column", gap: 4 }}
-        >
-          {values.map((v) => {
-            const isExternal = v === "external-mcp";
-            const isBad = !isExternal && incompatibleIds.includes(v.slice(4));
-            return (
-              <Reorder.Item
-                key={v}
-                value={v}
-                style={{ display: "flex", alignItems: "center", gap: 8, padding: "4px 8px", background: "#1f1f23", border: "1px solid #303034", borderRadius: 6, cursor: "grab", touchAction: "none" }}
-                whileDrag={{ boxShadow: "0 4px 12px rgba(0,0,0,0.35)", borderColor: "#3f3f46" }}
-              >
-                <HolderOutlined style={{ color: "#888" }} />
-                <Tag color={isExternal ? "default" : isBad ? "error" : "blue"} style={{ margin: 0, flex: 1 }}>{labelOf(v)}</Tag>
-                <Tooltip title="移除">
-                  <Button type="text" size="small" aria-label="移除候选" icon={<CloseOutlined />} onClick={() => setValues(values.filter((x) => x !== v))} />
-                </Tooltip>
-              </Reorder.Item>
-            );
-          })}
-        </Reorder.Group>
+        <div className="settings-candidate-chain-scroll">
+          <Reorder.Group
+            className="settings-candidate-chain"
+            axis="x"
+            values={values}
+            onReorder={setValues}
+          >
+            {values.map((v) => {
+              const isExternal = v === "external-mcp";
+              const isBad = !isExternal && incompatibleIds.includes(v.slice(4));
+              return (
+                <Reorder.Item
+                  className="settings-candidate-chain-item"
+                  key={v}
+                  value={v}
+                  aria-label={`${labelOf(v)}，可拖动调整顺序`}
+                  whileDrag={{ boxShadow: "0 4px 12px rgba(0,0,0,0.35)", borderColor: "#3f3f46" }}
+                >
+                  <Tooltip title="拖动调整顺序">
+                    <HolderOutlined className="settings-candidate-chain-handle" />
+                  </Tooltip>
+                  <Tag className="settings-candidate-chain-label" color={isExternal ? "default" : isBad ? "error" : "blue"}>{labelOf(v)}</Tag>
+                  <Tooltip title="移除">
+                    <Button type="text" size="small" aria-label="移除候选" icon={<CloseOutlined />} onClick={() => setValues(values.filter((x) => x !== v))} />
+                  </Tooltip>
+                </Reorder.Item>
+              );
+            })}
+          </Reorder.Group>
+        </div>
       )}
       <Select
         style={{ width: "100%" }}

@@ -3,6 +3,7 @@ import { Alert, Button, Card, Descriptions, Empty, Form, Input, InputNumber, Mod
 import { ArrowLeftOutlined, DownOutlined, ReloadOutlined, SendOutlined, ThunderboltOutlined, PlayCircleOutlined, FileTextOutlined, AuditOutlined, ApiOutlined } from "@ant-design/icons";
 import { motion } from "motion/react";
 import "../novel-v2.css";
+import { novelFetch as readJson } from "../../lib/novelApi";
 import {
   commandTypeMeta,
   describeCreativeEvent,
@@ -39,12 +40,6 @@ interface CreativeCommand {
   review?: { subjectArtifactId?: string; reviewer?: string; verdict?: ReviewVerdict; issues?: string[]; summary?: string };
 }
 
-async function readJson<T>(input: RequestInfo, init?: RequestInit): Promise<T> {
-  const response = await fetch(input, init);
-  const body = await response.json();
-  if (!response.ok) throw new Error((body as { error?: string }).error ?? "V2 API 请求失败");
-  return body as T;
-}
 const eventSequence = (e: CreativeEvent) => e.sequence ?? e.id ?? 0;
 const eventTimeOf = (e: CreativeEvent) => e.createdAt ?? e.created_at;
 const eventTypeOf = (e: CreativeEvent) => e.eventType ?? e.event_type;

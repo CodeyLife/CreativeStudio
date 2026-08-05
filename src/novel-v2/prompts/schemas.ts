@@ -24,14 +24,12 @@ const reviewIssueSchema = {
   additionalProperties: false,
   required: ["severity", "title", "description", "excerpt", "revisionRanges", "rule", "suggestion"],
   properties: {
-    severity: { enum: ["blocker", "major", "warning"] },
+    severity: { type: "string", enum: ["blocker", "major", "warning"], description: "问题严重程度；只使用 schema 中的字符串枚举" },
     title: { type: "string", minLength: 1 },
     description: { type: "string", minLength: 1 },
     excerpt: { type: "string" },
-    paragraph: { type: "integer", minimum: 1 },
-    revisionRanges: { type: "array", items: { type: "object", additionalProperties: false, required: ["start", "end"], properties: { start: { type: "integer", minimum: 1 }, end: { type: "integer", minimum: 1 } } } },
+    revisionRanges: { type: "array", description: "1-based正文段落编号范围，不是字符、token或字节偏移", items: { type: "object", additionalProperties: false, required: ["start", "end"], properties: { start: { type: "integer", minimum: 1, description: "起始段落编号" }, end: { type: "integer", minimum: 1, description: "结束段落编号" } } } },
     rule: { type: "string", minLength: 1 },
-    sourceId: { type: "string" },
     suggestion: { type: "string", minLength: 1 },
   },
 } as const;
@@ -41,8 +39,8 @@ export const reviewerSchema = {
   additionalProperties: false,
   required: ["verdict", "score", "issues"],
   properties: {
-    verdict: { enum: ["passed", "revise", "blocked"] },
-    score: { type: "number", minimum: 0, maximum: 5 },
+    verdict: { type: "string", enum: ["passed", "revise", "blocked"], description: "审核结论字符串；不要用数字或额外的 passed 布尔字段" },
+    score: { type: "number", minimum: 0, maximum: 5, description: "本角色整体质量分，范围 0 到 5" },
     issues: { type: "array", items: reviewIssueSchema },
   },
 } as const;
@@ -71,9 +69,8 @@ export interface ReviewerOutput {
 export const factExtractionSchema = {
   type: "object",
   additionalProperties: false,
-  required: ["summary", "facts"],
+  required: ["facts", "narrativeElements", "payoffMoments"],
   properties: {
-    summary: { type: "string", minLength: 1 },
     facts: {
       type: "array",
       items: {
@@ -108,14 +105,13 @@ export const factExtractionSchema = {
             required: ["kind", "value"],
             properties: {
               kind: { enum: ["entity-ref", "string", "number", "boolean", "json"] },
-              value: {},
+              value: { type: "string", description: "字符串、实体 ID 或规范化 JSON 文本；按 kind 解释" },
             },
           },
           polarity: { enum: ["affirmed", "negated"] },
           truthStatus: { enum: ["objective", "claim", "contested", "open-question"] },
           humanReadable: { type: "string", minLength: 1 },
           evidence: { type: "string", minLength: 1 },
-          paragraph: { type: "integer", minimum: 1 },
           confidence: { type: "number", minimum: 0, maximum: 1 },
           novelty: { enum: ["new", "update", "duplicate"] },
           conflict: { type: "boolean" },
@@ -136,13 +132,14 @@ export const factExtractionSchema = {
     narrativeElements: {
       type: "object",
       additionalProperties: false,
+      required: ["foreshadowings", "promises", "payoffs"],
       properties: {
         foreshadowings: {
           type: "array",
           items: {
             type: "object",
             additionalProperties: false,
-            required: ["description", "triggerKeywords", "expectedPayoffWindow"],
+            required: ["description", "triggerKeywords", "expectedPayoffWindow", "evidence"],
             properties: {
               description: { type: "string", minLength: 1, description: "伏笔内容描述" },
               triggerKeywords: {
@@ -160,7 +157,7 @@ export const factExtractionSchema = {
           items: {
             type: "object",
             additionalProperties: false,
-            required: ["promiser", "promisee", "statement"],
+            required: ["promiser", "promisee", "statement", "evidence"],
             properties: {
               promiser: { type: "string", minLength: 1, description: "承诺者（角色名）" },
               promisee: { type: "string", minLength: 1, description: "被承诺者（角色名或‘自己’）" },
@@ -174,7 +171,7 @@ export const factExtractionSchema = {
           items: {
             type: "object",
             additionalProperties: false,
-            required: ["description", "payoffType"],
+            required: ["description", "payoffType", "matchedTriggerKeywords", "matchedForeshadowingIds", "matchedPromiseId", "matchedPromiser", "intensity", "evidence"],
             properties: {
               description: { type: "string", minLength: 1, description: "兑现内容描述" },
               payoffType: { enum: ["foreshadowing", "promise"], description: "兑现类型：伏笔兑现或承诺兑现" },
@@ -190,7 +187,7 @@ export const factExtractionSchema = {
               },
               matchedPromiseId: { type: "string", description: "已知开放承诺的精确 ID；只有明确兑现时填写，不得自行编造 ID" },
               matchedPromiser: { type: "string", description: "匹配到的承诺者（用于关联到对应 promise）" },
-              intensity: { type: "integer", minimum: 1, maximum: 5, description: "兑现强度（1=轻描淡写，5=高潮爆发）" },
+              intensity: { type: "integer", minimum: 0, maximum: 5, description: "兑现强度；0 表示没有可靠强度判断" },
               evidence: { type: "string", minLength: 1, description: "正文逐字证据" },
             },
           },
@@ -215,7 +212,7 @@ export const factExtractionSchema = {
       items: {
         type: "object",
         additionalProperties: false,
-        required: ["payoffType", "intensity", "description"],
+        required: ["payoffType", "intensity", "description", "setupDescription", "evidence"],
         properties: {
           payoffType: {
             enum: ["achievement", "recognition", "reversal", "emotional", "mystery"],
@@ -223,9 +220,9 @@ export const factExtractionSchema = {
           },
           intensity: {
             type: "integer",
-            minimum: 1,
+            minimum: 0,
             maximum: 5,
-            description: "爽点强度（1=轻描淡写，3=明显推进，5=高潮爆发）",
+            description: "爽点强度（0=没有可靠判断，1=轻描淡写，3=明显推进，5=高潮爆发）",
           },
           description: { type: "string", minLength: 1, description: "爽点内容描述" },
           setupDescription: { type: "string", description: "铺垫描述（若有铺垫，简述哪一章哪些事件铺垫了这个爽点）" },
@@ -240,7 +237,8 @@ export const factExtractionSchema = {
  * V2 事实提取输出类型。
  */
 export interface FactExtractionOutput {
-  summary: string;
+  /** Legacy application field; new model output no longer requests it. */
+  summary?: string;
   facts: Array<{
     subject: { kind: string; id: string };
     predicate: string;
@@ -249,6 +247,7 @@ export interface FactExtractionOutput {
     truthStatus: "objective" | "claim" | "contested" | "open-question";
     humanReadable: string;
     evidence: string;
+    /** Legacy application metadata; narrative scoping uses the chapter order instead. */
     paragraph?: number;
     confidence: number;
     novelty: "new" | "update" | "duplicate";
@@ -409,8 +408,8 @@ export const characterEnrichmentSchema = {
               additionalProperties: false,
               required: ["description", "evidence"],
               properties: {
-                description: { type: "string", minLength: 1 },
-                evidence: { type: "string", minLength: 1 },
+                description: { type: "string", minLength: 1, description: "角色获得的最小知识命题" },
+                evidence: { type: "string", minLength: 1, description: "支持该知识命题的正文逐字证据" },
               },
             },
           },
@@ -461,14 +460,44 @@ export interface ChapterStateDelta extends FactExtractionOutput {
   characterDeltas?: CharacterEnrichmentOutput["characters"];
 }
 
-export const chapterStateDeltaSchema = {
-  ...factExtractionSchema,
-  properties: {
-    ...factExtractionSchema.properties,
-    chapterMemory: chapterMemorySchema,
-    characterDeltas: characterEnrichmentSchema.properties.characters,
-  },
-} as const;
+/** Strict model boundary for fact extraction; chapter memory and character deltas use independent calls. */
+export interface FactExtractionModelOutput {
+  facts: Array<{
+    subject: { kind: string; id: string };
+    predicate: string;
+    object: { kind: string; value: string };
+    polarity: "affirmed" | "negated";
+    truthStatus: "objective" | "claim" | "contested" | "open-question";
+    humanReadable: string;
+    evidence: string;
+    confidence: number;
+    novelty: "new" | "update" | "duplicate";
+    conflict: boolean;
+  }>;
+  narrativeElements: {
+    foreshadowings: Array<{ description: string; triggerKeywords: string[]; expectedPayoffWindow: string; evidence: string }>;
+    promises: Array<{ promiser: string; promisee: string; statement: string; evidence: string }>;
+    payoffs: Array<{
+      description: string;
+      payoffType: "foreshadowing" | "promise";
+      matchedTriggerKeywords: string[];
+      matchedForeshadowingIds: string[];
+      matchedPromiseId: string;
+      matchedPromiser: string;
+      intensity: number;
+      evidence: string;
+    }>;
+  };
+  payoffMoments: Array<{
+    payoffType: "achievement" | "recognition" | "reversal" | "emotional" | "mystery";
+    intensity: number;
+    description: string;
+    setupDescription: string;
+    evidence: string;
+  }>;
+}
+
+export const chapterStateDeltaSchema = factExtractionSchema;
 
 /**
  * V2 架构生成（foundation）schema。
@@ -498,7 +527,7 @@ export const chapterStateDeltaSchema = {
  */
 export const foundationSchema = {
   type: "object",
-  additionalProperties: true,
+  additionalProperties: false,
   required: ["title", "summary", "sections", "structuredData"],
   properties: {
     title: { type: "string", minLength: 1, description: "本次架构产出标题（如「主要人物档案」「世界观设定」）" },
@@ -508,8 +537,8 @@ export const foundationSchema = {
       description: "架构产出的分节内容（人类可读）",
       items: {
         type: "object",
-        additionalProperties: true,
-        required: ["heading", "content"],
+        additionalProperties: false,
+        required: ["heading", "content", "items"],
         properties: {
           heading: { type: "string", minLength: 1 },
           content: { type: "string", minLength: 1 },
@@ -518,16 +547,11 @@ export const foundationSchema = {
             description: "分节下的结构化条目（如人物列表、势力列表、章节列表等）",
             items: {
               type: "object",
-              additionalProperties: true,
+              additionalProperties: false,
               required: ["label", "detail"],
               properties: {
                 label: { type: "string", minLength: 1 },
                 detail: { type: "string", minLength: 1 },
-                attributes: {
-                  type: "object",
-                  description: "可选的结构化属性（键值对，如 {alias, age, faction, role}）",
-                  additionalProperties: true,
-                },
               },
             },
           },
@@ -535,9 +559,9 @@ export const foundationSchema = {
       },
     },
     structuredData: {
-      type: "object",
-      description: "可机读的结构化数据，格式因 taskKey 而异（如 characters=人物数组, relations=关系数组, timeline=事件数组）",
-      additionalProperties: true,
+      type: "string",
+      minLength: 2,
+      description: "taskKey 对应 structuredData 的 JSON 文本；应用层解析后恢复为结构化对象",
     },
   },
 } as const;

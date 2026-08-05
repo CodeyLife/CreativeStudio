@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { applyRevisionWindows, applyTargetedRevisionReplacements, buildAuthorRevisionBrief, buildFullChapterRevisionPrompt, buildFullChapterRevisionPromptPackage, buildRevisionWindowPrompt, buildTargetedRevisionBatchPrompt, planRevisionWindows, sanitizeRevisionOutput } from "../prompts/chapter-revision";
+import { applyRevisionWindows, applyTargetedRevisionReplacements, buildAuthorRevisionBrief, buildFullChapterRevisionPrompt, buildFullChapterRevisionPromptPackage, buildRevisionWindowPrompt, buildTargetedRevisionBatchPrompt, planRevisionWindows, sanitizeRevisionOutput, TargetedRevisionContractError } from "../prompts/chapter-revision";
 import type { Artifact, ExecutionBlueprint, MemoryBundle, ReviewIssue, SkillBundle } from "../protocol";
 import type { ModelGateway } from "../model-gateway";
 import type { ContentObjectStore } from "../object-store";
@@ -18,6 +18,11 @@ describe("chapter revision", () => {
     expect(sanitizeRevisionOutput("修订结果：\n正文第一段。\n\n正文第二段。")).toContain("正文第一段。");
   });
 
+  it("removes only adjacent exact duplicate paragraphs from revision output", () => {
+    expect(sanitizeRevisionOutput("等待。\n\n等待。\n\n上方传来脚步。\n\n等待。"))
+      .toBe("等待。\n\n上方传来脚步。\n\n等待。");
+  });
+
   it("plans evidence windows and preserves unrelated paragraphs", () => {
     const text = "第一段。\n\n第二段。\n\n第三段。\n\n第四段。";
     const issues: ReviewIssue[] = [{ severity: "major", title: "证据问题", evidence: "第二段。", revisionRanges: [{ start: 2, end: 2 }], suggestion: "改变承载方式" }];
@@ -31,6 +36,18 @@ describe("chapter revision", () => {
     const windows = planRevisionWindows(text, [{ severity: "warning", title: "乙", evidence: "乙。", revisionRanges: [{ start: 2, end: 2 }] }]);
     expect(applyTargetedRevisionReplacements(text, windows, [{ start: 2, end: 2, text: "新乙。" }])).toBe("甲。\n\n新乙。\n\n丙。");
     expect(() => applyTargetedRevisionReplacements(text, windows, [{ start: 1, end: 1, text: "越界" }])).toThrow();
+  });
+
+  it("falls back from stale ranges to current paragraph evidence", () => {
+    const text = "甲。\n\n乙。\n\n丙。";
+    const [window] = planRevisionWindows(text, [{ severity: "major", title: "边界变化", evidence: "乙。", excerpt: "乙。", paragraph: 2, revisionRanges: [{ start: 9, end: 9 }] }]);
+    expect(window).toMatchObject({ start: 1, end: 1 });
+  });
+
+  it("classifies invalid batch replacements as contract errors", () => {
+    const text = "甲。\n\n乙。";
+    const windows = planRevisionWindows(text, [{ severity: "major", title: "目标", evidence: "乙。", revisionRanges: [{ start: 2, end: 2 }] }]);
+    expect(() => applyTargetedRevisionReplacements(text, windows, [{ start: 1, end: 1, text: "错误窗口" }])).toThrow(TargetedRevisionContractError);
   });
 
   it("renders shared revision context once for a multi-window batch", () => {
@@ -48,6 +65,7 @@ describe("chapter revision", () => {
     expect((batch.match(/## 局部修订契约/g) ?? [])).toHaveLength(1);
     expect(batch).toContain("## 窗口 1");
     expect(batch).toContain("## 窗口 2");
+    expect(batch).toContain("章末未解列表是冻结边界");
     expect(batch.length).toBeLessThan(individual.length);
   });
 
@@ -67,6 +85,9 @@ describe("chapter revision", () => {
     });
     expect(prompt).toContain("让动作更有停顿感。");
     expect(prompt).toContain("因果跳步");
+    expect(prompt).toContain("至少两类相互独立的可观察锚点");
+    expect(prompt).toContain("技术认知应建立在已经发生的感官或动作之上");
+    expect(prompt).toContain("不得删除、回答或合并其中的问题");
     expect(prompt).not.toContain("narrativeScale");
     expect(prompt).not.toContain("必须有新鲜贡献");
   });
@@ -130,5 +151,52 @@ describe("chapter revision", () => {
     expect(generateStructured).toHaveBeenCalledWith(expect.objectContaining({ schemaName: "targeted-chapter-revision", taskId: "chapter-1:revise:targeted-batch" }));
     expect(generateText).not.toHaveBeenCalled();
     expect((result as { artifact: Artifact }).artifact.structuredData).toMatchObject({ revisionMode: "targeted-batch" });
+  });
+
+  it("falls back to per-window calls when a batch omits a declared window", async () => {
+    const text = "甲在门外停了一会儿。\n\n乙没有回答。\n\n雨声压过了脚步。\n\n灯影晃了一下。";
+    const artifact: Artifact = { id: "artifact-1", projectId: "p1", taskId: "chapter-1", attemptId: "attempt-1", kind: "draft", contentHash: "hash", baseRevision: 0, createdAt: 1, fingerprint: "artifact-fp" };
+    const reviews = [{
+      id: "review-1", projectId: "p1", artifactId: artifact.id, reviewerId: "reviewer-1", identity: "internal" as const, verdict: "revise" as const,
+      issues: [
+        { severity: "major" as const, title: "动作承接", evidence: "甲在门外停了一会儿。", revisionRanges: [{ start: 1, end: 1 }], suggestion: "按证据局部修订" },
+        { severity: "major" as const, title: "反应缺口", evidence: "灯影晃了一下。", revisionRanges: [{ start: 4, end: 4 }], suggestion: "按证据局部修订" },
+      ],
+      createdAt: 1, artifactFingerprint: artifact.fingerprint,
+    }];
+    const generateStructured = vi.fn(async () => ({
+      value: { replacements: [{ start: 1, end: 1, text: "只返回一个窗口" }] },
+      provenance: { routeSnapshotId: "route-1", purpose: "writing.revision", candidateIndex: 0, executor: "api" as const, profileId: "profile-1", model: "model-1", promptFingerprint: "prompt-fp" },
+    }));
+    const generateText = vi.fn(async () => ({
+      text: "按当前窗口完成局部修订。",
+      provenance: { routeSnapshotId: "route-1", purpose: "writing.revision", candidateIndex: 0, executor: "api" as const, profileId: "profile-1", model: "model-1", promptFingerprint: "prompt-fp" },
+    }));
+    const activities = createNovelWorkflowActivities({
+      repository: { recordArtifact: vi.fn(async () => undefined) } as unknown as NovelPostgresRepository,
+      memoryProvider: { search: async () => [] },
+      skillProvider: { list: async () => [{ skillId: "revision-skill", version: "1", capabilities: ["revision"], applicableTasks: ["revision"], requiredMemoryKinds: [], conflicts: [], qualityGates: [], promptSections: { "chapter.revision": "保持窗口边界与已冻结事实。" }, enabled: true, executionPoints: ["chapter.revision" as const], roles: [] }] },
+      modelGateway: { generateStructured, generateText } as unknown as ModelGateway,
+      objectStore: { putText: vi.fn(async (value: string) => ({ key: "object-1", hash: `hash-${value.length}` })) } as unknown as ContentObjectStore,
+      commitService: {} as CommitService,
+      enableChapterMemory: false,
+    });
+
+    const result = await activities.revise({
+      workflowId: "workflow-1",
+      intent: { id: "intent-1", projectId: "p1", source: "chapter-review", objective: "修订章节", createdAt: 1, idempotencyKey: "intent-1" },
+      artifact,
+      text,
+      reviews,
+      memory,
+      blueprint: { id: "blueprint-1", projectId: "p1", preflightId: "preflight-1", budget: { maxInputTokens: 100_000, maxOutputTokens: 20_000 } } as unknown as ExecutionBlueprint,
+      skills: {} as SkillBundle,
+      routingSnapshot: { id: "route-1" } as never,
+    });
+
+    expect(result.kind).toBe("completed");
+    expect(generateStructured).toHaveBeenCalledOnce();
+    expect(generateText).toHaveBeenCalledTimes(2);
+    expect((result as { artifact: Artifact }).artifact.structuredData).not.toMatchObject({ revisionMode: "targeted-batch" });
   });
 });

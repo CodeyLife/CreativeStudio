@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { normalizeStoryArcRebaseBundle, parseStoryArcBundle, projectChapterForExecution, validateStoryArcExecutionContracts, validateStoryArcPlanContracts, validateStoryArcRebaseBundle, type StoryArcBundle, type StoryArcRebaseTarget } from "../application/story-arc";
+import { normalizeStoryArcRebaseBundle, parseStoryArcBundle, projectChapterForExecution, projectLegacyArcContractForReview, validateStoryArcExecutionContracts, validateStoryArcPlanContracts, validateStoryArcRebaseBundle, type StoryArcBundle, type StoryArcRebaseTarget } from "../application/story-arc";
 import { normalizeStoryArcReviewAuthority, validateStoryArcReview } from "../application/story-arc-review-policy";
 
 const bundle: StoryArcBundle = {
@@ -48,6 +48,19 @@ describe("story arc blueprint subtraction contract", () => {
     const arc = { ...bundle.arc, plotThreadRefs: ["thread-a"], threadResponsibilities: [{ threadRef: "thread-a", responsibility: "保持线索压力并观察新的证据", nextAdvance: "出现与旧证据矛盾的可验证信息" }] };
     expect(() => validateStoryArcPlanContracts(arc)).not.toThrow();
     expect(() => validateStoryArcPlanContracts({ ...arc, threadResponsibilities: [] })).toThrow("缺少剧情线阶段责任");
+  });
+
+  it("projects a newly introduced arc contract into a legacy review baseline without changing chapter authority", () => {
+    const currentArc = {
+      ...bundle.arc,
+      plotThreadRefs: ["thread:current"],
+      threadResponsibilities: [{ threadRef: "thread:current", responsibility: "保持阶段压力", nextAdvance: "出现可验证的新证据" }],
+    };
+    const approvedArc = { ...bundle.arc, title: "历史批准弧", plotThreadRefs: ["旧版剧情线名称"] };
+    const projected = projectLegacyArcContractForReview({ approvedArc, currentArc, legacyArcContractGaps: ["threadResponsibilities"] });
+    expect(projected.title).toBe("历史批准弧");
+    expect(projected.plotThreadRefs).toEqual(["thread:current"]);
+    expect(projected.threadResponsibilities).toEqual(currentArc.threadResponsibilities);
   });
 
   it("preserves legacy frozen scene shape during rebase without weakening new candidates", () => {
@@ -108,6 +121,60 @@ describe("story arc blueprint subtraction contract", () => {
     const normalized = normalizeStoryArcReviewAuthority(bundle, review, target);
     expect(normalized.authorityChecks[0].checkedPaths).toEqual(["stateTransition.before", "stateTransition.after", "stateTransition.evidence", "scenes[0].situation", "scenes[0].observableActions", "scenes[0].outcome"]);
     expect(normalized.authorityChecks[0].unresolvedAtClose).toEqual(bundle.chapters[0].unresolvedAtClose);
+    expect(() => validateStoryArcReview(bundle, normalized)).not.toThrow();
+  });
+
+  it("derives the dynamic authority coverage ledger from the candidate blueprint", () => {
+    const review = {
+      verdict: "passed" as const,
+      summary: "candidate review",
+      issues: [],
+      chapterChecks: ["state-continuity", "causal-fit", "function-fit", "authority-boundary"].map((dimension) => ({ chapterIndex: 1, dimension: dimension as "state-continuity" | "causal-fit" | "function-fit" | "authority-boundary", verdict: "passed" as const, evidence: "reviewed", reason: "reviewed" })),
+      arcChecks: ["arc-boundary", "window-rhythm", "longform-hierarchy"].map((dimension) => ({ dimension: dimension as "arc-boundary" | "window-rhythm" | "longform-hierarchy", verdict: "passed" as const, evidence: "reviewed", reason: "reviewed" })),
+      authorityChecks: [{ chapterIndex: 1, verdict: "passed" as const, unresolvedAtClose: ["model omitted this"], checkedPaths: ["summary-only"], candidateClaims: ["summary-only"], frozenEvidence: ["candidate blueprint"], certaintyUpgrades: [], reason: "reviewed" }],
+    };
+    const normalized = normalizeStoryArcReviewAuthority(bundle, review);
+    expect(normalized.authorityChecks[0].checkedPaths).toEqual([
+      "stateTransition.before",
+      "stateTransition.after",
+      "stateTransition.evidence",
+      "scenes[0].situation",
+      "scenes[0].observableActions",
+      "scenes[0].outcome",
+    ]);
+    expect(normalized.authorityChecks[0].candidateClaims).toEqual([
+      bundle.chapters[0].stateTransition.before,
+      bundle.chapters[0].stateTransition.after,
+      bundle.chapters[0].stateTransition.evidence,
+      bundle.chapters[0].scenes[0].situation,
+      bundle.chapters[0].scenes[0].observableActions.join("；"),
+      bundle.chapters[0].scenes[0].outcome,
+    ]);
+    expect(normalized.authorityChecks[0].unresolvedAtClose).toEqual(bundle.chapters[0].unresolvedAtClose);
+    expect(() => validateStoryArcReview(bundle, normalized)).not.toThrow();
+  });
+
+  it("downgrades a passed authority check when it contains a certainty upgrade", () => {
+    const review = {
+      verdict: "passed" as const,
+      summary: "unsupported certainty found",
+      issues: [],
+      chapterChecks: ["state-continuity", "causal-fit", "function-fit", "authority-boundary"].map((dimension) => ({ chapterIndex: 1, dimension: dimension as "state-continuity" | "causal-fit" | "function-fit" | "authority-boundary", verdict: "passed" as const, evidence: "reviewed", reason: "reviewed" })),
+      arcChecks: ["arc-boundary", "window-rhythm", "longform-hierarchy"].map((dimension) => ({ dimension: dimension as "arc-boundary" | "window-rhythm" | "longform-hierarchy", verdict: "passed" as const, evidence: "reviewed", reason: "reviewed" })),
+      authorityChecks: [{
+        chapterIndex: 1,
+        verdict: "passed" as const,
+        unresolvedAtClose: [],
+        checkedPaths: [],
+        candidateClaims: [],
+        frozenEvidence: ["当前边界"],
+        certaintyUpgrades: [{ candidateClaim: "把推测当成事实", frozenBoundary: "仅有现场痕迹", reason: "缺少因果证据" }],
+        reason: "发现一个边界问题",
+      }],
+    };
+    const normalized = normalizeStoryArcReviewAuthority(bundle, review);
+    expect(normalized.verdict).toBe("revise");
+    expect(normalized.authorityChecks[0].verdict).toBe("revise");
     expect(() => validateStoryArcReview(bundle, normalized)).not.toThrow();
   });
 });

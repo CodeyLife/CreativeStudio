@@ -79,6 +79,36 @@ describe("Skill runtime resolution", () => {
     }
   });
 
+  it("injects the cross-layer anti-degeneration craft Skills with fresh fingerprints", async () => {
+    const provider = createWorkspaceSkillProvider(path.resolve(process.cwd(), "skills", "novel-v2"));
+    const descriptors = await provider.list("test-project");
+    const byId = new Map(descriptors.map((skill) => [skill.skillId, skill]));
+
+    for (const skillId of ["prose-craft", "reader-emotion", "plot-causality"]) {
+    expect(byId.get(skillId)?.version).toBe(skillId === "prose-craft" ? "1.2.0" : "1.1.0");
+      expect(byId.get(skillId)?.contentFingerprint).toBeTruthy();
+    }
+
+    const draft = await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint: "chapter.drafting", role: "writer" });
+    const draftText = renderSkillInstruction(draft, "chapter.drafting");
+    expect(draftText).toContain("当前 POV");
+    expect(draftText).toContain("检测器结果");
+
+    const planning = await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint: "chapter.blueprint", role: "planner" });
+    expect(renderSkillInstruction(planning, "chapter.blueprint")).toContain("选择窗口");
+
+    const arcPlanning = await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint: "arc.plan", role: "planner" });
+    const arcPlanningText = renderSkillInstruction(arcPlanning, "arc.plan");
+    expect(arcPlanningText).not.toContain("固定顺序");
+    expect(arcPlanningText).not.toContain("现场过程");
+
+    const review = await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint: "chapter.review.prose", role: "prose-reviewer" });
+    const reviewText = renderSkillInstruction(review, "chapter.review.prose");
+    expect(reviewText).toContain("当前功能失效");
+    expect(reviewText).toContain("信息差");
+    expect(reviewText).toContain("摘要式结论");
+  });
+
   it("gives foundation review its own role-specific evidence Skill without changing planning resolution", async () => {
     const provider = createWorkspaceSkillProvider(path.resolve(process.cwd(), "skills", "novel-v2"));
     const planning = await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint: "foundation.book-plan", role: "planner" });

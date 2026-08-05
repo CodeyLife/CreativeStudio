@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Alert, Button, Input, Modal, Popconfirm, Segmented, Space, Spin, Tag, message } from "antd";
 import { ArrowDownOutlined, ArrowUpOutlined, CheckOutlined, DeleteOutlined, EditOutlined, FileAddOutlined, PlusOutlined, ReloadOutlined, StopOutlined } from "@ant-design/icons";
 import { motion } from "motion/react";
+import { novelFetch as readJson } from "../../lib/novelApi";
 
 type Scene = { title: string; participants: string[]; situation: string; observableActions: string[]; opposition?: string; decision?: string; outcome: string; cost?: string };
 type Chapter = { id?: string; index: number; globalOrder?: number; documentId?: string; title: string; narrativeFunction?: string; povCharacterId?: string; stateTransition: { before: string; after: string; evidence: string }; scenes: Scene[]; continuityConstraints: string[]; unresolvedAtClose?: string[] };
@@ -28,13 +29,6 @@ function arcCanBeEdited(arc: StoryArc): boolean {
 }
 function arcCanBeDeleted(arc: StoryArc): boolean {
   return arc.planningStatus !== "generating" || arc.executionStatus === "abandoned";
-}
-
-async function readJson<T>(input: RequestInfo, init?: RequestInit): Promise<T> {
-  const response = await fetch(input, init);
-  const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error((body as { error?: string }).error ?? `HTTP ${response.status}`);
-  return body as T;
 }
 
 export default function StoryArcPanel({ projectId, onApplied }: { projectId: string; onApplied?: () => void }) {

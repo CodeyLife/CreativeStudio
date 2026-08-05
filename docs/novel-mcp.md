@@ -1,6 +1,6 @@
 # Novel MCP V2
 
-The MCP server in `scripts/novel-v2-mcp-server.mjs` calls `executeTool` from `src/novel-v2/mcp/index.ts` directly (no HTTP proxy). It loads 29 tools defined in `src/novel-v2/mcp/tool-definitions.ts`. Start with `pnpm novel:mcp:v2` (requires Postgres + tsx loader).
+The MCP server in `scripts/novel-v2-mcp-server.mjs` calls `executeTool` from `src/novel-v2/mcp/index.ts` directly (no HTTP proxy). It loads 32 tools defined in `src/novel-v2/mcp/tool-definitions.ts`. Start with `pnpm novel:mcp:v2` (requires Postgres + tsx loader).
 
 ## Tools
 
@@ -10,8 +10,8 @@ The MCP server in `scripts/novel-v2-mcp-server.mjs` calls `executeTool` from `sr
 - `novel_catalog_get` / `novel_receipt_get` / `novel_rule_target_get` read catalogs, receipts, rule targets.
 - `novel_rule_candidate_create` / `novel_rule_candidate_get` / `novel_rule_evidence_submit` / `novel_rule_foundation_evaluate` / `novel_rule_review_submit` / `novel_rule_promote` / `novel_rule_rollback` manage craft-rule candidate evolution.
 - `novel_project_create` / `novel_project_list` / `novel_project_delete` manage project lifecycle.
-- `novel_bootstrap_run` / `novel_chapter_review` / `novel_chapter_generate` / `novel_chapter_review_decision` one-click flows.
-- `novel_story_arc_start` / `novel_story_arc_get` manage story arc lifecycle.
+- `novel_bootstrap_run` / `novel_chapter_review` / `novel_chapter_review_issue_add` / `novel_chapter_generate` / `novel_chapter_review_decision` one-click flows. `novel_chapter_review` defaults to full review; `mode=targeted` with `targetIssueIds` reuses the current complete snapshot and formal review/revision/fact/commit gate for issue-scoped repair. `novel_chapter_review_issue_add` persists a正文有证据的作者/架构意见 into the current snapshot without mutating the manuscript.
+- `novel_story_arc_start` / `novel_story_arc_get` / `novel_story_arc_review` manage story arc lifecycle. `novel_story_arc_review` is the recovery entry for a failed blueprint that remains reviewable; it reuses the durable review workflow and does not regenerate the blueprint.
 - `novel_workflow_get` / `novel_workflow_list` inspect workflow status.
 - `novel_closed_loop_run` evaluation closed-loop.
 

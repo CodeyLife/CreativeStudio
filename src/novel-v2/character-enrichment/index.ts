@@ -10,6 +10,14 @@ import { characterEnrichmentSchema, type CharacterEnrichmentOutput } from "../pr
 import { buildCharacterEnrichmentPrompt } from "./prompt";
 import { compileStageContext } from "../stage-context";
 import { buildSkillContextSections } from "../skill-runtime";
+import {
+  buildCharacterIdentityIndex,
+  characterIdentityPayload,
+  resolveCharacterIdentity,
+  uniqueCharacterIdentities,
+  type CharacterIdentityIndex,
+  type FoundationCharacter,
+} from "../character-identity";
 
 /**
  * 识别 motivationDelta 的"无变化"占位标记。
@@ -20,6 +28,37 @@ import { buildSkillContextSections } from "../skill-runtime";
  * 改用正则覆盖所有"无 + 变化"语义变体，prompt 侧同步标准化为"无变化"三字。
  */
 const NO_MOTIVATION_CHANGE_REGEX = /^\s*(无变化|.*无(明显)?(动机)?变化.*|.*动机未(发生)?变化.*)\s*$/u;
+
+interface CharacterEntityRow {
+  id: string;
+  name: string;
+  payload: Record<string, unknown> | null;
+}
+
+interface CharacterIdentityRegistry {
+  index: CharacterIdentityIndex;
+  entities: CharacterEntityRow[];
+}
+
+// TODO: move prompt-context budgets to the runtime routing configuration.
+const MAX_CHARACTER_DIGEST_ENTRIES = 100;
+
+function foundationCharacters(value: unknown): FoundationCharacter[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is FoundationCharacter => Boolean(item) && typeof item === "object" && !Array.isArray(item))
+    : [];
+}
+
+async function loadCharacterIdentityRegistry(projectId: string, repository: NovelPostgresRepository): Promise<CharacterIdentityRegistry> {
+  const [entities, foundation] = await Promise.all([
+    repository.pool.query<CharacterEntityRow>("SELECT id, name, payload FROM entities WHERE project_id=$1 AND kind='character' ORDER BY name ASC", [projectId]),
+    repository.pool.query<{ characters: unknown }>("SELECT payload->'structuredData'->'characters' AS characters FROM project_plan_sections WHERE project_id=$1 AND task_key='characters'", [projectId]),
+  ]);
+  return {
+    entities: entities.rows,
+    index: buildCharacterIdentityIndex(projectId, entities.rows, foundationCharacters(foundation.rows[0]?.characters)),
+  };
+}
 
 /**
  * V2 角色富化（character enrichment）模块。
@@ -104,18 +143,16 @@ export interface EnrichCharactersResult {
  */
 export async function enrichCharactersFromChapter(input: EnrichCharactersInput, deps: EnrichCharactersDeps): Promise<EnrichCharactersResult> {
   // 1. 取已有角色档案摘要（让 LLM 只提取增量）
-  const existingCharacters = await deps.repository.pool.query<{ id: string; name: string; payload: Record<string, unknown> }>(
-    "SELECT id, name, payload FROM entities WHERE project_id=$1 AND kind='character' ORDER BY name ASC LIMIT 20",
-    [input.projectId],
-  );
-  const existingCharactersDigest = existingCharacters.rowCount
-    ? existingCharacters.rows.map((row) => {
-        const payload = row.payload ?? {};
-        const voice = payload.voiceAnchor ? `声部：${JSON.stringify(payload.voiceAnchor)}` : "";
-        const motivation = payload.motivation ? `动机：${payload.motivation}` : "";
-        return `- ${row.name}：${voice} ${motivation}`.trim();
-      }).join("\n")
-    : undefined;
+  const characterRegistry = await loadCharacterIdentityRegistry(input.projectId, deps.repository);
+  const entityById = new Map(characterRegistry.entities.map((row) => [row.id, row]));
+  const existingCharactersDigest = uniqueCharacterIdentities(characterRegistry.index)
+    .slice(0, MAX_CHARACTER_DIGEST_ENTRIES)
+    .map((identity) => {
+      const payload = entityById.get(identity.entityId)?.payload ?? {};
+      const voice = payload.voiceAnchor ? `声部：${JSON.stringify(payload.voiceAnchor)}` : "";
+      const motivation = payload.motivation ? `动机：${payload.motivation}` : "";
+      return `- 规范 ID：${identity.canonicalId}；展示名：${identity.displayName}${voice ? `；${voice}` : ""}${motivation ? `；${motivation}` : ""}`;
+    }).join("\n") || undefined;
 
   // 2. LLM 结构化提取
   const prompt = buildCharacterEnrichmentPrompt({
@@ -177,14 +214,16 @@ export async function persistCharacterEnrichment(input: { projectId: string; doc
   let entityUpdates = 0;
   let relationRecords = 0;
   const knowledgeClaims: MemoryClaim[] = [];
+  const characterRegistry = await loadCharacterIdentityRegistry(input.projectId, deps.repository);
 
   for (const delta of deltas) {
-    // P1-D3: entity id 统一为 `entity:${projectId}:character:${characterId}` 格式，
+    const subjectIdentity = resolveCharacterIdentity(input.projectId, delta.characterId, characterRegistry.index);
+    // P1-D3: entity id 统一为 `entity:${projectId}:character:${canonicalId}` 格式，
     // relations.subject_id/object_id 必须使用同样的 entityId 格式才能与 entities.id 对齐，
     // 否则 GraphMemoryProvider 基于 relations 表的图检索会找不到对应 entity（id 不匹配）。
     // 设计依据：AGENTS.md「root-cause analysis」——id 不对齐是数据模型层机制错误，
     // 不是单点 bug，会影响所有依赖 relations.subject_id=entities.id 的图遍历逻辑。
-    const subjectEntityId = `entity:${input.projectId}:character:${delta.characterId}`;
+    const subjectEntityId = subjectIdentity.entityId;
     const existingEntity = await deps.repository.pool.query<{ payload: Record<string, unknown> }>(
       "SELECT payload FROM entities WHERE id=$1",
       [subjectEntityId],
@@ -192,6 +231,7 @@ export async function persistCharacterEnrichment(input: { projectId: string; doc
     const existingPayload = existingEntity.rows[0]?.payload ?? {};
     const mergedPayload = {
       ...existingPayload,
+      ...characterIdentityPayload(subjectIdentity),
       voiceAnchor: mergeVoiceAnchor(existingPayload.voiceAnchor, delta.voiceAnchor),
       motivation: NO_MOTIVATION_CHANGE_REGEX.test(delta.motivationDelta.trim())
         ? existingPayload.motivation ?? undefined
@@ -201,22 +241,22 @@ export async function persistCharacterEnrichment(input: { projectId: string; doc
       `INSERT INTO entities(id, project_id, kind, name, payload)
        VALUES($1, $2, 'character', $3, $4)
        ON CONFLICT(id) DO UPDATE SET payload=EXCLUDED.payload, name=EXCLUDED.name`,
-      [subjectEntityId, input.projectId, delta.characterId, mergedPayload],
+      [subjectEntityId, input.projectId, subjectIdentity.displayName, mergedPayload],
     );
     entityUpdates += 1;
 
     // 3b. 创建 MemoryClaim（角色知识边界）
     for (const knowledge of delta.newKnowledge) {
-      const contentHash = createHash("sha256").update(`knowledge:${delta.characterId}:${knowledge.description}`).digest("hex");
+      const contentHash = createHash("sha256").update(`knowledge:${subjectIdentity.canonicalId}:${knowledge.description}`).digest("hex");
       const claim: MemoryClaim = {
         id: `claim:knowledge:${input.revisionId}:${contentHash.slice(0, 16)}`,
         projectId: input.projectId,
         kind: "episodic",
-        title: `${delta.characterId} 的信息边界（第${input.narrativeOrder}章）`,
+        title: `${subjectIdentity.displayName} 的信息边界（第${input.narrativeOrder}章）`,
         content: knowledge.description,
-        subjectRefs: [delta.characterId],
+        subjectRefs: [subjectIdentity.canonicalId],
         narrativeRange: { start: input.narrativeOrder, end: input.narrativeOrder },
-        knowledgeScope: { characterId: delta.characterId },
+        knowledgeScope: { characterId: subjectIdentity.canonicalId },
         authority: "derived",
         confidence: 0.85,
         sourceRevisionIds: [input.revisionId],
@@ -265,7 +305,8 @@ export async function persistCharacterEnrichment(input: { projectId: string; doc
     // 回归风险：无——ON CONFLICT DO NOTHING 对已存在 entity 无副作用；新 stub entity
     // 仅满足 FK + 图遍历可达性，不影响 character-reviewer（它按 subject 富化数据审校）。
     for (const relation of delta.relationDeltas) {
-      const objectEntityId = `entity:${input.projectId}:character:${relation.targetCharacterId}`;
+      const targetIdentity = resolveCharacterIdentity(input.projectId, relation.targetCharacterId, characterRegistry.index);
+      const objectEntityId = targetIdentity.entityId;
       await deps.repository.pool.query(
         `INSERT INTO entities(id, project_id, kind, name, payload)
          VALUES($1, $2, 'character', $3, $4)
@@ -273,8 +314,8 @@ export async function persistCharacterEnrichment(input: { projectId: string; doc
         [
           objectEntityId,
           input.projectId,
-          relation.targetCharacterId,
-          { autoCreated: true, autoCreatedFrom: "relation", sourceRevisionId: input.revisionId, narrativeOrder: input.narrativeOrder, pendingEnrichment: true },
+          targetIdentity.displayName,
+          { autoCreated: true, autoCreatedFrom: "relation", sourceRevisionId: input.revisionId, narrativeOrder: input.narrativeOrder, pendingEnrichment: true, ...characterIdentityPayload(targetIdentity) },
         ],
       );
       const relationId = `relation:${input.projectId}:${subjectEntityId}:${relation.predicate}:${objectEntityId}:${input.revisionId}`;

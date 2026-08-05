@@ -37,12 +37,12 @@ const mockCtx = {
 // ===== A. 纯函数：validateToolArgs（无 Postgres 依赖）=====
 
 describe("validateToolArgs pure function", () => {
-  it("TOOL_NAMES has exactly 29 tools", () => {
-    expect(TOOL_NAMES).toHaveLength(29);
+  it("TOOL_NAMES has exactly 32 tools", () => {
+    expect(TOOL_NAMES).toHaveLength(32);
   });
 
-  it("TOOL_DEFINITIONS has 29 defs, each with name/description/inputSchema", () => {
-    expect(TOOL_DEFINITIONS).toHaveLength(29);
+  it("TOOL_DEFINITIONS has 32 defs, each with name/description/inputSchema", () => {
+    expect(TOOL_DEFINITIONS).toHaveLength(32);
     for (const def of TOOL_DEFINITIONS) {
       expect(typeof def.name).toBe("string");
       expect(def.name.length).toBeGreaterThan(0);
@@ -73,6 +73,25 @@ describe("validateToolArgs pure function", () => {
       scenarioClass: "",
       scenarioRole: "source-failure",
     });
+  });
+
+  it("accepts targeted chapter review arguments", () => {
+    expect(validateToolArgs("novel_chapter_review", {
+      projectId: "p-1",
+      documentId: "d-1",
+      mode: "targeted",
+      targetIssueIds: ["issue-1"],
+      idempotencyKey: "review-targeted-1",
+    }).valid).toBe(true);
+  });
+
+  it("rejects an invalid chapter review mode at schema validation", () => {
+    expect(validateToolArgs("novel_chapter_review", {
+      projectId: "p-1",
+      documentId: "d-1",
+      mode: "partial",
+      idempotencyKey: "review-invalid-mode",
+    }).valid).toBe(false);
   });
 
   it("unknown tool → valid=false", () => {
@@ -257,7 +276,131 @@ describe("executeTool error paths", () => {
     expect(putWorkflowRun).toHaveBeenCalledWith(expect.objectContaining({ temporalWorkflowId: payload.workflowId, workflowType: "chapter-review" }));
     expect(start).toHaveBeenCalledWith("chapterReviewWorkflow", expect.objectContaining({
       workflowId: payload.workflowId,
-      args: [expect.objectContaining({ projectId: "p1", documentId: "d1", workflowId: payload.workflowId })],
+      args: [expect.objectContaining({ projectId: "p1", documentId: "d1", workflowId: payload.workflowId, mode: "full", targetIssueIds: undefined })],
+    }));
+  });
+
+  it("novel_chapter_review routes targeted issue ids into the formal workflow", async () => {
+    const putWorkflowRun = vi.fn().mockResolvedValue(undefined);
+    const start = vi.fn().mockResolvedValue({ firstExecutionRunId: "temporal-run-targeted-1" });
+    const result = await executeTool(
+      "novel_chapter_review",
+      { projectId: "p1", documentId: "d1", mode: "targeted", targetIssueIds: ["issue-1", "issue-2"], idempotencyKey: "review-targeted-1" },
+      {
+        repository: { getChapterReviewPreflight: vi.fn().mockResolvedValue({ status: "final", baseRevision: 1, hasBlueprint: true }), putWorkflowRun } as never,
+        temporal: { workflow: { start } } as never,
+        taskQueue: "novel-v2",
+      },
+    );
+    expect(result.isError).toBeFalsy();
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.mode).toBe("targeted");
+    expect(payload.targetIssueIds).toEqual(["issue-1", "issue-2"]);
+    expect(putWorkflowRun).toHaveBeenCalledWith(expect.objectContaining({
+      payload: expect.objectContaining({ mode: "targeted", targetIssueIds: ["issue-1", "issue-2"] }),
+    }));
+    expect(start).toHaveBeenCalledWith("chapterReviewWorkflow", expect.objectContaining({
+      args: [expect.objectContaining({ mode: "targeted", targetIssueIds: ["issue-1", "issue-2"] })],
+    }));
+  });
+
+  it("novel_chapter_review_issue_add persists an author issue without mutating the manuscript", async () => {
+    const addChapterReviewIssue = vi.fn().mockResolvedValue({ id: "issue-1", status: "pending" });
+    const result = await executeTool(
+      "novel_chapter_review_issue_add",
+      { projectId: "p1", documentId: "d1", severity: "major", title: "推断超出蓝图边界", evidenceQuote: "正文证据", paragraph: 3, suggestion: "收回为未解观察" },
+      { repository: { addChapterReviewIssue } as never },
+    );
+    expect(result.isError).toBeFalsy();
+    expect(addChapterReviewIssue).toHaveBeenCalledWith(expect.objectContaining({
+      projectId: "p1", documentId: "d1", severity: "major", title: "推断超出蓝图边界", paragraph: 3,
+    }));
+  });
+
+  it("novel_chapter_review_issue_add rejects an invalid severity", async () => {
+    const result = await executeTool(
+      "novel_chapter_review_issue_add",
+      { projectId: "p1", documentId: "d1", severity: "info", title: "无效" },
+      { repository: { addChapterReviewIssue: vi.fn() } as never },
+    );
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("参数校验失败");
+  });
+
+  it("rejects targeted chapter review without issue ids before starting Temporal", async () => {
+    const start = vi.fn();
+    const result = await executeTool(
+      "novel_chapter_review",
+      { projectId: "p1", documentId: "d1", mode: "targeted", idempotencyKey: "review-targeted-missing" },
+      {
+        repository: { getChapterReviewPreflight: vi.fn(), putWorkflowRun: vi.fn() } as never,
+        temporal: { workflow: { start } } as never,
+        taskQueue: "novel-v2",
+      },
+    );
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("targetIssueIds");
+    expect(start).not.toHaveBeenCalled();
+  });
+
+  it("novel_story_arc_review resumes an existing blueprint through the formal review workflow", async () => {
+    const putWorkflowRun = vi.fn().mockResolvedValue(undefined);
+    const start = vi.fn().mockResolvedValue({ firstExecutionRunId: "temporal-run-arc-review-1" });
+    const result = await executeTool(
+      "novel_story_arc_review",
+      { projectId: "p1", arcId: "arc-1" },
+      {
+        repository: {
+          getStoryArc: vi.fn().mockResolvedValue({
+            id: "arc-1",
+            planningStatus: "failed",
+            blueprintArtifactId: "blueprint-1",
+            chapters: [],
+          }),
+          prepareStoryArcReviewRetry: vi.fn().mockResolvedValue({
+            id: "arc-1",
+            planningStatus: "awaiting-review",
+            executionStatus: "planned",
+            blueprintArtifactId: "blueprint-1",
+            chapters: [],
+          }),
+          putWorkflowRun,
+        } as never,
+        temporal: { workflow: { start } } as never,
+        taskQueue: "novel-v2",
+      },
+    );
+    expect(result.isError).toBeFalsy();
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.status).toBe("accepted");
+    expect(putWorkflowRun).toHaveBeenCalledWith(expect.objectContaining({
+      workflowType: "story-arc-planning",
+      payload: expect.objectContaining({ existingArtifactId: "blueprint-1", rebase: false }),
+    }));
+    expect(start).toHaveBeenCalledWith("storyArcPlanningWorkflow", expect.objectContaining({
+      args: [expect.objectContaining({ existingArtifactId: "blueprint-1", rebase: false })],
+    }));
+  });
+
+  it("novel_story_arc_batch_start plans the next batch through the formal workflow", async () => {
+    const putWorkflowRun = vi.fn().mockResolvedValue(undefined);
+    const prepareNextStoryArcBatch = vi.fn().mockResolvedValue({ batchIndex: 2, startChapterIndex: 11 });
+    const start = vi.fn().mockResolvedValue({ firstExecutionRunId: "temporal-run-arc-batch-1" });
+    const result = await executeTool(
+      "novel_story_arc_batch_start",
+      { projectId: "p1", arcId: "arc-1" },
+      {
+        repository: { prepareNextStoryArcBatch, putWorkflowRun } as never,
+        temporal: { workflow: { start } } as never,
+        taskQueue: "novel-v2",
+      },
+    );
+    expect(result.isError).toBeFalsy();
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload).toMatchObject({ status: "accepted", batchIndex: 2, startChapterIndex: 11 });
+    expect(prepareNextStoryArcBatch).toHaveBeenCalledWith("p1", "arc-1");
+    expect(start).toHaveBeenCalledWith("storyArcPlanningWorkflow", expect.objectContaining({
+      args: [expect.objectContaining({ arcId: "arc-1", batchIndex: 2, startChapterIndex: 11 })],
     }));
   });
 });

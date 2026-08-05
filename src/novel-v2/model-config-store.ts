@@ -13,6 +13,18 @@ import {
 
 export const DEFAULT_MODEL_CONFIG_PATH = join(process.cwd(), "config", "model-providers.local.yaml");
 
+function normalizeLoadedConfig(value: ModelRoutingConfig): ModelRoutingConfig {
+  const legacy = value as ModelRoutingConfig & { profiles: Array<ModelProviderProfile & { structuredOutput?: unknown }> };
+  return {
+    ...legacy,
+    profiles: (legacy.profiles ?? []).map((profile) => {
+      const normalized = { ...profile } as ModelProviderProfile & { structuredOutput?: unknown };
+      delete normalized.structuredOutput;
+      return normalized;
+    }),
+  };
+}
+
 export function applyRuntimeModelOverrides(
   config: ModelRoutingConfig,
   overrides: { embeddingBaseUrl?: string } = {},
@@ -53,7 +65,7 @@ export class ModelConfigStore {
 
   async load(): Promise<ModelRoutingConfig> {
     try {
-      const parsed = parse(await readFile(this.path, "utf8")) as ModelRoutingConfig;
+      const parsed = normalizeLoadedConfig(parse(await readFile(this.path, "utf8")) as ModelRoutingConfig);
       validateModelRoutingConfig(parsed);
       this.current = applyRuntimeModelOverrides(parsed, { embeddingBaseUrl: process.env.NOVEL_EMBEDDING_BASE_URL });
       this.snapshot = createRoutingSnapshot(this.current);
@@ -69,7 +81,7 @@ export class ModelConfigStore {
     try {
       const stats = statSync(this.path);
       if (this.loadedMtimeMs !== undefined && stats.mtimeMs <= this.loadedMtimeMs) return;
-      const parsed = parse(readFileSync(this.path, "utf8")) as ModelRoutingConfig;
+      const parsed = normalizeLoadedConfig(parse(readFileSync(this.path, "utf8")) as ModelRoutingConfig);
       validateModelRoutingConfig(parsed);
       this.current = applyRuntimeModelOverrides(parsed, { embeddingBaseUrl: process.env.NOVEL_EMBEDDING_BASE_URL });
       this.snapshot = createRoutingSnapshot(this.current);

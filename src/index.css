@@ -98,6 +98,67 @@ body {
   margin-top: 24px;
 }
 
+.settings-candidate-chain-scroll {
+  width: 100%;
+  overflow-x: auto;
+  overscroll-behavior-inline: contain;
+  padding: 2px 0 6px;
+  scrollbar-width: thin;
+}
+
+.settings-candidate-chain {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  width: max-content;
+  min-width: 100%;
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.settings-candidate-chain-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 190px;
+  min-width: 0;
+  padding: 6px 8px;
+  background: #1f1f23;
+  border: 1px solid #303034;
+  border-radius: 6px;
+  cursor: grab;
+  touch-action: none;
+  transition: border-color 0.18s ease, background-color 0.18s ease;
+}
+
+.settings-candidate-chain-item:active {
+  cursor: grabbing;
+}
+
+.settings-candidate-chain-item:hover {
+  background: #252529;
+  border-color: #3f3f46;
+}
+
+.settings-candidate-chain-handle {
+  flex: 0 0 auto;
+  color: #888;
+}
+
+.settings-candidate-chain-label {
+  min-width: 0;
+  flex: 1 1 auto;
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.settings-candidate-chain-item > .ant-btn {
+  flex: 0 0 auto;
+}
+
 @media (max-width: 767px) {
   .settings-page {
     padding: 20px 16px 36px;

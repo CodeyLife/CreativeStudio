@@ -55,6 +55,7 @@ import {
   useNovelRunEvents,
   useNovelRunReviews,
   useNovelRunPromptExecutions,
+  useNovelRunModelInvocations,
   useCancelNovelRun,
   useCreateChapterReviewIssue,
   useReplacePendingArtifact,
@@ -71,6 +72,7 @@ import {
   type NovelChapterReviewIssue,
   type NovelReviewSummary,
   type NovelPromptExecution,
+  type NovelModelInvocation,
   type NovelRunEvent,
   type NovelRunState,
   type NovelWorkflowRunRecord,
@@ -512,8 +514,8 @@ function RunStatusPanel({ run, document, superseded }: { run?: NovelRunState; do
   return <Alert type="info" showIcon message={`运行${statusMeta(run.status).label}`} description={stage ? `当前正在执行“${STAGE_META.find((item) => item.stage === stage)?.label ?? stage}”，完成后会自动刷新。` : "Runtime 已受理任务，正在准备执行上下文。"} />;
 }
 
-/** 章节正文工作台：纯文本是唯一事实源，保存、重审、从蓝图重写是三个显式动作。 */
-function ManuscriptWorkbench({ projectId, documentId, workspace, loading, error, onRefresh, activeParagraph, onDirtyChange, onRegenerateFromBlueprint }: { projectId: string; documentId?: string; workspace?: NovelChapterWorkspace; loading?: boolean; error?: boolean; onRefresh?: () => void; activeParagraph?: number; onDirtyChange?: (dirty: boolean) => void; onRegenerateFromBlueprint?: () => void }) {
+/** 章节正文工作台：纯文本是唯一事实源，保存、重审、按蓝图重新审校是三个显式动作。 */
+function ManuscriptWorkbench({ projectId, documentId, workspace, loading, error, onRefresh, activeParagraph, onDirtyChange, onReviewFromBlueprint }: { projectId: string; documentId?: string; workspace?: NovelChapterWorkspace; loading?: boolean; error?: boolean; onRefresh?: () => void; activeParagraph?: number; onDirtyChange?: (dirty: boolean) => void; onReviewFromBlueprint?: () => void }) {
   const [mode, setMode] = useState<"read" | "edit" | "diff">("read");
   const [edited, setEdited] = useState("");
   const save = useSaveNovelDocumentContent(projectId, documentId);
@@ -578,17 +580,17 @@ function ManuscriptWorkbench({ projectId, documentId, workspace, loading, error,
           )}
           {mode === "edit" && dirty && <Button size="small" icon={<SaveOutlined />} loading={save.isPending} onClick={() => void handleSave()}>保存</Button>}
           {content && <Button size="small" type="primary" loading={submit.isPending || save.isPending} onClick={() => void handleSubmit()}>{dirty ? "保存并重新审校" : "重新审校"}</Button>}
-          {content && onRegenerateFromBlueprint && (
+          {content && onReviewFromBlueprint && (
             <Popconfirm
-              title="从蓝图重新生成本章？"
-              description="会重新进入章节蓝图/草稿/审核/事实/提交流水线，当前定稿会保留到你批准新候选稿之后。"
-              okText="从蓝图重写"
+              title="按历史蓝图重新审校本章？"
+              description="会从当前定稿和历史 blueprint 进入审核、修订、事实提取与提交闭环，当前定稿会保留到新候选稿获批之后。"
+              okText="重新审校"
               cancelText="取消"
-              onConfirm={onRegenerateFromBlueprint}
+              onConfirm={onReviewFromBlueprint}
               disabled={dirty}
             >
-              <Tooltip title={dirty ? "正文有未保存修改，请先保存或放弃编辑" : "不是基于审核意见局部修复，而是从章节蓝图重新生成整章候选"}>
-                <span><Button size="small" icon={<ReloadOutlined />} disabled={dirty}>从蓝图重写</Button></span>
+              <Tooltip title={dirty ? "正文有未保存修改，请先保存或放弃编辑" : "基于历史章节蓝图重新启动完整审校闭环"}>
+                <span><Button size="small" icon={<ReloadOutlined />} disabled={dirty}>按蓝图重新审校</Button></span>
               </Tooltip>
             </Popconfirm>
           )}
@@ -839,8 +841,8 @@ function FactReviewWorkspace({ candidates, loading, deciding, onDecide, onContin
   </section>;
 }
 
-function FinalWorkspace({ projectId, documentId, workspace, loading, error, onRefresh, activeParagraph, onDirtyChange, onRegenerateFromBlueprint }: { projectId: string; documentId?: string; workspace?: NovelChapterWorkspace; loading: boolean; error: boolean; onRefresh: () => void; activeParagraph?: number; onDirtyChange?: (dirty: boolean) => void; onRegenerateFromBlueprint?: () => void }) {
-  return <ManuscriptWorkbench projectId={projectId} documentId={documentId} workspace={workspace} loading={loading} error={error} onRefresh={onRefresh} activeParagraph={activeParagraph} onDirtyChange={onDirtyChange} onRegenerateFromBlueprint={onRegenerateFromBlueprint} />;
+function FinalWorkspace({ projectId, documentId, workspace, loading, error, onRefresh, activeParagraph, onDirtyChange, onReviewFromBlueprint }: { projectId: string; documentId?: string; workspace?: NovelChapterWorkspace; loading: boolean; error: boolean; onRefresh: () => void; activeParagraph?: number; onDirtyChange?: (dirty: boolean) => void; onReviewFromBlueprint?: () => void }) {
+  return <ManuscriptWorkbench projectId={projectId} documentId={documentId} workspace={workspace} loading={loading} error={error} onRefresh={onRefresh} activeParagraph={activeParagraph} onDirtyChange={onDirtyChange} onReviewFromBlueprint={onReviewFromBlueprint} />;
 }
 
 function InterruptedReviewBanner({ run, retrying, onRetry, onOpenReview, onDismiss }: { run: NovelWorkflowRunRecord; retrying: boolean; onRetry: (instruction?: string) => void; onOpenReview: () => void; onDismiss: () => void }) {
@@ -961,6 +963,7 @@ function WorkflowInspector({
   reviews,
   events,
   promptExecutions,
+  modelInvocations,
   selectedStage,
   latestWorkflowId,
   onSelectWorkflow,
@@ -975,6 +978,7 @@ function WorkflowInspector({
   reviews: NovelReviewSummary[];
   events: NovelRunEvent[];
   promptExecutions: NovelPromptExecution[];
+  modelInvocations: NovelModelInvocation[];
   selectedStage: string | null;
   latestWorkflowId?: string;
   onSelectWorkflow: (workflowId: string) => void;
@@ -1054,23 +1058,36 @@ function WorkflowInspector({
       {latestReviewsByRole.map((review) => <article key={review.id}><strong>{review.role ?? review.reviewerId}</strong><span>{review.verdict}</span><b>{review.score?.toFixed(1) ?? "—"}<small>/5</small></b></article>)}
     </section>}
 
-    {promptExecutions.length > 0 && <details className="pb-workflow-prompts">
-      <summary><span><DatabaseOutlined /> 模型调用与上下文</span><b>{promptExecutions.length}</b></summary>
-      <div className="pb-prompt-call-list">{promptExecutions.slice(-12).reverse().map((execution) => {
-        const manifest = execution.contextManifest;
+    {(modelInvocations.length > 0 || promptExecutions.length > 0) && <details className="pb-workflow-prompts">
+      <summary><span><DatabaseOutlined /> 实际模型调用与上下文</span><b>{modelInvocations.length || promptExecutions.length}</b></summary>
+      {modelInvocations.length === 0 && <p className="pb-prompt-call-audit-missing">当前只返回了提示词快照，尚未返回实际 provider 审计；候选序号不能代表已命中的模型。</p>}
+      <div className="pb-prompt-call-list">{(modelInvocations.length > 0 ? modelInvocations.slice(-24).reverse() : promptExecutions.slice(-12).reverse()).map((call) => {
+        const invocation = "provider" in call ? call : undefined;
+        const execution = invocation
+          ? promptExecutions.find((item) => item.taskId === invocation.taskId && item.candidateIndex === invocation.candidateIndex)
+          : "contextManifest" in call ? call : undefined;
+        const manifest = execution?.contextManifest;
         const sectionReceipts = manifest?.sections ?? [];
         const included = sectionReceipts.filter((section) => section.status === "included").length;
         const excluded = sectionReceipts.filter((section) => section.status !== "included").length;
-        return <details key={execution.id} className={`pb-prompt-call is-${execution.status}`}>
-          <summary><div><strong>{execution.purpose}</strong><small>{relativeTime(execution.createdAt)} · candidate {execution.candidateIndex + 1}</small></div><span>{manifest?.estimatedInputTokens?.toLocaleString() ?? "—"}<small> tokens</small></span></summary>
+        const status = invocation?.status ?? call.status;
+        const routeState = invocation?.isCurrentConfig === false ? "历史路由" : invocation?.isCurrentConfig === true ? "当前路由" : "路由未知";
+        const routeRevision = invocation?.configRevision ? invocation.configRevision.slice(0, 8) : "未知版本";
+        return <details key={invocation ? `${invocation.id}` : call.id} className={`pb-prompt-call is-${status === "completed" ? "completed" : "failed"}`}>
+          <summary><div><strong>{invocation?.purpose ?? call.purpose}</strong><small>{relativeTime(invocation?.createdAt ?? call.createdAt)} · 候选 {(invocation?.candidateIndex ?? call.candidateIndex) + 1}</small></div><span className="pb-prompt-call-provider">{invocation ? `${invocation.provider} · ${invocation.model}` : "provider 未返回"}<small>{invocation?.latencyMs ? `${invocation.latencyMs} ms` : "等待审计"}</small></span></summary>
           <div className="pb-prompt-call-meta">
+            {invocation?.protocol && <Tag color="blue">{invocation.protocol}</Tag>}
+            {invocation && <Tag color={invocation.status === "completed" ? "green" : "red"}>{invocation.status === "completed" ? "已完成" : invocation.status}</Tag>}
+            {invocation && <Tag color={invocation.isCurrentConfig === false ? "gold" : "cyan"}>{routeState} {routeRevision}</Tag>}
             {manifest?.goalId && <Tag color="cyan">目标 {manifest.goalId.slice(-8)}</Tag>}
             {manifest?.maxInputTokens && <Tag>预算 {manifest.maxInputTokens.toLocaleString()}</Tag>}
             {sectionReceipts.length > 0 && <Tag color="green">纳入 {included}</Tag>}
             {excluded > 0 && <Tag color="gold">裁剪 {excluded}</Tag>}
-            {execution.errorCategory && <Tag color="red">{execution.errorCategory}</Tag>}
+            {invocation?.errorCategory && <Tag color="red">{invocation.errorCategory}</Tag>}
+            {!invocation && call.errorCategory && <Tag color="red">{call.errorCategory}</Tag>}
           </div>
-          {sectionReceipts.length > 0 && <div className="pb-prompt-sections">{sectionReceipts.map((section) => <div key={`${execution.id}:${section.id}`} className={`is-${section.status}`}><span>{section.title}</span><small>{section.estimatedTokens} t · {section.reason}</small></div>)}</div>}
+          {(invocation?.errorMessage || (!invocation && call.errorCategory)) && <p className="pb-prompt-call-error">{invocation?.errorMessage ?? call.errorCategory}</p>}
+          {sectionReceipts.length > 0 && <div className="pb-prompt-sections">{sectionReceipts.map((section) => <div key={`${execution?.id ?? call.id}:${section.id}`} className={`is-${section.status}`}><span>{section.title}</span><small>{section.estimatedTokens} t · {section.reason}</small></div>)}</div>}
         </details>;
       })}</div>
     </details>}
@@ -1197,6 +1214,7 @@ export default function NovelProductionWorkspace({
   const eventsQ = useNovelRunEvents(mainWorkflowId, isActive);
   const artifactsQ = useNovelRunArtifacts(mainWorkflowId, isActive);
   const reviewsQ = useNovelRunReviews(mainWorkflowId, isActive);
+  const submitBlueprintReview = useSubmitChapterReview(projectId, selectedDocId);
   const artifacts = artifactsQ.data ?? [];
   const reviews = reviewsQ.data ?? [];
   const factsQ = useNovelFactCandidates(projectId, selectedDocId);
@@ -1218,6 +1236,7 @@ export default function NovelProductionWorkspace({
   const diagnosticArtifactsQ = useNovelRunArtifacts(effectiveDiagnosticWfId, diagnosticActive);
   const diagnosticReviewsQ = useNovelRunReviews(effectiveDiagnosticWfId, diagnosticActive);
   const diagnosticPromptsQ = useNovelRunPromptExecutions(effectiveDiagnosticWfId, diagnosticActive);
+  const diagnosticInvocationsQ = useNovelRunModelInvocations(effectiveDiagnosticWfId, diagnosticActive);
 
   useEffect(() => {
     if (selectedDocId) return;
@@ -1364,6 +1383,20 @@ export default function NovelProductionWorkspace({
 
   const chapterMeta = CHAPTER_MODE_META[workspaceState.mode];
 
+  async function handleBlueprintReview() {
+    try {
+      const result = await submitBlueprintReview.mutateAsync({
+        instruction: "基于该章节历史 blueprint 与当前定稿，进行完整章节审校与优化；不要只做局部修补，必须复用正式的审核、修订、事实提取与提交闭环。",
+      });
+      setDiagnosticWfId(result.workflowId);
+      setContextTab("workflow");
+      onSelectionChange?.({ documentId: selectedDocId, workflowId: result.workflowId, stage: "review" });
+      message.success("已按历史蓝图重新发起章节审校");
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : String(error));
+    }
+  }
+
   function renderAuthorWorkspace() {
     if (!selectedDocument) return <WorkspaceEmpty><span className="pb-author-empty-icon"><FileTextOutlined /></span><h3>选择一个章节开始工作</h3><p>左侧会根据每章当前状态显示需要处理的事项。</p></WorkspaceEmpty>;
     if (workspaceState.mode === "planned") return <PlannedWorkspace document={selectedDocument} onStart={() => onStartCreation?.(selectedDocument)} onDelete={() => onDeleteChapter?.(selectedDocument)} />;
@@ -1371,7 +1404,7 @@ export default function NovelProductionWorkspace({
     if (liveWorkspaceMode === "manuscript-review" || liveWorkspaceMode === "fact-review") return renderGateWorkspace();
     if (workspaceState.mode === "final") return <>
       {interruptedReviewRun && interruptedReviewRun.temporalWorkflowId !== dismissedReviewRunId && <InterruptedReviewBanner run={interruptedReviewRun} retrying={retryTargetedReview.isPending} onRetry={(instruction) => void handleRetryTargetedReview(instruction)} onOpenReview={() => setContextTab("review")} onDismiss={() => { rememberDismissedReviewRun(projectId, interruptedReviewRun.temporalWorkflowId); setDismissedReviewRunId(interruptedReviewRun.temporalWorkflowId); }} />}
-      <FinalWorkspace projectId={projectId} documentId={selectedDocId} workspace={workspaceQ.data} loading={workspaceQ.isLoading} error={workspaceQ.isError} onRefresh={() => void workspaceQ.refetch()} activeParagraph={activeParagraph} onDirtyChange={setManuscriptDirty} onRegenerateFromBlueprint={() => { void onStartCreation?.(selectedDocument); }} />
+      <FinalWorkspace projectId={projectId} documentId={selectedDocId} workspace={workspaceQ.data} loading={workspaceQ.isLoading} error={workspaceQ.isError} onRefresh={() => void workspaceQ.refetch()} activeParagraph={activeParagraph} onDirtyChange={setManuscriptDirty} onReviewFromBlueprint={() => { void handleBlueprintReview(); }} />
     </>;
     return <AttentionWorkspace mode={workspaceState.mode === "failed" ? "failed" : "stalled"} run={workspaceState.latestRun} onRetry={() => onStartCreation?.(selectedDocument)} onKnowledge={onOpenKnowledge} />;
   }
@@ -1426,6 +1459,7 @@ export default function NovelProductionWorkspace({
                 reviews: diagnosticReviewsQ.data ?? [],
                 events: diagnosticEventsQ.data ?? [],
                 promptExecutions: diagnosticPromptsQ.data ?? [],
+                modelInvocations: diagnosticInvocationsQ.data ?? [],
                 selectedStage,
                 latestWorkflowId: mainWorkflowId,
                 onSelectWorkflow: selectDiagnosticWorkflow,

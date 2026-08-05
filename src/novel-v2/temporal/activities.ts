@@ -10,14 +10,14 @@ import { ContentObjectStore } from "../object-store";
 import { normalizeStoryArcRebaseBundle, parseStoryArcBundle, validateChapterExecutionContract, validateStoryArcExecutionContracts, validateStoryArcRebaseBundle, type ChapterPlanningContext, type StoryArcBundle } from "../application/story-arc";
 import { mergeStoryArcReviews, normalizeStoryArcReviewAuthority } from "../application/story-arc-review-policy";
 import { inspectManuscript, structuralReviewFromReport, type ManuscriptStructuralReport } from "../application/manuscript-structure";
-import { buildStoryArcBatchPrompt, buildStoryArcPlanningContextSections, buildStoryArcPrompt, buildStoryArcRebasePrompt, buildStoryArcReviewPrompt, buildStoryArcRevisionPrompt, storyArcBundleSchema, storyArcReviewSchema, validateStoryArcReview, type StoryArcReviewOutput } from "../prompts/story-arc";
+import { buildStoryArcChaptersPrompt, buildStoryArcPlanPrompt, buildStoryArcPlanningContextSections, buildStoryArcReviewPrompt, buildStoryArcRevisionPrompt, storyArcBundleSchema, storyArcChaptersOutputSchema, storyArcPlanBatchSchema, storyArcReviewSchema, validateStoryArcReview, type StoryArcReviewOutput } from "../prompts/story-arc";
 import { foundationArtifactToMemoryClaim } from "../foundation-memory";
 import { CommitService } from "../commit-service";
 import type { MemoryIndex } from "../qdrant-memory";
 import { assessRuntimeLearningWithModel, reviewIssuesForLearning, buildRuntimeLearningPrompt, parseRuntimeLearningAssessmentV2, runtimeLearningAssessmentSchema } from "../learning-assessment";
 import { buildChapterDraftPromptPackage } from "../prompts/chapter-draft";
 import { buildChapterReviewPromptPackage, getReviewFocus, groundReviewForText, groundReviewerIssues, reviewExecutionPoint, selectReviewerMemory, selectReviewerSkills, toReview, type ReviewerRole } from "../prompts/chapter-review";
-import { applyRevisionWindows, applyTargetedRevisionReplacements, authorRevisionAlignmentSchema, buildAuthorRevisionRepairPrompt, buildFullChapterRevisionPromptPackage, buildRevisionWindowPrompt, buildTargetedRevisionBatchPrompt, planRevisionWindows, revisionWindowsCoverAllIssues, sanitizeRevisionOutput, shouldUseRevisionWindows, splitChapterParagraphs, targetedRevisionBatchSchema, type AuthorRevisionAlignment, type RevisionAttempt, type TargetedRevisionReplacement } from "../prompts/chapter-revision";
+import { applyRevisionWindows, applyTargetedRevisionReplacements, authorRevisionAlignmentSchema, buildAuthorRevisionRepairPrompt, buildFullChapterRevisionPromptPackage, buildRevisionWindowPrompt, buildTargetedRevisionBatchPrompt, planRevisionWindows, revisionWindowsCoverAllIssues, sanitizeRevisionOutput, shouldUseRevisionWindows, splitChapterParagraphs, TargetedRevisionContractError, targetedRevisionBatchSchema, type AuthorRevisionAlignment, type RevisionAttempt, type TargetedRevisionReplacement } from "../prompts/chapter-revision";
 import { chapterStateDeltaSchema, reviewerSchema, type ChapterStateDelta, type FactExtractionOutput, type FoundationOutput, type ReviewerOutput } from "../prompts/schemas";
 import { extractFactsWithStats, projectFactExtractionOutput } from "../fact-extraction";
 import { enrichCharactersFromChapter, parseCharacterEnrichmentOutput, persistCharacterEnrichment, validateCharacterEnrichmentOutput } from "../character-enrichment";
@@ -28,7 +28,7 @@ import { countNovelCharacters } from "../word-count";
 import { buildFoundationPrompt, FOUNDATION_SYSTEM_PROMPT } from "../prompts/foundation";
 import { compileStageContext, createStageGoalContract, StageContextBudgetError } from "../stage-context";
 import { reviewIssueFingerprint } from "../chapter-review-snapshot";
-import { buildRevisionBrief } from "../application/revision-brief";
+import { buildRevisionBrief, shouldBlockRevisionForConflicts } from "../application/revision-brief";
 import { classifyRevisionEvidence } from "./revision-policy";
 import { buildSkillContextSections, resolveStageSkillBundle } from "../skill-runtime";
 import {
@@ -65,7 +65,7 @@ import {
   submitReview as creativeSubmitReview,
 } from "../creative";
 import { parseCreativeBrief } from "../application/creative-brief";
-import { assertFoundationTaskContract, foundationSchemaForTask } from "../application/foundation-contract";
+import { assertFoundationTaskContract, foundationSchemaForTask, normalizeFoundationModelOutput } from "../application/foundation-contract";
 import { hasPassedIndependentReviewForArtifact } from "../creative/review-gate";
 import { isProjectPlanTaskKey, isRetiredFoundationTaskKey, requiresFoundationAuthorConfirmation } from "../application/project-plan";
 import { buildFoundationReviewPrompt, foundationReviewSchema, type FoundationReviewOutput } from "../prompts/foundation-review";
@@ -80,11 +80,23 @@ type GeneratedReviewResult = { kind: "completed"; review: Review } | { kind: "ex
 type GeneratedArtifactResult = { kind: "completed"; artifact: Artifact } | { kind: "external"; task: ModelTaskRecord; artifact: Artifact };
 type GeneratedLearningResult = { kind: "completed"; assessment: RuntimeLearningAssessmentV2 } | { kind: "external"; task: ModelTaskRecord };
 type GeneratedStoryArcResult = { kind: "completed"; artifact: Artifact; bundle: StoryArcBundle } | { kind: "external"; task: ModelTaskRecord };
+type StoryArcPlanOutput = Pick<StoryArcBundle, "arc" | "batch">;
+type StoryArcChaptersOutput = Pick<StoryArcBundle, "chapters">;
 type GeneratedStoryArcReviewResult = { kind: "completed"; artifact: Artifact; review: StoryArcReviewOutput } | { kind: "external"; task: ModelTaskRecord };
 type GeneratedBookSynopsisResult = { kind: "completed"; text: string } | { kind: "external"; task: ModelTaskRecord };
 type GeneratedBookTitleCandidatesResult = { kind: "completed"; candidates: BookTitleCandidate[] } | { kind: "external"; task: ModelTaskRecord };
 type GeneratedChapterTitleResult = { kind: "completed"; title: string } | { kind: "external"; task: ModelTaskRecord };
 type TargetedRevisionBatchOutput = { replacements: TargetedRevisionReplacement[] };
+
+// TODO: Move the review-pass budget into the persisted model-route contract so
+// operators can tune provider latency without rebuilding the worker. The
+// default bounds one independent lens while leaving enough time for a large
+// structured architecture review; a slow lens is evidence to retain, not a
+// reason to block a complete independent review.
+const ARC_REVIEW_PASS_TIMEOUT_MS = (() => {
+  const configured = Number(process.env.NOVEL_ARC_REVIEW_PASS_TIMEOUT_MS);
+  return Number.isFinite(configured) && configured > 0 ? configured : 120_000;
+})();
 
 export function buildCraftRuleCandidateInput(assessment: RuntimeLearningAssessmentV2): Parameters<typeof createCraftRuleCandidate>[1] | undefined {
   if (assessment.conclusion !== "propose-improvement" || !assessment.candidate) return undefined;
@@ -362,6 +374,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       return current.length ? current : deps.repository.listFoundationArtifacts(input.projectId);
     },
     assertRequiredPlanApproved: (input: { projectId: string }) => deps.repository.assertRequiredPlanApproved(input.projectId),
+    assertChapterGenerationAllowed: (input: { projectId: string; documentId: string }) => deps.repository.assertChapterGenerationAllowed(input.projectId, input.documentId),
     loadChapterPlanningContext: (input: { projectId: string; documentId: string }) => deps.repository.getChapterPlanningContext(input.projectId, input.documentId),
     loadChapterPlanningContextSnapshot: (input: { blueprintId: string }) => deps.repository.getChapterPlanningContextSnapshot(input.blueprintId),
     draft: async (input: { workflowId: string; intent: NovelIntent; blueprint: ExecutionBlueprint; memory: MemoryBundle; skills: SkillBundle; routingSnapshot: ModelRoutingSnapshot; candidateStartIndex?: number; foundationArtifacts?: Artifact[]; planningContext?: ChapterPlanningContext }): Promise<GeneratedTextResult> => {
@@ -418,12 +431,20 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
             candidateStartIndex: input.candidateStartIndex,
             promptContext: promptPackage.manifest,
           });
-        const review = { ...toReview({ artifact: input.artifact, identity: input.identity, role: input.role, output: generated.value, text: input.text }), modelProvenance: generated.provenance };
+        const review = {
+          ...toReview({ artifact: input.artifact, identity: input.identity, role: input.role, output: generated.value, text: input.text }),
+          modelProvenance: {
+            ...generated.provenance,
+            skillBundleId: roleSkills.id,
+            skillBundleFingerprint: roleSkills.fingerprint,
+            contextManifestId: promptPackage.manifest.id,
+          },
+        };
         await deps.repository.putReview(review, { refreshChapterSnapshot: !input.suppressChapterSnapshotPromotion });
         return { kind: "completed", review };
       } catch (error) {
         if (!(error instanceof ExternalMcpRequiredError)) throw error;
-        const task = await externalTask({ workflowId: input.workflowId, taskId: `${input.artifact.taskId}:review:${input.role}`, purpose: reviewerPurpose(input.role), candidateIndex: error.candidateIndex, routingSnapshot: input.routingSnapshot, outputKind: "review", system, instruction: prompt, schema: roleSchema, schemaName: `reviewer:${input.role}`, baseRevision: input.artifact.baseRevision, contextRefs: { artifactId: input.artifact.id, blueprintId: input.blueprint.id, memoryBundleId: roleMemory.id, skillBundleId: roleSkills.id, goalId: stageGoal?.id }, promptContext: promptPackage.manifest });
+        const task = await externalTask({ workflowId: input.workflowId, taskId: `${input.artifact.taskId}:review:${input.role}`, purpose: reviewerPurpose(input.role), candidateIndex: error.candidateIndex, routingSnapshot: input.routingSnapshot, outputKind: "review", system, instruction: prompt, schema: roleSchema, schemaName: `reviewer:${input.role}`, baseRevision: input.artifact.baseRevision, contextRefs: { artifactId: input.artifact.id, blueprintId: input.blueprint.id, memoryBundleId: roleMemory.id, skillBundleId: roleSkills.id, skillBundleFingerprint: roleSkills.fingerprint, contextManifestId: promptPackage.manifest.id, goalId: stageGoal?.id }, promptContext: promptPackage.manifest });
         return { kind: "external", task };
       }
     },
@@ -447,12 +468,13 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       const revisionEvidence = classifyRevisionEvidence(groundedReviews);
       const revisionBrief = buildRevisionBrief(groundedReviews, groundedDirectedIssues, {
         includeWarnings: revisionEvidence === "quality-warning",
+        includeDirectedReviewEvidence: Boolean(groundedDirectedIssues?.length),
       });
-      if (revisionBrief.conflicts.length) {
+      const hasAuthorInstruction = Boolean(input.authorInstruction?.trim());
+      if (shouldBlockRevisionForConflicts(revisionBrief.conflicts, hasAuthorInstruction)) {
         throw new Error(`revision-brief-conflict: ${revisionBrief.conflicts.map((conflict) => conflict.mechanism).join("、")}`);
       }
       const actionableIssues = revisionBrief.issues;
-      const hasAuthorInstruction = Boolean(input.authorInstruction?.trim());
       const stageGoal = actionableIssues.length || hasAuthorInstruction ? createStageGoalContract({
         projectId: input.intent.projectId,
         workflowId: input.workflowId,
@@ -488,8 +510,12 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       });
       try {
         const windows = planRevisionWindows(input.text, actionableIssues);
-        if (input.strictRevisionWindows && !windows.length) throw new Error("目标意见无法解析出安全修订窗口");
-        const requiresFullRevision = !input.strictRevisionWindows && !revisionWindowsCoverAllIssues(windows, actionableIssues);
+        // 审核范围来自旧正文时可能失效；窗口规划器会按当前段落、摘录和证据回定位。
+        // 只有所有 actionable issue 都能安全落到当前正文，才允许严格局部修订。
+        const windowsCoverAllIssues = revisionWindowsCoverAllIssues(windows, actionableIssues);
+        const strictRevisionWindows = Boolean(input.strictRevisionWindows && windows.length && windowsCoverAllIssues);
+        if (input.strictRevisionWindows && !windowsCoverAllIssues && !hasAuthorInstruction) throw new Error("目标意见无法解析出安全修订窗口");
+        const requiresFullRevision = !strictRevisionWindows && !windowsCoverAllIssues;
         const useRevisionWindows = shouldUseRevisionWindows({ requiresFullRevision, authorInstruction: input.authorInstruction });
         const paragraphs = splitChapterParagraphs(input.text);
         const replacements: Array<{ window: (typeof windows)[number]; text: string }> = [];
@@ -556,7 +582,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
             // A batch that cannot fit the existing input budget falls back to
             // the previous per-window path, which keeps the quality boundary
             // for long chapters without making the common case more expensive.
-            if (!(error instanceof StageContextBudgetError)) throw error;
+            if (!(error instanceof StageContextBudgetError) && !(error instanceof TargetedRevisionContractError)) throw error;
           }
         }
         for (const window of revisionWindows) {
@@ -580,12 +606,12 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
             modelProvenance.push(generated.provenance);
           }
         }
-        if (input.strictRevisionWindows && replacements.length !== windows.length) throw new Error("AI 未实际修改全部目标段落");
+        if (strictRevisionWindows && replacements.length !== windows.length) throw new Error("AI 未实际修改全部目标段落");
         if (replacements.length) {
           const revisedText = applyRevisionWindows(input.text, replacements);
           return { kind: "completed", artifact: await makeArtifact({ projectId: input.intent.projectId, taskId: `${input.artifact.taskId}:revise`, kind: "revision", baseRevision: input.artifact.baseRevision, text: revisedText, structuredData: { modelProvenance, revisionWindows: replacements.map(({ window }) => ({ start: window.start + 1, end: window.end + 1, issueCount: window.issues.length })), stageGoal, workflowId: input.workflowId } }), text: revisedText };
         }
-        if (input.strictRevisionWindows) throw new Error("AI 未实际修改任何目标段落");
+        if (strictRevisionWindows) throw new Error("AI 未实际修改任何目标段落");
         const generated = await model.generateText({ purpose: "writing.revision", system, prompt: fullRevisionPackage.instruction, maxTokens: input.blueprint.budget.maxOutputTokens, temperature: REVISION_TEMPERATURE, workflowRunId: input.workflowId, taskId: `${input.artifact.taskId}:revise:full`, routingSnapshot: input.routingSnapshot, candidateStartIndex: input.candidateStartIndex, promptContext: fullRevisionPackage.manifest });
         let revisedText = sanitizeRevisionOutput(generated.text);
         const fullRevisionProvenance: ModelExecutionProvenance[] = [generated.provenance];
@@ -723,8 +749,10 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       } catch (error) {
         if (!(error instanceof ExternalMcpRequiredError)) throw error;
         const windows = planRevisionWindows(input.text, actionableIssues);
-        if (input.strictRevisionWindows && !windows.length) throw new Error("目标意见无法解析出安全修订窗口");
-        const useTargetedExternal = input.strictRevisionWindows && shouldUseRevisionWindows({ requiresFullRevision: false, authorInstruction: input.authorInstruction });
+        const windowsCoverAllIssues = revisionWindowsCoverAllIssues(windows, actionableIssues);
+        const strictRevisionWindows = Boolean(input.strictRevisionWindows && windows.length && windowsCoverAllIssues);
+        if (input.strictRevisionWindows && !windowsCoverAllIssues && !hasAuthorInstruction) throw new Error("目标意见无法解析出安全修订窗口");
+        const useTargetedExternal = strictRevisionWindows && shouldUseRevisionWindows({ requiresFullRevision: false, authorInstruction: input.authorInstruction });
         const targetedRevisionPackage = useTargetedExternal ? compileStageContext({
           projectId: input.intent.projectId,
           workflowId: input.workflowId,
@@ -753,10 +781,11 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
     },
     materializeExternalTargetedRevision: async (input: { projectId: string; modelTaskId: string; artifact: Artifact; text: string; issues: ReviewIssue[] }): Promise<{ artifact: Artifact; text: string }> => {
       const task = await deps.repository.getModelTask(input.modelTaskId);
-      const value = task?.result?.value as { replacements?: TargetedRevisionReplacement[] } | undefined;
-      if (!task || task.status !== "submitted" || !Array.isArray(value?.replacements)) throw new Error("外部定向修订任务尚未通过 Runtime 验证");
+      const value = task?.result?.value as unknown;
+      const validate = new Ajv({ allErrors: true, strict: false }).compile(targetedRevisionBatchSchema);
+      if (!task || task.status !== "submitted" || !validate(value)) throw new TargetedRevisionContractError(`外部定向修订结果无效：${validate.errors?.map((item) => item.message).join("；") ?? "任务未提交"}`);
       const windows = planRevisionWindows(input.text, input.issues);
-      const revisedText = applyTargetedRevisionReplacements(input.text, windows, value.replacements);
+      const revisedText = applyTargetedRevisionReplacements(input.text, windows, (value as { replacements: TargetedRevisionReplacement[] }).replacements);
       const stageGoal = task.workPackage.contextRefs.goalContract ? JSON.parse(task.workPackage.contextRefs.goalContract) as StageGoalContract : undefined;
       const artifact = await makeArtifact({ projectId: input.projectId, taskId: task.taskId, kind: "revision", baseRevision: input.artifact.baseRevision, text: revisedText, structuredData: { externalModelTaskId: task.id, revisionMode: "targeted-windows", revisionWindows: windows.map((window) => ({ start: window.start + 1, end: window.end + 1, issueCount: window.issues.length })), modelProvenance: { routeSnapshotId: task.configRevision, purpose: task.purpose, candidateIndex: task.candidateIndex, executor: "external-mcp", model: "external-mcp", promptFingerprint: task.workPackage.inputFingerprint }, stageGoal, workflowId: task.workflowRunId } });
       return { artifact, text: revisedText };
@@ -766,7 +795,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       const validate = new Ajv({ allErrors: true, strict: false }).compile(reviewerSchema);
       if (!task || task.status !== "submitted" || !validate(input.value)) throw new Error(`外部审核结果无效：${validate.errors?.map((item) => item.message).join("；") ?? "任务未提交"}`);
       const text = input.artifact.objectKey ? await objects.getText(input.artifact.objectKey) : undefined;
-      const review = { ...toReview({ artifact: input.artifact, identity: input.identity, role: input.role, output: input.value as ReviewerOutput, text }), modelProvenance: { routeSnapshotId: task.configRevision, purpose: task.purpose, candidateIndex: task.candidateIndex, executor: "external-mcp" as const, model: "external-mcp", promptFingerprint: task.workPackage.inputFingerprint } };
+      const review = { ...toReview({ artifact: input.artifact, identity: input.identity, role: input.role, output: input.value as ReviewerOutput, text }), modelProvenance: { routeSnapshotId: task.configRevision, purpose: task.purpose, candidateIndex: task.candidateIndex, executor: "external-mcp" as const, model: "external-mcp", promptFingerprint: task.workPackage.inputFingerprint, skillBundleId: task.workPackage.contextRefs.skillBundleId, skillBundleFingerprint: task.workPackage.contextRefs.skillBundleFingerprint, contextManifestId: task.workPackage.contextRefs.contextManifestId } };
       await deps.repository.putReview(review, { refreshChapterSnapshot: !input.suppressChapterSnapshotPromotion });
       return review;
     },
@@ -1525,49 +1554,71 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       return { title };
     },
 
-    generateStoryArcBundle: async (input: { workflowId: string; projectId: string; arcId: string; authorIntent?: string; candidateStartIndex?: number; batchIndex?: number; startChapterIndex?: number; rebase?: boolean }): Promise<GeneratedStoryArcResult> => {
+    generateStoryArcBundle: async (input: { workflowId: string; projectId: string; arcId: string; authorIntent?: string; routingSnapshot: ModelRoutingSnapshot; candidateStartIndex?: number; batchIndex?: number; startChapterIndex?: number; rebase?: boolean; arcPlan?: StoryArcPlanOutput }): Promise<GeneratedStoryArcResult> => {
       const planning = await deps.repository.getStoryArcPlanningInput(input.projectId);
       const skills = await resolveCurrentSkills({ projectId: input.projectId, executionPoint: "arc.plan", role: "planner" });
       const rebaseTarget = input.rebase ? await deps.repository.getStoryArcRebaseTarget(input.projectId, input.arcId) : undefined;
       const arc = input.batchIndex ? await deps.repository.getStoryArc(input.projectId, input.arcId) : undefined;
       if (input.batchIndex && !arc) throw new Error("故事弧不存在");
-      const prompt = rebaseTarget
-        ? buildStoryArcRebasePrompt({ ...planning, authorIntent: input.authorIntent, target: rebaseTarget })
-        : input.batchIndex && arc
-        ? buildStoryArcBatchPrompt({ ...planning, authorIntent: input.authorIntent, arc: arc.arc, batchIndex: input.batchIndex, startChapterIndex: input.startChapterIndex! })
-        : buildStoryArcPrompt({ ...planning, authorIntent: input.authorIntent });
       const system = "你是长篇小说故事弧策划师。只输出符合 schema 的 JSON。";
-      const promptPackage = compileSinglePrompt({ projectId: input.projectId, workflowId: input.workflowId, purpose: "planning.arc", stage: "planning", system, prompt, schema: storyArcBundleSchema as unknown as Record<string, unknown>, reservedOutputTokens: 12_000, provenanceRefs: [input.arcId], skillBundle: skills, skillExecutionPoint: "arc.plan" });
+      const existingPlan = input.arcPlan
+        ?? (input.batchIndex && arc ? { arc: arc.arc, batch: { batchIndex: input.batchIndex, startChapterIndex: input.startChapterIndex!, complete: false } } : undefined);
+      let plan = existingPlan;
+      let planProvenance: ModelExecutionProvenance | undefined;
+      if (!plan) {
+        const planPromptPackage = compileSinglePrompt({ projectId: input.projectId, workflowId: input.workflowId, purpose: "planning.arc", stage: "planning", system, prompt: buildStoryArcPlanPrompt({ ...planning, authorIntent: input.authorIntent }, rebaseTarget), schema: storyArcPlanBatchSchema as unknown as Record<string, unknown>, reservedOutputTokens: 8_000, provenanceRefs: [input.arcId, "segment:arc-batch"], skillBundle: skills, skillExecutionPoint: "arc.plan" });
+        try {
+          const generatedPlan = await model.generateStructured<StoryArcPlanOutput>({ purpose: "planning.arc", system, prompt: planPromptPackage.instruction, schema: storyArcPlanBatchSchema as unknown as Record<string, unknown>, schemaName: "story-arc-plan-batch", maxTokens: 8_000, workflowRunId: input.workflowId, taskId: `${input.arcId}:story-arc:arc-batch`, routingSnapshot: input.routingSnapshot, candidateStartIndex: input.candidateStartIndex, promptContext: planPromptPackage.manifest });
+          plan = generatedPlan.value;
+          planProvenance = generatedPlan.provenance;
+        } catch (error) {
+          if (!(error instanceof ExternalMcpRequiredError)) throw error;
+          return { kind: "external", task: await externalTask({ workflowId: input.workflowId, taskId: `${input.arcId}:story-arc:arc-batch`, purpose: "planning.arc", candidateIndex: error.candidateIndex, routingSnapshot: input.routingSnapshot, outputKind: "structured", system, instruction: planPromptPackage.instruction, schema: storyArcPlanBatchSchema as unknown as Record<string, unknown>, schemaName: "story-arc-plan-batch", baseRevision: 0, contextRefs: { arcId: input.arcId, skillBundleId: skills.id, outputSegment: "arc-batch", segmentIndex: "1", segmentCount: "2" }, promptContext: planPromptPackage.manifest }) };
+        }
+      }
+
+      const chapterPromptPackage = compileSinglePrompt({ projectId: input.projectId, workflowId: input.workflowId, purpose: "planning.arc", stage: "planning", system, prompt: buildStoryArcChaptersPrompt({ ...planning, authorIntent: input.authorIntent, arc: plan.arc, batch: plan.batch }, rebaseTarget), schema: storyArcChaptersOutputSchema as unknown as Record<string, unknown>, reservedOutputTokens: 10_000, provenanceRefs: [input.arcId, "segment:chapters"], skillBundle: skills, skillExecutionPoint: "arc.plan" });
       try {
-        const generated = await model.generateStructured<StoryArcBundle>({ purpose: "planning.arc", system, prompt: promptPackage.instruction, schema: storyArcBundleSchema as unknown as Record<string, unknown>, schemaName: "story-arc-bundle", maxTokens: 12_000, workflowRunId: input.workflowId, taskId: `${input.arcId}:story-arc`, candidateStartIndex: input.candidateStartIndex, promptContext: promptPackage.manifest });
-        let bundle = parseStoryArcBundle(generated.value);
+        const generatedChapters = await model.generateStructured<StoryArcChaptersOutput>({ purpose: "planning.arc", system, prompt: chapterPromptPackage.instruction, schema: storyArcChaptersOutputSchema as unknown as Record<string, unknown>, schemaName: "story-arc-chapters", maxTokens: 10_000, workflowRunId: input.workflowId, taskId: `${input.arcId}:story-arc:chapters`, routingSnapshot: input.routingSnapshot, candidateStartIndex: input.candidateStartIndex, promptContext: chapterPromptPackage.manifest });
+        let bundle = parseStoryArcBundle({ ...plan, chapters: generatedChapters.value.chapters });
+        validateStoryArcExecutionContracts(bundle);
         if (rebaseTarget) {
-          // Validate the newly generated candidate before overlaying frozen history.
-          // Historical committed blueprints remain authoritative during rebase and may
-          // use an older optional-scene shape; re-validating that shape as a new plan
-          // would reject compatible history and incorrectly push the fix into prose.
-          validateStoryArcExecutionContracts(bundle);
           bundle = normalizeStoryArcRebaseBundle(bundle, rebaseTarget);
           validateStoryArcRebaseBundle(bundle, rebaseTarget);
-        } else {
-          bundle = parseStoryArcBundle(bundle);
-          validateStoryArcExecutionContracts(bundle);
         }
         if (input.batchIndex && (bundle.batch.batchIndex !== input.batchIndex || bundle.batch.startChapterIndex !== input.startChapterIndex)) throw new Error("生成结果的故事弧批次位置与请求不一致");
-        const artifact = await makeArtifact({ projectId: input.projectId, taskId: `${input.arcId}:story-arc`, kind: "chapter-blueprint", baseRevision: 0, text: JSON.stringify(bundle, null, 2), structuredData: { ...bundle, workflowId: input.workflowId, arcId: input.arcId, modelProvenance: generated.provenance } });
+        const artifact = await makeArtifact({ projectId: input.projectId, taskId: `${input.arcId}:story-arc`, kind: "chapter-blueprint", baseRevision: 0, text: JSON.stringify(bundle, null, 2), structuredData: { ...bundle, workflowId: input.workflowId, arcId: input.arcId, modelProvenance: { plan: planProvenance, chapters: generatedChapters.provenance } } });
         return { kind: "completed", artifact, bundle };
       } catch (error) {
         if (!(error instanceof ExternalMcpRequiredError)) throw error;
-        const routingSnapshot = model.getRoutingSnapshot();
-        return { kind: "external", task: await externalTask({ workflowId: input.workflowId, taskId: `${input.arcId}:story-arc`, purpose: "planning.arc", candidateIndex: error.candidateIndex, routingSnapshot, outputKind: "structured", system, instruction: promptPackage.instruction, schema: storyArcBundleSchema as unknown as Record<string, unknown>, schemaName: "story-arc-bundle", baseRevision: 0, contextRefs: { arcId: input.arcId, skillBundleId: skills.id }, promptContext: promptPackage.manifest }) };
+        return { kind: "external", task: await externalTask({ workflowId: input.workflowId, taskId: `${input.arcId}:story-arc:chapters`, purpose: "planning.arc", candidateIndex: error.candidateIndex, routingSnapshot: input.routingSnapshot, outputKind: "structured", system, instruction: chapterPromptPackage.instruction, schema: storyArcChaptersOutputSchema as unknown as Record<string, unknown>, schemaName: "story-arc-chapters", baseRevision: 0, contextRefs: { arcId: input.arcId, skillBundleId: skills.id, outputSegment: "chapters", segmentIndex: "2", segmentCount: "2", arcJson: JSON.stringify(plan.arc), batchJson: JSON.stringify(plan.batch) }, promptContext: chapterPromptPackage.manifest }) };
       }
+    },
+
+    materializeExternalStoryArcPlan: async (input: { modelTaskId: string; value: unknown }): Promise<StoryArcPlanOutput> => {
+      const task = await deps.repository.getModelTask(input.modelTaskId);
+      if (!task) throw new Error("外部故事弧分段任务不存在");
+      assertStructuredSchema(input.value, storyArcPlanBatchSchema as unknown as Record<string, unknown>, "外部故事弧 arc+batch 分段结果");
+      const value = input.value as StoryArcPlanOutput;
+      if (!value.arc || !value.batch) throw new Error("外部故事弧 arc+batch 分段缺少完整对象");
+      return value;
     },
 
     materializeExternalStoryArcBundle: async (input: { modelTaskId: string; projectId: string; arcId: string; value: unknown; rebase?: boolean }): Promise<{ artifact: Artifact; bundle: StoryArcBundle }> => {
       const task = await deps.repository.getModelTask(input.modelTaskId);
       if (!task) throw new Error("外部故事弧任务不存在");
-      assertStructuredSchema(input.value, storyArcBundleSchema as unknown as Record<string, unknown>, "外部故事弧结果");
-      let bundle = parseStoryArcBundle(input.value);
+      const segment = task.workPackage.contextRefs.outputSegment;
+      let rawBundle: unknown = input.value;
+      if (segment === "chapters") {
+        assertStructuredSchema(input.value, storyArcChaptersOutputSchema as unknown as Record<string, unknown>, "外部故事弧 chapters 分段结果");
+        const arc = JSON.parse(task.workPackage.contextRefs.arcJson ?? "null") as StoryArcBundle["arc"] | null;
+        const batch = JSON.parse(task.workPackage.contextRefs.batchJson ?? "null") as StoryArcBundle["batch"] | null;
+        if (!arc || !batch) throw new Error("外部故事弧 chapters 分段缺少前置 arc+batch");
+        rawBundle = { arc, batch, chapters: (input.value as StoryArcChaptersOutput).chapters };
+      } else {
+        assertStructuredSchema(input.value, storyArcBundleSchema as unknown as Record<string, unknown>, "外部故事弧结果");
+      }
+      let bundle = parseStoryArcBundle(rawBundle);
       const rebaseTarget = input.rebase ? await deps.repository.getStoryArcRebaseTarget(input.projectId, input.arcId) : undefined;
       if (rebaseTarget) bundle = normalizeStoryArcRebaseBundle(bundle, rebaseTarget);
       else bundle = parseStoryArcBundle(bundle);
@@ -1579,13 +1630,12 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
 
     projectStoryArcBundle: async (input: { projectId: string; arcId: string; artifact: Artifact; bundle: StoryArcBundle; actor: string; edited?: boolean }) => deps.repository.projectStoryArcBundle(input),
 
-    reviewStoryArcBundle: async (input: { workflowId: string; projectId: string; arcId: string; artifact: Artifact; bundle: StoryArcBundle; candidateStartIndex?: number; rebase?: boolean }): Promise<GeneratedStoryArcReviewResult> => {
+    reviewStoryArcBundle: async (input: { workflowId: string; projectId: string; arcId: string; artifact: Artifact; bundle: StoryArcBundle; routingSnapshot: ModelRoutingSnapshot; candidateStartIndex?: number; rebase?: boolean }): Promise<GeneratedStoryArcReviewResult> => {
       const planning = await deps.repository.getStoryArcPlanningInput(input.projectId);
       const skills = await resolveCurrentSkills({ projectId: input.projectId, executionPoint: "arc.review", role: "structure-reviewer" });
       const rebaseTarget = input.rebase ? await deps.repository.getStoryArcRebaseTarget(input.projectId, input.arcId) : undefined;
       const prompt = buildStoryArcReviewPrompt(input.bundle, "", rebaseTarget);
       const contextSections = buildStoryArcPlanningContextSections(planning);
-      const routingSnapshot = model.getRoutingSnapshot();
       const system = "你是独立长篇故事弧审核员。";
       const promptPackage = compileSinglePrompt({ projectId: input.projectId, workflowId: input.workflowId, purpose: "review.arc", stage: "review", system, prompt, contextSections, schema: storyArcReviewSchema as unknown as Record<string, unknown>, provenanceRefs: [input.arcId, input.artifact.id], skillBundle: skills, skillExecutionPoint: "arc.review" });
       const prompts = rebaseTarget
@@ -1597,17 +1647,24 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       try {
         const attempts = await Promise.allSettled(prompts.map((pass, passIndex) => {
           const passPackage = passIndex === 0 ? promptPackage : compileSinglePrompt({ projectId: input.projectId, workflowId: input.workflowId, purpose: "review.arc", stage: "review", system, prompt: `${prompt}${pass.suffix}`, contextSections, schema: storyArcReviewSchema as unknown as Record<string, unknown>, provenanceRefs: [input.arcId, input.artifact.id, pass.lens], skillBundle: skills, skillExecutionPoint: "arc.review" });
-          return model.generateStructured<StoryArcReviewOutput>({ purpose: "review.arc", system, prompt: passPackage.instruction, schema: storyArcReviewSchema as unknown as Record<string, unknown>, schemaName: "story-arc-review", workflowRunId: input.workflowId, taskId: `${input.arcId}:story-arc-review:${input.artifact.id}:${pass.lens}`, candidateStartIndex: (input.candidateStartIndex ?? 0) + passIndex, promptContext: passPackage.manifest });
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(new Error(`故事弧审核轮次超过 ${ARC_REVIEW_PASS_TIMEOUT_MS}ms`)), ARC_REVIEW_PASS_TIMEOUT_MS);
+          return model.generateStructured<StoryArcReviewOutput>({ purpose: "review.arc", system, prompt: passPackage.instruction, schema: storyArcReviewSchema as unknown as Record<string, unknown>, schemaName: "story-arc-review", workflowRunId: input.workflowId, taskId: `${input.arcId}:story-arc-review:${input.artifact.id}:${pass.lens}`, routingSnapshot: input.routingSnapshot, candidateStartIndex: (input.candidateStartIndex ?? 0) + passIndex, promptContext: passPackage.manifest, signal: controller.signal }).finally(() => clearTimeout(timeout));
         }));
-        const failedPasses = attempts.flatMap((result, index) => result.status === "rejected" ? [{ lens: prompts[index].lens, reason: result.reason }] : []);
+        const failedPasses = attempts.flatMap((result, index) => result.status === "rejected" ? [{ index, lens: prompts[index].lens, reason: result.reason }] : []);
         const externalFailure = failedPasses.find((pass) => pass.reason instanceof ExternalMcpRequiredError);
-        if (externalFailure) throw externalFailure.reason;
-        if (failedPasses.length) throw new Error(`故事弧审核未完成必需轮次：${failedPasses.map((pass) => pass.lens).join("、")}`);
-        const generated = attempts.filter((result): result is PromiseFulfilledResult<Awaited<ReturnType<typeof model.generateStructured<StoryArcReviewOutput>>>> => result.status === "fulfilled").map((result) => result.value);
-        if (!generated.length) throw attempts.find((result): result is PromiseRejectedResult => result.status === "rejected")?.reason ?? new Error("故事弧审核没有成功候选");
+        const generated = attempts.flatMap((result, index) => result.status === "fulfilled" ? [{ index, result: result.value }] : []);
+        // The lenses are independent evidence sources. A provider timeout or
+        // malformed response in one lens must not erase a complete review from
+        // another lens; retain the failure in artifact metadata instead. Only
+        // fall back to an external task when no complete API review exists.
+        if (!generated.length) {
+          if (externalFailure) throw externalFailure.reason;
+          throw failedPasses[0]?.reason ?? new Error("故事弧审核没有成功候选");
+        }
         const acceptedReviews: Array<{ lens: string; review: StoryArcReviewOutput }> = [];
         const discardedReviews: Array<{ lens: string; reason: string }> = [];
-        generated.forEach((result, index) => {
+        generated.forEach(({ index, result }) => {
           const review = normalizeStoryArcReviewAuthority(input.bundle, result.value, rebaseTarget);
           try {
             validateStoryArcReview(input.bundle, review);
@@ -1623,14 +1680,14 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
         if (!acceptedReviews.length) throw new Error(`故事弧审核没有完整候选：${discardedReviews.map((item) => `${item.lens}：${item.reason}`).join("；")}`);
         const review = mergeStoryArcReviews(input.bundle, acceptedReviews.map((item) => item.review), rebaseTarget);
         validateStoryArcReview(input.bundle, review);
-        const artifact = await makeArtifact({ projectId: input.projectId, taskId: `${input.arcId}:story-arc-review`, kind: "review", baseRevision: 0, text: JSON.stringify(review, null, 2), structuredData: { ...review, subjectArtifactId: input.artifact.id, workflowId: input.workflowId, modelProvenance: generated.map((result) => result.provenance), reviewLenses: acceptedReviews.map((item) => item.lens), discardedReviewLenses: discardedReviews } });
+        const artifact = await makeArtifact({ projectId: input.projectId, taskId: `${input.arcId}:story-arc-review`, kind: "review", baseRevision: 0, text: JSON.stringify(review, null, 2), structuredData: { ...review, subjectArtifactId: input.artifact.id, workflowId: input.workflowId, modelProvenance: generated.map(({ result }) => result.provenance), reviewLenses: acceptedReviews.map((item) => item.lens), discardedReviewLenses: [...discardedReviews, ...failedPasses.map((pass) => ({ lens: pass.lens, reason: pass.reason instanceof Error ? pass.reason.message : String(pass.reason) }))] } });
         return { kind: "completed", artifact, review };
       } catch (error) {
         if (!(error instanceof ExternalMcpRequiredError)) throw error;
         const externalPromptPackage = rebaseTarget
           ? compileSinglePrompt({ projectId: input.projectId, workflowId: input.workflowId, purpose: "review.arc", stage: "review", system, prompt: `${prompt}${prompts[1].suffix}`, contextSections, schema: storyArcReviewSchema as unknown as Record<string, unknown>, provenanceRefs: [input.arcId, input.artifact.id, prompts[1].lens], skillBundle: skills, skillExecutionPoint: "arc.review" })
           : promptPackage;
-        return { kind: "external", task: await externalTask({ workflowId: input.workflowId, taskId: `${input.arcId}:story-arc-review:${input.artifact.id}`, purpose: "review.arc", candidateIndex: error.candidateIndex, routingSnapshot, outputKind: "review", system, instruction: externalPromptPackage.instruction, schema: storyArcReviewSchema as unknown as Record<string, unknown>, schemaName: "story-arc-review", baseRevision: 0, contextRefs: { arcId: input.arcId, artifactId: input.artifact.id, skillBundleId: skills.id }, promptContext: externalPromptPackage.manifest }) };
+        return { kind: "external", task: await externalTask({ workflowId: input.workflowId, taskId: `${input.arcId}:story-arc-review:${input.artifact.id}`, purpose: "review.arc", candidateIndex: error.candidateIndex, routingSnapshot: input.routingSnapshot, outputKind: "review", system, instruction: externalPromptPackage.instruction, schema: storyArcReviewSchema as unknown as Record<string, unknown>, schemaName: "story-arc-review", baseRevision: 0, contextRefs: { arcId: input.arcId, artifactId: input.artifact.id, skillBundleId: skills.id }, promptContext: externalPromptPackage.manifest }) };
       }
     },
 
@@ -1648,7 +1705,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       return { artifact, review };
     },
 
-    reviseStoryArcBundle: async (input: { workflowId: string; projectId: string; arcId: string; artifact: Artifact; bundle: StoryArcBundle; review: StoryArcReviewOutput; candidateStartIndex?: number; rebase?: boolean }): Promise<GeneratedStoryArcResult> => {
+    reviseStoryArcBundle: async (input: { workflowId: string; projectId: string; arcId: string; artifact: Artifact; bundle: StoryArcBundle; review: StoryArcReviewOutput; routingSnapshot: ModelRoutingSnapshot; candidateStartIndex?: number; rebase?: boolean }): Promise<GeneratedStoryArcResult> => {
       const planning = await deps.repository.getStoryArcPlanningInput(input.projectId);
       const skills = await resolveCurrentSkills({ projectId: input.projectId, executionPoint: "arc.revision", role: "reviser" });
       const rebaseTarget = input.rebase ? await deps.repository.getStoryArcRebaseTarget(input.projectId, input.arcId) : undefined;
@@ -1657,7 +1714,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       const system = "你是长篇小说故事弧修订策划师。只输出完整 JSON。";
       const promptPackage = compileSinglePrompt({ projectId: input.projectId, workflowId: input.workflowId, purpose: "planning.arc-revision", stage: "revision", system, prompt, contextSections, schema: storyArcBundleSchema as unknown as Record<string, unknown>, reservedOutputTokens: 12_000, provenanceRefs: [input.arcId, input.artifact.id], skillBundle: skills, skillExecutionPoint: "arc.revision" });
       try {
-        const generated = await model.generateStructured<StoryArcBundle>({ purpose: "planning.arc-revision", system, prompt: promptPackage.instruction, schema: storyArcBundleSchema as unknown as Record<string, unknown>, schemaName: "story-arc-bundle", maxTokens: 12_000, workflowRunId: input.workflowId, taskId: `${input.arcId}:story-arc-revision`, candidateStartIndex: input.candidateStartIndex, promptContext: promptPackage.manifest });
+        const generated = await model.generateStructured<StoryArcBundle>({ purpose: "planning.arc-revision", system, prompt: promptPackage.instruction, schema: storyArcBundleSchema as unknown as Record<string, unknown>, schemaName: "story-arc-bundle", maxTokens: 12_000, workflowRunId: input.workflowId, taskId: `${input.arcId}:story-arc-revision`, routingSnapshot: input.routingSnapshot, candidateStartIndex: input.candidateStartIndex, promptContext: promptPackage.manifest });
         let bundle = parseStoryArcBundle(generated.value);
         if (rebaseTarget) bundle = normalizeStoryArcRebaseBundle(bundle, rebaseTarget);
         else bundle = parseStoryArcBundle(bundle);
@@ -1668,8 +1725,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
         return { kind: "completed", artifact, bundle };
       } catch (error) {
         if (!(error instanceof ExternalMcpRequiredError)) throw error;
-        const routingSnapshot = model.getRoutingSnapshot();
-        return { kind: "external", task: await externalTask({ workflowId: input.workflowId, taskId: `${input.arcId}:story-arc-revision`, purpose: "planning.arc-revision", candidateIndex: error.candidateIndex, routingSnapshot, outputKind: "structured", system, instruction: promptPackage.instruction, schema: storyArcBundleSchema as unknown as Record<string, unknown>, schemaName: "story-arc-bundle", baseRevision: 0, contextRefs: { arcId: input.arcId, artifactId: input.artifact.id, skillBundleId: skills.id }, promptContext: promptPackage.manifest }) };
+        return { kind: "external", task: await externalTask({ workflowId: input.workflowId, taskId: `${input.arcId}:story-arc-revision`, purpose: "planning.arc-revision", candidateIndex: error.candidateIndex, routingSnapshot: input.routingSnapshot, outputKind: "structured", system, instruction: promptPackage.instruction, schema: storyArcBundleSchema as unknown as Record<string, unknown>, schemaName: "story-arc-bundle", baseRevision: 0, contextRefs: { arcId: input.arcId, artifactId: input.artifact.id, skillBundleId: skills.id }, promptContext: promptPackage.manifest }) };
       }
     },
 
@@ -1756,16 +1812,17 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
           candidateStartIndex: input.candidateStartIndex,
           promptContext: promptPackage.manifest,
         });
-        assertFoundationTaskContract(generated.value, work.taskKey);
+        const normalizedFoundation = normalizeFoundationModelOutput(generated.value);
+        assertFoundationTaskContract(normalizedFoundation, work.taskKey);
 
         const artifact = await makeArtifact({
           projectId: run.projectId,
           taskId,
           kind: "foundation",
           baseRevision: 0,
-          text: JSON.stringify(generated.value, null, 2),
+          text: JSON.stringify(normalizedFoundation, null, 2),
           structuredData: {
-            ...generated.value,
+            ...normalizedFoundation,
             modelProvenance: generated.provenance,
             workItemId: input.workItemId,
             taskKey: work.taskKey,
@@ -1849,16 +1906,17 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       const stubArtifact = work.artifactRefs.at(-1) ? await deps.repository.getArtifact(work.artifactRefs.at(-1)!) : undefined;
       const taskSchema = foundationSchemaForTask(work.taskKey ?? "");
       assertStructuredSchema(input.value, taskSchema, "外部 foundation 结果");
-      assertFoundationTaskContract(input.value as FoundationOutput, work.taskKey ?? "");
+      const normalizedFoundation = normalizeFoundationModelOutput(input.value);
+      assertFoundationTaskContract(normalizedFoundation, work.taskKey ?? "");
 
       const artifact = await makeArtifact({
         projectId: run.projectId,
         taskId: `${input.workItemId}:foundation`,
         kind: "foundation",
         baseRevision: 0,
-        text: JSON.stringify(input.value, null, 2),
+        text: JSON.stringify(normalizedFoundation, null, 2),
         structuredData: {
-          ...(input.value as Record<string, unknown>),
+          ...normalizedFoundation,
           workItemId: input.workItemId,
           taskKey: work.taskKey,
           runId: work.runId,

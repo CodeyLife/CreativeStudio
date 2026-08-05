@@ -57,6 +57,8 @@ async function main() {
     body: JSON.stringify({
       objective: "规划一部跨百万字长篇的第一卷主线、角色知识边界和伏笔承诺",
       includeChapterPlan: true,
+      progression: "automatic",
+      reviewGate: "none",
       idempotencyKey: `bootstrap-${suffix}`,
     }),
   });

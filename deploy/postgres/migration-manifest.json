@@ -1,0 +1,8 @@
+{
+  "legacyAliases": [
+    {
+      "version": "014_migrate_v1_skills.sql",
+      "reason": "历史数据库已应用的 V1 Skill seed migration，当前代码由 017_migrate_v1_skills.sql 取代"
+    }
+  ]
+}

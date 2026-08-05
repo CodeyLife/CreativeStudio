@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import Ajv, { type AnySchema, type ValidateFunction } from "ajv";
 import { ModelConfigStore } from "./model-config-store";
+import { assertNativeJsonSchema } from "./native-schema";
 import {
   ExternalMcpRequiredError,
   type ModelExecutionProvenance,
@@ -73,6 +74,7 @@ export interface ModelInvocationAudit {
   candidateIndex: number;
   executor: "api" | "external-mcp";
   profileId?: string;
+  providerLabel?: string;
   protocol?: string;
   model: string;
   status: "completed" | "failed" | "waiting-external";
@@ -88,6 +90,7 @@ export interface ModelInvocationAudit {
   promptFingerprint: string;
   responseId?: string;
   errorCategory?: string;
+  errorMessage?: string;
 }
 
 export type ModelInvocationRecorder = (audit: ModelInvocationAudit) => Promise<void>;
@@ -164,21 +167,13 @@ function promptFingerprint(system: string | undefined, prompt: string): string {
   return createHash("sha256").update(`${system ?? ""}\n${prompt}`).digest("hex");
 }
 
-function endpoint(baseUrl: string, path: string): string {
-  return `${baseUrl.replace(/\/+$/, "")}/${path.replace(/^\/+/, "")}`;
+function modelErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.slice(0, 2_000);
 }
 
-function structuredPromptForProfile(prompt: string, schema: Record<string, unknown> | undefined, protocol: ModelProviderProfile["protocol"]): string {
-  // Responses carries the schema in `text.format`; repeating the full schema in
-  // the user input only increases billed context. Chat-compatible gateways may
-  // accept but ignore response_format, so retain one prompt-level fallback there.
-  if (!schema || protocol === "responses") return prompt;
-  return [
-    prompt,
-    "## 结构化输出契约",
-    "只输出一个严格符合下列 JSON Schema 的 JSON 值，不使用 Markdown，不在 JSON 前后添加说明。",
-    JSON.stringify(schema),
-  ].join("\n\n");
+function endpoint(baseUrl: string, path: string): string {
+  return `${baseUrl.replace(/\/+$/, "")}/${path.replace(/^\/+/, "")}`;
 }
 
 function jsonSchemaPrimitiveType(value: unknown): string | undefined {
@@ -542,7 +537,7 @@ export class RoutedModelGateway implements ModelGateway {
       if (estimatedInputTokens > effectiveInputLimit) {
         const error = new ModelContextBudgetError(estimatedInputTokens, effectiveInputLimit, input.purpose);
         await this.recordPrompt({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, candidateIndex, status: "failed", system: input.system, prompt: input.prompt, promptFingerprint: fingerprint, contextManifest: input.promptContext, errorCategory: error.category });
-        await this.record({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, configRevision: snapshot.id, candidateIndex, executor: "external-mcp", model: "external-mcp", status: "failed", inputTokens: estimatedInputTokens, outputTokens: 0, estimatedInputTokens, estimatedOutputTokens: 0, usageSource: "estimated", latencyMs: 0, promptFingerprint: fingerprint, errorCategory: error.category });
+        await this.record({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, configRevision: snapshot.id, candidateIndex, executor: "external-mcp", model: "external-mcp", providerLabel: "external-mcp", status: "failed", inputTokens: estimatedInputTokens, outputTokens: 0, estimatedInputTokens, estimatedOutputTokens: 0, usageSource: "estimated", latencyMs: 0, promptFingerprint: fingerprint, errorCategory: error.category, errorMessage: modelErrorMessage(error) });
         throw error;
       }
       await this.record({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, configRevision: snapshot.id, candidateIndex, executor: "external-mcp", model: "external-mcp", status: "waiting-external", inputTokens: 0, outputTokens: 0, latencyMs: 0, promptFingerprint: fingerprint });
@@ -550,7 +545,7 @@ export class RoutedModelGateway implements ModelGateway {
     }
     const profile = this.resolveProfile(snapshot, candidate.profileId);
     const model = candidate.model ?? profile.model;
-    const transportPrompt = structuredPromptForProfile(input.prompt, input.schema, profile.protocol);
+    const transportPrompt = input.prompt;
     const fingerprint = promptFingerprint(input.system, transportPrompt);
     const outputReserve = Math.max(1, Math.min(input.maxTokens ?? route.maxOutputTokens ?? 4_096, route.maxOutputTokens ?? Number.MAX_SAFE_INTEGER));
     const profileInputLimit = profile.contextWindow ? Math.max(0, profile.contextWindow - outputReserve) : Number.MAX_SAFE_INTEGER;
@@ -559,7 +554,7 @@ export class RoutedModelGateway implements ModelGateway {
     if (estimatedInputTokens > effectiveInputLimit) {
       const error = new ModelContextBudgetError(estimatedInputTokens, effectiveInputLimit, input.purpose);
       await this.recordPrompt({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, candidateIndex, status: "failed", system: input.system, prompt: transportPrompt, promptFingerprint: fingerprint, contextManifest: input.promptContext, errorCategory: error.category });
-      await this.record({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, configRevision: snapshot.id, candidateIndex, executor: "api", profileId: profile.id, protocol: profile.protocol, model, status: "failed", inputTokens: estimatedInputTokens, outputTokens: 0, estimatedInputTokens, estimatedOutputTokens: 0, usageSource: "estimated", latencyMs: 0, promptFingerprint: fingerprint, errorCategory: error.category });
+      await this.record({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, configRevision: snapshot.id, candidateIndex, executor: "api", profileId: profile.id, providerLabel: profile.label, protocol: profile.protocol, model, status: "failed", inputTokens: estimatedInputTokens, outputTokens: 0, estimatedInputTokens, estimatedOutputTokens: 0, usageSource: "estimated", latencyMs: 0, promptFingerprint: fingerprint, errorCategory: error.category, errorMessage: modelErrorMessage(error) });
       throw error;
     }
     const started = Date.now();
@@ -589,7 +584,7 @@ export class RoutedModelGateway implements ModelGateway {
         const latencyMs = Date.now() - started;
         const errorCategory = error instanceof ModelTransportError ? error.category : error instanceof ModelContextBudgetError ? error.category : "protocol";
         await this.recordPrompt({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, candidateIndex, status: "failed", system: input.system, prompt: transportPrompt, promptFingerprint: fingerprint, contextManifest: input.promptContext, errorCategory });
-        await this.record({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, configRevision: snapshot.id, candidateIndex, executor: "api", profileId: profile.id, protocol: profile.protocol, model, status: "failed", inputTokens: 0, outputTokens: 0, latencyMs, promptFingerprint: fingerprint, errorCategory });
+        await this.record({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, configRevision: snapshot.id, candidateIndex, executor: "api", profileId: profile.id, providerLabel: profile.label, protocol: profile.protocol, model, status: "failed", inputTokens: 0, outputTokens: 0, latencyMs, promptFingerprint: fingerprint, errorCategory, errorMessage: modelErrorMessage(error) });
         throw error;
       }
     }
@@ -625,6 +620,7 @@ export class RoutedModelGateway implements ModelGateway {
   }
 
   async generateStructured<T>(input: GenerateStructuredInput<T>): Promise<ModelResult<T>> {
+    assertNativeJsonSchema(input.schema, input.schemaName);
     const { snapshot, route } = this.route(input);
     const validate = new Ajv({ allErrors: true, strict: false }).compile(input.schema as AnySchema) as ValidateFunction<T>;
     let lastError: unknown;
@@ -669,21 +665,20 @@ export class RoutedModelGateway implements ModelGateway {
           }
           const errors = validate.errors?.map((item) => `${item.instancePath || "root"} ${item.message ?? ""}`).join("；") ?? "JSON 无法解析";
           if (repair === repairs) {
-            await this.record({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, configRevision: snapshot.id, candidateIndex: index, executor: "api", profileId: latest.profile.id, protocol: latest.profile.protocol, model: latest.model, status: "failed", inputTokens: totalInput, outputTokens: totalOutput, providerInputTokens: providerInputSeen ? providerInputTotal : undefined, providerOutputTokens: providerOutputSeen ? providerOutputTotal : undefined, providerCachedInputTokens: providerCachedInputSeen ? providerCachedInputTotal : undefined, estimatedInputTokens: estimatedInputTotal, estimatedOutputTokens: estimatedOutputTotal, usageSource: providerInputComplete && providerOutputComplete ? "provider" : providerInputSeen || providerOutputSeen ? "mixed" : "estimated", latencyMs: latest.latencyMs, promptFingerprint: latest.provenance.promptFingerprint, responseId: latest.response.responseId, errorCategory: "schema-validation" });
-            throw new ModelTransportError(`结构化输出校验失败：${errors}`, false, "schema-validation");
+            const error = new ModelTransportError(`结构化输出校验失败：${errors}`, false, "schema-validation");
+            await this.record({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, configRevision: snapshot.id, candidateIndex: index, executor: "api", profileId: latest.profile.id, providerLabel: latest.profile.label, protocol: latest.profile.protocol, model: latest.model, status: "failed", inputTokens: totalInput, outputTokens: totalOutput, providerInputTokens: providerInputSeen ? providerInputTotal : undefined, providerOutputTokens: providerOutputSeen ? providerOutputTotal : undefined, providerCachedInputTokens: providerCachedInputSeen ? providerCachedInputTotal : undefined, estimatedInputTokens: estimatedInputTotal, estimatedOutputTokens: estimatedOutputTotal, usageSource: providerInputComplete && providerOutputComplete ? "provider" : providerInputSeen || providerOutputSeen ? "mixed" : "estimated", latencyMs: latest.latencyMs, promptFingerprint: latest.provenance.promptFingerprint, responseId: latest.response.responseId, errorCategory: error.category, errorMessage: modelErrorMessage(error) });
+            throw error;
           }
           const repairSystem = [input.system, "修复结构化输出时仍须遵守原始角色、任务目标和事实边界。只输出严格符合 JSON Schema 的 JSON，不使用 Markdown。"].filter(Boolean).join("\n\n");
           const candidate = route.candidates[index];
           let repairInputLimit = Math.min(route.maxInputTokens ?? Number.MAX_SAFE_INTEGER, input.promptContext?.maxInputTokens ?? Number.MAX_SAFE_INTEGER);
-          let schemaPromptOverhead = 0;
           if (candidate?.executor === "api") {
             const profile = this.resolveProfile(snapshot, candidate.profileId);
             const outputReserve = Math.max(1, Math.min(input.maxTokens ?? route.maxOutputTokens ?? 4_096, route.maxOutputTokens ?? Number.MAX_SAFE_INTEGER));
             if (profile.contextWindow) repairInputLimit = Math.min(repairInputLimit, Math.max(0, profile.contextWindow - outputReserve));
-            schemaPromptOverhead = profile.protocol === "chat-completions" ? structuredPromptForProfile("", input.schema, profile.protocol).length : 0;
           }
           currentSystem = repairSystem;
-          currentPrompt = repairPrompt(input.prompt, latest.response.text, errors, repair, repairInputLimit, repairSystem, schemaPromptOverhead);
+          currentPrompt = repairPrompt(input.prompt, latest.response.text, errors, repair, repairInputLimit, repairSystem);
         }
       } catch (error) {
         if (error instanceof ExternalMcpRequiredError) throw error;
@@ -735,7 +730,10 @@ export class RoutedModelGateway implements ModelGateway {
         const provenance = { routeSnapshotId: snapshot.id, purpose: input.purpose, candidateIndex: index, executor: "api" as const, profileId: profile.id, protocol: profile.protocol, model, promptFingerprint: fingerprint };
         await this.record({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, configRevision: snapshot.id, candidateIndex: index, executor: "api", profileId: profile.id, protocol: profile.protocol, model, status: "completed", inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, providerInputTokens: usage.providerInputTokens, providerOutputTokens: usage.providerOutputTokens, providerCachedInputTokens: usage.providerCachedInputTokens, estimatedInputTokens: usage.estimatedInputTokens, estimatedOutputTokens: usage.estimatedOutputTokens, usageSource: usage.usageSource, latencyMs: usage.latencyMs, promptFingerprint: fingerprint });
         return { data, provenance, usage };
-      } catch (error) { lastError = error; }
+      } catch (error) {
+        await this.record({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, configRevision: snapshot.id, candidateIndex: index, executor: "api", profileId: profile.id, providerLabel: profile.label, protocol: profile.protocol, model, status: "failed", inputTokens: 0, outputTokens: 0, latencyMs: Date.now() - started, promptFingerprint: fingerprint, errorCategory: error instanceof ModelTransportError ? error.category : "protocol", errorMessage: modelErrorMessage(error) });
+        lastError = error;
+      }
     }
     throw lastError ?? new Error(`模型路由 ${input.purpose} 没有可执行候选`);
   }
@@ -782,7 +780,7 @@ export class InMemoryModelGateway implements ModelGateway {
   getRoutingSnapshot(): ModelRoutingSnapshot { return { id: "in-memory", configVersion: 1, profiles: [], routes: { "*": { candidates: [{ executor: "external-mcp" }] } }, createdAt: 0 }; }
   private provenance(purpose: ModelPurpose, prompt: string): ModelExecutionProvenance { return { routeSnapshotId: "in-memory", purpose, candidateIndex: 0, executor: "api", profileId: "in-memory", protocol: "chat-completions", model: "in-memory", promptFingerprint: promptFingerprint(undefined, prompt) }; }
   async generateText(input: GenerateTextInput) { const raw = this.responder({ purpose: input.purpose, system: input.system, prompt: input.prompt }); const text = typeof raw === "string" ? raw : JSON.stringify(raw); return { value: text, text, usage: { model: "in-memory", inputTokens: 0, outputTokens: 0, costUsd: 0, latencyMs: 0 }, provenance: this.provenance(input.purpose, input.prompt) }; }
-  async generateStructured<T>(input: GenerateStructuredInput<T>): Promise<ModelResult<T>> { const value = this.responder({ purpose: input.purpose, system: input.system, prompt: input.prompt, schema: input.schema }); const validate = new Ajv({ allErrors: true, strict: false }).compile(input.schema as AnySchema); if (!validate(value)) throw new Error(`InMemoryModelGateway structured 输出校验失败：${validate.errors?.map((item) => `${item.instancePath || "root"} ${item.message ?? ""}`).join("；")}`); return { value: value as T, usage: { model: "in-memory", inputTokens: 0, outputTokens: 0, costUsd: 0, latencyMs: 0 }, provenance: this.provenance(input.purpose, input.prompt) }; }
+  async generateStructured<T>(input: GenerateStructuredInput<T>): Promise<ModelResult<T>> { assertNativeJsonSchema(input.schema, input.schemaName); const value = this.responder({ purpose: input.purpose, system: input.system, prompt: input.prompt, schema: input.schema }); const validate = new Ajv({ allErrors: true, strict: false }).compile(input.schema as AnySchema); if (!validate(value)) throw new Error(`InMemoryModelGateway structured 输出校验失败：${validate.errors?.map((item) => `${item.instancePath || "root"} ${item.message ?? ""}`).join("；")}`); return { value: value as T, usage: { model: "in-memory", inputTokens: 0, outputTokens: 0, costUsd: 0, latencyMs: 0 }, provenance: this.provenance(input.purpose, input.prompt) }; }
   async embed(input: { purpose: "memory.embed"; texts: string[] }) { const vectors = input.texts.map(() => [] as number[]); return { value: vectors, vectors, usage: { model: "in-memory", inputTokens: 0, outputTokens: 0, costUsd: 0, latencyMs: 0 }, provenance: this.provenance(input.purpose, input.texts.join("\n")) }; }
   async rerank(input: { purpose: "memory.rerank"; query: string; documents: string[] }) { const scores = input.documents.map(() => 0); return { value: scores, scores, usage: { model: "in-memory", inputTokens: 0, outputTokens: 0, costUsd: 0, latencyMs: 0 }, provenance: this.provenance(input.purpose, input.query) }; }
 }

@@ -94,7 +94,7 @@ export default function LearningPanel({ projectId, documents }: { projectId: str
     </div>
 
     <section>
-      <header>Learning assessment</header>
+      <header>学习评估</header>
       {assessments.length ? <div className="pb-learning-assessments">{assessments.slice(0, 12).map((item) => <div key={item.assessment.id}>
         <div><Tag color={item.assessment.conclusion === "propose-improvement" ? "gold" : "default"}>{item.assessment.conclusion === "propose-improvement" ? "提出改进" : "无共享经验"}</Tag><span>{item.sourceChapter?.title ?? item.assessment.source.workflowId}</span></div>
         <p>{text(item.assessment.underlyingMechanism, item.assessment.symptom ?? "未记录机制")}</p>

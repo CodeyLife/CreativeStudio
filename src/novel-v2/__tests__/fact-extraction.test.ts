@@ -10,7 +10,7 @@ import { extractFactsFromText, extractFactsWithStats, computeClaimContentHash, p
 import { scopeClaimsToChapter } from "../fact-extraction/narrative-scope";
 import { InMemoryModelGateway } from "../model-gateway";
 import type { Artifact, MemoryClaim } from "../protocol";
-import type { ChapterStateDelta, FactExtractionOutput } from "../prompts/schemas";
+import { chapterStateDeltaSchema, type ChapterStateDelta, type FactExtractionOutput } from "../prompts/schemas";
 import { canonicalizeFactPredicate, factIdentityHash, factValueHash } from "../fact-extraction/fingerprint";
 import { buildFactExtractionPrompt } from "../fact-extraction/prompt";
 
@@ -25,7 +25,6 @@ function fact(overrides: Partial<FactExtractionOutput["facts"][number]> = {}): F
     truthStatus: "objective",
     humanReadable: "主角持有古剑承影",
     evidence: "他从匣中取出承影，剑身冷光一闪。",
-    paragraph: 1,
     confidence: 0.9,
     novelty: "new",
     conflict: false,
@@ -170,7 +169,7 @@ describe("fact-extraction retention contract", () => {
     });
     expect(prompt).toContain("foreshadowing-1");
     expect(prompt).toContain("promise-1");
-    expect(prompt).toContain("不要填写 ID，也不要为了完成关联猜测");
+    expect(prompt).toContain("不要猜测");
   });
 });
 
@@ -248,8 +247,15 @@ describe("fact-extraction classifyFactRisk maps to risk tiers", () => {
 });
 
 describe("fact-extraction extractFactsWithStats orchestration", () => {
+  it("states the model output contract instead of leaving providers to infer it", () => {
+    const prompt = buildFactExtractionPrompt({ artifact, text: "正文略。" });
+    expect(prompt).toContain("顶层必须始终输出 facts、narrativeElements、payoffMoments");
+    expect(prompt).toContain("chapterMemory 和 characterDeltas 不属于本次输出");
+    expect(chapterStateDeltaSchema.required).toEqual(["facts", "narrativeElements", "payoffMoments"]);
+  });
+
   it("binds chapter facts to narrativeOrder instead of the evidence paragraph", () => {
-    const output: ChapterStateDelta = { summary: "章节事实", facts: [fact({ paragraph: 87 })] };
+    const output: ChapterStateDelta = { facts: [fact()] };
     const result = projectFactExtractionOutput({ projectId: "p1", artifact, text: "正文略。", narrativeOrder: 12 }, output);
 
     expect(result.claims[0].narrativeRange).toEqual({ start: 12, end: 12 });
@@ -261,33 +267,31 @@ describe("fact-extraction extractFactsWithStats orchestration", () => {
     expect(() => scopeClaimsToChapter([claim], 1.5)).toThrow(/narrativeOrder/);
   });
 
-  it("returns chapter memory and character deltas from the same extraction", async () => {
+  it("returns narrative elements and payoff moments from the same extraction", async () => {
     const output: ChapterStateDelta = {
-      summary: "统一提取",
       facts: [fact()],
-      chapterMemory: {
-        summary: "本章围绕一次受阻的会面展开，双方通过选择与行动确认了当前关系边界，并留下下一阶段仍需处理的冲突。".repeat(2),
-        keyEvents: ["双方完成会面"],
-        characterStates: [{ characterId: "hero", stateSnapshot: "决定继续追查" }],
-        unresolvedThreads: ["信物来源"],
-        emotionalArc: "戒备转为有限信任",
+      narrativeElements: {
+        foreshadowings: [],
+        promises: [],
+        payoffs: [],
       },
-      characterDeltas: [{ characterId: "hero", voiceAnchor: { sentenceLength: "短句", vocabulary: "克制", directness: "间接", avoidance: "回避承诺" }, motivationDelta: "继续追查信物", newKnowledge: [], relationDeltas: [] }],
+      payoffMoments: [{ payoffType: "recognition", intensity: 2, description: "角色得到有限认可", setupDescription: "", evidence: "他终于听见对方承认自己的判断。" }],
     };
     const result = await extractFactsWithStats({ projectId: "p1", artifact, text: "正文略。", model: new InMemoryModelGateway(() => output) });
-    expect(result.chapterMemory?.keyEvents).toEqual(["双方完成会面"]);
-    expect(result.characterDeltas?.[0].characterId).toBe("hero");
+    expect(result.narrativeElements?.payoffs).toEqual([]);
+    expect(result.payoffMoments?.[0].payoffType).toBe("recognition");
   });
 
   it("returns claims and stats end-to-end through the model gateway", async () => {
     const output: FactExtractionOutput = {
-      summary: "提取到 2 条事实",
       facts: [
         fact(),
         fact({ subject: { kind: "entity", id: "mentor" }, humanReadable: "师父交还信物", evidence: "师父把玉佩放回桌上，未发一言。" }),
         fact({ confidence: 0.3 }), // 被 L6 丢弃
         fact({ humanReadable: "主角持有古剑承影" }), // 被 L1 丢弃
       ],
+      narrativeElements: { foreshadowings: [], promises: [], payoffs: [] },
+      payoffMoments: [],
     };
     const model = new InMemoryModelGateway(() => output);
     const result = await extractFactsWithStats({
@@ -304,7 +308,7 @@ describe("fact-extraction extractFactsWithStats orchestration", () => {
   });
 
   it("returns an empty claim list when the model produces nothing", async () => {
-    const model = new InMemoryModelGateway(() => ({ summary: "无事实", facts: [] }));
+    const model = new InMemoryModelGateway(() => ({ facts: [], narrativeElements: { foreshadowings: [], promises: [], payoffs: [] }, payoffMoments: [] }));
     const result = await extractFactsFromText({ projectId: "p1", artifact, text: "正文略。", model });
     expect(result).toEqual([] satisfies MemoryClaim[]);
   });

@@ -103,6 +103,35 @@ describe("model routing config", () => {
     }
   });
 
+  it("ignores the removed structuredOutput field when loading legacy provider config", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ymcp-model-config-legacy-"));
+    const path = join(dir, "model-providers.local.yaml");
+    try {
+      await (await import("node:fs/promises")).writeFile(path, [
+        "version: 1",
+        "profiles:",
+        "  - id: primary",
+        "    label: Primary",
+        "    protocol: chat-completions",
+        "    baseUrl: https://example.test/v1",
+        "    model: writer-model",
+        "    structuredOutput: prompt",
+        "    capabilities: [text, structured, stream, embedding, rerank]",
+        "    enabled: true",
+        "routes:",
+        "  '*':",
+        "    candidates:",
+        "      - executor: api",
+        "        profileId: primary",
+      ].join("\n"), "utf8");
+      const store = new ModelConfigStore(path);
+      await store.load();
+      expect(store.getProfile("primary")).not.toHaveProperty("structuredOutput");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("rejects task-chain on non-writing purposes", () => {
     const invalid = config([profile({ protocol: "responses", capabilities: ["text", "structured", "responses-continuation", "embedding", "rerank"] })]);
     invalid.routes = { "review.*": { candidates: [{ executor: "api", profileId: "primary" }], conversationPolicy: "task-chain" }, "*": { candidates: [{ executor: "api", profileId: "primary" }] } };
@@ -224,6 +253,20 @@ describe("RoutedModelGateway adapters", () => {
     expect(recorder).toHaveBeenLastCalledWith(expect.objectContaining({ providerInputTokens: 12, providerCachedInputTokens: 8 }));
   });
 
+  it("records the provider label and response body for failed model calls", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("{\"error\":\"Insufficient Balance\"}", { status: 402 })));
+    const recorder = vi.fn(async () => undefined);
+    const gateway = new RoutedModelGateway(new ModelConfigStore("unused", config()), recorder);
+
+    await expect(gateway.generateText({ purpose: "review.prose", prompt: "审校正文" })).rejects.toMatchObject({ name: "NonRetryableModelTransportError" });
+    expect(recorder).toHaveBeenCalledWith(expect.objectContaining({
+      providerLabel: "Primary",
+      model: "writer-model",
+      errorCategory: "http-402",
+      errorMessage: expect.stringContaining("Insufficient Balance"),
+    }));
+  });
+
   it("uses previous_response_id only for a configured Responses writing chain", async () => {
     const responsesProfile = profile({ protocol: "responses", responseMode: "json", capabilities: ["text", "structured", "responses-continuation", "embedding", "rerank"] });
     const next = config([responsesProfile]);
@@ -259,6 +302,25 @@ describe("RoutedModelGateway adapters", () => {
     expect(requestBody?.text).toEqual({ format: { type: "json_schema", name: "model_output", strict: true, schema } });
   });
 
+  it("uses the native Chat Completions schema envelope without prompt fallback", async () => {
+    const schema = { type: "object", additionalProperties: false, required: ["ok"], properties: { ok: { type: "boolean" } } };
+    let requestBody: Record<string, unknown> | undefined;
+    vi.stubGlobal("fetch", vi.fn(async (_url: string, init?: RequestInit) => {
+      requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ ok: true }) } }] }), { status: 200 });
+    }));
+
+    await expect(new RoutedModelGateway(new ModelConfigStore("unused", config())).generateStructured({
+      purpose: "review.prose",
+      prompt: "只检查当前段落的事实边界。",
+      schema,
+    })).resolves.toMatchObject({ value: { ok: true } });
+
+    expect(requestBody?.messages).toEqual([{ role: "user", content: "只检查当前段落的事实边界。" }]);
+    expect(JSON.stringify(requestBody?.messages)).not.toContain("additionalProperties");
+    expect(requestBody?.response_format).toEqual({ type: "json_schema", json_schema: { name: "model_output", strict: true, schema } });
+  });
+
   it("moves to the next explicit candidate after a non-retryable provider error", async () => {
     const profiles = [profile({ id: "bad" }), profile({ id: "good", model: "good-model" })];
     const fetchMock = vi.fn()
@@ -289,7 +351,7 @@ describe("RoutedModelGateway adapters", () => {
     const result = await gateway.generateStructured<{ ok: boolean }>({
       purpose: "facts.extract",
       prompt: "extract",
-      schema: { type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } },
+      schema: { type: "object", additionalProperties: false, required: ["ok"], properties: { ok: { type: "boolean" } } },
     });
 
     expect(result.value).toEqual({ ok: true });
@@ -305,7 +367,7 @@ describe("RoutedModelGateway adapters", () => {
     vi.stubGlobal("fetch", fetchMock);
     const gateway = new RoutedModelGateway(new ModelConfigStore("unused", next), undefined, promptRecorder);
 
-    await expect(gateway.generateStructured({ purpose: "review.prose", prompt: "正文".repeat(100), schema: { type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } }, maxTokens: 16 }))
+    await expect(gateway.generateStructured({ purpose: "review.prose", prompt: "正文".repeat(100), schema: { type: "object", additionalProperties: false, required: ["ok"], properties: { ok: { type: "boolean" } } }, maxTokens: 16 }))
       .rejects.toThrow("context-budget-exceeded");
     expect(fetchMock).not.toHaveBeenCalled();
     expect(promptRecorder).toHaveBeenCalledWith(expect.objectContaining({ status: "failed", errorCategory: "context-budget-exceeded" }));
@@ -459,7 +521,7 @@ describe("RoutedModelGateway adapters", () => {
     await expect(gateway.generateStructured({
       purpose: "review.prose",
       prompt: "review",
-      schema: { type: "object", required: ["verdict"], properties: { verdict: { type: "string" } } },
+      schema: { type: "object", additionalProperties: false, required: ["verdict"], properties: { verdict: { type: "string" } } },
     })).rejects.toMatchObject({ name: "NonRetryableModelTransportError" });
     expect(fetchMock).toHaveBeenCalledTimes(3);
   });
@@ -470,5 +532,26 @@ describe("RoutedModelGateway adapters", () => {
     const gateway = new RoutedModelGateway(new ModelConfigStore("unused", config([], [{ executor: "external-mcp" }])));
     await expect(gateway.generateText({ purpose: "writing.draft", prompt: "p" })).rejects.toBeInstanceOf(ExternalMcpRequiredError);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("uses the native Responses schema envelope without copying schema into the prompt", async () => {
+    let requestBody: Record<string, unknown> | undefined;
+    vi.stubGlobal("fetch", vi.fn(async (_url: string, init?: RequestInit) => {
+      requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return new Response(JSON.stringify({ output_text: JSON.stringify({ verdict: "passed", score: 5, issues: [] }) }), { status: 200 });
+    }));
+    const responsesProfile = profile({ protocol: "responses", responseMode: "json", capabilities: ["text", "structured", "responses-continuation", "embedding", "rerank"] });
+    const schema = { type: "object", additionalProperties: false, required: ["verdict", "score", "issues"], properties: { verdict: { enum: ["passed"] }, score: { type: "number" }, issues: { type: "array", items: { type: "object", additionalProperties: false, required: ["title"], properties: { title: { type: "string" } } } } } };
+
+    await expect(new RoutedModelGateway(new ModelConfigStore("unused", config([responsesProfile]))).generateStructured({
+      purpose: "review.prose",
+      prompt: "审核正文",
+      schema,
+      maxRepairAttempts: 0,
+    })).resolves.toMatchObject({ value: { verdict: "passed", score: 5, issues: [] } });
+
+    expect(requestBody?.text).toMatchObject({ format: { type: "json_schema", strict: true, schema } });
+    expect(requestBody?.input).toBe("审核正文");
+    expect(String(requestBody?.input)).not.toContain(JSON.stringify(schema));
   });
 });

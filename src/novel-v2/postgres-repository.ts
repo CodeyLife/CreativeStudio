@@ -1,9 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
 import { Pool, type PoolClient, type PoolConfig } from "pg";
-import { readdirSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { foundationArtifactToMemoryClaim } from "./foundation-memory";
+import { assertCompleteChapterReviewEvidence } from "./application/chapter-approval";
 import { ChapterStateRebuildConflictError } from "./application/chapter-state-rebuild-conflict";
 import {
   PROJECT_PLAN_STAGES,
@@ -55,7 +56,7 @@ import type { ObjectStoreIdentity } from "./object-store";
 import { normalizeManuscriptStructuralReview } from "./application/manuscript-structure";
 import { auditNamedReferences, auditStoryArcBatchRanges, canonicalReferenceId, normalizeThreadResponsibilityReferences, resolveNamedReference, type NamedReferenceCandidate, type StoryArcIntegrityIssue } from "./application/story-arc-integrity";
 import { auditFullBookArchitecture } from "./application/full-book-architecture";
-import { CHAPTER_NARRATIVE_FUNCTIONS, canGenerateNextStoryArcBatch, compileChapterPlanValidationReport, normalizeChapterPlanningContext, parseStoryArcBundle, planningContextFingerprint, validateStoryArcPlanContracts, type ArcPlanningStatus, type ChapterBlueprint, type ChapterBlueprintRecord, type ChapterPlanningContext, type ChapterSceneBlueprint, type NarrativeArcPlan, type StoryArcBatchRecord, type StoryArcBundle, type StoryArcContextReceipt, type StoryArcRebaseTarget, type StoryArcRecord } from "./application/story-arc";
+import { CHAPTER_NARRATIVE_FUNCTIONS, canGenerateNextStoryArcBatch, compileChapterPlanValidationReport, normalizeChapterPlanningContext, parseStoryArcBundle, parseStoryArcPlan, planningContextFingerprint, projectLegacyArcContractForReview, validateStoryArcPlanContracts, type ArcPlanningStatus, type ChapterBlueprint, type ChapterBlueprintRecord, type ChapterPlanningContext, type ChapterSceneBlueprint, type NarrativeArcPlan, type StoryArcBatchRecord, type StoryArcBundle, type StoryArcContextReceipt, type StoryArcRebaseTarget, type StoryArcRecord } from "./application/story-arc";
 import type { StoryArcReviewOutput } from "./prompts/story-arc";
 import { aggregateChapterReviews, reviewIssueFingerprint, type ChapterReviewIssueStatus } from "./chapter-review-snapshot";
 import {
@@ -69,6 +70,8 @@ import { chapterTitleSourceFingerprint, type ChapterTitleSource } from "./applic
 import { canonicalSha256 } from "./canonical-json";
 import { canonicalizeFactPredicate, normalizeFactToken } from "./fact-extraction/fingerprint";
 import { scopeClaimsToChapter } from "./fact-extraction/narrative-scope";
+import { buildCharacterIdentityIndex, resolveCharacterIdentity, type FoundationCharacter } from "./character-identity";
+import { auditMigrations as auditMigrationFiles, formatMigrationAudit, readMigrationFiles, readMigrationManifest, type MigrationAudit } from "./migrations";
 
 export const V1_MIGRATED_SKILL_IDS = [
   "long-form-master-craft",
@@ -141,7 +144,20 @@ type TaskAttemptRow = { id: string; workflow_run_id: string | null; task_id: str
 type ModelTaskRow = { id: string; workflow_run_id: string; task_id: string; purpose: ModelTaskRecord["purpose"]; config_revision: string; candidate_index: number; status: ModelTaskRecord["status"]; work_package: ModelWorkPackage; result: ModelTaskRecord["result"] | null; idempotency_key: string; created_at: Date | string; updated_at: Date | string };
 type ProjectPlanSectionRow = { project_id: string; task_key: string; work_item_id: string | null; source_artifact_id: string | null; status: ProjectPlanStatus; payload: Record<string, unknown>; edit_revision: string | number; approved_at: Date | string | null; created_at: Date | string; updated_at: Date | string };
 type ArcRow = { id: string; volume_id: string; project_id: string; title: string; ordinal: string | number; planning_status: StoryArcRecord["planningStatus"]; execution_status: StoryArcRecord["executionStatus"]; payload: NarrativeArcPlan; source_artifact_id: string | null; blueprint_artifact_id: string | null; context_fingerprint: string | null; review_artifact_id: string | null; review_fingerprint: string | null; edit_revision: string | number; approved_at: Date | string | null; completed_at: Date | string | null; abandoned_at: Date | string | null; updated_at: Date | string };
-type ChapterBlueprintRow = { id: string; arc_id: string; project_id: string; document_id: string | null; title: string; ordinal: string | number; status: string; payload: Record<string, unknown>; source_artifact_id: string | null; blueprint_revision: string | number };
+type ChapterBlueprintRow = {
+  id: string;
+  arc_id: string;
+  project_id: string;
+  document_id: string | null;
+  document_status?: string | null;
+  document_current_revision_id?: string | null;
+  title: string;
+  ordinal: string | number;
+  status: string;
+  payload: Record<string, unknown>;
+  source_artifact_id: string | null;
+  blueprint_revision: string | number;
+};
 type StoryArcBatchRow = { id: string; arc_id: string; project_id: string; batch_index: string | number; start_chapter_index: string | number; end_chapter_index: string | number; status: StoryArcBatchRecord["status"]; entry_fingerprint: string; source_artifact_id: string | null; payload: Record<string, unknown>; approved_at: Date | string | null };
 
 export function buildNarrativeRhythmSnapshotQuery(): string {
@@ -276,7 +292,11 @@ function chapterBlueprintFromRow(row: ChapterBlueprintRow): ChapterBlueprintReco
     projectId: row.project_id,
     documentId: row.document_id ?? undefined,
     globalOrder: Number(row.ordinal),
-    status: row.status,
+    // manuscript_documents owns the lifecycle of the actual prose. Keep the
+    // denormalized chapter status for planning/query performance, but derive a
+    // final status defensively so historical or failed rebase projections do
+    // not make committed chapters look generatable again.
+    status: row.document_status === "final" && row.document_current_revision_id ? "final" : row.status,
     sourceArtifactId: row.source_artifact_id ?? undefined,
     blueprintRevision: Number(row.blueprint_revision),
     index: typeof payload.index === "number" ? payload.index : Number(row.ordinal),
@@ -316,6 +336,22 @@ export class NovelPostgresRepository {
     this.pool = new Pool(this.connectionConfig);
   }
 
+  private async syncFinalChapterBlueprintStatusTx(client: PoolClient, projectId: string, documentId: string): Promise<void> {
+    await client.query(
+      `UPDATE chapters c
+       SET status='final',updated_at=now()
+       FROM manuscript_documents d
+       WHERE c.project_id=$1
+         AND c.document_id=$2
+         AND d.id=c.document_id
+         AND d.project_id=c.project_id
+         AND d.status='final'
+         AND d.current_revision_id IS NOT NULL
+         AND c.status<>'final'`,
+      [projectId, documentId],
+    );
+  }
+
   forSchema(schemaName: string): NovelPostgresRepository {
     if (!/^[a-z_][a-z0-9_]*$/u.test(schemaName)) throw new Error(`非法 schema 名：${schemaName}`);
     return new NovelPostgresRepository({
@@ -324,134 +360,122 @@ export class NovelPostgresRepository {
     });
   }
 
-  async migrate() {
-    const migrationsDir = process.env.NOVEL_V2_MIGRATIONS_DIR ?? join(process.cwd(), "deploy", "postgres");
-    const files = readdirSync(migrationsDir).filter((file) => /^\d{3}_.+\.sql$/u.test(file)).sort();
+  async migrate(migrationsDir = process.env.NOVEL_V2_MIGRATIONS_DIR ?? join(process.cwd(), "deploy", "postgres")) {
+    const files = readMigrationFiles(migrationsDir);
     if (!files.length) throw new Error(`没有找到 V2 数据库迁移：${migrationsDir}`);
+    const manifest = readMigrationManifest(migrationsDir);
     const client = await this.connectForMigration();
     try {
       await client.query("SELECT pg_advisory_lock(hashtext('ymcp-novel-v2-migrations'))");
       await client.query("CREATE TABLE IF NOT EXISTS schema_migrations(version TEXT PRIMARY KEY, checksum TEXT NOT NULL, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())");
+      const appliedResult = await client.query<{ version: string; checksum: string; applied_at: Date }>("SELECT version,checksum,applied_at FROM schema_migrations ORDER BY version");
+      const audit = auditMigrationFiles(files, appliedResult.rows.map((row) => ({ version: row.version, checksum: row.checksum, appliedAt: row.applied_at.toISOString() })), manifest);
+      if (audit.checksumMismatches.length || audit.unexpectedApplied.length) {
+        throw new Error(`迁移审计失败：\n${formatMigrationAudit(audit).join("\n")}`);
+      }
       for (const file of files) {
-        const sql = readFileSync(join(migrationsDir, file), "utf8");
-        const rawChecksum = createHash("sha256").update(sql).digest("hex");
-        const normalizedSql = sql.replace(/\r\n?/gu, "\n");
-        const checksum = createHash("sha256").update(normalizedSql).digest("hex");
-        const applied = await client.query<{ checksum: string }>("SELECT checksum FROM schema_migrations WHERE version=$1", [file]);
-        if (applied.rowCount) {
-          if (applied.rows[0].checksum !== checksum && applied.rows[0].checksum !== rawChecksum) {
-            let compatibleAppliedMigration = false;
-            if (file === "022_chapter_workspace.sql") {
-              const markers = await client.query<{ object_count: number }>(`
-                SELECT count(*)::int AS object_count FROM (
-                  SELECT table_name,column_name FROM information_schema.columns
-                  WHERE table_schema=current_schema() AND (
-                    (table_name='workflow_run_summaries' AND column_name IN ('final_status','metrics')) OR
-                    (table_name='chapter_review_snapshots' AND column_name IN ('reviewed_content_hash','dimension_scores')) OR
-                    (table_name='manuscript_revisions' AND column_name IN ('retention_class','expires_at'))
-                  )
-                ) markers
-              `);
-              compatibleAppliedMigration = markers.rows[0]?.object_count === 6;
-            } else if (file === "013_default_skills.sql") {
-              // 013 is a repeatable seed migration. Older deployments may have
-              // the same three canonical seed rows under a different checksum.
-              const markers = await client.query<{ compatible: boolean }>(`
-                SELECT count(*) = 3 AS compatible
-                FROM skill_definitions
-                WHERE skill_id=ANY($1::text[])
-              `, [["longform-continuity", "independent-quality-gate", "memory-consolidation"]]);
-              compatibleAppliedMigration = markers.rows[0]?.compatible === true;
-            } else if (file === "017_migrate_v1_skills.sql") {
-              // 017 only adds repeatable skill seeds. The live database already
-              // contains the migrated set when this compatibility marker holds.
-              const markers = await client.query<{ compatible: boolean }>(`
-                SELECT count(DISTINCT skill_id) = $2 AS compatible
-                FROM skill_definitions
-                WHERE skill_id=ANY($1::text[])
-              `, [V1_MIGRATED_SKILL_IDS, V1_MIGRATED_SKILL_IDS.length]);
-              compatibleAppliedMigration = markers.rows[0]?.compatible === true;
-            } else if (file === "020_foreshadowing_narrative_order.sql") {
-              const markers = await client.query<{ compatible: boolean }>(`
-                SELECT
-                  (SELECT count(*) FROM information_schema.columns
-                   WHERE table_schema=current_schema() AND table_name='foreshadowing' AND column_name='narrative_order') = 1
-                  AND (SELECT count(*) FROM pg_indexes
-                       WHERE schemaname=current_schema() AND indexname='idx_foreshadowing_project_order') = 1
-                  AS compatible
-              `);
-              compatibleAppliedMigration = markers.rows[0]?.compatible === true;
-            } else if (file === "030_memory_claim_revision_lifecycle.sql") {
-              const markers = await client.query<{ compatible: boolean }>(`
-                SELECT
-                  (SELECT count(DISTINCT table_name || ':' || column_name) FROM information_schema.columns
-                   WHERE table_schema=current_schema() AND (
-                     (table_name='memory_claims' AND column_name IN ('lifecycle_status','source_document_id','source_workflow_id','identity_hash','value_hash')) OR
-                     (table_name='memory_claim_sources' AND column_name IN ('claim_id','project_id','document_id','revision_id','artifact_id','workflow_id','lifecycle_status','created_at'))
-                   )) = 13
-                  AND (SELECT count(DISTINCT indexname) FROM pg_indexes
-                       WHERE schemaname=current_schema() AND indexname IN ('memory_claims_active_project','memory_claims_active_identity','memory_claims_project_content_scope','memory_claim_sources_revision')) = 4
-                  AND (SELECT count(DISTINCT conname) FROM pg_constraint
-                       WHERE conname IN ('memory_claims_lifecycle_status_check','memory_claim_sources_lifecycle_status_check','memory_claim_sources_pkey')) = 3
-                  AS compatible
-              `);
-              compatibleAppliedMigration = markers.rows[0]?.compatible === true;
-            }
-            if (!compatibleAppliedMigration && file === "017_migrate_v1_skills.sql") {
-              // 017 的历史 SQL 会在冲突时更新 canonical Skill。兼容回放只应补齐
-              // 缺失种子，因此先保存已有行的可变字段，并在回放后恢复它们。
-              await client.query("BEGIN");
-              try {
-                await client.query(`
-                  CREATE TEMP TABLE preserved_v1_skills ON COMMIT DROP AS
-                  SELECT skill_id,version,capabilities,applicable_tasks,required_memory_kinds,
-                         conflicts,quality_gates,prompt_sections,enabled,updated_at
-                  FROM skill_definitions
-                  WHERE skill_id=ANY($1::text[])
-                `, [V1_MIGRATED_SKILL_IDS]);
-                await client.query(sql);
-                await client.query(`
-                  UPDATE skill_definitions current
-                  SET version=preserved.version,
-                      capabilities=preserved.capabilities,
-                      applicable_tasks=preserved.applicable_tasks,
-                      required_memory_kinds=preserved.required_memory_kinds,
-                      conflicts=preserved.conflicts,
-                      quality_gates=preserved.quality_gates,
-                      prompt_sections=preserved.prompt_sections,
-                      enabled=preserved.enabled,
-                      updated_at=preserved.updated_at
-                  FROM preserved_v1_skills preserved
-                  WHERE current.skill_id=preserved.skill_id
-                `);
-                await client.query("UPDATE schema_migrations SET checksum=$2 WHERE version=$1", [file, checksum]);
-                await client.query("COMMIT");
-              } catch (error) {
-                await client.query("ROLLBACK");
-                throw new Error(`数据库迁移失败 ${file}: ${(error as Error).message}`, { cause: error });
-              }
-            } else {
-              if (!compatibleAppliedMigration) throw new Error(`已应用迁移被修改：${file}`);
-              await client.query("UPDATE schema_migrations SET checksum=$2 WHERE version=$1", [file, checksum]);
-            }
-          }
-          continue;
-        }
+        if (!audit.missingInDatabase.includes(file.version)) continue;
+        const sql = readFileSync(join(migrationsDir, file.version), "utf8");
         await client.query("BEGIN");
         try {
           await client.query(sql);
-          await client.query("INSERT INTO schema_migrations(version,checksum) VALUES($1,$2)", [file, checksum]);
+          await client.query("INSERT INTO schema_migrations(version,checksum) VALUES($1,$2)", [file.version, file.checksum]);
           await client.query("COMMIT");
         } catch (error) {
           await client.query("ROLLBACK");
-          throw new Error(`数据库迁移失败 ${file}: ${(error as Error).message}`, { cause: error });
+          throw new Error(`数据库迁移失败 ${file.version}: ${(error as Error).message}`, { cause: error });
         }
       }
     } finally {
       await client.query("SELECT pg_advisory_unlock(hashtext('ymcp-novel-v2-migrations'))").catch(() => undefined);
       client.release();
     }
+    // Keep the repair available even in deployments where local SQL migration
+    // files are supplied outside the application package.
+    await this.repairFinalChapterBlueprintStatuses();
+    await this.repairCompletedStoryArcStatuses();
     await this.backfillCurrentChapterReviewSnapshots();
+  }
+
+  async auditMigrations(migrationsDir = process.env.NOVEL_V2_MIGRATIONS_DIR ?? join(process.cwd(), "deploy", "postgres")): Promise<MigrationAudit> {
+    const files = readMigrationFiles(migrationsDir);
+    if (!files.length) throw new Error(`没有找到 V2 数据库迁移：${migrationsDir}`);
+    const manifest = readMigrationManifest(migrationsDir);
+    const client = await this.connectForMigration();
+    try {
+      const result = await client.query<{ version: string; checksum: string; applied_at: Date }>("SELECT version,checksum,applied_at FROM schema_migrations ORDER BY version");
+      return auditMigrationFiles(files, result.rows.map((row) => ({ version: row.version, checksum: row.checksum, appliedAt: row.applied_at.toISOString() })), manifest);
+    } finally {
+      client.release();
+    }
+  }
+
+  private async repairFinalChapterBlueprintStatuses(): Promise<number> {
+    const result = await this.pool.query(
+      `UPDATE chapters c
+       SET status='final',updated_at=now()
+       FROM manuscript_documents d
+       WHERE c.project_id=d.project_id
+         AND c.document_id=d.id
+         AND d.status='final'
+         AND d.current_revision_id IS NOT NULL
+         AND c.status<>'final'`,
+    );
+    return result.rowCount ?? 0;
+  }
+
+  /**
+   * Reconcile arc lifecycle state after an older commit path left all of its
+   * approved batch chapters final while the arc remained active.
+   *
+   * The condition intentionally requires every blueprint chapter to have a
+   * final manuscript revision and the last approved batch either to declare
+   * itself complete or to cover the arc's expected chapter boundary. The
+   * boundary fallback prevents a model omission of `complete=true` from
+   * leaving a fully committed arc permanently active; an unlinked or planned
+   * chapter still blocks completion.
+   */
+  private async repairCompletedStoryArcStatuses(): Promise<number> {
+    const result = await this.pool.query<{ id: string; project_id: string }>(
+      `UPDATE arcs a
+       SET execution_status='completed',completed_at=COALESCE(completed_at,now()),updated_at=now()
+       WHERE a.execution_status='active'
+         AND EXISTS (SELECT 1 FROM chapters c WHERE c.arc_id=a.id)
+         AND NOT EXISTS (
+           SELECT 1
+           FROM chapters c
+           LEFT JOIN manuscript_documents d ON d.id=c.document_id AND d.project_id=c.project_id
+           WHERE c.arc_id=a.id
+             AND (d.id IS NULL OR d.status<>'final' OR d.current_revision_id IS NULL)
+         )
+         AND EXISTS (
+           SELECT 1
+           FROM story_arc_batches b
+           WHERE b.arc_id=a.id
+             AND b.batch_index=(SELECT MAX(last_approved_batch.batch_index) FROM story_arc_batches last_approved_batch WHERE last_approved_batch.arc_id=a.id AND last_approved_batch.status='approved')
+             AND b.status='approved'
+             AND (
+               COALESCE((b.payload->>'complete')::boolean,false)=true
+               OR (
+                 COALESCE((a.payload->>'expectedChapterCount')::integer,0)>0
+                 AND b.end_chapter_index >= (a.payload->>'expectedChapterCount')::integer
+               )
+             )
+             AND b.end_chapter_index >= CASE
+               WHEN COALESCE((a.payload->>'expectedChapterCount')::integer,0)>0
+                 THEN (a.payload->>'expectedChapterCount')::integer
+               ELSE b.end_chapter_index
+             END
+         )
+       RETURNING a.id,a.project_id`,
+    );
+    for (const row of result.rows) {
+      await this.pool.query(
+        "INSERT INTO audit_records(project_id,actor,action,aggregate_type,aggregate_id,payload) VALUES($1,'runtime','story-arc.completion-reconciled','story-arc',$2,$3)",
+        [row.project_id, row.id, { reason: "all chapters final and last approved batch complete" }],
+      );
+    }
+    return result.rowCount ?? 0;
   }
 
   async backfillMissingContentWordCounts(objects: ObjectStoreAdapter): Promise<{ updated: number; failed: number }> {
@@ -597,9 +621,9 @@ export class NovelPostgresRepository {
 
   async recordModelInvocation(input: ModelInvocationAudit): Promise<void> {
     await this.pool.query(
-      `INSERT INTO model_invocations(workflow_run_id,task_id,purpose,config_revision,candidate_index,executor,profile_id,protocol,model,status,input_tokens,output_tokens,provider_input_tokens,provider_output_tokens,provider_cached_input_tokens,estimated_input_tokens,estimated_output_tokens,usage_source,latency_ms,prompt_fingerprint,response_id,error_category)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`,
-      [input.workflowRunId ?? null, input.taskId ?? null, input.purpose, input.configRevision, input.candidateIndex, input.executor, input.profileId ?? null, input.protocol ?? null, input.model, input.status, input.inputTokens, input.outputTokens, input.providerInputTokens ?? null, input.providerOutputTokens ?? null, input.providerCachedInputTokens ?? null, input.estimatedInputTokens ?? null, input.estimatedOutputTokens ?? null, input.usageSource ?? "provider", input.latencyMs, input.promptFingerprint, input.responseId ?? null, input.errorCategory ?? null],
+      `INSERT INTO model_invocations(workflow_run_id,task_id,purpose,config_revision,candidate_index,executor,profile_id,provider_label,protocol,model,status,input_tokens,output_tokens,provider_input_tokens,provider_output_tokens,provider_cached_input_tokens,estimated_input_tokens,estimated_output_tokens,usage_source,latency_ms,prompt_fingerprint,response_id,error_category,error_message)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)`,
+      [input.workflowRunId ?? null, input.taskId ?? null, input.purpose, input.configRevision, input.candidateIndex, input.executor, input.profileId ?? null, input.providerLabel ?? null, input.protocol ?? null, input.model, input.status, input.inputTokens, input.outputTokens, input.providerInputTokens ?? null, input.providerOutputTokens ?? null, input.providerCachedInputTokens ?? null, input.estimatedInputTokens ?? null, input.estimatedOutputTokens ?? null, input.usageSource ?? "provider", input.latencyMs, input.promptFingerprint, input.responseId ?? null, input.errorCategory ?? null, input.errorMessage?.slice(0, 2_000) ?? null],
     );
   }
 
@@ -993,6 +1017,60 @@ export class NovelPostgresRepository {
     }));
   }
 
+  async listModelInvocations(workflowId: string, limit = 200) {
+    const boundedLimit = Math.min(Math.max(Math.floor(limit), 1), 200);
+    const result = await this.pool.query(`
+      SELECT invocation.id,
+             invocation.workflow_run_id,
+             invocation.task_id,
+             invocation.purpose,
+             invocation.candidate_index,
+             invocation.executor,
+             invocation.profile_id,
+             COALESCE(invocation.provider_label, provider.label, invocation.profile_id, invocation.executor) AS provider,
+             invocation.protocol,
+             invocation.model,
+             invocation.status,
+             invocation.config_revision,
+             current_config.config_revision AS current_config_revision,
+             invocation.latency_ms,
+             invocation.error_category,
+             invocation.error_message,
+             invocation.created_at
+      FROM model_invocations invocation
+      LEFT JOIN provider_configs provider ON provider.id=invocation.profile_id
+      LEFT JOIN LATERAL (
+        SELECT config_revision
+        FROM model_routes
+        WHERE config_revision IS NOT NULL
+        ORDER BY updated_at DESC
+        LIMIT 1
+      ) current_config ON TRUE
+      WHERE invocation.workflow_run_id=$1
+      ORDER BY invocation.created_at ASC, invocation.id ASC
+      LIMIT $2
+    `, [workflowId, boundedLimit]);
+    return result.rows.map((row) => ({
+      id: Number(row.id),
+      workflowRunId: row.workflow_run_id,
+      taskId: row.task_id,
+      purpose: row.purpose,
+      candidateIndex: Number(row.candidate_index),
+      executor: row.executor,
+      profileId: row.profile_id ?? undefined,
+      provider: row.provider ?? "未知提供方",
+      protocol: row.protocol ?? undefined,
+      model: row.model,
+      status: row.status,
+      configRevision: row.config_revision,
+      isCurrentConfig: row.current_config_revision ? row.config_revision === row.current_config_revision : undefined,
+      latencyMs: row.latency_ms === null ? undefined : Number(row.latency_ms),
+      errorCategory: row.error_category ?? undefined,
+      errorMessage: row.error_message ?? undefined,
+      createdAt: new Date(row.created_at).toISOString(),
+    }));
+  }
+
   async getPromptExecutionSnapshot(id: string, objects: ObjectStoreAdapter) {
     const result = await this.pool.query<{ prompt_object_key: string | null; response_object_key: string | null }>("SELECT prompt_object_key,response_object_key FROM prompt_executions WHERE id=$1 AND expires_at>now()", [id]);
     const row = result.rows[0];
@@ -1038,8 +1116,8 @@ export class NovelPostgresRepository {
          FROM project_plan_sections WHERE project_id=$1 FOR UPDATE`,
         [input.projectId],
       );
-      const project = await client.query<ProjectRow>(
-        "SELECT id,title,current_revision,metadata,created_at,updated_at FROM novel_projects WHERE id=$1 FOR UPDATE",
+      const project = await client.query<ProjectRow & { positioning_payload?: Record<string, unknown> | null }>(
+        "SELECT p.id,p.title,p.current_revision,p.metadata,p.created_at,p.updated_at,positioning.payload AS positioning_payload FROM novel_projects p LEFT JOIN project_plan_sections positioning ON positioning.project_id=p.id AND positioning.task_key='project-positioning' AND positioning.status='approved' WHERE p.id=$1 FOR UPDATE OF p",
         [input.projectId],
       );
       if (!project.rowCount) throw new Error("项目不存在");
@@ -1048,7 +1126,7 @@ export class NovelPostgresRepository {
         const section = byKey.get(stage.taskKey);
         return section ? [section] : [];
       });
-      const currentFingerprint = bookSynopsisSourceFingerprint({ projectTitle: project.rows[0].title, sections });
+      const currentFingerprint = bookSynopsisSourceFingerprint({ projectTitle: resolveProjectTitle(project.rows[0].id, project.rows[0].title, project.rows[0].positioning_payload ?? undefined), sections });
       if (currentFingerprint !== input.sourceFingerprint) {
         await client.query("ROLLBACK");
         return false;
@@ -1507,6 +1585,7 @@ export class NovelPostgresRepository {
         VALUES($1,$2,$3,$4,$5,$6,$7,$8,CASE WHEN $7='named' THEN NULL ELSE now()+interval '30 days' END)
       `, [revisionId, input.projectId, input.documentId, revision, Number(current.rows[0].current_revision), input.contentHash, input.label ? "named" : "rolling", input.label ?? null]);
       await client.query("UPDATE manuscript_documents SET current_revision_id=$1,status='final',updated_at=now() WHERE id=$2", [revisionId, input.documentId]);
+      await this.syncFinalChapterBlueprintStatusTx(client, input.projectId, input.documentId);
       await client.query("UPDATE novel_projects SET current_revision=$1,updated_at=now() WHERE id=$2", [revision, input.projectId]);
       await this.appendOutboxTx(client, "manuscript-revision", revisionId, "manuscript-revision.saved", { projectId: input.projectId, documentId: input.documentId, revision, contentHash: input.contentHash, source: "web-author" });
       await client.query("COMMIT");
@@ -1539,6 +1618,7 @@ export class NovelPostgresRepository {
       const revisionId = randomUUID();
       await client.query("INSERT INTO manuscript_revisions(id,project_id,document_id,revision,base_revision,content_hash,retention_class,expires_at) VALUES($1,$2,$3,$4,$5,$6,'rolling',now()+interval '30 days')", [revisionId, input.projectId, input.documentId, revision, Number(head.rows[0].current_revision), source.rows[0].content_hash]);
       await client.query("UPDATE manuscript_documents SET current_revision_id=$1,status='final',updated_at=now() WHERE id=$2", [revisionId, input.documentId]);
+      await this.syncFinalChapterBlueprintStatusTx(client, input.projectId, input.documentId);
       await client.query("UPDATE novel_projects SET current_revision=$1,updated_at=now() WHERE id=$2", [revision, input.projectId]);
       await this.appendOutboxTx(client, "manuscript-revision", revisionId, "manuscript-revision.restored", { projectId: input.projectId, documentId: input.documentId, revision, sourceRevisionId: input.revisionId });
       await client.query("COMMIT");
@@ -1852,8 +1932,26 @@ export class NovelPostgresRepository {
     }
     if (kind === "planning" || kind === "worldview" || kind === "characters") {
       const entityKind = kind === "characters" ? "character" : kind;
-      const result = await this.pool.query("SELECT id, kind, name, payload FROM entities WHERE project_id=$1 AND kind=$2 ORDER BY name,id", [projectId, entityKind]);
-      return result.rows;
+      const result = await this.pool.query<{ id: string; kind: string; name: string; payload: Record<string, unknown> | null }>("SELECT id, kind, name, payload FROM entities WHERE project_id=$1 AND kind=$2 ORDER BY name,id", [projectId, entityKind]);
+      if (kind !== "characters") return result.rows;
+      const foundation = await this.pool.query<{ characters: unknown }>("SELECT payload->'structuredData'->'characters' AS characters FROM project_plan_sections WHERE project_id=$1 AND task_key='characters'", [projectId]);
+      const foundationCharacters = Array.isArray(foundation.rows[0]?.characters)
+        ? foundation.rows[0].characters.filter((item): item is FoundationCharacter => Boolean(item) && typeof item === "object" && !Array.isArray(item))
+        : [];
+      const index = buildCharacterIdentityIndex(projectId, result.rows, foundationCharacters);
+      const foundationById = new Map(foundationCharacters.flatMap((item) => typeof item.id === "string" && item.id.trim() ? [[item.id.trim(), item] as const] : []));
+      return result.rows.map((row) => {
+        const identity = resolveCharacterIdentity(projectId, row.id, index);
+        return {
+          ...row,
+          name: identity.displayName,
+          displayName: identity.displayName,
+          canonicalId: identity.canonicalId,
+          displayNameStatus: identity.status,
+          sourceCharacterId: identity.sourceId,
+          foundation: foundationById.get(identity.canonicalId),
+        };
+      });
     }
     if (kind === "relations") {
       const result = await this.pool.query("SELECT id, subject_id, predicate, object_id, valid_from, valid_to, source_revision_id FROM relations WHERE project_id=$1 ORDER BY id", [projectId]);
@@ -2104,6 +2202,10 @@ export class NovelPostgresRepository {
         && runResult.rows[0].payload.reasonCode !== "fact-approval-pending") {
         throw new Error("自动化来源不能执行作者覆盖批准");
       }
+      const missingReviewerRoles = Array.isArray(runResult.rows[0].payload.missingReviewerRoles)
+        ? runResult.rows[0].payload.missingReviewerRoles.filter((role): role is string => typeof role === "string")
+        : [];
+      assertCompleteChapterReviewEvidence(input.decision, missingReviewerRoles);
       const reviewRows = await client.query<{ issues: ReviewIssue[] }>("SELECT issues FROM reviews WHERE artifact_id=$1", [input.artifactId]);
       const unresolvedIssueFingerprints = [...new Set(reviewRows.rows.flatMap((row) => Array.isArray(row.issues) ? row.issues : [])
         .filter((item) => item.severity === "blocker" || item.severity === "major")
@@ -2578,7 +2680,7 @@ export class NovelPostgresRepository {
       const ordinalResult = await client.query<{ ordinal: number }>("SELECT COALESCE(MAX(ordinal),0)+1 AS ordinal FROM arcs WHERE project_id=$1", [input.projectId]);
       const ordinal = Number(ordinalResult.rows[0]?.ordinal ?? 1);
       arcId = randomUUID();
-      const payload = { title: `故事弧 ${ordinal}`, objective: input.authorIntent || "依据当前宏观规划和已定稿故事状态，形成一个完整的小故事", entryState: "", centralConflict: "", development: [], resolution: "", exitState: "", plotThreadRefs: [], threadResponsibilities: [], foreshadowingRefs: [], expectedChapterCount: 0, phases: [], authorIntent: input.authorIntent, workflowId: input.workflowId };
+      const payload = { title: `故事弧 ${ordinal}`, objective: input.authorIntent || "依据当前宏观规划和已定稿故事状态，形成一个完整的小故事", entryState: "", centralConflict: "", development: [], resolution: "", exitState: "", plotThreadRefs: [], threadResponsibilities: [], foreshadowingRefs: [], expectedChapterCount: 0, phases: [], workflowId: input.workflowId };
       await client.query(
         `INSERT INTO arcs(id,volume_id,project_id,title,ordinal,planning_status,execution_status,payload)
          VALUES($1,$2,$3,$4,$5,'generating','planned',$6)`,
@@ -2686,6 +2788,22 @@ export class NovelPostgresRepository {
           }
         }
       }
+      // A protected chapter may skip the blueprint upsert during rebase. Sync
+      // the denormalized lifecycle marker so an old planned value cannot
+      // survive beside a committed manuscript.
+      await client.query(
+        `UPDATE chapters c
+         SET status='final',updated_at=now()
+         FROM manuscript_documents d
+         WHERE c.project_id=$1
+           AND c.arc_id=$2
+           AND c.document_id=d.id
+           AND d.project_id=c.project_id
+           AND d.status='final'
+           AND d.current_revision_id IS NOT NULL
+           AND c.status<>'final'`,
+        [input.projectId, input.arcId],
+      );
       const removable = existing.rows.filter((row) => {
         const index = Number(row.payload?.index ?? 0);
         return index >= previousBatchStart && index <= previousBatchEnd && !keptIds.includes(row.id) && !row.document_id;
@@ -2944,7 +3062,15 @@ export class NovelPostgresRepository {
   async getStoryArc(projectId: string, arcId: string): Promise<StoryArcRecord | undefined> {
     const [arcResult, chapterResult, batchResult] = await Promise.all([
       this.pool.query<ArcRow>("SELECT * FROM arcs WHERE id=$1 AND project_id=$2", [arcId, projectId]),
-      this.pool.query<ChapterBlueprintRow>("SELECT id,arc_id,project_id,document_id,title,ordinal,status,payload,source_artifact_id,blueprint_revision FROM chapters WHERE arc_id=$1 AND project_id=$2 ORDER BY ordinal", [arcId, projectId]),
+      this.pool.query<ChapterBlueprintRow>(
+        `SELECT c.id,c.arc_id,c.project_id,c.document_id,c.title,c.ordinal,c.status,c.payload,c.source_artifact_id,c.blueprint_revision,
+                d.status AS document_status,d.current_revision_id AS document_current_revision_id
+         FROM chapters c
+         LEFT JOIN manuscript_documents d ON d.id=c.document_id AND d.project_id=c.project_id
+         WHERE c.arc_id=$1 AND c.project_id=$2
+         ORDER BY c.ordinal`,
+        [arcId, projectId],
+      ),
       this.pool.query<StoryArcBatchRow>("SELECT * FROM story_arc_batches WHERE arc_id=$1 AND project_id=$2 ORDER BY batch_index", [arcId, projectId]),
     ]);
     const row = arcResult.rows[0];
@@ -2956,7 +3082,7 @@ export class NovelPostgresRepository {
       ordinal: Number(row.ordinal),
       planningStatus: row.planning_status,
       executionStatus: row.execution_status,
-      arc: row.payload,
+      arc: parseStoryArcPlan(row.payload),
       chapters: chapterResult.rows.map(chapterBlueprintFromRow),
       batches: batchResult.rows.map((batch) => ({ id: batch.id, arcId: batch.arc_id, projectId: batch.project_id, batchIndex: Number(batch.batch_index), startChapterIndex: Number(batch.start_chapter_index), endChapterIndex: Number(batch.end_chapter_index), complete: batch.payload?.complete === true, status: batch.status, entryFingerprint: batch.entry_fingerprint, sourceArtifactId: batch.source_artifact_id ?? undefined, approvedAt: batch.approved_at ? iso(batch.approved_at) : undefined })),
       sourceArtifactId: row.source_artifact_id ?? undefined,
@@ -3210,6 +3336,36 @@ export class NovelPostgresRepository {
     }
   }
 
+  async prepareStoryArcBatchRetry(projectId: string, arcId: string): Promise<{ batchIndex: number; startChapterIndex: number }> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const arc = await client.query<ArcRow>("SELECT * FROM arcs WHERE id=$1 AND project_id=$2 FOR UPDATE", [arcId, projectId]);
+      if (!arc.rowCount || arc.rows[0].planning_status !== "approved" || arc.rows[0].execution_status !== "active") throw new Error("故事弧当前不可重试批次");
+      const batches = await client.query<StoryArcBatchRow>("SELECT * FROM story_arc_batches WHERE arc_id=$1 AND project_id=$2 ORDER BY batch_index FOR UPDATE", [arcId, projectId]);
+      const last = batches.rows.at(-1);
+      if (!last || last.status !== "failed") throw new Error("当前没有可重试的失败批次");
+      const progress = await client.query<{ planned: string; finalized: string }>(
+        `SELECT count(*)::text AS planned,count(*) FILTER (WHERE d.status='final')::text AS finalized
+         FROM chapters c LEFT JOIN manuscript_documents d ON d.id=c.document_id WHERE c.batch_id=$1`, [last.id],
+      );
+      if (Number(progress.rows[0]?.planned ?? 0) > 0 || Number(progress.rows[0]?.finalized ?? 0) > 0) throw new Error("失败批次已有章节投影，不能原区间重试");
+      const retryCount = Number((last.payload as { retryCount?: number } | undefined)?.retryCount ?? 0) + 1;
+      await client.query(
+        "UPDATE story_arc_batches SET status='generating',payload=(payload - 'failureReason') || $4::jsonb,updated_at=now() WHERE id=$1 AND arc_id=$2 AND project_id=$3 AND status='failed'",
+        [last.id, arcId, projectId, JSON.stringify({ complete: false, retryCount })],
+      );
+      await client.query("INSERT INTO audit_records(project_id,actor,action,aggregate_type,aggregate_id,payload) VALUES($1,'runtime','story-arc-batch.retry','story-arc-batch',$2,$3)", [projectId, last.id, { arcId, batchIndex: Number(last.batch_index), startChapterIndex: Number(last.start_chapter_index), retryCount }]);
+      await client.query("COMMIT");
+      return { batchIndex: Number(last.batch_index), startChapterIndex: Number(last.start_chapter_index) };
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
   async failStoryArcBatch(projectId: string, arcId: string, batchIndex: number, reason: string): Promise<void> {
     await this.pool.query("UPDATE story_arc_batches SET status='failed',payload=payload || $4,updated_at=now() WHERE project_id=$1 AND arc_id=$2 AND batch_index=$3 AND status='generating'", [projectId, arcId, batchIndex, { failureReason: reason }]);
   }
@@ -3318,18 +3474,50 @@ export class NovelPostgresRepository {
     return this.getStoryArc(projectId, arcId);
   }
 
-  async markStoryArcGenerating(projectId: string, arcId: string, actor: string) {
+  async markStoryArcGenerating(projectId: string, arcId: string, actor: string, options: { workflowId?: string } = {}) {
+    const payloadPatch = {
+      ...(options.workflowId ? { workflowId: options.workflowId } : {}),
+    };
     const result = await this.pool.query(`
       UPDATE arcs SET
         planning_status='generating',
         approved_at=CASE WHEN execution_status='completed' THEN approved_at ELSE NULL END,
         context_fingerprint=CASE WHEN execution_status='completed' THEN context_fingerprint ELSE NULL END,
+        payload=(payload - 'failureReason') || $3,
         updated_at=now()
       WHERE id=$1 AND project_id=$2 AND execution_status<>'abandoned'
       RETURNING id,execution_status
-    `, [arcId, projectId]);
+    `, [arcId, projectId, payloadPatch]);
     if (!result.rowCount) throw new Error("故事弧当前不可重基线");
     await this.pool.query("INSERT INTO audit_records(project_id,actor,action,aggregate_type,aggregate_id,payload) VALUES($1,$2,'story-arc.rebase-started','story-arc',$3,$4)", [projectId, actor, arcId, { preserveExecutionStatus: result.rows[0]?.execution_status === "completed" }]);
+    return this.getStoryArc(projectId, arcId);
+  }
+
+  async prepareStoryArcReviewRetry(projectId: string, arcId: string, actor: string) {
+    const result = await this.pool.query(`
+      UPDATE arcs a SET
+        planning_status='awaiting-review',
+        updated_at=now(),
+        payload=payload - 'failureReason'
+      WHERE a.id=$1
+        AND a.project_id=$2
+        AND a.planning_status='failed'
+        AND a.blueprint_artifact_id IS NOT NULL
+        AND EXISTS (
+          SELECT 1
+          FROM story_arc_batches b
+          WHERE b.arc_id=a.id
+            AND b.project_id=a.project_id
+            AND b.status='awaiting-review'
+            AND b.source_artifact_id=a.blueprint_artifact_id
+        )
+      RETURNING a.id
+    `, [arcId, projectId]);
+    if (!result.rowCount) throw new Error("故事弧没有可重试的审核蓝图");
+    await this.pool.query(
+      "INSERT INTO audit_records(project_id,actor,action,aggregate_type,aggregate_id,payload) VALUES($1,$2,'story-arc.review-retry-prepared','story-arc',$3,$4)",
+      [projectId, actor, arcId, { blueprintArtifactId: (await this.getStoryArc(projectId, arcId))?.blueprintArtifactId }],
+    );
     return this.getStoryArc(projectId, arcId);
   }
 
@@ -3476,6 +3664,21 @@ export class NovelPostgresRepository {
     const approvedArc = approvedArtifact?.structuredData
       ? parseStoryArcBundle(approvedArtifact.structuredData).arc
       : arc.arc;
+    const approvedStructuredArc = approvedArtifact?.structuredData
+      && typeof approvedArtifact.structuredData === "object"
+      && !Array.isArray(approvedArtifact.structuredData)
+      && typeof (approvedArtifact.structuredData as Record<string, unknown>).arc === "object"
+      && (approvedArtifact.structuredData as Record<string, unknown>).arc !== null
+      && !Array.isArray((approvedArtifact.structuredData as Record<string, unknown>).arc)
+      ? (approvedArtifact.structuredData as Record<string, unknown>).arc as Record<string, unknown>
+      : undefined;
+    const legacyArcContractGaps = approvedStructuredArc
+      && arc.arc.plotThreadRefs.length > 0
+      && arc.arc.threadResponsibilities?.length
+      && !Object.prototype.hasOwnProperty.call(approvedStructuredArc, "threadResponsibilities")
+      ? ["threadResponsibilities"]
+      : [];
+    const reviewApprovedArc = projectLegacyArcContractForReview({ approvedArc, currentArc: arc.arc, legacyArcContractGaps });
     const batch = arc.batches[0];
     const startChapterIndex = batch?.startChapterIndex ?? Number(rows.rows[0].global_order);
 
@@ -3528,7 +3731,9 @@ export class NovelPostgresRepository {
     return {
       arcId,
       executionStatus: arc.executionStatus,
-      approvedArc,
+      currentArc: arc.arc,
+      approvedArc: reviewApprovedArc,
+      legacyArcContractGaps,
       batchIndex: batch?.batchIndex ?? 1,
       startChapterIndex,
       chapters,
@@ -3693,7 +3898,7 @@ export class NovelPostgresRepository {
       projectId,
       arcId: row.arc_id,
       chapterBlueprintId: row.id,
-      arc: row.arc_payload,
+      arc: parseStoryArcPlan(row.arc_payload),
       chapter,
       neighbors: neighborsResult.rows.map(chapterBlueprintFromRow).map(({ id, globalOrder, title, narrativeFunction, stateTransition, unresolvedAtClose }) => ({ id, globalOrder, title, narrativeFunction, stateTransition, unresolvedAtClose })),
       sourceArtifactIds,
@@ -3957,6 +4162,64 @@ export class NovelPostgresRepository {
     return result.rows;
   }
 
+  async listModelInvocationErrors(projectId?: string, limit = 50) {
+    const boundedLimit = Math.min(Math.max(Math.floor(limit), 1), 50);
+    const result = await this.pool.query(`
+      SELECT invocation.id,
+             invocation.workflow_run_id,
+             invocation.task_id,
+             invocation.purpose,
+             invocation.candidate_index,
+             invocation.executor,
+             invocation.profile_id,
+             invocation.config_revision,
+             current_config.config_revision AS current_config_revision,
+             COALESCE(invocation.provider_label, provider.label, invocation.profile_id, invocation.executor) AS provider,
+             invocation.protocol,
+             invocation.model,
+             invocation.error_category,
+             invocation.error_message,
+             invocation.created_at,
+             workflow.project_id,
+             workflow.workflow_type,
+             COALESCE(workflow.payload->>'documentId', workflow.payload #>> '{intent,target,id}') AS document_id
+      FROM model_invocations invocation
+      LEFT JOIN provider_configs provider ON provider.id=invocation.profile_id
+      LEFT JOIN workflow_runs workflow ON workflow.temporal_workflow_id=invocation.workflow_run_id
+      LEFT JOIN LATERAL (
+        SELECT config_revision
+        FROM model_routes
+        WHERE config_revision IS NOT NULL
+        ORDER BY updated_at DESC
+        LIMIT 1
+      ) current_config ON TRUE
+      WHERE invocation.status='failed'
+        AND ($1::text IS NULL OR workflow.project_id=$1)
+      ORDER BY invocation.created_at DESC, invocation.id DESC
+      LIMIT $2
+    `, [projectId ?? null, boundedLimit]);
+    return result.rows.map((row) => ({
+      id: Number(row.id),
+      workflowRunId: row.workflow_run_id ?? undefined,
+      taskId: row.task_id ?? undefined,
+      purpose: row.purpose,
+      candidateIndex: Number(row.candidate_index),
+      executor: row.executor,
+      profileId: row.profile_id ?? undefined,
+      configRevision: row.config_revision,
+      isCurrentConfig: row.current_config_revision ? row.config_revision === row.current_config_revision : undefined,
+      provider: row.provider ?? "未知提供方",
+      protocol: row.protocol ?? undefined,
+      model: row.model,
+      errorCategory: row.error_category ?? undefined,
+      errorMessage: row.error_message ?? undefined,
+      createdAt: new Date(row.created_at).toISOString(),
+      projectId: row.project_id ?? undefined,
+      workflowType: row.workflow_type ?? undefined,
+      documentId: row.document_id ?? undefined,
+    }));
+  }
+
   /**
    * 列出项目下所有 foundation artifacts(全书规划产出)。
    *
@@ -4003,6 +4266,22 @@ export class NovelPostgresRepository {
   async getDocumentStatus(projectId: string, documentId: string): Promise<string | undefined> {
     const result = await this.pool.query<{ status: string }>("SELECT status FROM manuscript_documents WHERE project_id=$1 AND id=$2", [projectId, documentId]);
     return result.rows[0]?.status;
+  }
+
+  /**
+   * Generation must use the manuscript lifecycle as its authority. A stale
+   * blueprint projection must not make an already committed chapter writable.
+   */
+  async assertChapterGenerationAllowed(projectId: string, documentId: string): Promise<void> {
+    const result = await this.pool.query<{ status: string; current_revision_id: string | null }>(
+      "SELECT status,current_revision_id FROM manuscript_documents WHERE project_id=$1 AND id=$2",
+      [projectId, documentId],
+    );
+    const document = result.rows[0];
+    if (!document) throw new Error(`章节不存在:${documentId}`);
+    if (document.status === "final" || document.current_revision_id !== null) {
+      throw new Error("章节已定稿,如需重审请使用 novel_chapter_review");
+    }
   }
 
   async getChapterReviewPreflight(projectId: string, documentId: string): Promise<{ status: string; baseRevision: number; activeWorkflowId?: string; hasBlueprint: boolean } | undefined> {
@@ -5198,6 +5477,17 @@ export class NovelPostgresRepository {
   async recordLearningAssessment(assessment: RuntimeLearningAssessmentV2) {
     if (assessment.conclusion === "propose-improvement" && (!assessment.underlyingMechanism || !assessment.affectedInputClass || !assessment.candidate)) throw new Error("propose-improvement 必须包含机制、影响输入类和候选变更");
     await this.pool.query("INSERT INTO learning_assessments(id,project_id,source,conclusion,payload) VALUES($1,$2,$3,$4,$5) ON CONFLICT(id) DO UPDATE SET payload=EXCLUDED.payload,conclusion=EXCLUDED.conclusion", [assessment.id, assessment.projectId, assessment.source, assessment.conclusion, assessment]);
+    if (assessment.conclusion === "no-shared-learning") {
+      // 同一 assessment 可能经历模型重试：旧 worker 已创建的未审核候选不能继续冒充有效改进。
+      // 已进入 evidencing/reviewing 或已晋升的候选保留，避免撤销新状态的审计轨迹。
+      await this.pool.query(
+        `DELETE FROM craft_rule_candidates
+         WHERE project_id=$1
+           AND learning_source->>'assessmentId'=$2
+           AND status='proposed'`,
+        [assessment.projectId, assessment.id],
+      );
+    }
     await this.appendOutbox("learning-assessment", assessment.id, `learning.${assessment.conclusion}`, { projectId: assessment.projectId, assessmentId: assessment.id, source: assessment.source, proposeImprovement: assessment.conclusion === "propose-improvement" });
     return assessment;
   }
@@ -5421,6 +5711,7 @@ export class NovelPostgresRepository {
       await client.query("INSERT INTO manuscript_revisions(id,project_id,document_id,revision,base_revision,content_hash,artifact_id) VALUES($1,$2,$3,$4,$5,$6,$7)", [input.revisionId, input.projectId, input.documentId, revision, input.baseRevision, input.contentHash, input.artifact.id]);
       await this.refreshChapterReviewSnapshotTx(client, input.artifact.id, input.revisionId);
       await client.query("UPDATE manuscript_documents SET current_revision_id=$1,status='final',updated_at=now() WHERE id=$2 AND project_id=$3", [input.revisionId, input.documentId, input.projectId]);
+      await this.syncFinalChapterBlueprintStatusTx(client, input.projectId, input.documentId);
 
       let removedClaimIds: string[] = [];
       let activatedClaims: MemoryClaim[] = [];
@@ -5508,16 +5799,25 @@ export class NovelPostgresRepository {
            AND a.execution_status='active'
            AND EXISTS (SELECT 1 FROM chapters c WHERE c.arc_id=a.id)
            AND NOT EXISTS (
-             SELECT 1 FROM chapters c JOIN manuscript_documents d ON d.id=c.document_id
-             WHERE c.arc_id=a.id AND d.status<>'final'
+             SELECT 1
+             FROM chapters c
+             LEFT JOIN manuscript_documents d ON d.id=c.document_id AND d.project_id=c.project_id
+             WHERE c.arc_id=a.id
+               AND (d.id IS NULL OR d.status<>'final' OR d.current_revision_id IS NULL)
            )
            AND EXISTS (
              SELECT 1
              FROM story_arc_batches b
              WHERE b.arc_id=a.id
-               AND b.batch_index=(SELECT MAX(batch_index) FROM story_arc_batches WHERE arc_id=a.id)
+               AND b.batch_index=(SELECT MAX(batch_index) FROM story_arc_batches WHERE arc_id=a.id AND status='approved')
                AND b.status='approved'
-               AND COALESCE((b.payload->>'complete')::boolean,false)=true
+               AND (
+                 COALESCE((b.payload->>'complete')::boolean,false)=true
+                 OR (
+                   COALESCE((a.payload->>'expectedChapterCount')::integer,0)>0
+                   AND b.end_chapter_index >= (a.payload->>'expectedChapterCount')::integer
+                 )
+               )
                AND b.end_chapter_index >= CASE
                  WHEN COALESCE((a.payload->>'expectedChapterCount')::integer,0)>0
                    THEN (a.payload->>'expectedChapterCount')::integer

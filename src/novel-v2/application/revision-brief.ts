@@ -73,14 +73,22 @@ function evidenceSimilarity(left: ReviewIssue, right: ReviewIssue): number {
 
 function mechanismSimilarity(left: ReviewIssue, right: ReviewIssue): number {
   const value = (issue: ReviewIssue) => [issue.title, issue.description, issue.suggestion, issue.rule].filter(Boolean).join(" ");
-  const a = value(left).toLowerCase().replace(/[^\u4e00-\u9fffA-Za-z0-9]/gu, "");
-  const b = value(right).toLowerCase().replace(/[^\u4e00-\u9fffA-Za-z0-9]/gu, "");
-  const leftBigrams = new Set([...Array(Math.max(0, a.length - 1))].map((_, index) => a.slice(index, index + 2)));
-  const rightBigrams = new Set([...Array(Math.max(0, b.length - 1))].map((_, index) => b.slice(index, index + 2)));
-  if (!leftBigrams.size || !rightBigrams.size) return 0;
-  let intersection = 0;
-  for (const value of leftBigrams) if (rightBigrams.has(value)) intersection += 1;
-  return intersection / new Set([...leftBigrams, ...rightBigrams]).size;
+  const similarity = (leftText: string, rightText: string): number => {
+    const a = leftText.toLowerCase().replace(/[^\u4e00-\u9fffA-Za-z0-9]/gu, "");
+    const b = rightText.toLowerCase().replace(/[^\u4e00-\u9fffA-Za-z0-9]/gu, "");
+    const leftBigrams = new Set([...Array(Math.max(0, a.length - 1))].map((_, index) => a.slice(index, index + 2)));
+    const rightBigrams = new Set([...Array(Math.max(0, b.length - 1))].map((_, index) => b.slice(index, index + 2)));
+    if (!leftBigrams.size || !rightBigrams.size) return 0;
+    let intersection = 0;
+    for (const value of leftBigrams) if (rightBigrams.has(value)) intersection += 1;
+    return intersection / new Set([...leftBigrams, ...rightBigrams]).size;
+  };
+  const combinedSimilarity = similarity(value(left), value(right));
+  const titleSimilarity = similarity(left.title, right.title);
+  const ruleSimilarity = similarity(left.rule ?? "", right.rule ?? "");
+  // 长描述会稀释同一机制的短标题/规则。分别比较标签后再取最大值，
+  // 才能把跨段落、跨 reviewer 的同类安全窗口合并起来。
+  return Math.max(combinedSimilarity, titleSimilarity, ruleSimilarity);
 }
 
 function rangesOverlap(left: ReviewIssue, right: ReviewIssue): boolean {
@@ -90,13 +98,14 @@ function rangesOverlap(left: ReviewIssue, right: ReviewIssue): boolean {
 }
 
 function canMergeIssues(left: ReviewIssue, right: ReviewIssue): boolean {
-  if (!rangesOverlap(left, right)) return false;
   const leftRule = normalize(left.rule);
   const rightRule = normalize(right.rule);
   const leftEvidence = normalize(left.excerpt ?? left.evidence);
   const rightEvidence = normalize(right.excerpt ?? right.evidence);
-  if (leftEvidence === rightEvidence) return Boolean(leftRule && leftRule === rightRule);
+  // 同一通用规则在不同段落出现时，必须共享一个修订簇，否则局部修订会被误当成全局修复。
   if (leftRule && leftRule === rightRule) return true;
+  if (!rangesOverlap(left, right)) return mechanismSimilarity(left, right) >= 0.08;
+  if (leftEvidence === rightEvidence) return Boolean(leftRule && leftRule === rightRule);
   return evidenceSimilarity(left, right) >= 0.2 || mechanismSimilarity(left, right) >= 0.08;
 }
 
@@ -208,15 +217,29 @@ function mergeGroup(group: SourceIssue[]): RevisionIssueCluster {
 export interface RevisionBriefOptions {
   /** 仅当质量门因低分触发修订时开启；普通自动修订仍聚焦 blocker/major。 */
   includeWarnings?: boolean;
+  /** 定向修订时，把当前 reviewer 发现的同机制安全窗口并入作者选中的 issue。 */
+  includeDirectedReviewEvidence?: boolean;
+}
+
+/**
+ * 作者已经给出明确修订要求时，冲突的 reviewer 指令属于可丢弃的辅助证据；
+ * 没有作者裁决时仍阻断自动修订，避免流程在互斥建议中自行选边。
+ */
+export function shouldBlockRevisionForConflicts(conflicts: RevisionDirectiveConflict[], hasAuthorInstruction: boolean): boolean {
+  return conflicts.length > 0 && !hasAuthorInstruction;
 }
 
 export function buildRevisionBrief(reviews: Review[], directedIssues?: ReviewIssue[], options: RevisionBriefOptions = {}): RevisionBrief {
   const includedSeverities = options.includeWarnings ? new Set(["blocker", "major", "warning"]) : new Set(["blocker", "major"]);
+  const reviewSources: SourceIssue[] = reviews.flatMap((review) => review.issues
+    .filter((issue) => includedSeverities.has(issue.severity))
+    .map((issue) => ({ issue, role: review.role ?? review.reviewerId, fingerprint: sourceIssueFingerprint(issue) })));
   const sources: SourceIssue[] = directedIssues
-    ? directedIssues.map((issue) => ({ issue, role: "directed", fingerprint: sourceIssueFingerprint(issue) }))
-    : reviews.flatMap((review) => review.issues
-      .filter((issue) => includedSeverities.has(issue.severity))
-      .map((issue) => ({ issue, role: review.role ?? review.reviewerId, fingerprint: sourceIssueFingerprint(issue) })));
+    ? [
+        ...directedIssues.map((issue) => ({ issue, role: "directed", fingerprint: sourceIssueFingerprint(issue) })),
+        ...(options.includeDirectedReviewEvidence ? reviewSources : []),
+      ]
+    : reviewSources;
   const groups: SourceIssue[][] = [];
   for (const source of sources) {
     const matchedIndexes = groups
@@ -251,7 +274,10 @@ export function buildRevisionBrief(reviews: Review[], directedIssues?: ReviewIss
     }
   }
   const conflictedIds = new Set(conflicts.map(({ clusterId }) => clusterId));
-  return { issues: clusters.filter(({ id }) => !conflictedIds.has(id)).map(({ issue }) => issue), clusters, conflicts };
+  const visibleClusters = options.includeDirectedReviewEvidence
+    ? clusters.filter(({ sourceRoles }) => sourceRoles.includes("directed"))
+    : clusters;
+  return { issues: visibleClusters.filter(({ id }) => !conflictedIds.has(id)).map(({ issue }) => issue), clusters, conflicts };
 }
 
 export function buildRevisionDirection(input: { directedIssues?: ReviewIssue[]; authorInstruction?: string; chapterParagraphCount?: number }) {

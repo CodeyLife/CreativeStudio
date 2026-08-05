@@ -6,7 +6,7 @@ import { buildFoundationPrompt } from "../prompts/foundation";
 import { buildFoundationReviewPrompt } from "../prompts/foundation-review";
 import { getReviewFocus } from "../prompts/chapter-review";
 import Ajv from "ajv";
-import { buildStoryArcPlanningContextSections, buildStoryArcPrompt, buildStoryArcRebasePrompt, buildStoryArcReviewPrompt, buildStoryArcRevisionPrompt, storyArcBundleSchema } from "../prompts/story-arc";
+import { buildStoryArcChaptersPrompt, buildStoryArcPlanningContextSections, buildStoryArcPrompt, buildStoryArcRebasePrompt, buildStoryArcReviewPrompt, buildStoryArcRevisionPrompt, storyArcBundleSchema } from "../prompts/story-arc";
 import { WRITER_HARD_CONSTRAINTS } from "../prompts/writer-rules";
 
 describe("long-form prompt contracts", () => {
@@ -67,6 +67,40 @@ describe("long-form prompt contracts", () => {
     expect(prompt).toContain("当前因果、状态、事实边界和场景执行材料");
     expect(prompt).toContain("状态保持稳定也是合法结果");
     expect(prompt).not.toContain("每章必须有新鲜贡献");
+  });
+
+  it("declares the complete chapter field contract for split arc planning", () => {
+    const prompt = buildStoryArcChaptersPrompt({
+      projectTitle: "测试项目",
+      macro: [],
+      recentChapters: [],
+      openThreads: [],
+      arc: { title: "当前弧" } as never,
+      batch: { batchIndex: 2, startChapterIndex: 11, complete: false },
+    });
+    expect(prompt).toContain("index、title、narrativeFunction、povCharacterId、stateTransition、scenes、continuityConstraints、unresolvedAtClose");
+    expect(prompt).toContain("before、after、evidence 三个非空字符串");
+    expect(prompt).toContain("narrativeFunction 必须使用 schema 枚举值");
+  });
+
+  it("guards local reactions from becoming unsupported material functions", () => {
+    const prompt = buildStoryArcReviewPrompt({
+      arc: { title: "当前弧" },
+      batch: { batchIndex: 2, startChapterIndex: 11, complete: false },
+      chapters: [{
+        index: 1,
+        title: "当前章",
+        narrativeFunction: "development",
+        povCharacterId: "char-1",
+        stateTransition: { before: "前", after: "后", evidence: "证据" },
+        scenes: [{ situation: "处境", observableActions: ["动作"], outcome: "结果" }],
+        continuityConstraints: [],
+        unresolvedAtClose: ["未知"],
+      }],
+    } as never, "");
+    expect(prompt).toContain("未知物质、装置、痕迹或局部反应");
+    expect(prompt).toContain("不能单凭一次反应推出用途、成分、机制");
+    expect(prompt).toContain("保留未知状态");
   });
 
   it("projects ledger elements and learning mechanisms into story-arc planning without forcing them into events", () => {
@@ -136,6 +170,9 @@ describe("long-form prompt contracts", () => {
     expect(planning).toContain("关键选择、代价、退出状态和新问题");
     expect(planning).toContain("安静场景也要有可感知的");
     expect(review).toContain("前置证据、行动代价和意义变化");
+    expect(review).toContain("跨章节持续的物件、伤势、资源、关系、知识或限制");
+    expect(review).toContain("故事弧按批次滚动审核");
+    expect(review).toContain("certaintyUpgrades 只记录证据不足却越过冻结边界的确定性升级");
     expect(revision).toContain("保留已经成立的人物选择、关系积累");
   });
 
@@ -174,6 +211,20 @@ describe("long-form prompt contracts", () => {
       target: {
         arcId: "arc-1",
         executionStatus: "active",
+        currentArc: {
+          title: "当前弧",
+          objective: "保留既有因果并补齐阶段责任",
+          entryState: "入口",
+          centralConflict: "冲突",
+          development: [],
+          resolution: "阶段结果",
+          exitState: "出口",
+          plotThreadRefs: ["thread-1"],
+          threadResponsibilities: [{ threadRef: "thread-1", responsibility: "保持压力", nextAdvance: "出现新证据" }],
+          foreshadowingRefs: [],
+          expectedChapterCount: 2,
+          phases: [],
+        },
         approvedArc: {
           title: "第一弧",
           objective: "保留既有因果并修复边界",
@@ -199,15 +250,18 @@ describe("long-form prompt contracts", () => {
           approvedPlan: { sceneEvents: [], continuityConstraints: [], setupRefs: [], payoffRefs: [] },
           authoritativeFacts: [],
         }],
+        legacyArcContractGaps: ["threadResponsibilities"],
       },
     });
     expect(prompt).toContain("不是下一批次生成");
     expect(prompt).toContain("batch.batchIndex=1");
     expect(prompt).toContain("只读输入 envelope");
+    expect(prompt).toContain("currentArc 与当前输出 bundle.arc 才是本次待审的弧级契约");
+    expect(prompt).toContain("legacyArcContractGaps");
     expect(prompt).toContain("不得原样复制到输出");
   });
 
-  it("does not require optional scene execution detail to invent constraints", () => {
+  it("uses explicit empty execution values instead of optional scene fields", () => {
     const validate = new Ajv({ strict: false }).compile(storyArcBundleSchema);
     expect(validate({
       arc: {
@@ -223,20 +277,22 @@ describe("long-form prompt contracts", () => {
         foreshadowingRefs: [],
         expectedChapterCount: 1,
         phases: [],
-        thematicQuestions: [],
       },
       batch: { batchIndex: 1, startChapterIndex: 1, complete: false },
       chapters: [{
         index: 1,
         title: "安静的一章",
+        narrativeFunction: "unspecified",
+        povCharacterId: "",
         stateTransition: { before: "入口", after: "状态仍在", evidence: "观察与相处留下可见证据" },
-        scenes: [{ title: "室内", participants: ["主角"], situation: "两人等待消息", observableActions: ["主角把未寄出的信收回抽屉"], outcome: "关系和信息边界保持开放" }],
+        scenes: [{ title: "室内", participants: ["主角"], situation: "两人等待消息", observableActions: ["主角把未寄出的信收回抽屉"], opposition: "", decision: "", outcome: "关系和信息边界保持开放", cost: "" }],
         continuityConstraints: [],
+        unresolvedAtClose: [],
       }],
     })).toBe(true);
   });
 
-  it("keeps empty continuity and thematic collections optional", () => {
+  it("accepts the reduced arc contract without deprecated fields", () => {
     const validate = new Ajv({ allErrors: true, strict: false }).compile(storyArcBundleSchema);
     const value = {
       arc: {
@@ -257,8 +313,12 @@ describe("long-form prompt contracts", () => {
       chapters: [{
         index: 1,
         title: "quiet chapter",
+        narrativeFunction: "unspecified",
+        povCharacterId: "",
         stateTransition: { before: "tired", after: "rested", evidence: "sleep" },
-        scenes: [{ title: "rest", participants: ["person"], situation: "at home", observableActions: ["sleep"], outcome: "rested" }],
+        scenes: [{ title: "rest", participants: ["person"], situation: "at home", observableActions: ["sleep"], opposition: "", decision: "", outcome: "rested", cost: "" }],
+        continuityConstraints: [],
+        unresolvedAtClose: [],
       }],
     };
     expect(validate(value)).toBe(true);
@@ -286,5 +346,6 @@ describe("long-form prompt contracts", () => {
     expect(getReviewFocus("structure-reviewer")).toContain("D1 世界观与 D2 故事性");
     expect(getReviewFocus("character-reviewer")).toContain("D3 群像与 D4 感情线");
     expect(getReviewFocus("prose-reviewer")).toContain("D5 幽默");
+    expect(getReviewFocus("prose-reviewer")).toContain("专业化、制度化或理论化术语");
   });
 });

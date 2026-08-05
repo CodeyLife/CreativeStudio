@@ -498,8 +498,12 @@
 .pb-prompt-call > summary strong { overflow: hidden; color: #d4d4d8; font-size: 9.5px; text-overflow: ellipsis; white-space: nowrap; }
 .pb-prompt-call > summary small { color: #52525b; font-size: 8px; }
 .pb-prompt-call > summary > span { color: #a1a1aa; font: 500 9px/1 "Geist Mono", monospace; }
+.pb-prompt-call-provider { display: flex; min-width: 0; max-width: 150px; flex-direction: column; gap: 2px; overflow: hidden; text-align: right; text-overflow: ellipsis; white-space: nowrap; }
+.pb-prompt-call-provider small { overflow: hidden; text-overflow: ellipsis; }
 .pb-prompt-call-meta { display: flex; flex-wrap: wrap; gap: 4px; padding: 0 8px 7px; }
 .pb-prompt-call-meta .ant-tag { margin: 0; font-size: 8px; }
+.pb-prompt-call-audit-missing, .pb-prompt-call-error { margin: 7px 8px; color: #a1a1aa; font-size: 9px; line-height: 1.45; overflow-wrap: anywhere; }
+.pb-prompt-call-error { color: #fca5a5; }
 .pb-prompt-sections { display: flex; max-height: 180px; overflow: auto; flex-direction: column; border-top: 1px solid #27272a; }
 .pb-prompt-sections > div { display: flex; justify-content: space-between; gap: 8px; padding: 6px 8px; border-top: 1px solid #202024; color: #a1a1aa; font-size: 8.5px; }
 .pb-prompt-sections > div.is-excluded, .pb-prompt-sections > div.is-truncated { color: #71717a; }
@@ -518,11 +522,153 @@
 .pb-context-info dl { display: flex; margin: 0; flex-direction: column; }
 .pb-context-info dl > div { display: grid; grid-template-columns: 78px minmax(0, 1fr); gap: 10px; padding: 9px 0; border-bottom: 1px solid #27272a; }
 .pb-context-info dt { color: #52525b; font-size: 10px; }
-.pb-context-info dd { margin: 0; color: #a1a1aa; font-size: 10.5px; line-height: 1.55; }
+.pb-context-info dd { min-width: 0; margin: 0; color: #a1a1aa; font-size: 10.5px; line-height: 1.55; overflow-wrap: anywhere; }
 .pb-context-info section { margin-top: 18px; }
 .pb-context-info section > header { display: flex; align-items: center; gap: 7px; margin-bottom: 7px; color: #a1a1aa; font-size: 11px; font-weight: 650; }
-.pb-context-info section > div { display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto; align-items: center; gap: 5px; padding: 8px 0; border-top: 1px solid #27272a; color: #71717a; font-size: 10px; }
+.pb-context-info:not(.pb-learning-panel) section > div { display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto; align-items: center; gap: 5px; padding: 8px 0; border-top: 1px solid #27272a; color: #71717a; font-size: 10px; }
 .pb-context-info section > div small { grid-column: 1 / -1; color: #3f3f46; font-size: 9px; }
+
+/* ---------- 经验沉淀 ----------
+ * The learning panel lives inside the narrow author context rail. Keep each
+ * record as a readable block instead of inheriting the chapter-info row grid.
+ */
+.pb-learning-panel {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 0;
+}
+.pb-learning-panel > section {
+  min-width: 0;
+  margin-top: 22px;
+  padding-top: 16px;
+  border-top: 1px solid #27272a;
+}
+.pb-learning-panel > section:first-of-type {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
+}
+.pb-learning-panel > section > header {
+  min-width: 0;
+  margin-bottom: 10px;
+  color: #d4d4d8;
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 1.4;
+}
+.pb-learning-panel .ant-tag {
+  flex: 0 0 auto;
+  margin-inline-end: 0;
+}
+.pb-learning-summary {
+  margin-bottom: 0;
+}
+.pb-learning-summary > div {
+  min-width: 0;
+  min-height: 62px;
+  justify-content: center;
+  padding: 10px;
+  border-color: #303036;
+  border-radius: 6px;
+  background: #18181b;
+}
+.pb-learning-summary strong {
+  font-size: 20px;
+}
+.pb-learning-summary span {
+  font-size: 10px;
+}
+.pb-learning-assessments,
+.pb-learning-candidates,
+.pb-learning-evidence {
+  min-width: 0;
+}
+.pb-learning-assessments > div {
+  display: block;
+  min-width: 0;
+  padding: 11px 0 12px;
+  border-top: 1px solid #27272a;
+}
+.pb-learning-assessments > div:first-child {
+  border-top: 0;
+}
+.pb-learning-assessments > div > div {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 7px;
+  color: #a1a1aa;
+  font-size: 10px;
+}
+.pb-learning-assessments > div > div > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  line-height: 1.45;
+}
+.pb-learning-assessments p {
+  margin: 7px 0 0;
+  color: #a1a1aa;
+  font-size: 11px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.pb-learning-assessments small {
+  margin-top: 7px;
+  overflow-wrap: anywhere;
+  color: #52525b;
+  font-size: 9px;
+}
+.pb-learning-candidate {
+  min-width: 0;
+  border-radius: 6px;
+}
+.pb-learning-candidate > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  line-height: 1.4;
+}
+.pb-learning-prompt,
+.pb-learning-source,
+.pb-learning-evidence {
+  display: block;
+  min-width: 0;
+}
+.pb-learning-prompt pre,
+.pb-learning-source strong,
+.pb-learning-evidence small {
+  overflow-wrap: anywhere;
+}
+.pb-learning-source {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  flex-direction: column;
+  gap: 5px;
+}
+.pb-learning-source strong {
+  line-height: 1.45;
+}
+.pb-learning-evidence > div {
+  min-width: 0;
+}
+.pb-learning-evidence > div > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  line-height: 1.45;
+}
+.pb-learning-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+.pb-learning-actions > header {
+  grid-column: 1 / -1;
+}
+.pb-learning-actions > .ant-btn:last-child {
+  grid-column: 1 / -1;
+}
 
 /* ---------- 响应式 ---------- */
 @media (max-width: 1280px) {
@@ -535,8 +681,10 @@
   .pb-col-left { position: static; max-height: none; }
   .pb-topbar { flex-wrap: wrap; }
   .pb-quality { flex-direction: column; align-items: flex-start; }
-  .pb-author-shell { grid-template-columns: minmax(0, 1fr); }
+  .pb-author-shell { min-width: 0; grid-template-columns: minmax(0, 1fr); }
   .pb-author-chapters { position: static; max-height: 300px; }
+  .pb-author-content { grid-template-columns: minmax(0, 1fr); }
+  .pb-author-context { position: static; max-height: none; border-top: 1px solid #27272a; border-left: 0; padding-top: 14px; padding-left: 0; }
   .pb-review-workspace { grid-template-columns: minmax(0, 1fr); }
   .pb-review-manuscript { border-right: 0; border-bottom: 1px solid var(--color-line-soft); }
   .pb-review-actions { align-items: stretch; flex-direction: column; }

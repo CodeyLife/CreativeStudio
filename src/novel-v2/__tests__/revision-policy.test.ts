@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { assertCompleteChapterReviewEvidence } from "../application/chapter-approval";
 import { inspectManuscript } from "../application/manuscript-structure";
 import type { Artifact, Review, ReviewIssue } from "../protocol";
 import {
@@ -6,6 +7,7 @@ import {
   candidateQualityKey,
   decideRevision,
   DEFAULT_MAX_AUTO_REVISIONS,
+  detectNamedEntityDrift,
   evaluateCommitGate,
   hasBlocker,
   hasBlockerOrMajor,
@@ -59,6 +61,12 @@ describe("revision-policy", () => {
     });
   });
 
+  it("does not allow approval while a required reviewer is missing", () => {
+    expect(() => assertCompleteChapterReviewEvidence("approve", ["structure-reviewer"])).toThrow(/缺少必要的审核证据/);
+    expect(() => assertCompleteChapterReviewEvidence("revise", ["structure-reviewer"])).not.toThrow();
+    expect(() => assertCompleteChapterReviewEvidence("approve", [])).not.toThrow();
+  });
+
   it("rejects blockers, majors and low local reviewer scores", () => {
     expect(hasBlocker([makeReview({ issues: [issue("blocker")] })])).toBe(true);
     expect(hasBlockerOrMajor([makeReview({ issues: [issue("major")] })])).toBe(true);
@@ -77,5 +85,18 @@ describe("revision-policy", () => {
     expect(allReviewsPassed(completeReviews())).toBe(true);
     expect(decideRevision({ reviews: completeReviews(), iteration: 0 }).shouldRevise).toBe(false);
     expect(decideRevision({ reviews: [makeReview({ verdict: "blocked", issues: [issue("blocker")] })], iteration: DEFAULT_MAX_AUTO_REVISIONS }).shouldRevise).toBe(false);
+  });
+
+  it("does not treat quoted introspection as named-entity drift", () => {
+    expect(detectNamedEntityDrift("他反复问‘我是谁’和‘为什么’，没有出现专名。", "他咽下疑问，改看向‘赤铜令’。")).toMatchObject({
+      disappeared: [],
+      appeared: ["赤铜令"],
+      hasDrift: true,
+    });
+    expect(detectNamedEntityDrift("他握住‘赤铜令’。", "他松开手，空无一物。")).toMatchObject({
+      disappeared: ["赤铜令"],
+      appeared: [],
+      hasDrift: true,
+    });
   });
 });

@@ -17,7 +17,8 @@ tmp/
 .cursor/
 .data/
 .logs/
-deploy/
+# Keep committed database migrations. Ignore only generated deployment output.
+deploy/generated/
 
 # novel bench 历史基线与 fixture（本地生成，不入库）
 .novel-bench/

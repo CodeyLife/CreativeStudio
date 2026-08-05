@@ -206,6 +206,54 @@ describe("book synopsis planning contract", () => {
     expect(queries).toContain("ROLLBACK");
   });
 
+  it("uses the approved positioning title when the stored project title is still a technical id", async () => {
+    const sections = completePlan();
+    const sourceFingerprint = bookSynopsisSourceFingerprint({ projectTitle: "长夜归舟", sections });
+    const rows = sections.map((section) => ({
+      project_id: section.projectId,
+      task_key: section.taskKey,
+      work_item_id: section.workItemId,
+      source_artifact_id: section.sourceArtifactId,
+      status: section.status,
+      payload: section.payload,
+      edit_revision: section.editRevision,
+      approved_at: null,
+      created_at: section.createdAt,
+      updated_at: section.updatedAt,
+    }));
+    const queries: string[] = [];
+    const client = {
+      query: vi.fn(async (sql: string) => {
+        queries.push(sql);
+        if (sql.includes("FROM project_plan_sections")) return { rows, rowCount: rows.length };
+        if (sql.includes("FROM novel_projects")) return {
+          rows: [{
+            id: "project-1",
+            title: "project-1",
+            current_revision: 0,
+            metadata: {},
+            created_at: "now",
+            updated_at: "now",
+            positioning_payload: { structuredData: { positioning: { bookTitle: "长夜归舟" } } },
+          }],
+          rowCount: 1,
+        };
+        return { rows: [], rowCount: 0 };
+      }),
+      release: vi.fn(),
+    };
+    const repository = Object.create(NovelPostgresRepository.prototype) as NovelPostgresRepository;
+    Object.defineProperty(repository, "pool", { value: { connect: async () => client, query: vi.fn(async () => ({ rows: [{ id: 1 }], rowCount: 1 })) } });
+
+    await expect(repository.saveBookSynopsisIfCurrent({
+      projectId: "project-1",
+      sourceFingerprint,
+      synopsis: { text: "当前规划对应的作品简介", generatedAt: "now", sourceFingerprint },
+    })).resolves.toBe(true);
+    expect(queries.some((sql) => sql.startsWith("UPDATE novel_projects"))).toBe(true);
+    expect(queries).toContain("COMMIT");
+  });
+
   it("rejects a title that was not generated for the current planning snapshot", async () => {
     const sections = completePlan();
     const sourceFingerprint = bookTitleSourceFingerprint(sections);

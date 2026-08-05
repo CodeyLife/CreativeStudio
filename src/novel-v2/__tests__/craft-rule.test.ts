@@ -28,6 +28,7 @@ import {
   type CraftRuleScopeAnalysis,
 } from "../craft-rule";
 import { createCraftRulePromotionService } from "../craft-rule/promotion-service";
+import type { RuntimeLearningAssessmentV2 } from "../protocol";
 
 /**
  * 基础任务评估结果类型（与 craft-rule/index.ts 内部 FoundationEvaluationResult 一致）。
@@ -678,5 +679,45 @@ describe("craft-rule integration", () => {
     // 验证 candidate 状态已回滚为 rolled-back
     const finalCandidate = await inspectCraftRuleCandidate(repository, projectId, candidate.id);
     expect(finalCandidate?.status).toBe("rolled-back");
+  });
+
+  it("retracts an unreviewed candidate when a retried learning assessment falls back", async () => {
+    if (!postgresAvailable) return;
+
+    const projectId = `test-craft-learning-retract-${randomUUID().slice(0, 8)}`;
+    const assessmentId = `learning:${randomUUID()}`;
+    const skillId = `test-craft-learning-retract-skill-${randomUUID().slice(0, 8)}`;
+    await repository.ensureProject(projectId, "Craft Rule Learning Retract Test");
+    await repository.pool.query(
+      `INSERT INTO skill_definitions(skill_id, version, prompt_sections)
+       VALUES($1, '1.0.0', $2::jsonb)
+       ON CONFLICT(skill_id) DO UPDATE SET version = EXCLUDED.version, prompt_sections = EXCLUDED.prompt_sections`,
+      [skillId, JSON.stringify({ drafting: "原始规则" })],
+    );
+
+    await createCraftRuleCandidate(repository, {
+      projectId,
+      targetKind: "skill",
+      targetId: skillId,
+      afterText: JSON.stringify({ drafting: `候选规则：${"保留通用原则、适用边界和验证步骤；".repeat(8)}` }),
+      rationale: "旧 worker 在 learning 重试期间创建的候选",
+      scope: makeScope(),
+      learningSource: { assessmentId, conclusion: "propose-improvement", mechanism: "旧候选尚未经过有效审核" },
+    });
+
+    const assessment: RuntimeLearningAssessmentV2 = {
+      id: assessmentId,
+      projectId,
+      source: { workflowId: "wf-learning-retry", artifactId: "artifact-learning-retry", reviewIds: ["review-learning-retry"], fingerprint: "fp-learning-retry" },
+      conclusion: "no-shared-learning",
+      createdAt: Date.now(),
+    };
+    await repository.recordLearningAssessment(assessment);
+
+    const remaining = await repository.pool.query<{ count: string }>(
+      "SELECT count(*)::text AS count FROM craft_rule_candidates WHERE project_id=$1 AND learning_source->>'assessmentId'=$2",
+      [projectId, assessmentId],
+    );
+    expect(remaining.rows[0].count).toBe("0");
   });
 });

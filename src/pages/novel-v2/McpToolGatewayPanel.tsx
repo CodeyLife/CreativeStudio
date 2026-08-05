@@ -4,6 +4,7 @@ import { CopyOutlined, DownOutlined, FormatPainterOutlined, PlayCircleOutlined, 
 import { motion } from "motion/react";
 import "../novel-v2.css";
 import { buildToolArgumentSkeleton, DIRECT_EXEC_TOOLS, TOOL_COUNT, TOOL_DESCRIPTIONS, TOOL_GROUP_COUNT, TOOL_GROUPS, type ToolInfo } from "../../novel-v2/mcp/tool-metadata";
+import { novelFetch } from "../../lib/novelApi";
 
 export interface McpToolGatewayPanelProps {
   // 无 props，MCP 工具面板是全局的
@@ -53,41 +54,26 @@ async function directExecute(toolName: string, args: Record<string, unknown>): P
       if (typeof args.title === "string" && args.title.trim()) payload.title = args.title.trim();
       if (typeof args.genre === "string" && args.genre.trim()) payload.genre = args.genre.trim();
       if (typeof args.objective === "string" && args.objective.trim()) payload.objective = args.objective.trim();
-      const res = await fetch("/v2/projects", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
-      const body = await res.json();
-      if (!res.ok) throw new Error(body.error ?? "V2 API 请求失败");
-      return body;
+      return novelFetch("/v2/projects", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
     }
     case "novel_project_list": {
-      const res = await fetch("/v2/projects");
-      const body = await res.json();
-      if (!res.ok) throw new Error(body.error ?? "V2 API 请求失败");
-      return body;
+      return novelFetch("/v2/projects");
     }
     case "novel_run_create": {
       const projectId = String(args.projectId ?? "");
       if (!projectId) throw new Error("projectId 必填");
-      const res = await fetch(`/v2/projects/${encodeURIComponent(projectId)}/creative-runs`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(args) });
-      const body = await res.json();
-      if (!res.ok) throw new Error(body.error ?? "V2 API 请求失败");
-      return body;
+      return novelFetch(`/v2/projects/${encodeURIComponent(projectId)}/creative-runs`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(args) });
     }
     case "novel_chapter_review": {
       const projectId = String(args.projectId ?? "");
       const documentId = String(args.documentId ?? "");
       if (!projectId || !documentId) throw new Error("projectId 和 documentId 必填");
-      const res = await fetch(`/v2/projects/${encodeURIComponent(projectId)}/documents/${encodeURIComponent(documentId)}/review`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(args) });
-      const body = await res.json();
-      if (!res.ok) throw new Error(body.error ?? "V2 API 请求失败");
-      return body;
+      return novelFetch(`/v2/projects/${encodeURIComponent(projectId)}/documents/${encodeURIComponent(documentId)}/review`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(args) });
     }
     case "novel_closed_loop_run": {
       const projectId = String(args.projectId ?? "");
       if (!projectId) throw new Error("projectId 必填");
-      const res = await fetch(`/v2/projects/${encodeURIComponent(projectId)}/closed-loop`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(args) });
-      const body = await res.json();
-      if (!res.ok) throw new Error(body.error ?? "V2 API 请求失败");
-      return body;
+      return novelFetch(`/v2/projects/${encodeURIComponent(projectId)}/closed-loop`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(args) });
     }
     default:
       throw new Error(`工具 ${toolName} 不支持直接执行，请复制 MCP 调用命令后通过 MCP server 调用`);

@@ -98,25 +98,41 @@ export function normalizeStoryArcReviewAuthority(bundle: StoryArcBundle, review:
   const frozen = new Set(bundle.chapters
     .filter((chapter) => isFrozenHistoricalChapter(rebaseTarget?.chapters.find((target) => target.globalOrder === chapter.index)))
     .map((chapter) => chapter.index));
+  const authorityChecks = review.authorityChecks.map((check) => {
+    const chapter = bundle.chapters.find((candidate) => candidate.index === check.chapterIndex);
+    const target = rebaseTarget?.chapters.find((candidate) => candidate.globalOrder === check.chapterIndex);
+    if (!chapter) return check;
+    // These fields are a deterministic coverage ledger, not model judgment.
+    // Derive them from the candidate blueprint so a valid structured response
+    // cannot be discarded merely because the model omitted a dynamic path.
+    const canonical = {
+      ...check,
+      unresolvedAtClose: [...(chapter.unresolvedAtClose ?? [])],
+      checkedPaths: storyArcAuthorityPaths(chapter),
+      candidateClaims: storyArcAuthorityClaims(chapter),
+    };
+    if (!frozen.has(chapter.index)) {
+      return canonical.certaintyUpgrades.length && canonical.verdict === "passed"
+        ? { ...canonical, verdict: "revise" as const, reason: `${canonical.reason}；发现确定性升级，需回到审核修订。` }
+        : canonical;
+    }
+    return {
+      ...canonical,
+      verdict: "passed" as const,
+      frozenEvidence: frozenAuthorityEvidence(chapter, target),
+      certaintyUpgrades: [],
+      reason: "候选与重基线冻结的因果和状态边界一致。",
+    };
+  });
+  const verdict = review.verdict === "passed" && authorityChecks.some((check) => check.verdict !== "passed")
+    ? "revise" as const
+    : review.verdict;
   return {
     ...review,
+    verdict,
     issues: review.issues.filter((issue) => ![...frozen].some((index) => issueMentionsChapter(issue, index))),
     chapterChecks: review.chapterChecks.map((check) => frozen.has(check.chapterIndex) ? { ...check, verdict: "passed" as const, reason: "本次重基线沿用冻结章节因果和状态边界。" } : check),
-    authorityChecks: review.authorityChecks.map((check) => {
-      const chapter = bundle.chapters.find((candidate) => candidate.index === check.chapterIndex);
-      const target = rebaseTarget?.chapters.find((candidate) => candidate.globalOrder === check.chapterIndex);
-      if (!chapter || !frozen.has(chapter.index)) return check;
-      return {
-        ...check,
-        unresolvedAtClose: [...(chapter.unresolvedAtClose ?? [])],
-        checkedPaths: storyArcAuthorityPaths(chapter),
-        candidateClaims: storyArcAuthorityClaims(chapter),
-        verdict: "passed" as const,
-        frozenEvidence: frozenAuthorityEvidence(chapter, target),
-        certaintyUpgrades: [],
-        reason: "候选与重基线冻结的因果和状态边界一致。",
-      };
-    }),
+    authorityChecks,
   };
 }
 
@@ -168,7 +184,7 @@ export function validateStoryArcReview(bundle: StoryArcBundle, review: StoryArcR
     if (checks.length !== 1) throw new Error(`故事弧审核缺少第${chapter.index}章唯一的事实权威校验`);
     const check = checks[0];
     if (!check.candidateClaims.length || !check.frozenEvidence.length || !check.reason.trim()) throw new Error(`第${chapter.index}章事实权威校验证据不完整`);
-    if (JSON.stringify(check.checkedPaths) !== JSON.stringify(storyArcAuthorityPaths(chapter)) || check.candidateClaims.length !== storyArcAuthorityPaths(chapter).length) throw new Error(`第${chapter.index}章事实权威校验未覆盖因果边界`);
+    if (JSON.stringify(check.checkedPaths) !== JSON.stringify(storyArcAuthorityPaths(chapter)) || JSON.stringify(check.candidateClaims) !== JSON.stringify(storyArcAuthorityClaims(chapter))) throw new Error(`第${chapter.index}章事实权威校验未覆盖因果边界`);
     if (JSON.stringify(check.unresolvedAtClose) !== JSON.stringify(chapter.unresolvedAtClose ?? [])) throw new Error(`第${chapter.index}章事实权威校验未覆盖 unresolvedAtClose`);
     if (check.certaintyUpgrades.length && check.verdict === "passed") throw new Error(`第${chapter.index}章发现确定性升级却标记通过`);
   }

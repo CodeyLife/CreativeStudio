@@ -979,6 +979,8 @@ export interface CreativeActionResult {
   workStatus?: CreativeWorkStatus;
   artifactRefs: string[];
   reviewId?: string;
+  /** Read-only model review. It is not persisted and cannot satisfy a gate. */
+  reviewPreview?: CreativeReviewInput;
   reviewGate?: CreativeReviewGate;
   summary: string;
 }

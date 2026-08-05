@@ -9,8 +9,10 @@ export async function startStoryArcPlanning(
 ) {
   const workflowId = `story-arc-${randomUUID()}`;
   const reviewPolicy = input.reviewPolicy ?? (input.mode === "mcp" ? "auto" : "manual");
+  const existingArc = input.arcId ? await repository.getStoryArc(input.projectId, input.arcId) : undefined;
+  const rebase = Boolean(input.arcId && (existingArc?.blueprintArtifactId || existingArc?.chapters.some((chapter) => Boolean(chapter.documentId))));
   const arc = input.arcId
-    ? await repository.markStoryArcGenerating(input.projectId, input.arcId, input.mode === "web" ? "web-author" : "mcp")
+    ? await repository.markStoryArcGenerating(input.projectId, input.arcId, input.mode === "web" ? "web-author" : "mcp", { workflowId })
     : await repository.createNextStoryArc({ projectId: input.projectId, workflowId, authorIntent: input.authorIntent });
   if (!arc) throw new Error("故事弧不存在");
   await repository.putWorkflowRun({
@@ -19,10 +21,10 @@ export async function startStoryArcPlanning(
     projectId: input.projectId,
     temporalWorkflowId: workflowId,
     status: "accepted",
-    payload: { arcId: arc.id, mode: input.mode, reviewPolicy, authorIntent: input.authorIntent, rebase: Boolean(input.arcId) },
+    payload: { arcId: arc.id, mode: input.mode, reviewPolicy, authorIntent: input.authorIntent, rebase },
   });
   const handle = await temporal.workflow.start("storyArcPlanningWorkflow", {
-    args: [{ workflowId, projectId: input.projectId, arcId: arc.id, mode: input.mode, reviewPolicy, authorIntent: input.authorIntent, rebase: Boolean(input.arcId) }],
+    args: [{ workflowId, projectId: input.projectId, arcId: arc.id, mode: input.mode, reviewPolicy, authorIntent: input.authorIntent, rebase }],
     taskQueue: input.taskQueue ?? "novel-v2",
     workflowId,
   });
@@ -34,14 +36,22 @@ export async function startStoryArcReview(
   temporal: Client,
   input: { projectId: string; arcId: string; mode: "web" | "mcp"; reviewPolicy?: "manual" | "auto"; taskQueue?: string },
 ) {
-  const arc = await repository.getStoryArc(input.projectId, input.arcId);
+  let arc = await repository.getStoryArc(input.projectId, input.arcId);
+  if (arc?.planningStatus === "failed" && arc.blueprintArtifactId) {
+    arc = await repository.prepareStoryArcReviewRetry(input.projectId, input.arcId, input.mode === "web" ? "web-author" : "mcp");
+  }
   if (!arc?.blueprintArtifactId || arc.planningStatus !== "awaiting-review") throw new Error("故事弧当前没有可审核的蓝图");
   const workflowId = `story-arc-review-${randomUUID()}`;
   const reviewPolicy = input.reviewPolicy ?? (input.mode === "mcp" ? "auto" : "manual");
   // A review of an active arc can still sit behind committed chapters. Those
   // chapters remain frozen authority during review even before the whole arc
   // reaches completed status.
-  const rebase = arc.executionStatus === "completed" || arc.chapters.some((chapter) => Boolean(chapter.documentId));
+  // A pending batch artifact contains only the new planning window. Reviewing
+  // it must stay on the ordinary batch path even when earlier chapters are
+  // already committed; frozen-history rebase is for an artifact whose target
+  // is the committed chapter set.
+  const hasPendingBatchReview = arc.batches?.some((batch) => batch.status === "awaiting-review") ?? false;
+  const rebase = !hasPendingBatchReview && (arc.executionStatus === "completed" || arc.chapters.some((chapter) => Boolean(chapter.documentId)));
   await repository.putWorkflowRun({
     id: workflowId,
     workflowType: "story-arc-planning",
@@ -61,18 +71,20 @@ export async function startStoryArcReview(
 export async function startStoryArcBatchPlanning(
   repository: NovelPostgresRepository,
   temporal: Client,
-  input: { projectId: string; arcId: string; mode: "web" | "mcp"; reviewPolicy?: "manual" | "auto"; taskQueue?: string },
+  input: { projectId: string; arcId: string; mode: "web" | "mcp"; reviewPolicy?: "manual" | "auto"; taskQueue?: string; retryFailed?: boolean },
 ) {
   const workflowId = `story-arc-batch-${randomUUID()}`;
   const reviewPolicy = input.reviewPolicy ?? (input.mode === "mcp" ? "auto" : "manual");
-  const batch = await repository.prepareNextStoryArcBatch(input.projectId, input.arcId);
+  const batch = input.retryFailed
+    ? await repository.prepareStoryArcBatchRetry(input.projectId, input.arcId)
+    : await repository.prepareNextStoryArcBatch(input.projectId, input.arcId);
   await repository.putWorkflowRun({
     id: workflowId,
     workflowType: "story-arc-planning",
     projectId: input.projectId,
     temporalWorkflowId: workflowId,
     status: "accepted",
-    payload: { arcId: input.arcId, mode: input.mode, reviewPolicy, batchIndex: batch.batchIndex, startChapterIndex: batch.startChapterIndex },
+    payload: { arcId: input.arcId, mode: input.mode, reviewPolicy, retryFailed: input.retryFailed === true, batchIndex: batch.batchIndex, startChapterIndex: batch.startChapterIndex },
   });
   try {
     const handle = await temporal.workflow.start("storyArcPlanningWorkflow", {

@@ -1,6 +1,8 @@
 # Novel V2 当前流程审核
 
-> 审核基线：2026-08-03。本文记录当前代码、prompt、schema 和 workflow 的活动契约；旧版本问题作为历史背景保留在版本控制中，不作为新运行规则。
+> 审核基线：2026-08-04。本文记录当前代码、prompt、schema 和 workflow 的活动契约；旧版本问题作为历史背景保留在版本控制中，不作为新运行规则。
+
+数据连续性与文学质量证明是两个独立门禁：固定卷、正式工作流唯一入口和 prompt/Skill/artifact 追溯属于可靠性要求；只有真实跨场景 A/B 文本与工作流转换通过后，才能声称文学质量提升。恢复和盲评操作契约见 [data-recovery-quality-validation.md](./data-recovery-quality-validation.md)。
 
 ## 1. 结论
 
@@ -50,7 +52,11 @@
 
 它不检查正文句式、章节长度、事件数量或文学风格。故事弧蓝图通过 `threadResponsibilities` 承载每条 `plotThreadRefs` 在本弧的责任和下一次可验证推进；这不是逐章兑现清单。架构问题的修复顺序是 Foundation 编辑/作者确认 → 活动 Story Arc rebase → 弧级审核；只有局部正文证据仍失败时，才进入正式 chapterReviewWorkflow。
 
-本次项目运行 `novel-create-wanfa-20260801` 的架构审计结果：6 卷、估计 670 章、6 名核心人物、3 条长线，`passed=true` 且结构问题为空。四个被补强的 Foundation section 已完成独立审核和作者确认；原有 6 个 final 章节未被该修复重写。rebase 已实际完成规划并生成新的弧级 blueprint artifact，随后进入弧级审核；最新尝试因 provider 402/网络超时取消，尚未生成新的 review artifact。
+重基线审校使用三类弧级输入：当前待审 `currentArc`/蓝图、经过兼容投影的 `approvedArc`，以及旧批准记录缺少新字段时的 `legacyArcContractGaps`。后者只表示 schema 演进造成的证据缺口；审核必须检查当前蓝图自己的 `plotThreadRefs`/`threadResponsibilities` 覆盖，不能把旧记录的空数组直接解释成当前弧或正文的退化。兼容投影只影响弧级对照视图，不覆盖章节冻结证据。
+
+本次项目运行 `novel-create-wanfa-20260801` 的架构审计结果：6 卷、估计 670 章、6 名核心人物、3 条长线，`passed=true` 且结构问题为空。四个被补强的 Foundation section 已完成独立审核和作者确认；原有 6 个 final 章节未被该修复重写。迁移后的正式 rebase、Story Arc 审核与作者确认均已完成：当前 blueprint 为 `85957d3f-20c1-473e-bddb-a892d33767d5`，review artifact 为 `9855c6e0-e316-4bcc-a4b3-4ab2f96921f1`，弧级审核 `passed` 且无 blocking issue，当前弧为 `approved/active`。
+
+弧级审核证据账本区分历史规划与当前架构：`frozenEvidence` 只说明历史批准蓝图的冻结边界，`candidateClaims` 由当前候选蓝图确定性投影，二者不是同一份正文快照；定稿事实以 `committedMemory`、`authoritativeFacts` 和正文 revision 为权威。这样可以修正陈旧的章节规划而不把规划修正误报为正文修订，也不让模型回显动态路径的遗漏伪装成完整审核。
 
 ### 2.2 Story Arc
 
@@ -102,7 +108,7 @@ REVIEW_COVERAGE 作为内部映射覆盖 D1 世界观、D2 故事性、D3 群像
 
 ### 2.6 Revision / Commit
 
-修订以 grounded evidence 为入口，只修改目标范围。revision policy 保留：
+修订以 grounded evidence 为入口，只修改目标范围；人物的专业化/制度化/理论化认知可以保留，但若连续抽象表达替代身体、环境或即时判断，修订必须回到可观察依据，而不是只替换术语。revision policy 保留：
 
 - blocker/major 阻断；
 - 总体改善阈值；
@@ -155,7 +161,7 @@ Skill database check 必须报告未知 execution point；运行时不能静默�
 - 不要求每章新事件、强钩子、反转、爽点、主题、感情线或幽默；
 - 不把参考手册的文学原则变成 schema；
 - 不通过精确短语黑名单修补 LLM 输出；
-- 不重写历史 artifact、旧 review 或旧数据库 JSONB。
+- 不重写已完成的历史 artifact、旧 review 或旧数据库 JSONB；不兼容的活动审核运行直接终止并标记 abandoned，未提交候选不进入新 workflow，定稿 revision 保持不变。
 
 ## 6. 验证矩阵
 
@@ -178,6 +184,7 @@ git diff --check
 - reflection 不进入新 workflow；
 - prompt 不出现固定字数、narrativeScale、强制新贡献、固定钩子和章节级主题/感情/幽默必填；
 - draft → review → revision → facts → commit → memory smoke。
+- 已定稿正文与故事弧蓝图状态投影一致性：历史 `chapters.status='planned'` 必须由迁移/读取派生纠正，commit、手工保存、版本恢复和受保护 rebase 均不得重新产生该不一致。
 
 ## 7. 源码索引
 

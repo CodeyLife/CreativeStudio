@@ -1,14 +1,15 @@
 import { useEffect, useMemo, useState } from "react";
 import { Button, Input, Modal, Popconfirm, Segmented, Space, Table, Tabs, Tag, Tooltip, message } from "antd";
-import { DeleteOutlined, EditOutlined, EyeOutlined, PlusOutlined, ReloadOutlined } from "@ant-design/icons";
+import { CheckCircleOutlined, DeleteOutlined, EditOutlined, ExclamationCircleOutlined, EyeOutlined, PlusOutlined, ReloadOutlined, SearchOutlined, TeamOutlined } from "@ant-design/icons";
 import { motion } from "motion/react";
 import "../novel-v2.css";
+import { novelFetch as readJson } from "../../lib/novelApi";
 import { knowledgeKindMeta, shortId } from "./presentation";
 import KnowledgeRecordForm, { type KnowledgeFormKind } from "./KnowledgeRecordForm";
 
 type KnowledgeKind = "characters" | "relations" | "claims" | "chapter-memories" | "project-skills" | "skills";
 type EditableKnowledgeKind = "characters" | "relations" | "claims" | "skills";
-type KnowledgeRecord = Record<string, unknown> & { id?: string; readOnly?: boolean; source?: string };
+type KnowledgeRecord = Record<string, unknown> & { id?: string; readOnly?: boolean; source?: string; displayName?: string; canonicalId?: string; displayNameStatus?: "identified" | "pending" };
 
 const KINDS: Array<{ key: KnowledgeKind; label: string }> = [
   { key: "characters", label: "角色" },
@@ -20,7 +21,18 @@ const KINDS: Array<{ key: KnowledgeKind; label: string }> = [
 ];
 
 const NEW_RECORD: Record<EditableKnowledgeKind, KnowledgeRecord> = {
-  characters: { name: "", payload: { role: "", motivation: "", voiceAnchor: "" } },
+  characters: {
+    name: "",
+    payload: {
+      role: "",
+      motivation: "",
+      fear: "",
+      secret: "",
+      voiceAnchor: { sentenceLength: "", vocabulary: "", directness: "", avoidance: "" },
+      arc: { start: "", end: "" },
+      independentAction: { desire: "", strategy: "", choice: "", cost: "", knowledgeBoundary: "" },
+    },
+  },
   relations: { subjectId: "", predicate: "", objectId: "" },
   claims: { title: "", subjectRefs: [], predicate: "", content: "", narrativeStart: undefined, narrativeEnd: undefined },
   skills: { id: "", version: "1.0.0", capabilities: [], applicableTasks: [], qualityGates: [], promptSections: {}, enabled: true },
@@ -31,16 +43,112 @@ export function isEditableKnowledgeKind(kind: KnowledgeKind): kind is EditableKn
 }
 
 function labelOf(record: KnowledgeRecord) {
-  return String(record.name ?? record.title ?? record.skillId ?? record.predicate ?? record.documentId ?? record.taskKey ?? record.id ?? "未命名记录");
+  return String(record.displayName ?? record.name ?? record.title ?? record.skillId ?? record.predicate ?? record.documentId ?? record.taskKey ?? record.id ?? "未命名记录");
 }
 
 function recordId(record: KnowledgeRecord) {
   return String(record.id ?? record.skill_id ?? "");
 }
 
+function payloadOf(record: KnowledgeRecord): Record<string, unknown> {
+  const payload = (record.payload ?? {}) as Record<string, unknown>;
+  const foundation = record.foundation;
+  return foundation && typeof foundation === "object" && !Array.isArray(foundation)
+    ? { ...(foundation as Record<string, unknown>), ...payload }
+    : payload;
+}
+
+/** 编辑时把只读的 Foundation 档案并入 payload，确保结构化表单和 JSON 模式都不丢字段。 */
+export function toEditableKnowledgeRecord(record: KnowledgeRecord): KnowledgeRecord {
+  const foundation = record.foundation;
+  if (!foundation || typeof foundation !== "object" || Array.isArray(foundation)) return record;
+  const foundationPayload = Object.fromEntries(Object.entries(foundation as Record<string, unknown>).filter(([key]) => key !== "id" && key !== "name"));
+  const editable = { ...record };
+  delete editable.foundation;
+  const payload = editable.payload && typeof editable.payload === "object" && !Array.isArray(editable.payload)
+    ? editable.payload as Record<string, unknown>
+    : {};
+  return { ...editable, payload: { ...foundationPayload, ...payload } };
+}
+
+function textOf(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function roleLabel(value: unknown): string {
+  const role = textOf(value);
+  const labels: Record<string, string> = {
+    protagonist: "主角",
+    antagonist: "对手",
+    ally: "盟友",
+    rival: "竞争者",
+    guardian: "守护者",
+    wildcard: "变量",
+    mentor: "引导者",
+  };
+  return (labels[role] ?? role) || "未设定身份";
+}
+
+function characterStatus(record: KnowledgeRecord): { label: string; color: string; pending: boolean } {
+  const payload = payloadOf(record);
+  const pending = payload.pendingEnrichment === true || record.displayNameStatus === "pending";
+  return pending
+    ? { label: "待补全", color: "gold", pending: true }
+    : { label: "已建档", color: "green", pending: false };
+}
+
+function canonicalCharacterId(record: KnowledgeRecord): string {
+  const payload = payloadOf(record);
+  const fromPayload = textOf(payload.canonicalCharacterId);
+  if (fromPayload) return fromPayload;
+  if (textOf(record.canonicalId)) return textOf(record.canonicalId);
+  const id = recordId(record);
+  const marker = ":character:";
+  return id.includes(marker) ? id.slice(id.indexOf(marker) + marker.length) : id;
+}
+
+function voiceSummary(record: KnowledgeRecord): string {
+  const voice = payloadOf(record).voiceAnchor;
+  if (!voice || typeof voice !== "object" || Array.isArray(voice)) return "尚未形成声部锚点";
+  const values = Object.entries(voice as Record<string, unknown>).flatMap(([key, value]) => {
+    const source = value && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>).latest
+      : value;
+    const text = textOf(source);
+    if (!text) return [];
+    const labels: Record<string, string> = { sentenceLength: "句式", vocabulary: "词汇", directness: "直率", avoidance: "回避" };
+    return [`${labels[key] ?? key}：${text}`];
+  });
+  return values.join(" · ") || "尚未形成声部锚点";
+}
+
+function CharacterDetail({ record }: { record: KnowledgeRecord }) {
+  const payload = payloadOf(record);
+  const status = characterStatus(record);
+  const motivation = textOf(payload.motivation);
+  return (
+    <div className="novel-character-detail">
+      <div className="novel-character-detail-hero">
+        <div>
+          <span className="novel-eyebrow"><TeamOutlined /> 角色档案</span>
+          <h3>{labelOf(record)}</h3>
+          <code>{canonicalCharacterId(record) || "未生成规范 ID"}</code>
+        </div>
+        <Tag color={status.color} icon={status.pending ? <ExclamationCircleOutlined /> : <CheckCircleOutlined />}>{status.label}</Tag>
+      </div>
+      <div className="novel-character-detail-grid">
+        <div><span>身份</span><strong>{roleLabel(payload.role)}</strong></div>
+        <div><span>来源</span><strong>{payload.autoCreated === true ? "关系推导" : "角色档案"}</strong></div>
+        <div className="is-wide"><span>动机</span><p>{motivation || "尚未记录"}</p></div>
+        <div className="is-wide"><span>声部锚点</span><p>{voiceSummary(record)}</p></div>
+      </div>
+    </div>
+  );
+}
+
 // 按知识库类型提取人话摘要，避免直接 dump JSON
 function describeRecord(kind: KnowledgeKind, record: KnowledgeRecord): string {
-  const p = (record.payload ?? record) as Record<string, unknown>;
+  const p = (kind === "characters" ? payloadOf(record) : (record.payload ?? record)) as Record<string, unknown>;
   const str = (v: unknown) => (v === undefined || v === null || v === "") ? "" : String(v);
   const arrLen = (v: unknown) => Array.isArray(v) ? v.length : 0;
   const compact = (v: unknown, max = 180) => {
@@ -93,13 +201,7 @@ export default function KnowledgeWorkbenchPanel({ projectId }: { projectId: stri
   const [draft, setDraft] = useState<KnowledgeRecord>({});
   const [jsonText, setJsonText] = useState("");
   const [editorMode, setEditorMode] = useState<"form" | "json">("form");
-
-  async function readJson<T>(input: RequestInfo, init?: RequestInit): Promise<T> {
-    const response = await fetch(input, init);
-    const body = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error((body as { error?: string }).error ?? `HTTP ${response.status}`);
-    return body as T;
-  }
+  const [characterQuery, setCharacterQuery] = useState("");
 
   async function load(nextKind = kind) {
     setLoading(true);
@@ -118,15 +220,17 @@ export default function KnowledgeWorkbenchPanel({ projectId }: { projectId: stri
   function openCreate() {
     if (!isEditableKnowledgeKind(kind)) return;
     setEditing({});
-    setDraft(NEW_RECORD[kind]);
-    setJsonText(JSON.stringify(NEW_RECORD[kind], null, 2));
+    const initial = JSON.parse(JSON.stringify(NEW_RECORD[kind])) as KnowledgeRecord;
+    setDraft(initial);
+    setJsonText(JSON.stringify(initial, null, 2));
     setEditorMode("form");
   }
 
   function openEdit(record: KnowledgeRecord) {
     setEditing(record);
-    setDraft(record);
-    setJsonText(JSON.stringify(record, null, 2));
+    const editable = toEditableKnowledgeRecord(record);
+    setDraft(editable);
+    setJsonText(JSON.stringify(editable, null, 2));
     setEditorMode("form");
   }
 
@@ -168,16 +272,41 @@ export default function KnowledgeWorkbenchPanel({ projectId }: { projectId: stri
   }
 
   const kindMeta = knowledgeKindMeta(kind);
+  const visibleRecords = useMemo(() => {
+    if (kind !== "characters" || !characterQuery.trim()) return records;
+    const query = characterQuery.trim().toLocaleLowerCase();
+    return records.filter((record) => [labelOf(record), canonicalCharacterId(record), textOf(payloadOf(record).role), textOf(payloadOf(record).motivation)]
+      .some((value) => value.toLocaleLowerCase().includes(query)));
+  }, [characterQuery, kind, records]);
+  const characterStats = useMemo(() => {
+    const identified = records.filter((record) => !characterStatus(record).pending).length;
+    return { total: records.length, identified, pending: records.length - identified };
+  }, [records]);
   const columns = useMemo(() => [
-    { title: "记录", key: "label", width: 200, render: (_: unknown, record: KnowledgeRecord) => (
-      <div className="novel-table-cell-stack">
-        <Space size={6} align="center">
-          <span className="novel-run-item-icon">{kindMeta.icon}</span>
-          <strong>{labelOf(record)}</strong>
-        </Space>
-        <code className="novel-table-cell-sub">{recordId(record) ? shortId(recordId(record)) : "自动生成"}</code>
-      </div>
-    )},
+    ...(kind === "characters" ? [
+      { title: "角色", key: "label", width: 250, render: (_: unknown, record: KnowledgeRecord) => {
+        const status = characterStatus(record);
+        return <div className="novel-character-name-cell">
+          <div className="novel-character-name-line"><span className="novel-run-item-icon"><TeamOutlined /></span><strong>{labelOf(record)}</strong><Tag color={status.color}>{status.label}</Tag></div>
+          <code className="novel-table-cell-sub">规范 ID · {canonicalCharacterId(record) || "未生成"}</code>
+        </div>;
+      }},
+      { title: "身份与动机", key: "profile", width: 390, render: (_: unknown, record: KnowledgeRecord) => {
+        const payload = payloadOf(record);
+        return <div className="novel-character-profile-cell"><Tag>{roleLabel(payload.role)}</Tag><span>{textOf(payload.motivation) || "尚未记录动机"}</span></div>;
+      }},
+      { title: "声部", key: "voice", width: 300, render: (_: unknown, record: KnowledgeRecord) => <span className="novel-character-voice-cell">{voiceSummary(record)}</span> },
+    ] : [
+      { title: "记录", key: "label", width: 200, render: (_: unknown, record: KnowledgeRecord) => (
+        <div className="novel-table-cell-stack">
+          <Space size={6} align="center">
+            <span className="novel-run-item-icon">{kindMeta.icon}</span>
+            <strong>{labelOf(record)}</strong>
+          </Space>
+          <code className="novel-table-cell-sub">{recordId(record) ? shortId(recordId(record)) : "自动生成"}</code>
+        </div>
+      )},
+    ]),
     { title: "来源", key: "source", width: 110, render: (_: unknown, record: KnowledgeRecord) => <Tag>{sourceLabel(record.source)}</Tag> },
     { title: "详情", key: "data", render: (_: unknown, record: KnowledgeRecord) => (
       <span className="novel-table-cell-sub" style={{ fontSize: 12, color: "#a1a1aa" }}>{describeRecord(kind, record)}</span>
@@ -196,7 +325,7 @@ export default function KnowledgeWorkbenchPanel({ projectId }: { projectId: stri
         </Space>
       ),
     },
-  ], [kind]);
+  ], [kind, kindMeta.icon]);
 
   return (
     <motion.section
@@ -216,11 +345,22 @@ export default function KnowledgeWorkbenchPanel({ projectId }: { projectId: stri
         </Space>
       </div>
       <Tabs activeKey={kind} items={KINDS.map((item) => ({ key: item.key, label: item.label }))} onChange={(value) => setKind(value as KnowledgeKind)} />
-      <Table rowKey={(record) => recordId(record) || JSON.stringify(record)} loading={loading} dataSource={records} columns={columns} pagination={{ pageSize: 12 }} scroll={{ x: 900 }} />
+      {kind === "characters" ? <div className="novel-character-overview">
+        <div className="novel-character-overview-head">
+          <div><strong>角色档案</strong><span>{characterStats.total} 条记录 · {characterStats.pending ? `${characterStats.pending} 条待补全` : "档案完整"}</span></div>
+          <Input allowClear prefix={<SearchOutlined />} value={characterQuery} onChange={(event) => setCharacterQuery(event.target.value)} placeholder="搜索角色名、规范 ID 或动机" style={{ maxWidth: 310 }} />
+        </div>
+        <div className="novel-character-metrics">
+          <div><span>角色总数</span><strong>{characterStats.total}</strong></div>
+          <div><span>已建档</span><strong className="is-positive">{characterStats.identified}</strong></div>
+          <div><span>待补全</span><strong className={characterStats.pending ? "is-warning" : ""}>{characterStats.pending}</strong></div>
+        </div>
+      </div> : null}
+      <Table rowKey={(record) => recordId(record) || JSON.stringify(record)} loading={loading} dataSource={visibleRecords} columns={columns} pagination={{ pageSize: 12, showSizeChanger: false }} scroll={{ x: kind === "characters" ? 1180 : 900 }} />
       <Modal title={viewing ? labelOf(viewing) : "资料详情"} open={Boolean(viewing)} onCancel={() => setViewing(undefined)} footer={<Button onClick={() => setViewing(undefined)}>关闭</Button>} width={820} destroyOnHidden>
-        <pre style={{ margin: 0, maxHeight: "62vh", overflow: "auto", whiteSpace: "pre-wrap", overflowWrap: "anywhere", fontFamily: "ui-monospace, SFMono-Regular, Consolas, monospace", fontSize: 12, lineHeight: 1.65 }}>{viewing ? JSON.stringify(viewing, null, 2) : ""}</pre>
+        {viewing && kind === "characters" ? <CharacterDetail record={viewing} /> : <pre style={{ margin: 0, maxHeight: "62vh", overflow: "auto", whiteSpace: "pre-wrap", overflowWrap: "anywhere", fontFamily: "ui-monospace, SFMono-Regular, Consolas, monospace", fontSize: 12, lineHeight: 1.65 }}>{viewing ? JSON.stringify(viewing, null, 2) : ""}</pre>}
       </Modal>
-      <Modal title={recordId(editing ?? {}) ? "编辑记录" : "新增记录"} open={Boolean(editing)} onCancel={() => setEditing(undefined)} onOk={() => void save()} okText="保存" width={820} destroyOnHidden>
+      <Modal className="novel-knowledge-edit-modal" title={recordId(editing ?? {}) ? "编辑记录" : "新增记录"} open={Boolean(editing)} onCancel={() => setEditing(undefined)} onOk={() => void save()} okText="保存" width={820} destroyOnHidden>
         <Segmented
           value={editorMode}
           onChange={(v) => {
