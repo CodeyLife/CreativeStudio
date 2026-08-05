@@ -106,9 +106,13 @@ reviewer schema 只输出 verdict、score、issues。issue 必须有 evidence/ex
 
 REVIEW_COVERAGE 作为内部映射覆盖 D1 世界观、D2 故事性、D3 群像、D4 感情线、D5 幽默，但模型不被要求逐项填表。
 
+跨章序列证据（`MemoryBundle.serialContext`）作为 planning section 注入 draft/review/revision（priority=normal，可被预算淘汰），只提供描述性统计（角色状态跨度、连续同功能游程 ≥3、物件/主题跨度），不是短语黑名单；"母题还是疲劳"由 reviewer 依正文证据判断。三个 reviewer 的 focus 扩展跨章机制检查（状态重述/节奏疲劳、群像单薄、跨章重复命名），全部以"有序列证据与正文共同支持才报告"为边界，不要求每章变化、不嵌词表。
+
 ### 2.6 Revision / Commit
 
 修订以审核 evidence 和明确目标范围为入口，只修改目标范围；人物的专业化/制度化/理论化认知可以保留，但若连续抽象表达替代身体、环境或即时判断，修订必须回到可观察依据，而不是只替换术语。revision policy 保留：
+
+章节蓝图把规划器分析与写作者执行材料分开：`planningRationale` 只保存技术模型、推演理由等作者侧内容，在完整蓝图和规划上下文读取投影中保留，但不进入 draft、prose review 或 revision 的执行合同。正文遵循读者复原契约，要求普通读者能从上下文复原当前经历、行动原因和行动结果，但不要求所有术语立即解释或所有段落使用同样的现场证据。读者复原问题通过现有 `prose-reviewer` 的 `readerReconstruction` 证据记录，不新增独立审核角色；该证据只用于诊断和修订，不改变 issue 稳定身份。
 
 - blocker/major 阻断；
 - 总体改善阈值；
@@ -138,6 +142,8 @@ review/commit 后聚合 issue 模式为 RuntimeLearningAssessment。结论为 pr
 - boundaries；
 - regressionRisks；
 - candidate scope。
+
+learning 评估聚合跨章模式：`getRecentReviewIssueClusters` 按 rule/title 聚类近 N=6 章的章节审核 issue（同规则类 ≥2 章），并注入 `serialContext` 序列信号。同 rule 类近 N 章重复 ≥2 次，或连续同类功能章节缺少压力推进时，即使当前章无 blocker/major 也触发 propose-improvement 评估；状态/主题跨度只作为有 issue 时的持续模式证据注入 prompt（在场统计无判别力，不参与零 issue 触发）。连续低行动/观察型章节密度类问题 failingLayer 优先定位 story-arc planning 层，candidate 指向规划类 skill 的 planning 执行点，不只在 drafting 修。skill iteration 触发门禁与 learning 打通：blocker/major 或 propose-improvement 任一存在即运行迭代，两者都没有才跳过。
 
 成功章节只允许在 commit/enrich 后执行一次持久化 learning；事实审批挂起不得提前创建候选。质量门失败可保存一次原始失败 learning，不能用同一 artifact 的后续 assessment 覆盖候选而不重新生成候选内容。
 
@@ -183,6 +189,12 @@ git diff --check
 - blocker/major、总体改善和局部退化守卫；
 - reflection 不进入新 workflow；
 - prompt 不出现固定字数、narrativeScale、强制新贡献、固定钩子和章节级主题/感情/幽默必填；
+- 伏笔账本富化字段（readerQuestion/possiblePayoffs/meaningDelta/cost）从 fact-extraction 经 recordNarrativeElements 写入、经 getOpenForeshadowingAndPromises 与 narrative state snapshot 投影后仍保留，且不作为逐章必填；
+- 卷级 promiseWindows 内容软诊断：缺引用或窗口的条目报 `promise-window-ungrounded` warning，有引用+窗口的条目不误报；
+- 长线耦合软诊断：缺 coupling/mergePoint/exitPoint/transformPoint 的线报 `long-horizon-thread-coupling-incomplete` warning，有耦合机制或生命周期条件的线不误报；旧数据不因缺可选字段失效；structureType 可选且不产生质量门；
+- 世界观压力层软诊断：缺 resourcesAndTechnology 或 valuesAndConflicts 报 `worldview-pressure-layer-incomplete` warning，已结构化两层的条目不误报；旧 worldview 数据不因缺可选层失效；
+- 文风契约：十维滑杆经 normalize 落库、激活后经 retrieveMemory 以 style facet 注入 draft/review/revision（可被预算淘汰），渲染为对照参考而非逐章清单；无契约或缺失维度时静默降级，不阻断生成；
+- 跨章序列证据：`getSerialContextSnapshot` 从 chapter_memories/chapters/memory_claims 确定性投影最近 N 章的角色状态跨度、连续同功能游程（≥3）与物件/主题跨度；渲染为描述性统计且不输出硬性要求；learning 的 issue 聚类能识别同 rule 跨 ≥2 章并触发 propose-improvement，单章偶发不误报；skill iteration 在无 blocker/major 但 propose-improvement 时仍运行，无任何信号时跳过；
 - draft → review → revision → facts → commit → memory smoke。
 - 已定稿正文与故事弧蓝图状态投影一致性：历史 `chapters.status='planned'` 必须由迁移/读取派生纠正，commit、手工保存、版本恢复和受保护 rebase 均不得重新产生该不一致。
 
@@ -195,6 +207,7 @@ git diff --check
 | 上下文合同 | src/novel-v2/prompts/chapter-planning-context.ts |
 | 正文 prompt | src/novel-v2/prompts/chapter-draft.ts（StagePromptPackage） |
 | 审核 prompt/schema | src/novel-v2/prompts/chapter-review.ts、schemas.ts |
+| 跨章序列证据 | src/novel-v2/postgres-repository.ts（getSerialContextSnapshot / getRecentReviewIssueClusters）、chapter-planning-context.ts（renderSerialContext） |
 | 正式 workflow | src/novel-v2/temporal/workflows.ts、activities.ts |
 | 修订和 commit gate | src/novel-v2/temporal/revision-policy.ts、commit-service.ts |
 | Learning | src/novel-v2/learning-assessment.ts、evaluation/skill-iteration.ts |

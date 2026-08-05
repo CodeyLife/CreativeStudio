@@ -1,9 +1,12 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { assessRuntimeLearningWithModel, buildRuntimeLearningPrompt, parseRuntimeLearningAssessmentV2, reviewIssuesForLearning } from "../learning-assessment";
-import { buildCraftRuleCandidateInput } from "../temporal/activities";
-import type { Artifact, Review } from "../protocol";
+import { buildCraftRuleCandidateInput, createNovelWorkflowActivities } from "../temporal/activities";
+import type { Artifact, Review, RuntimeLearningAssessmentV2, SerialContextSnapshot } from "../protocol";
 import type { ModelGateway, ModelUsage } from "../model-gateway";
 import type { ModelExecutionProvenance, ModelRoutingSnapshot } from "../model-routing";
+import type { NovelPostgresRepository } from "../postgres-repository";
+import type { ContentObjectStore } from "../object-store";
+import type { CommitService } from "../commit-service";
 
 const usage: ModelUsage = { model: "test", inputTokens: 1, outputTokens: 1, costUsd: 0, latencyMs: 1 };
 const mockProvenance: ModelExecutionProvenance = {
@@ -98,6 +101,65 @@ describe("V2 runtime learning assessment", () => {
     expect(rejected.validationError).toContain("未声明的 executionPoint");
   });
 
+  it("short-circuits zero-issue chapters when only presence spans are present", async () => {
+    let called = 0;
+    const model: ModelGateway = {
+      getRoutingSnapshot: () => mockRoutingSnapshot,
+      generateStructured: async <T,>() => {
+        called += 1;
+        return { value: { conclusion: "propose-improvement" } as T, usage, provenance: mockProvenance };
+      },
+      generateText: async () => ({ value: "", text: "", usage, provenance: mockProvenance }),
+      embed: async () => ({ value: [], vectors: [], usage, provenance: mockProvenance }),
+      rerank: async () => ({ value: [], scores: [], usage, provenance: mockProvenance }),
+    };
+    // 只有状态/主题跨度（在场统计）时，不触发零 issue 评估
+    const { assessment } = await assessRuntimeLearningWithModel({
+      projectId: "p1",
+      workflowId: "wf-1",
+      artifact,
+      reviews: [],
+      model,
+      now: 8,
+      serialContext: { ...serialSnapshot, functionRuns: [] },
+    });
+    expect(called).toBe(0);
+    expect(assessment.conclusion).toBe("no-shared-learning");
+  });
+
+  it("still triggers zero-issue evaluation for function runs and issue clusters", async () => {
+    let called = 0;
+    const model: ModelGateway = {
+      getRoutingSnapshot: () => mockRoutingSnapshot,
+      generateStructured: async <T,>() => {
+        called += 1;
+        return { value: { conclusion: "no-shared-learning", candidate: { targetKind: "none" } } as T, usage, provenance: mockProvenance };
+      },
+      generateText: async () => ({ value: "", text: "", usage, provenance: mockProvenance }),
+      embed: async () => ({ value: [], vectors: [], usage, provenance: mockProvenance }),
+      rerank: async () => ({ value: [], scores: [], usage, provenance: mockProvenance }),
+    };
+    await assessRuntimeLearningWithModel({
+      projectId: "p1",
+      workflowId: "wf-1",
+      artifact,
+      reviews: [],
+      model,
+      now: 9,
+      serialContext: serialSnapshot,
+    });
+    await assessRuntimeLearningWithModel({
+      projectId: "p1",
+      workflowId: "wf-1",
+      artifact,
+      reviews: [],
+      model,
+      now: 10,
+      recentIssueClusters: [{ key: "cross-chapter-restatement", chapterCount: 2, narrativeOrders: [2, 3], titles: ["第二章", "第三章"], severities: ["warning"] }],
+    });
+    expect(called).toBe(2);
+  });
+
   it("exposes declared execution points when asking for a reusable Skill patch", () => {
     const prompt = buildRuntimeLearningPrompt({
       artifact,
@@ -184,5 +246,112 @@ describe("V2 runtime learning assessment", () => {
       },
       learningSource: { assessmentId: propose.id, mechanism: propose.underlyingMechanism },
     });
+  });
+});
+
+const serialSnapshot: SerialContextSnapshot = {
+  window: 6,
+  chapters: [
+    { documentId: "doc-1", narrativeOrder: 1, title: "第一章", narrativeFunction: "development" },
+    { documentId: "doc-2", narrativeOrder: 2, title: "第二章", narrativeFunction: "discovery" },
+    { documentId: "doc-3", narrativeOrder: 3, title: "第三章", narrativeFunction: "discovery" },
+  ],
+  characterSpans: [
+    { characterId: "陈渊", states: [{ narrativeOrder: 1, stateSnapshot: "虚弱。" }, { narrativeOrder: 2, stateSnapshot: "肋骨断茬钝痛。" }] },
+  ],
+  functionRuns: [
+    { narrativeFunction: "discovery", narrativeOrders: [2, 3] },
+  ],
+  subjectSpans: [
+    { subject: "金属残片", narrativeOrders: [1, 3], latestExcerpt: "陈渊握着金属残片。" },
+  ],
+  fingerprint: "serial-fp",
+};
+
+function learningActivities(repository: Partial<NovelPostgresRepository>, generateStructured: ModelGateway["generateStructured"]) {
+  return createNovelWorkflowActivities({
+    repository: repository as unknown as NovelPostgresRepository,
+    memoryProvider: { search: async () => [] },
+    skillProvider: {
+      list: async () => [{
+        skillId: "learning-audit",
+        version: "1",
+        capabilities: ["learning"],
+        applicableTasks: [],
+        requiredMemoryKinds: [],
+        conflicts: [],
+        qualityGates: [],
+        promptSections: { "learning.assessment": "保持规则文本泛化，不绑定具体书名人物。" },
+        enabled: true,
+        executionPoints: ["learning.assessment" as const],
+        roles: ["learning-auditor"],
+      }],
+    },
+    modelGateway: { generateStructured } as unknown as ModelGateway,
+    objectStore: {} as ContentObjectStore,
+    commitService: {} as CommitService,
+    enableChapterMemory: false,
+  });
+}
+
+describe("assessLearning activity serial-context wiring", () => {
+  it("passes the caller documentId to getSerialContextSnapshot instead of artifact.taskId", async () => {
+    const getSerialContextSnapshot = vi.fn(async () => serialSnapshot);
+    const getRecentReviewIssueClusters = vi.fn(async () => []);
+    const recordLearningAssessment = vi.fn(async (assessment: RuntimeLearningAssessmentV2) => assessment);
+    const generateStructured = vi.fn<ModelGateway["generateStructured"]>(async <T,>() => ({ value: { conclusion: "no-shared-learning", candidate: { targetKind: "none" } } as T, usage, provenance: mockProvenance }));
+    const activities = learningActivities({ getSerialContextSnapshot, getRecentReviewIssueClusters, recordLearningAssessment }, generateStructured as unknown as ModelGateway["generateStructured"]);
+
+    const result = await activities.assessLearning({ projectId: "p1", workflowId: "wf-1", assessmentKey: "1", artifact, reviews: [blockingReview], routingSnapshot: mockRoutingSnapshot, narrativeOrder: 4, documentId: "doc-4" });
+
+    expect(result.kind).toBe("completed");
+    expect(getSerialContextSnapshot).toHaveBeenCalledOnce();
+    expect(getSerialContextSnapshot).toHaveBeenCalledWith("p1", "doc-4", 3);
+    expect(getSerialContextSnapshot).not.toHaveBeenCalledWith("p1", artifact.taskId, expect.anything());
+    expect(getRecentReviewIssueClusters).toHaveBeenCalledWith("p1", 3);
+    expect(recordLearningAssessment).toHaveBeenCalledOnce();
+  });
+
+  it("skips the serial-context query when documentId is missing (no misleading taskId lookup)", async () => {
+    const getSerialContextSnapshot = vi.fn(async () => serialSnapshot);
+    const getRecentReviewIssueClusters = vi.fn(async () => []);
+    const recordLearningAssessment = vi.fn(async (assessment: RuntimeLearningAssessmentV2) => assessment);
+    const generateStructured = vi.fn<ModelGateway["generateStructured"]>(async <T,>() => ({ value: { conclusion: "no-shared-learning", candidate: { targetKind: "none" } } as T, usage, provenance: mockProvenance }));
+    const activities = learningActivities({ getSerialContextSnapshot, getRecentReviewIssueClusters, recordLearningAssessment }, generateStructured as unknown as ModelGateway["generateStructured"]);
+
+    const result = await activities.assessLearning({ projectId: "p1", workflowId: "wf-1", assessmentKey: "1", artifact, reviews: [blockingReview], routingSnapshot: mockRoutingSnapshot, narrativeOrder: 4 });
+
+    expect(result.kind).toBe("completed");
+    expect(getSerialContextSnapshot).not.toHaveBeenCalled();
+    expect(getRecentReviewIssueClusters).toHaveBeenCalledWith("p1", 3);
+  });
+
+  it("skips both pre-chapter queries when narrativeOrder is missing", async () => {
+    const getSerialContextSnapshot = vi.fn(async () => serialSnapshot);
+    const getRecentReviewIssueClusters = vi.fn(async () => []);
+    const recordLearningAssessment = vi.fn(async (assessment: RuntimeLearningAssessmentV2) => assessment);
+    const generateStructured = vi.fn<ModelGateway["generateStructured"]>(async <T,>() => ({ value: { conclusion: "no-shared-learning", candidate: { targetKind: "none" } } as T, usage, provenance: mockProvenance }));
+    const activities = learningActivities({ getSerialContextSnapshot, getRecentReviewIssueClusters, recordLearningAssessment }, generateStructured as unknown as ModelGateway["generateStructured"]);
+
+    const result = await activities.assessLearning({ projectId: "p1", workflowId: "wf-1", assessmentKey: "1", artifact, reviews: [blockingReview], routingSnapshot: mockRoutingSnapshot });
+
+    expect(result.kind).toBe("completed");
+    expect(getSerialContextSnapshot).not.toHaveBeenCalled();
+    expect(getRecentReviewIssueClusters).not.toHaveBeenCalled();
+  });
+
+  it("injects the loaded serial context into the learning prompt", async () => {
+    const getSerialContextSnapshot = vi.fn(async () => serialSnapshot);
+    const getRecentReviewIssueClusters = vi.fn(async () => []);
+    const recordLearningAssessment = vi.fn(async (assessment: RuntimeLearningAssessmentV2) => assessment);
+    const generateStructured = vi.fn<ModelGateway["generateStructured"]>(async <T,>() => ({ value: { conclusion: "no-shared-learning", candidate: { targetKind: "none" } } as T, usage, provenance: mockProvenance }));
+    const activities = learningActivities({ getSerialContextSnapshot, getRecentReviewIssueClusters, recordLearningAssessment }, generateStructured as unknown as ModelGateway["generateStructured"]);
+
+    await activities.assessLearning({ projectId: "p1", workflowId: "wf-1", assessmentKey: "1", artifact, reviews: [blockingReview], routingSnapshot: mockRoutingSnapshot, narrativeOrder: 4, documentId: "doc-4" });
+
+    const call = generateStructured.mock.calls[0]![0];
+    expect(call.prompt).toContain("角色状态跨度");
+    expect(call.prompt).toContain("陈渊");
+    expect(call.prompt).toContain("连续同类功能");
   });
 });

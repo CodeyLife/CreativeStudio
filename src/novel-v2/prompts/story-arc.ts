@@ -8,12 +8,13 @@ export type { StoryArcReviewOutput } from "../application/story-arc-review-polic
 const sceneSchema = {
   type: "object",
   additionalProperties: false,
-  required: ["title", "participants", "situation", "observableActions", "opposition", "decision", "outcome", "cost"],
+  required: ["title", "participants", "situation", "observableActions", "planningRationale", "opposition", "decision", "outcome", "cost"],
   properties: {
     title: { type: "string" },
     participants: { type: "array", items: { type: "string" } },
     situation: { type: "string", minLength: 1 },
     observableActions: { type: "array", minItems: 1, items: { type: "string", minLength: 1 } },
+    planningRationale: { type: "string", description: "仅供规划器保存的分析理由；无分析理由时使用空字符串。正文、审校和修订执行合同不会消费该字段" },
     opposition: { type: "string" },
     decision: { type: "string" },
     outcome: { type: "string", minLength: 1 },
@@ -87,7 +88,7 @@ export type StoryArcPromptInput = {
   macro: Array<{ taskKey: string; title: string; summary: string }>;
   recentChapters: Array<{ order: number; summary: string; unresolvedThreads: string[]; emotionalArc?: string }>;
   openThreads: Array<{ id: string; title: string; payload: Record<string, unknown> }>;
-  openForeshadowings?: Array<{ id: string; description: string; triggerKeywords: string[]; expectedPayoffWindow: string; plantedRevisionId: string }>;
+  openForeshadowings?: Array<{ id: string; description: string; triggerKeywords: string[]; expectedPayoffWindow: string; readerQuestion?: string; possiblePayoffs?: string[]; meaningDelta?: string; cost?: string; plantedRevisionId: string }>;
   openPromises?: Array<{ id: string; promiser: string; promisee: string; statement: string; sourceRevisionId: string }>;
   planningFeedback?: Array<{ sourceChapterOrder?: number; targetId: string; underlyingMechanism: string; affectedInputClass: string; boundaries?: string; sourceArtifactId?: string }>;
   narrativeState?: NarrativeStateSnapshot;
@@ -112,7 +113,7 @@ export function buildStoryArcPlanningContextSections(input: StoryArcPromptInput)
   ].join("\n");
   const open = [
     `开放剧情线：${input.openThreads.map((item) => `${item.id} ${item.title}${renderThreadPayload(item.payload)}`).join("\n") || "无"}`,
-    `开放伏笔：${input.openForeshadowings?.map((item) => `${item.id} ${item.description}；触发=${item.triggerKeywords.join("、") || "未指定"}；窗口=${item.expectedPayoffWindow}`).join("\n") || "无"}`,
+    `开放伏笔：${input.openForeshadowings?.map(renderOpenForeshadowing).join("\n") || "无"}`,
     `开放承诺：${input.openPromises?.map((item) => `${item.id} ${item.promiser}->${item.promisee}：${item.statement}`).join("\n") || "无"}`,
   ].join("\n");
   const feedback = [
@@ -145,6 +146,19 @@ function renderNarrativeState(state: NarrativeStateSnapshot): string {
   ].join("\n");
 }
 
+function renderOpenForeshadowing(item: { id: string; description: string; triggerKeywords: string[]; expectedPayoffWindow: string; readerQuestion?: string; possiblePayoffs?: string[]; meaningDelta?: string; cost?: string }): string {
+  const parts = [
+    `${item.id} ${item.description}`,
+    `触发=${item.triggerKeywords.join("、") || "未指定"}`,
+    `窗口=${item.expectedPayoffWindow}`,
+  ];
+  if (item.readerQuestion) parts.push(`读者问题=${item.readerQuestion}`);
+  if (item.possiblePayoffs?.length) parts.push(`可行兑现方向=${item.possiblePayoffs.join("、")}`);
+  if (item.meaningDelta) parts.push(`意义增量=${item.meaningDelta}`);
+  if (item.cost) parts.push(`代价=${item.cost}`);
+  return parts.join("；");
+}
+
 function renderThreadPayload(payload: Record<string, unknown>): string {
   const entries = Object.entries(payload)
     .filter(([, value]) => typeof value === "string" || typeof value === "number" || typeof value === "boolean" || (Array.isArray(value) && value.every((item) => typeof item === "string")))
@@ -159,7 +173,7 @@ function context(input: StoryArcPromptInput): string {
     `全局规划引用：${input.macro.map((item) => `[${item.taskKey}] ${item.title}: ${item.summary}`).join("\n") || "无"}`,
     `最近章节位置：${input.recentChapters.map((item) => `第${item.order}章 ${item.summary}；未解=${item.unresolvedThreads.join("、") || "无"}`).join("\n") || "无"}`,
     `开放剧情线：${input.openThreads.map((item) => `${item.id} ${item.title}${renderThreadPayload(item.payload)}`).join("\n") || "无"}`,
-    `开放伏笔：${input.openForeshadowings?.map((item) => `${item.id} ${item.description}；触发=${item.triggerKeywords.join("、") || "未指定"}；窗口=${item.expectedPayoffWindow}`).join("\n") || "无"}`,
+    `开放伏笔：${input.openForeshadowings?.map(renderOpenForeshadowing).join("\n") || "无"}`,
     `开放承诺：${input.openPromises?.map((item) => `${item.id} ${item.promiser}->${item.promisee}：${item.statement}`).join("\n") || "无"}`,
     input.planningFeedback?.length
       ? `近期可迁移的规划反馈（只作为风险信号，不是新增剧情要求）：${input.planningFeedback.map((item) => `${item.targetId}${item.sourceChapterOrder ? `/第${item.sourceChapterOrder}章` : ""}：机制=${item.underlyingMechanism}；影响输入类=${item.affectedInputClass}${item.boundaries ? `；边界=${item.boundaries}` : ""}`).join("\n")}`
@@ -171,12 +185,12 @@ function context(input: StoryArcPromptInput): string {
 export function buildStoryArcPrompt(input: StoryArcPromptInput): string {
   return [
     "规划一个可滚动推进的故事弧及其第一批连续章节。全书规划只提供承诺、边界和长期方向；故事弧负责把当前状态转成阶段性因果链，章节蓝图只冻结当前因果、状态、事实边界和场景执行材料。",
-    "输出必须是 schema 定义的规范蓝图对象：根对象只包含 arc、batch、chapters，章节和场景只填写 schema 声明的执行字段。上下文中的持久化记录、执行状态、文档/修订标识、已批准或已提交的包装对象只是参考证据，不得原样复制到输出。",
+    "输出必须是 schema 定义的规范蓝图对象：根对象只包含 arc、batch、chapters。场景的 situation、observableActions、opposition、decision、outcome、cost 只填写写作者可转化为现场的处境、动作、阻力、选择、结果和代价；规划器的技术模型、分析步骤或推演理由只能放入 planningRationale，不能混入可观察行动或结果。上下文中的持久化记录、执行状态、文档/修订标识、已批准或已提交的包装对象只是参考证据，不得原样复制到输出。",
     "先写清故事弧入口状态、主要欲望/压力、关键选择、代价、退出状态和新问题；每个阶段都要说明它改变了什么人物选择、关系状态、信息分布、资源条件或读者期待。",
     "主线、支线、人物线、关系线和世界压力线要直接在 threadResponsibilities 中标明本弧责任、交汇/退出条件和未回收承诺，并写清下一推进条件。若某条线本弧暂缓，写清可验证的保持/观察责任和触发条件；没有剧情线时数组为空。不为了填满结构而制造无依据事件，也不提前消费后续答案。",
     "上下文优先级：已定稿事实、叙事状态账本和明确作者边界高于当前故事弧草案；开放线索是待判断的责任与素材，不是本批次必须兑现的事件；规划反馈只用于修复共享机制，不把某一章的表面问题复制成剧情规则。",
     "章节可以推进、停顿、相处、等待、恢复、内省或处理余波，不要求每章新增事件、压力、爽点、主题表达或固定结尾。未指定的表达层由作者自然发挥。",
-    "每章填写起始状态、结束状态和可观察证据；状态保持稳定也是合法结果，但必须说明本章承担的体验、关系、理解、条件或余波功能。每个场景填写处境、可观察行动和结果；阻力、选择、代价在自然承担时写清，不用标签代替过程。没有真实连续性约束时使用空数组，不要为了满足格式虚构内容。",
+    "每章填写起始状态、结束状态和可观察证据；状态保持稳定也是合法结果，但必须说明本章承担的体验、关系、理解、条件或余波功能。每个场景填写处境、可观察行动和结果；阻力、选择、代价在自然承担时写清，不用标签代替过程。若需要保留作者侧分析，使用 planningRationale；正文执行上下文不会读取它。没有真实连续性约束时使用空数组，不要为了满足格式虚构内容。",
     "场景设计至少能回答：谁此刻想要什么、什么在阻拦、人物知道什么/不知道什么、有哪些选择与代价、结果如何改变后续；安静场景也要有可感知的注意力、关系温度、理解或处境证据。",
     context(input),
     "只输出 schema 所需 JSON，不输出 Markdown 或解释文字。",
@@ -202,7 +216,7 @@ export function buildStoryArcChaptersPrompt(input: StoryArcPromptInput & { arc: 
     `依据故事弧“${input.arc.title}”生成第 ${input.batch.batchIndex} 批章节，叙事序号从 ${input.batch.startChapterIndex} 开始。输出根对象只包含 chapters。`,
     "只展开当前窗口，不把整卷或整本书压缩成章节任务清单；保留后续发展的空间。每章填写起始状态、结束状态和可观察证据；状态保持稳定也是合法结果，但必须说明本章承担的体验、关系、理解、条件或余波功能。",
     "每章都必须完整返回 schema 声明的 index、title、narrativeFunction、povCharacterId、stateTransition、scenes、continuityConstraints、unresolvedAtClose；stateTransition 必须是包含 before、after、evidence 三个非空字符串的对象，不能省略、改名或用摘要替代。narrativeFunction 必须使用 schema 枚举值，不得自造同义标签。",
-    "每个场景填写处境、可观察行动和结果；阻力、选择、代价在自然承担时写清，不用标签代替过程。没有真实连续性约束时使用空数组，不为了满足格式虚构内容。",
+    "每个场景填写处境、可观察行动和结果；阻力、选择、代价在自然承担时写清，不用标签代替过程。需要保留但不应进入正文的分析方法放入 planningRationale，不要写进 observableActions 或 outcome。没有真实连续性约束时使用空数组，不为了满足格式虚构内容。",
     `当前故事弧：${JSON.stringify(input.arc)}`,
     `当前批次：${JSON.stringify(input.batch)}`,
     context(input),
@@ -251,6 +265,7 @@ export function buildStoryArcRevisionPrompt(bundle: StoryArcBundle, review: Stor
     "依据审核证据修订故事弧。先修复承载问题的最低层级：状态和事实边界优先于章节安排，因果与人物选择优先于抽象主题标签，线索责任优先于增加事件。",
     "保留已经成立的人物选择、关系积累、有效证据、未解问题和下层创作空间；不得为了补结构而提前兑现承诺、替人物宣布感情结论、抹平合理未知或覆盖已冻结事实。",
     "不为满足抽象质量标签添加无依据的人物、事件、主题或固定节奏；若问题源于规划缺失，补充可验证的边界、选择、代价、窗口或退出条件，而不是补写正文摘要。",
+    "场景的 situation、observableActions、opposition、decision、outcome、cost 只保留写作者可转化为现场的材料；技术模型、分析步骤和推演理由放入 planningRationale，并确保正文执行投影不会消费该字段。",
     contextText,
     `当前蓝图：${JSON.stringify(bundle)}`,
     `审核结果：${JSON.stringify(review)}`,

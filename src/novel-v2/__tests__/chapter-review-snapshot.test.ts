@@ -51,4 +51,23 @@ describe("aggregateChapterReviews", () => {
     expect(snapshot.issues[0]).toMatchObject({ fingerprint, status: "ignored", sourceRoles: ["structure-reviewer", "prose-reviewer"] });
     expect(snapshot.verdict).toBe("revise");
   });
+
+  it("keeps diagnostic reader evidence out of issue identity", () => {
+    const base: ReviewIssue = { severity: "major", title: "动作承接", evidence: "他停住了。", excerpt: "他停住了。", rule: "因果跳步" };
+    const annotated = {
+      ...base,
+      readerReconstruction: { impact: "core" as const, missingEvidence: ["consequence" as const], blockedQuestion: "读者无法判断停顿改变了什么" },
+    };
+    const snapshot = aggregateChapterReviews([
+      makeReview("structure-reviewer", "internal", 4, [base]),
+      makeReview("character-reviewer", "independent", 4),
+      makeReview("prose-reviewer", "independent", 4, [annotated]),
+    ]);
+
+    expect(snapshot.issues).toHaveLength(1);
+    expect(snapshot.issues[0]).toMatchObject({
+      readerReconstruction: { impact: "core", missingEvidence: ["consequence"], blockedQuestion: "读者无法判断停顿改变了什么" },
+      sourceRoles: ["structure-reviewer", "prose-reviewer"],
+    });
+  });
 });

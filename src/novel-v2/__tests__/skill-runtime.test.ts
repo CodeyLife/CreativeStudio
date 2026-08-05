@@ -85,7 +85,7 @@ describe("Skill runtime resolution", () => {
     const byId = new Map(descriptors.map((skill) => [skill.skillId, skill]));
 
     for (const skillId of ["prose-craft", "reader-emotion", "plot-causality"]) {
-    expect(byId.get(skillId)?.version).toBe(skillId === "prose-craft" ? "1.2.0" : "1.1.0");
+      expect(byId.get(skillId)?.version).toBe(skillId === "prose-craft" ? "1.3.1" : "1.1.0");
       expect(byId.get(skillId)?.contentFingerprint).toBeTruthy();
     }
 

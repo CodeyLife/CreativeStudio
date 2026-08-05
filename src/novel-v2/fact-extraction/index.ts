@@ -39,7 +39,7 @@ export interface ExtractFactsInput {
   existingClaimsIndex?: Map<string, string[]>;
   /** 当前叙事截止点可见的开放伏笔/承诺，用于兑现时建立精确关联。 */
   openNarrativeElements?: {
-    foreshadowings: Array<{ id: string; description: string; triggerKeywords: string[]; expectedPayoffWindow: string }>;
+    foreshadowings: Array<{ id: string; description: string; triggerKeywords: string[]; expectedPayoffWindow: string; readerQuestion?: string; possiblePayoffs?: string[]; meaningDelta?: string; cost?: string }>;
     promises: Array<{ id: string; promiser: string; promisee: string; statement: string }>;
   };
   routingSnapshot?: ModelRoutingSnapshot;

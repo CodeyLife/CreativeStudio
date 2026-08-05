@@ -11,6 +11,7 @@ export interface StoryArcThreadResponsibility {
 
 export const CHAPTER_NARRATIVE_FUNCTIONS = ["setup", "development", "relationship", "discovery", "confrontation", "payoff", "aftermath", "transition", "reflection"] as const;
 export type ChapterNarrativeFunction = (typeof CHAPTER_NARRATIVE_FUNCTIONS)[number];
+export const CHAPTER_EXECUTION_CONTRACT_VERSION = "reader-grounded-v1";
 
 export interface StoryArcPlan {
   title: string;
@@ -49,6 +50,8 @@ export interface ChapterSceneBlueprint {
   participants: string[];
   situation: string;
   observableActions: string[];
+  /** Planner-only reasoning; excluded from the writer-facing execution contract. */
+  planningRationale?: string;
   opposition?: string;
   decision?: string;
   outcome: string;
@@ -391,6 +394,7 @@ export function parseStoryArcBundle(value: unknown): StoryArcBundle {
           participants: strings(item.participants),
           situation: typeof item.situation === "string" ? item.situation : "",
           observableActions: strings(item.observableActions),
+          planningRationale: typeof item.planningRationale === "string" && item.planningRationale.trim() ? item.planningRationale.trim() : undefined,
           opposition: typeof item.opposition === "string" && item.opposition.trim() ? item.opposition : undefined,
           decision: typeof item.decision === "string" && item.decision.trim() ? item.decision : undefined,
           outcome: typeof item.outcome === "string" ? item.outcome : "",
@@ -471,7 +475,10 @@ export function normalizeChapterPlanningContext(value: unknown): ChapterPlanning
     return [{ id: normalized.id ?? `legacy-neighbor-${index}`, globalOrder: normalized.globalOrder, title: normalized.title, narrativeFunction: normalized.narrativeFunction, stateTransition: normalized.stateTransition, unresolvedAtClose: normalized.unresolvedAtClose }];
   }) : [];
   const withoutFingerprint = { projectId, arcId, chapterBlueprintId: typeof source.chapterBlueprintId === "string" ? source.chapterBlueprintId : chapter.id ?? "", arc, chapter, neighbors, sourceArtifactIds: strings(source.sourceArtifactIds) };
-  return { ...withoutFingerprint, fingerprint: typeof source.fingerprint === "string" ? source.fingerprint : planningContextFingerprint(withoutFingerprint) };
+  // Historical snapshots may carry a fingerprint from an older execution
+  // contract. Recompute it at the read boundary so the next workflow sees the
+  // current projection version and persists a fresh context when it compiles.
+  return { ...withoutFingerprint, fingerprint: planningContextFingerprint(withoutFingerprint) };
 }
 
 export function canGenerateNextStoryArcBatch(input: { plannedInBatch: number; finalizedInBatch: number; batchStatus: StoryArcBatchRecord["status"] }): boolean {
@@ -480,5 +487,5 @@ export function canGenerateNextStoryArcBatch(input: { plannedInBatch: number; fi
 }
 
 export function planningContextFingerprint(value: Omit<ChapterPlanningContext, "fingerprint">): string {
-  return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+  return createHash("sha256").update(JSON.stringify({ executionContractVersion: CHAPTER_EXECUTION_CONTRACT_VERSION, ...value })).digest("hex");
 }

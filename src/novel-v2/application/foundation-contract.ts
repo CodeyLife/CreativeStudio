@@ -104,7 +104,21 @@ const architectureVolumeSchema = objectSchema(
     entryState: stringSchema,
     exitState: stringSchema,
     pressures: nonEmptyArraySchema({ type: "string", minLength: 1 }),
-    promiseWindows: { type: "array", items: { type: "object" } },
+    promiseWindows: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: true,
+        properties: {
+          promiseRef: { type: "string", minLength: 1 },
+          id: { type: "string", minLength: 1 },
+          description: { type: "string", minLength: 1 },
+          windowOrdinals: { type: "array", items: { type: "integer", minimum: 1 } },
+          window: { type: "string", minLength: 1 },
+          payoffWindow: { type: "string", minLength: 1 },
+        },
+      },
+    },
   },
 );
 
@@ -117,6 +131,10 @@ const longHorizonThreadSchema = objectSchema(
     doNotConsumeBefore: stringSchema,
     responsibleVolumeOrdinals: nonEmptyArraySchema({ type: "integer", minimum: 1 }),
     nextResponsibility: stringSchema,
+    coupling: stringSchema,
+    mergePoint: stringSchema,
+    exitPoint: stringSchema,
+    transformPoint: stringSchema,
   },
 );
 
@@ -148,6 +166,7 @@ const foundationDataSchemas: Record<string, JsonSchema> = {
   ),
   architecture: objectSchema(["structure", "volumes", "povStrategy", "timeSpan"], {
     structure: stringSchema,
+    structureType: { type: "string", enum: ["linear", "tree", "network"] },
     volumes: nonEmptyArraySchema(architectureVolumeSchema),
     povStrategy: stringSchema,
     timeSpan: stringSchema,
@@ -171,6 +190,19 @@ const foundationDataSchemas: Record<string, JsonSchema> = {
       statement: stringSchema,
       cost: stringSchema,
       boundary: stringSchema,
+    })),
+    resourcesAndTechnology: nonEmptyArraySchema(objectSchema(["name", "distribution", "scarcity", "access"], {
+      name: stringSchema,
+      distribution: stringSchema,
+      scarcity: stringSchema,
+      access: stringSchema,
+    })),
+    valuesAndConflicts: nonEmptyArraySchema(objectSchema(["value", "rewardedBy", "punishedBy", "unequalFor", "consequence"], {
+      value: stringSchema,
+      rewardedBy: stringSchema,
+      punishedBy: stringSchema,
+      unequalFor: stringSchema,
+      consequence: stringSchema,
     })),
   }),
   relations: nonEmptyArraySchema(objectSchema(["from", "to", "type", "strength", "evolution", "choiceConsequence"], {

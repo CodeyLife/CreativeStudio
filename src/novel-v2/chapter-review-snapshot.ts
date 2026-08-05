@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import type { Review, ReviewIssue } from "./protocol";
+import type { ReaderReconstructionEvidence, Review, ReviewIssue } from "./protocol";
+import { mergeReaderReconstructionEvidence } from "./reader-reconstruction";
 import { REQUIRED_CHAPTER_REVIEWERS } from "./temporal/revision-policy";
 
 export type ChapterReviewVerdict = "passed" | "revise" | "blocked";
@@ -16,6 +17,7 @@ export interface ChapterReviewSnapshotIssue {
   revisionRanges: Array<{ start: number; end: number }>;
   rule?: string;
   suggestion?: string;
+  readerReconstruction?: ReaderReconstructionEvidence | null;
   sourceRoles: string[];
   status: ChapterReviewIssueStatus;
 }
@@ -34,6 +36,8 @@ function normalized(value: string | undefined): string {
 
 export function reviewIssueFingerprint(issue: ReviewIssue): string {
   return createHash("sha256")
+    // Reader reconstruction is diagnostic metadata, not issue identity. Keep
+    // the historical three-part fingerprint so existing statuses remain valid.
     .update([normalized(issue.title), normalized(issue.excerpt ?? issue.evidence), normalized(issue.rule)].join("\u0000"))
     .digest("hex");
 }
@@ -66,6 +70,7 @@ export function aggregateChapterReviews(
       const existing = merged.get(fingerprint);
       if (existing) {
         existing.sourceRoles = [...new Set([...existing.sourceRoles, review.role ?? review.reviewerId])];
+        existing.readerReconstruction = mergeReaderReconstructionEvidence(existing.readerReconstruction, issue.readerReconstruction);
         continue;
       }
       merged.set(fingerprint, {
@@ -79,6 +84,7 @@ export function aggregateChapterReviews(
         revisionRanges: issue.revisionRanges ?? [],
         rule: issue.rule,
         suggestion: issue.suggestion,
+        readerReconstruction: issue.readerReconstruction ?? null,
         sourceRoles: [review.role ?? review.reviewerId],
         status: priorStatuses.get(fingerprint) ?? "pending",
       });

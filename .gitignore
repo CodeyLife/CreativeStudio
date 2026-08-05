@@ -37,3 +37,5 @@ analyze-revision-*.mjs
 approve-ch9.ts
 scripts/get-chapter-text.ts
 tmp-*.mjs
+.tmp-novel-v2-*.log*
+.tmp-novel-v2-*.err

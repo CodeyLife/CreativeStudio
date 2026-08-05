@@ -10,6 +10,11 @@
       "version": "017_migrate_v1_skills.sql",
       "checksum": "fa3cbaf764b157f574329f7754a8b622f72b6152df70af3ae503dafefc037d56",
       "reason": "017 seed migration 已改为只补缺失 Skill，接受已应用的旧覆盖式 SQL checksum"
+    },
+    {
+      "version": "020_foreshadowing_narrative_order.sql",
+      "checksum": "9adfb5c7150fa707440f13b67e04f5c5c9aee6e99f70ac22d3e5d58ab2bfc0a3",
+      "reason": "020 在部分旧数据库按早期版本应用；当前 SQL 使用 IF NOT EXISTS 幂等，归档旧 checksum 后由迁移审计接受"
     }
   ],
   "schemaSubtractions": [

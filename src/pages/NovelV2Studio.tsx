@@ -32,6 +32,7 @@ import {
   RocketOutlined,
   SearchOutlined,
   ThunderboltOutlined,
+  FontSizeOutlined,
 } from "@ant-design/icons";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { motion } from "motion/react";
@@ -66,9 +67,10 @@ const McpToolGatewayPanel = lazy(() => import("./novel-v2/McpToolGatewayPanel"))
 const KnowledgeWorkbenchPanel = lazy(() => import("./novel-v2/KnowledgeWorkbenchPanel"));
 const ProjectPlanPanel = lazy(() => import("./novel-v2/ProjectPlanPanel"));
 const StoryArcPanel = lazy(() => import("./novel-v2/StoryArcPanel"));
+const StyleContractPanel = lazy(() => import("./novel-v2/StyleContractPanel"));
 const NovelProductionWorkspace = lazy(() => import("./novel-v2/NovelPipelineBoard"));
 
-export type NovelWorkspaceView = "overview" | "plan" | "arcs" | "production" | "knowledge" | "evaluation" | "creative" | "mcp";
+export type NovelWorkspaceView = "overview" | "plan" | "arcs" | "production" | "knowledge" | "evaluation" | "creative" | "mcp" | "style";
 
 const VIEW_ITEMS: Array<{ key: NovelWorkspaceView; label: string; icon: React.ReactNode }> = [
   { key: "overview", label: "总览", icon: <ThunderboltOutlined /> },
@@ -79,6 +81,7 @@ const VIEW_ITEMS: Array<{ key: NovelWorkspaceView; label: string; icon: React.Re
   { key: "evaluation", label: "评估闭环", icon: <ExperimentOutlined /> },
   { key: "creative", label: "创意执行", icon: <RocketOutlined /> },
   { key: "mcp", label: "MCP 工具", icon: <RobotOutlined /> },
+  { key: "style", label: "文风契约", icon: <FontSizeOutlined /> },
 ];
 
 const VALID_VIEWS = new Set(VIEW_ITEMS.map((item) => item.key));
@@ -317,6 +320,7 @@ export default function NovelV2Studio() {
     if (view === "evaluation") return <Suspense fallback={<PanelFallback />}><EvaluationPanel projectId={projectId} /></Suspense>;
     if (view === "creative") return <Suspense fallback={<PanelFallback />}><CreativeRunPanel projectId={projectId} /></Suspense>;
     if (view === "mcp") return <Suspense fallback={<PanelFallback />}><McpToolGatewayPanel /></Suspense>;
+    if (view === "style") return <Suspense fallback={<PanelFallback />}><StyleContractPanel projectId={projectId} /></Suspense>;
     return (
       <div className="nwc-overview">
         <section className="nwc-priority" aria-label="优先处理队列">

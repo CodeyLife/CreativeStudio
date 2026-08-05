@@ -18,6 +18,7 @@ import {
   type ProjectPlanTaskKey,
 } from "./application/project-plan";
 import type { FactExtractionOutput } from "./prompts/schemas";
+import { normalizeStyleContractPayload, styleContractFingerprint, type StyleContract, type StyleContractPayload } from "./style-contract";
 import type {
   Artifact,
   ApprovalEvidence,
@@ -39,10 +40,15 @@ import type {
   PreflightPlan,
   ProjectSnapshotBundle,
   PromotionReceipt,
+  RecentIssueCluster,
   RetrievalFacet,
   Review,
   ReviewIssue,
   RuntimeLearningAssessmentV2,
+  SerialCharacterStateSpan,
+  SerialContextSnapshot,
+  SerialFunctionRun,
+  SerialSubjectSpan,
   SkillBundle,
   SkillDescriptor,
   TaskAttemptRecord,
@@ -281,7 +287,7 @@ function projectPlanSectionFromRow(row: ProjectPlanSectionRow): ProjectPlanSecti
   };
 }
 
-function chapterBlueprintFromRow(row: ChapterBlueprintRow): ChapterBlueprintRecord {
+export function chapterBlueprintFromRow(row: ChapterBlueprintRow): ChapterBlueprintRecord {
   const payload = row.payload ?? {};
   const state = payload.stateTransition && typeof payload.stateTransition === "object" && !Array.isArray(payload.stateTransition)
     ? payload.stateTransition as Record<string, unknown>
@@ -311,11 +317,13 @@ function chapterBlueprintFromRow(row: ChapterBlueprintRow): ChapterBlueprintReco
     scenes: Array.isArray(payload.scenes) ? payload.scenes.flatMap<ChapterSceneBlueprint>((value, index) => {
       if (!value || typeof value !== "object" || Array.isArray(value)) return [];
       const scene = value as Record<string, unknown>;
+      const planningRationale = typeof scene.planningRationale === "string" && scene.planningRationale.trim() ? scene.planningRationale.trim() : undefined;
       return [{
         title: typeof scene.title === "string" ? scene.title : `场景 ${index + 1}`,
         participants: Array.isArray(scene.participants) ? scene.participants.filter((item): item is string => typeof item === "string") : [],
         situation: typeof scene.situation === "string" ? scene.situation : "",
         observableActions: Array.isArray(scene.observableActions) ? scene.observableActions.filter((item): item is string => typeof item === "string") : [],
+        ...(planningRationale ? { planningRationale } : {}),
         opposition: typeof scene.opposition === "string" && scene.opposition.trim() ? scene.opposition : undefined,
         decision: typeof scene.decision === "string" && scene.decision.trim() ? scene.decision : undefined,
         outcome: typeof scene.outcome === "string" ? scene.outcome : "",
@@ -1477,7 +1485,7 @@ export class NovelPostgresRepository {
     if (!document.rowCount) return undefined;
     const row = document.rows[0];
     const issues = row.review_id ? await this.pool.query(`
-      SELECT id,issue_fingerprint,dimension,severity,title,description,evidence_quote,paragraph,revision_ranges,rule,suggestion,source_roles,status,updated_at
+      SELECT id,issue_fingerprint,dimension,severity,title,description,evidence_quote,paragraph,revision_ranges,rule,suggestion,reader_reconstruction,source_roles,status,updated_at
       FROM chapter_review_snapshot_issues WHERE snapshot_id=$1
       ORDER BY CASE severity WHEN 'blocker' THEN 0 WHEN 'major' THEN 1 ELSE 2 END,created_at,id
     `, [row.review_id]) : { rows: [] };
@@ -1501,7 +1509,7 @@ export class NovelPostgresRepository {
         artifactFingerprint: row.artifact_fingerprint, sourceWorkflowId: row.source_workflow_id ?? undefined, verdict: row.verdict,
         complete: row.complete, overallScore: row.overall_score === null ? undefined : Number(row.overall_score),
         reviewerRoles: row.reviewer_roles ?? [], reviewedAt: iso(row.reviewed_at), stale: row.reviewed_content_hash !== row.content_hash,
-        issues: issues.rows.map((issue) => ({ id: issue.id, fingerprint: issue.issue_fingerprint, severity: issue.severity, title: issue.title, description: issue.description ?? undefined, evidenceQuote: issue.evidence_quote, paragraph: issue.paragraph ?? undefined, revisionRanges: issue.revision_ranges ?? [], rule: issue.rule ?? undefined, suggestion: issue.suggestion ?? undefined, sourceRoles: issue.source_roles ?? [], status: issue.status, updatedAt: iso(issue.updated_at) })),
+        issues: issues.rows.map((issue) => ({ id: issue.id, fingerprint: issue.issue_fingerprint, severity: issue.severity, title: issue.title, description: issue.description ?? undefined, evidenceQuote: issue.evidence_quote, paragraph: issue.paragraph ?? undefined, revisionRanges: issue.revision_ranges ?? [], rule: issue.rule ?? undefined, suggestion: issue.suggestion ?? undefined, readerReconstruction: issue.reader_reconstruction ?? null, sourceRoles: issue.source_roles ?? [], status: issue.status, updatedAt: iso(issue.updated_at) })),
       } : undefined,
       versions: versions.rows.map((version) => ({ id: version.id, revision: Number(version.revision), contentHash: version.content_hash, retentionClass: version.retention_class, label: version.label ?? undefined, expiresAt: version.expires_at ? iso(version.expires_at) : undefined, createdAt: iso(version.created_at), current: version.is_current })),
     };
@@ -1581,9 +1589,9 @@ export class NovelPostgresRepository {
     const rows = await this.pool.query<{
       id: string; issue_fingerprint: string; dimension: string | null; severity: ReviewIssue["severity"]; title: string; description: string | null;
       evidence_quote: string; paragraph: number | null; revision_ranges: Array<{ start: number; end: number }> | null;
-      rule: string | null; suggestion: string | null; status: ChapterReviewIssueStatus;
+      rule: string | null; suggestion: string | null; reader_reconstruction: ReviewIssue["readerReconstruction"]; status: ChapterReviewIssueStatus;
     }>(`
-      SELECT id,issue_fingerprint,dimension,severity,title,description,evidence_quote,paragraph,revision_ranges,rule,suggestion,status
+      SELECT id,issue_fingerprint,dimension,severity,title,description,evidence_quote,paragraph,revision_ranges,rule,suggestion,reader_reconstruction,status
       FROM chapter_review_snapshot_issues
       WHERE snapshot_id=$1 AND id=ANY($2::text[])
       ORDER BY id
@@ -1600,6 +1608,7 @@ export class NovelPostgresRepository {
       revisionRanges: row.revision_ranges ?? [],
       rule: row.rule ?? undefined,
       suggestion: row.suggestion ?? undefined,
+      readerReconstruction: row.reader_reconstruction ?? null,
     }));
     if (issues.some((issue) => !issue.revisionRanges?.length && !issue.paragraph && !issue.excerpt?.trim())) throw new Error("所选审核意见缺少可定位的正文证据");
     return { snapshotId: current.id, reviewedContentHash: current.reviewed_content_hash, fingerprints: rows.rows.map((row) => row.issue_fingerprint), issues };
@@ -1829,9 +1838,9 @@ export class NovelPostgresRepository {
     await client.query("DELETE FROM chapter_review_snapshot_issues WHERE snapshot_id=$1", [snapshotId]);
     for (const issue of snapshot.issues) {
       await client.query(`
-        INSERT INTO chapter_review_snapshot_issues(id,snapshot_id,issue_fingerprint,dimension,severity,title,description,evidence_quote,paragraph,revision_ranges,rule,suggestion,source_roles,status)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-      `, [issue.id, snapshotId, issue.fingerprint, null, issue.severity, issue.title, issue.description ?? null, issue.evidenceQuote, issue.paragraph ?? null, JSON.stringify(issue.revisionRanges), issue.rule ?? null, issue.suggestion ?? null, issue.sourceRoles, issue.status]);
+        INSERT INTO chapter_review_snapshot_issues(id,snapshot_id,issue_fingerprint,dimension,severity,title,description,evidence_quote,paragraph,revision_ranges,rule,suggestion,reader_reconstruction,source_roles,status)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+      `, [issue.id, snapshotId, issue.fingerprint, null, issue.severity, issue.title, issue.description ?? null, issue.evidenceQuote, issue.paragraph ?? null, JSON.stringify(issue.revisionRanges), issue.rule ?? null, issue.suggestion ?? null, issue.readerReconstruction ?? null, issue.sourceRoles, issue.status]);
     }
     return true;
   }
@@ -3826,7 +3835,7 @@ export class NovelPostgresRepository {
         ...input.chapterMemory.unresolvedThreads,
         ...threads.rows.map((thread) => `${thread.id} ${thread.title}`),
       ])],
-      openForeshadowings: open.foreshadowings.map((item) => ({ id: item.id, description: item.description, expectedPayoffWindow: item.expectedPayoffWindow })),
+      openForeshadowings: open.foreshadowings.map((item) => ({ id: item.id, description: item.description, expectedPayoffWindow: item.expectedPayoffWindow, readerQuestion: item.readerQuestion, possiblePayoffs: item.possiblePayoffs, meaningDelta: item.meaningDelta, cost: item.cost })),
       openPromises: open.promises.map((item) => ({ id: item.id, promiser: item.promiser, promisee: item.promisee, statement: item.statement })),
       fulfilledNodes: [...new Set([
         ...fulfilled.rows.map((row) => row.description).filter(Boolean),
@@ -3976,6 +3985,132 @@ export class NovelPostgresRepository {
     });
     const arcId = result.rows[0].arc_id;
     return { arcId, chapters, fingerprint: canonicalSha256({ arcId, chapters }) };
+  }
+
+  /**
+   * 跨章序列证据快照：把最近 window 章的结构化统计投影给 draft/review/revision/learning。
+   *
+   * 设计依据：AGENTS.md「问题要在机制层解决」——单章审核结构上看不见跨章模式
+   * （状态等幅重述、连续同功能章节、物件/主题跨度），本快照用确定性计算（无 LLM）
+   * 把最近 N 章压缩为描述性统计信号：
+   * - characterSpans：同一角色章末状态快照的跨章序列（状态账本重述信号）；
+   * - functionRuns：同 narrativeFunction 的连续游程 ≥ FUNCTION_RUN_MIN（节奏密度信号）；
+   * - subjectSpans：同一 subject 相关事实出现在 ≥2 个窗口章节（物件/主题跨度信号）。
+   * 只输出统计与摘要，不输出短语黑名单；"母题还是疲劳"由 reviewer 判断。
+   *
+   * TODO P3: window 与 FUNCTION_RUN_MIN 为魔法值，未来应可配置（序列证据预算的一部分）。
+   */
+  async getSerialContextSnapshot(projectId: string, documentId: string, narrativeCutoff: number, window = 6): Promise<SerialContextSnapshot | undefined> {
+    const rhythm = await this.getNarrativeRhythmSnapshot(projectId, documentId, narrativeCutoff);
+    if (!rhythm) return undefined;
+    const windowChapters = rhythm.chapters.slice(-window);
+    if (!windowChapters.length) return undefined;
+    const minOrder = windowChapters[0].narrativeOrder;
+    const maxOrder = windowChapters[windowChapters.length - 1].narrativeOrder;
+
+    // characterSpans：取窗口内各章最新 chapter memory 的 characterStates
+    const memories = await this.getChapterMemories({ projectId, narrativeCutoff: maxOrder, limit: 64 });
+    const memoryByOrder = new Map(memories.filter((m) => m.narrativeRange.start >= minOrder).map((m) => [m.narrativeRange.start, m]));
+    const characterStateMap = new Map<string, Array<{ narrativeOrder: number; stateSnapshot: string }>>();
+    for (const chapter of windowChapters) {
+      const memory = memoryByOrder.get(chapter.narrativeOrder);
+      for (const state of memory?.characterStates ?? []) {
+        const list = characterStateMap.get(state.characterId) ?? [];
+        list.push({ narrativeOrder: chapter.narrativeOrder, stateSnapshot: state.stateSnapshot });
+        characterStateMap.set(state.characterId, list);
+      }
+    }
+    const characterSpans: SerialCharacterStateSpan[] = [...characterStateMap.entries()]
+      .filter(([, states]) => states.length >= 2)
+      .sort((left, right) => right[1].length - left[1].length)
+      .map(([characterId, states]) => ({ characterId, states }));
+
+    // functionRuns：同 narrativeFunction 的连续游程
+    const FUNCTION_RUN_MIN = 3; // TODO P3: 可配置阈值（序列证据预算的一部分）
+    const functionRuns: SerialFunctionRun[] = [];
+    let runStart = 0;
+    for (let index = 1; index <= windowChapters.length; index += 1) {
+      const previous = windowChapters[index - 1].narrativeFunction;
+      const current = index < windowChapters.length ? windowChapters[index].narrativeFunction : undefined;
+      if (previous && previous === current) continue;
+      const run = windowChapters.slice(runStart, index);
+      if (run.length >= FUNCTION_RUN_MIN && run[0].narrativeFunction) {
+        functionRuns.push({ narrativeFunction: run[0].narrativeFunction, narrativeOrders: run.map((chapter) => chapter.narrativeOrder) });
+      }
+      runStart = index;
+    }
+
+    // subjectSpans：窗口内出现在 ≥2 个章节的 subject（active claims）
+    const subjectRows = await this.pool.query<{ subject: string; orders: string[]; latest_title: string }>(
+      `WITH w AS (
+         SELECT unnest(subject_refs) AS subject, narrative_start, title
+         FROM memory_claims
+         WHERE project_id=$1 AND narrative_start BETWEEN $2 AND $3
+           AND lifecycle_status='active'
+       )
+       SELECT subject,
+              array_agg(DISTINCT narrative_start ORDER BY narrative_start) AS orders,
+              (array_agg(title ORDER BY narrative_start DESC))[1] AS latest_title
+       FROM w
+       GROUP BY subject
+       HAVING count(DISTINCT narrative_start) >= 2
+       ORDER BY count(DISTINCT narrative_start) DESC, subject
+       LIMIT 40`,
+      [projectId, minOrder, maxOrder],
+    );
+    const subjectSpans: SerialSubjectSpan[] = subjectRows.rows.map((row) => ({
+      subject: row.subject,
+      narrativeOrders: row.orders.map((value) => Number(value)),
+      latestExcerpt: row.latest_title ?? "",
+    }));
+
+    return {
+      window,
+      chapters: windowChapters,
+      characterSpans,
+      functionRuns,
+      subjectSpans,
+      fingerprint: canonicalSha256({ window, chapters: windowChapters, characterSpans, functionRuns, subjectSpans }),
+    };
+  }
+
+  /**
+   * 近 N 章审核 issue 按规则类聚类（learning 跨章聚合输入）。
+   *
+   * 设计依据：AGENTS.md「review-stage → learning 通路」——单章 issue 构不成"持续模式"，
+   * 只有同 rule/title 类别在多个章节重复出现才能让 learning 判定 propose-improvement。
+   * 聚类键优先 rule，其次 title（已规范化空白），按命中章节数降序。
+   *
+   * TODO P3: window 为魔法值，应可配置（learning 跨章窗口预算的一部分）。
+   */
+  async getRecentReviewIssueClusters(projectId: string, narrativeCutoff: number, window = 6): Promise<RecentIssueCluster[]> {
+    const minOrder = Math.max(1, narrativeCutoff - window + 1);
+    const result = await this.pool.query<{ key: string; chapter_count: string; orders: string[]; titles: string[]; severities: string[] }>(
+      `WITH windowed AS (
+         SELECT d.id AS document_id, d.narrative_order, d.title, i.rule, i.title AS issue_title, i.severity
+         FROM chapter_review_snapshots s
+         JOIN manuscript_documents d ON d.id=s.document_id AND d.project_id=s.project_id
+         JOIN chapter_review_snapshot_issues i ON i.snapshot_id=s.id
+         WHERE s.project_id=$1 AND d.narrative_order BETWEEN $2 AND $3
+       )
+       SELECT COALESCE(NULLIF(trim(rule),''), trim(issue_title)) AS key,
+              count(DISTINCT document_id) AS chapter_count,
+              array_agg(DISTINCT narrative_order ORDER BY narrative_order) AS orders,
+              array_agg(DISTINCT title ORDER BY title) AS titles,
+              array_agg(DISTINCT severity) AS severities
+       FROM windowed
+       GROUP BY key
+       HAVING count(DISTINCT document_id) >= 2
+       ORDER BY chapter_count DESC, key`,
+      [projectId, minOrder, narrativeCutoff],
+    );
+    return result.rows.map((row) => ({
+      key: row.key,
+      chapterCount: Number(row.chapter_count),
+      narrativeOrders: row.orders.map((value) => Number(value)),
+      titles: row.titles,
+      severities: row.severities,
+    }));
   }
 
   async findNextPlannedArcDocument(projectId: string): Promise<ManuscriptDocumentSummary | undefined> {
@@ -4836,7 +4971,7 @@ export class NovelPostgresRepository {
       const id = `foreshadowing:${projectId}:${createHash("sha256").update(`${artifact.id}:${f.description}`).digest("hex").slice(0, 12)}`;
       await connection.query(
         "INSERT INTO foreshadowing(id, project_id, planted_revision_id, status, payload, narrative_order) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(id) DO UPDATE SET payload=EXCLUDED.payload, narrative_order=EXCLUDED.narrative_order",
-        [id, projectId, revisionId, "open", { description: f.description, triggerKeywords: f.triggerKeywords, expectedPayoffWindow: f.expectedPayoffWindow, evidence: f.evidence, artifactId: artifact.id }, narrativeOrder ?? null],
+        [id, projectId, revisionId, "open", { description: f.description, triggerKeywords: f.triggerKeywords, expectedPayoffWindow: f.expectedPayoffWindow, readerQuestion: f.readerQuestion ?? "", possiblePayoffs: f.possiblePayoffs ?? [], meaningDelta: f.meaningDelta ?? "", cost: f.cost ?? "", evidence: f.evidence, artifactId: artifact.id }, narrativeOrder ?? null],
       );
       foreshadowingCount += 1;
     }
@@ -5045,7 +5180,7 @@ export class NovelPostgresRepository {
    * 返回结构化数据，由 retrieveMemory activity 包装为 MemoryHit[] 注入 MemoryBundle。
    */
   async getOpenForeshadowingAndPromises(projectId: string, narrativeCutoff?: number, connection: Pool | PoolClient = this.pool): Promise<{
-    foreshadowings: Array<{ id: string; description: string; triggerKeywords: string[]; expectedPayoffWindow: string; plantedRevisionId: string }>;
+    foreshadowings: Array<{ id: string; description: string; triggerKeywords: string[]; expectedPayoffWindow: string; readerQuestion?: string; possiblePayoffs?: string[]; meaningDelta?: string; cost?: string; plantedRevisionId: string }>;
     promises: Array<{ id: string; promiser: string; promisee: string; statement: string; sourceRevisionId: string }>;
   }> {
     // P0 #2: 按叙事顺序过滤未兑现伏笔，避免长篇后期审校注入"未来章节"埋设的伏笔造成剧透。
@@ -5057,7 +5192,7 @@ export class NovelPostgresRepository {
       : "SELECT id, planted_revision_id, payload FROM foreshadowing WHERE project_id=$1 AND status='open' AND narrative_order <= $2 ORDER BY narrative_order ASC, planted_revision_id ASC";
     const foreshadowingParams = narrativeCutoff === undefined ? [projectId] : [projectId, narrativeCutoff];
     // 查询未兑现的 foreshadowing
-    const foreshadowingRows = await connection.query<{ id: string; planted_revision_id: string; payload: { description?: string; triggerKeywords?: string[]; expectedPayoffWindow?: string } }>(
+    const foreshadowingRows = await connection.query<{ id: string; planted_revision_id: string; payload: { description?: string; triggerKeywords?: string[]; expectedPayoffWindow?: string; readerQuestion?: string; possiblePayoffs?: string[]; meaningDelta?: string; cost?: string } }>(
       foreshadowingSql,
       foreshadowingParams,
     );
@@ -5066,6 +5201,10 @@ export class NovelPostgresRepository {
       description: row.payload?.description ?? "",
       triggerKeywords: row.payload?.triggerKeywords ?? [],
       expectedPayoffWindow: row.payload?.expectedPayoffWindow ?? "未指定",
+      readerQuestion: row.payload?.readerQuestion || undefined,
+      possiblePayoffs: row.payload?.possiblePayoffs?.length ? row.payload.possiblePayoffs : undefined,
+      meaningDelta: row.payload?.meaningDelta || undefined,
+      cost: row.payload?.cost || undefined,
       plantedRevisionId: row.planted_revision_id,
     }));
 
@@ -5086,6 +5225,123 @@ export class NovelPostgresRepository {
     }));
 
     return { foreshadowings, promises };
+  }
+
+  /**
+   * 文风契约版本管理。
+   *
+   * 设计依据：参考手册 §7.1 的可版本化滑杆模型。契约按 (project_id, version) 唯一，
+   * 同一项目至多一个 active 版本；激活只改本地状态，不重写历史版本。
+   * 新版本号取当前最大版本 +1，保证契约版本可审计、可回滚。
+   */
+  async createStyleContract(projectId: string, draft: { label: string; payload: unknown; sourceArtifactId?: string }): Promise<StyleContract> {
+    const payload = normalizeStyleContractPayload(draft.payload);
+    const label = draft.label.trim();
+    if (!label) throw new Error("文风契约必须提供 label");
+    const fingerprint = styleContractFingerprint(payload);
+    // 版本号是审计计数器：MAX(version)+1 读后插入在并发创建同一项目草稿时可能撞
+    // UNIQUE(project_id, version)，用 ON CONFLICT DO NOTHING + 有限重试自愈，
+    // 而不是把唯一约束冲突原样抛给调用方。
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const versionRow = await this.pool.query<{ next_version: number }>(
+        "SELECT COALESCE(MAX(version), 0) + 1 AS next_version FROM style_contracts WHERE project_id=$1",
+        [projectId],
+      );
+      const version = Number(versionRow.rows[0]?.next_version ?? 1);
+      const id = `style-contract:${projectId}:${version}`;
+      const result = await this.pool.query(
+        `INSERT INTO style_contracts(id, project_id, version, label, payload, source_artifact_id, fingerprint, status)
+         VALUES($1,$2,$3,$4,$5,$6,$7,'draft')
+         ON CONFLICT (project_id, version) DO NOTHING`,
+        [id, projectId, version, label, payload, draft.sourceArtifactId ?? null, fingerprint],
+      );
+      if ((result.rowCount ?? 0) > 0) return (await this.getStyleContract(projectId, id))!;
+    }
+    throw new Error(`文风契约版本分配冲突：${projectId}`);
+  }
+
+  async getStyleContract(projectId: string, contractId: string, connection: Pool | PoolClient = this.pool): Promise<StyleContract | undefined> {
+    const result = await connection.query<{ id: string; project_id: string; version: number; label: string; payload: Record<string, unknown>; source_artifact_id: string | null; fingerprint: string; status: string; created_at: string; updated_at: string | null }>(
+      "SELECT id,project_id,version,label,payload,source_artifact_id,fingerprint,status,created_at,updated_at FROM style_contracts WHERE project_id=$1 AND id=$2",
+      [projectId, contractId],
+    );
+    const row = result.rows[0];
+    if (!row) return undefined;
+    return {
+      id: row.id,
+      projectId: row.project_id,
+      version: row.version,
+      label: row.label,
+      payload: row.payload as unknown as StyleContractPayload,
+      fingerprint: row.fingerprint,
+      status: row.status === "active" ? "active" : "draft",
+      createdAt: row.created_at,
+      updatedAt: row.updated_at ?? undefined,
+    };
+  }
+
+  async listStyleContracts(projectId: string, connection: Pool | PoolClient = this.pool): Promise<StyleContract[]> {
+    const result = await connection.query<{ id: string; project_id: string; version: number; label: string; payload: Record<string, unknown>; source_artifact_id: string | null; fingerprint: string; status: string; created_at: string; updated_at: string | null }>(
+      "SELECT id,project_id,version,label,payload,source_artifact_id,fingerprint,status,created_at,updated_at FROM style_contracts WHERE project_id=$1 ORDER BY version ASC",
+      [projectId],
+    );
+    return result.rows.map((row) => ({
+      id: row.id,
+      projectId: row.project_id,
+      version: row.version,
+      label: row.label,
+      payload: row.payload as unknown as StyleContractPayload,
+      fingerprint: row.fingerprint,
+      status: row.status === "active" ? "active" : "draft",
+      createdAt: row.created_at,
+      updatedAt: row.updated_at ?? undefined,
+    }));
+  }
+
+  async getActiveStyleContract(projectId: string, connection: Pool | PoolClient = this.pool): Promise<StyleContract | undefined> {
+    const result = await connection.query<{ id: string; project_id: string; version: number; label: string; payload: Record<string, unknown>; source_artifact_id: string | null; fingerprint: string; status: string; created_at: string; updated_at: string | null }>(
+      "SELECT id,project_id,version,label,payload,source_artifact_id,fingerprint,status,created_at,updated_at FROM style_contracts WHERE project_id=$1 AND status='active' ORDER BY version DESC LIMIT 1",
+      [projectId],
+    );
+    const row = result.rows[0];
+    if (!row) return undefined;
+    return {
+      id: row.id,
+      projectId: row.project_id,
+      version: row.version,
+      label: row.label,
+      payload: row.payload as unknown as StyleContractPayload,
+      fingerprint: row.fingerprint,
+      status: "active",
+      createdAt: row.created_at,
+      updatedAt: row.updated_at ?? undefined,
+    };
+  }
+
+  /**
+   * 激活指定版本并撤销同项目其它 active 版本；事务内完成。
+   *
+   * 修复依据：原实现直接用连接池执行 BEGIN/COMMIT——Pool.query() 每次获取并
+   * 释放连接，并发或池内有活跃连接时各条语句可能落到不同连接，事务不成立、
+   * ROLLBACK 成为无连接上的 no-op。必须用 pool.connect() 的专属 client
+   * 并在 finally 中 release，与仓库其它事务方法一致。
+   */
+  async activateStyleContract(projectId: string, contractId: string): Promise<StyleContract> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const existing = await this.getStyleContract(projectId, contractId, client);
+      if (!existing) throw new Error(`文风契约不存在：${contractId}`);
+      await client.query("UPDATE style_contracts SET status='draft' WHERE project_id=$1 AND status='active'", [projectId]);
+      await client.query("UPDATE style_contracts SET status='active', updated_at=now() WHERE id=$1 AND project_id=$2", [contractId, projectId]);
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+    return (await this.getStyleContract(projectId, contractId))!;
   }
 
   /**

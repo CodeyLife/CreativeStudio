@@ -1,8 +1,9 @@
 import type { MemoryBundle, ReviewIssue, SkillBundle, StageGoalContract, StagePromptPackage } from "../protocol";
 import type { ChapterPlanningContext } from "../application/story-arc";
-import { dedupeNarrativeRhythmMemory, memoryClaimPriority, renderChapterExecutionContract, renderExecutionMemoryClaim, renderNarrativeRhythm } from "./chapter-planning-context";
+import { dedupeNarrativeRhythmMemory, memoryClaimPriority, renderChapterExecutionContract, renderExecutionMemoryClaim, renderNarrativeRhythm, renderSerialContext } from "./chapter-planning-context";
 import { compileStageContext } from "../stage-context";
 import { buildSkillContextSections } from "../skill-runtime";
+import { READER_RECONSTRUCTION_CONTRACT } from "../reader-reconstruction";
 
 export interface RevisionWindow {
   start: number;
@@ -219,6 +220,12 @@ function formatIssues(issues: ReviewIssue[]): string {
       `原文证据：${issue.excerpt ?? issue.evidence}`,
       `修订要求：${issue.suggestion ?? "根据证据修复问题，同时保留原段承担的叙事功能。"}`,
     );
+    if (issue.readerReconstruction) {
+      lines.push(
+        `普通读者复原证据：影响=${issue.readerReconstruction.impact}；缺少=${issue.readerReconstruction.missingEvidence.join("、")}；读者无法判断的问题=${issue.readerReconstruction.blockedQuestion}`,
+        "修订边界：只补足上述缺失的现场证据；若技术表达仍改变即时选择或承担世界观功能，可以保留，不要把它机械替换成另一组术语。",
+      );
+    }
     if (continuity) {
       lines.push(
         "⚠️ 一致性约束修订方向：此问题要求文本与已建立设定保持一致，不是更换为新值。",
@@ -253,7 +260,8 @@ function renderRevisionInterpretationGuide(strictWindows: boolean): string {
     "审核问题描述的是可核对的文本问题，不是需要逐项遵守的文学公式。",
     "先根据 evidence、excerpt 和 revisionRanges 定位问题机制，再决定改变哪些文本。",
     "修订必须解决问题本身，同时保留原段承担的事实、因果、人物选择和有效表达；不要用抽象解释、无关润色或新增设定替代修复。",
-    "若问题涉及现场感、抽象表达或叙述距离，先检查候选是否提供至少两类相互独立的可观察锚点：具体身体/感官状态，以及接触、阻力、空间关系或动作后的状态变化。抽象判断可以保留为 POV 声部，但不能独自承担体验或选择；技术认知应建立在已经发生的感官或动作之上，并导向下一步即时判断。",
+    "遵循整章修订契约中的读者复原边界；只补真正缺失的现场证据，不机械凑齐证据类别。",
+    "若问题涉及局部抽象或冗余，保留仍承担即时选择、独有认知或世界观功能的技术表达；删除不改变事实、选择和因果的重复命名。",
     "修订完成后按窗口自检：读者能否仅凭正文复原人物身处何处、身体或物件发生了什么、这如何改变下一步动作？若不能，继续补足现场证据，而不是再换一组抽象词。",
     "章末未解列表是冻结边界：局部修订不得删除、回答或合并其中的问题；若目标段承载未解线索，只能在保留其未解状态的前提下具象化表达。",
     "如果审核者给出的事实或动机与冻结事实、规划上下文或原文线索冲突，优先核对来源；无法确认时保持原文事实，不创造新值。",
@@ -458,6 +466,7 @@ export function buildFullChapterRevisionPromptPackage(input: {
     "逐项落实审核问题；根据问题决定必要改动范围，不得用无关润色或同义替换冒充完成。",
     "保持原文已有的文学品质、文风节奏和有效细节；修订是改善而非重写，未被问题触及的段落应保持原貌。",
     "保留已发生事实、人物关系、POV、章节功能与既定因果，不新增冻结来源没有依据的事实。",
+    READER_RECONSTRUCTION_CONTRACT,
     "最小改动原则：只改动与审核问题直接相关的句子，不重写未触及的段落。修复一个问题时不得引入新问题。",
     "一致性约束处理：审核问题中标注为[一致性约束]的问题，修订方向是确保文本与已建立设定一致（统一为正确值），不是创造新值或更换名称。审核者给出的值可能不准确，必须通过真值确认流程独立验证（事实边界 > 规划上下文 > 原文线索 > 保持原值不变）。",
     "输出前按实际阅读效果核对修订是否实质改善了问题；不要输出分析、计划或核对过程。",
@@ -485,6 +494,7 @@ export function buildFullChapterRevisionPromptPackage(input: {
       { id: "revision-facts-soft", kind: "background", title: "宏观背景与软参考", text: memorySections.soft, priority: "normal", provenanceRefs: memorySections.softRefs.length ? memorySections.softRefs : [input.memory.id] },
       ...(input.planningContext ? [{ id: "revision-planning", kind: "planning" as const, title: "冻结章节规划边界", text: renderRevisionPlanningContext(input.planningContext, input.authorInstruction), priority: "required" as const, provenanceRefs: [input.planningContext.fingerprint] }] : []),
       { id: "revision-rhythm", kind: "planning", title: "连续章节叙事节奏", text: renderNarrativeRhythm(input.memory.narrativeRhythm), priority: "normal", provenanceRefs: [input.memory.narrativeRhythm?.fingerprint ?? input.memory.id] },
+      ...(input.memory.serialContext ? [{ id: "revision-serial-context", kind: "planning" as const, title: "跨章序列证据", text: renderSerialContext(input.memory.serialContext), priority: "normal" as const, provenanceRefs: [input.memory.serialContext.fingerprint] }] : []),
       ...buildSkillContextSections(input.skills ?? { skills: [] }, "chapter.revision", "修订 Skill"),
     ],
   });
@@ -539,13 +549,14 @@ function revisionWindowSharedSections(input: RevisionWindowPromptInput): string[
     memory,
     input.planningContext ? renderChapterExecutionContract(input.planningContext) : "## 冻结章节执行合同\n（历史章节无规划快照。）",
     renderRevisionRhythm(input.memory),
+    ...(input.memory.serialContext ? [`## 跨章序列证据\n${renderSerialContext(input.memory.serialContext)}`] : []),
     "## 局部修订契约",
     [
       "1. 保留目标段落承担的事件、信息、POV 和因果；若作者反馈要求减少对白或解释，可把信息改由动作、物象、环境反应或主角观察承载。",
       "2. 必须实际改写问题证据，不得原样返回；根据问题机制自行组织文字，不得套用审核者拟写的句子。",
       "3. 不得新增原文、冻结事实和相邻段落中都不存在的人物、物件、关系、线索或事件。",
       "4. 不得重写或复述相邻段落，不得解释修订过程，不得输出标题、编号、Markdown 或评语。",
-      "5. 用至少两类相互独立的可观察证据承载体验：具体身体/感官状态，加上接触、阻力、空间关系或动作后的状态变化。保持自然中文韵律和原有叙述距离。若问题涉及专业化、制度化或理论化抽象表达过密，保留人物的认知特色，但让重复的抽象解释收束为当前身体反应、环境阻力或即时行动依据，不要只把一组术语替换成另一组术语。",
+      "5. 用当前功能真正需要的可观察证据承载体验，身体或动作场景通常先给出一处直接的身体/物理反馈，再让必要的技术判断说明它如何改变下一步选择；不要求机械凑齐证据清单。若问题涉及专业化、制度化或理论化抽象表达过密，保留人物的认知特色，但不能让技术认知成为当前动作的唯一主语、原因或结果；删掉后事实、选择和因果不变的重复标签，不要只把一组术语替换成另一组术语。",
       "6. 作者反馈用于明确本轮取舍；不得借反馈越过目标段落或新增未建立事实。",
       "7. 章末未解列表是冻结边界：不得因局部修订删除、回答或合并其中的问题；若目标段承载未解线索，只能在保留未解状态的前提下具象化表达。",
       "8. 最小改动原则：只改动与审核问题直接相关的句子。标注为[一致性约束]的问题，修订方向是统一为已建立设定值，不是创造新值或更换名称。审核者给出的值可能不准确，必须通过真值确认流程独立验证（事实边界 > 规划上下文 > 原文线索 > 保持原值不变）。",

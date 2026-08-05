@@ -21,6 +21,10 @@ LLM 回显指令、注入元注释、包裹代码围栏等问题，必须在结�
 - 当 LLM 输出 schema 可约束输出格式时，优先在 schema 层强制结构化输出（如 `response_format: json_schema`），而非在输出后用正则修补。
 - 净化函数中的阈值（长度上限、扫描行数等）属魔法值，必须加 TODO 标注可配置意图。
 
+## 语言
+
+所有对话回复必须用中文
+
 ## 质量阈值与守卫约束
 
 质量改善阈值、回退策略和评分守卫必须泛化设计，不允许为通过特定样本而调参，且必须配合局部退化守卫。
@@ -47,16 +51,6 @@ Prompt 中的示例和审核维度必须覆盖 spec 定义的全部质量维度�
 - 当 spec 文档间存在矛盾时（如 workflow-map.md 的 Load 步骤描述与 AGENTS.md 的章节审校契约不一致），以代码实际行为为准更新 spec，并在文档中标注矛盾已消除。
 - 范围蔓延（scope creep）的处理方式是更新 spec 使其成为正式契约，而非删除代码功能——前提是功能确实有价值且不与现有契约冲突。
 
-## 章节审校工作流复用
-
-已定稿但内容不完美的章节需要"严苛读者视角审视 + 文案内容优化"能力。该能力必须复用正式章节生成的审核+优化闭环，不允许另起一套独立的离线修订逻辑。
-
-- 入口：`chapterReviewWorkflow`（`src/novel-v2/temporal/workflows.ts`），从 `review` 阶段半截启动 Temporal durable execution。
-- 复用范围：`review` → `revise` → `manuscriptApproval` → `extractFacts` → `approveFacts` → `commit` → `enrichCharacters` activity（均在 `src/novel-v2/temporal/activities.ts`），禁止重写或绕过这些 activity。
-- 产物回填契约：把 `document.plainText` 包装为 draft artifact、复用历史 blueprint artifact 的 `structuredData`（保留 beats/title/startingState 等 `ChapterBlueprint` 不存储的字段），使 review-stage 能拿到 draft+blueprint+contextPacket 三件套。
-- 前置条件：`document.status === "final"`（只对已定稿章节开放重审）、无活跃工作流、存在历史 blueprint artifact。
-- 不跳过 fact-extraction/commit：让 fact-extraction 用 `novelty` 字段去重，commit-stage 更新 `document.plainText/contentHtml` 并对新 `DocumentRevision` 创建 chapter memory，保持与正式生成一致。
-- 不设置 `conversationThreadId/creativeBriefId`：review-stage 在无 threadId 时走 `contextPacketId` 路径，跳过 context/blueprint/blueprint-approval/draft 阶段。
 
 ## 经验沉淀与技能/提示词迭代
 
@@ -68,11 +62,3 @@ MCP 工作流的核心是迭代优化。审核经验必须沉淀为可复用经�
 - `learning.underlyingMechanism/affectedInputClass` 在 `conclusion=propose-improvement` 时必填，不允许只记录症状不记录机制。
 - promote 后必须做回归验证（用新版本重跑失败场景），不允许只看 A/B 分数提升就 promote。
 
-## IndexedDB 删除/关闭契约
-
-UI 必须始终提供删除/关闭路径，不允许因全局开关形成逻辑死锁。
-
-- `closeProposal` 在 `legacyReadOnly` 模式下仍须调用 `rejectProposal`（只改本地 IndexedDB status，不触发 formal mutation），不允许被 `legacyReadOnly` 短路。
-- `legacyReadOnly` 只能禁用采纳/重生成/AI审核等 formal mutation 路径，不能禁用本地状态清理。
-- `removeProject` 在 runtime 不可达时必须仍能删除本地 IndexedDB 项目，不允许因 `ensureRuntimeProject` 抛错阻塞本地清理。
-- runtime 删除是尽力而为：try/catch 失败时只警告用户"运行时仍有该项目记录，重启后可能恢复"，不阻塞 `deleteLocalProject`。

@@ -156,6 +156,65 @@ export interface NarrativeRhythmSnapshot {
   fingerprint: string;
 }
 
+/**
+ * 跨章序列证据：把最近 N 章的结构化统计投影给 draft/review/revision/learning，
+ * 让审核者能看到单章审核结构上看不见的跨章模式（状态重述、功能密度、主题跨度）。
+ *
+ * 设计依据：AGENTS.md「问题要在机制层解决」。本快照只提供描述性统计信号，
+ * 不提供短语黑名单、不内置任何题材词表；"母题还是疲劳"的判断由 reviewer 依据
+ * 原则 13（重复必须改变层级/意义/代价）作出。
+ *
+ * - characterSpans：同一角色章末状态快照的跨章序列（状态账本重述信号）。
+ * - functionRuns：同 narrativeFunction 的连续章节游程（节奏密度信号）。
+ * - subjectSpans：同一 subject 相关事实出现的章节序列（物件/主题跨度信号）。
+ */
+export interface SerialCharacterStateSpan {
+  characterId: string;
+  /** 按章节顺序的章末状态快照。 */
+  states: Array<{ narrativeOrder: number; stateSnapshot: string }>;
+}
+
+export interface SerialFunctionRun {
+  narrativeFunction: string;
+  /** 连续章节的顺序号。 */
+  narrativeOrders: number[];
+}
+
+export interface SerialSubjectSpan {
+  subject: string;
+  /** 该 subject 相关事实出现的章节顺序号。 */
+  narrativeOrders: number[];
+  /** 最近一次相关事实的内容摘要，用于核对是否等幅重述。 */
+  latestExcerpt: string;
+}
+
+export interface SerialContextSnapshot {
+  window: number;
+  chapters: NarrativeRhythmEntry[];
+  characterSpans: SerialCharacterStateSpan[];
+  functionRuns: SerialFunctionRun[];
+  subjectSpans: SerialSubjectSpan[];
+  fingerprint: string;
+}
+
+/**
+ * 近 N 章审核 issue 按规则类聚类的模式信号（learning 跨章聚合输入）。
+ * 同 rule/title 类别在 ≥2 个章节出现 → "持续模式"候选，即使当前章无 blocker/major。
+ */
+export interface RecentIssueCluster {
+  /** 聚类键：优先 rule，其次 title（已规范化空白）。 */
+  key: string;
+  /** 命中的不同章节数。 */
+  chapterCount: number;
+  /** 命中的章节顺序号（升序）。 */
+  narrativeOrders: number[];
+  /** 命中章节标题。 */
+  titles: string[];
+  /** 命中的 severity 集合。 */
+  severities: string[];
+}
+
+
 export interface MemoryBundle {
   id: string;
   projectId: string;
@@ -170,6 +229,8 @@ export interface MemoryBundle {
   selectionReceipts?: MemorySelectionReceipt[];
   /** Minimal prior-chapter position data for drafting/review. */
   narrativeRhythm?: NarrativeRhythmSnapshot;
+  /** Cross-chapter structural statistics for drafting/review/revision/learning. */
+  serialContext?: SerialContextSnapshot;
   fingerprint: string;
   createdAt: number;
 }
@@ -328,7 +389,7 @@ export interface NarrativeStateSnapshot {
   chapterBlueprintId?: string;
   arcPhase?: string;
   openThreads: string[];
-  openForeshadowings: Array<{ id: string; description: string; expectedPayoffWindow: string }>;
+  openForeshadowings: Array<{ id: string; description: string; expectedPayoffWindow: string; readerQuestion?: string; possiblePayoffs?: string[]; meaningDelta?: string; cost?: string }>;
   openPromises: Array<{ id: string; promiser: string; promisee: string; statement: string }>;
   fulfilledNodes: string[];
   prohibitedEarlyConsumption: string[];
@@ -549,6 +610,12 @@ export interface Artifact {
   fingerprint: string;
 }
 
+export type ReaderReconstructionEvidence = {
+  impact: "core" | "local";
+  missingEvidence: Array<"body" | "space" | "object" | "action" | "consequence" | "relationship">;
+  blockedQuestion: string;
+};
+
 export interface ReviewIssue {
   severity: "blocker" | "major" | "warning";
   title: string;
@@ -560,6 +627,8 @@ export interface ReviewIssue {
   rule?: string;
   sourceId?: string;
   suggestion?: string;
+  /** Structured evidence only when an issue blocks ordinary-reader reconstruction. */
+  readerReconstruction?: ReaderReconstructionEvidence | null;
 }
 
 export interface Review {

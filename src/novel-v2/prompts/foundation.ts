@@ -19,14 +19,15 @@ const TASK_KEY_GUIDANCE: Record<string, FoundationGuidance> = {
     dimension: "设计全书层级、长期承诺和阶段边界，为故事弧与章节蓝图提供方向，而不是把未来正文压缩成固定目录。",
     focus: [
       "整体叙事结构及选择理由：说明全书、卷、故事弧、章节和场景各自负责什么",
+      "叙事结构类型（可选）：linear 线性成长、tree 树状单元、network 网状群像；说明所选结构与读者承诺的匹配理由，不把类型当作模板",
       "全书承诺与终局边界：读者期待被回应的核心问题、情感方向、必须解决的矛盾、允许保留的开放性和多种抵达方式",
-      "卷级职责与状态边界：每个阶段的入口状态、主要压力、关键选择、代价、退出状态和承诺回收窗口",
+      "卷级职责与状态边界：每个阶段的入口状态、主要压力、关键选择、代价、退出状态和承诺回收窗口；承诺窗口记录可解析引用与阶段边界",
       "线索层级：主线、支线、人物线、关系线和世界压力如何耦合、交汇、退出或转化；暂缓的线记录下一次推进责任",
       "视角策略和知识边界：叙述距离、视角切换规则、不同人物可知与不可知的信息范围",
       "时间跨度与长期收束：记录故事时间、叙事顺序和状态证据，不以章节数量或固定密度代替结构",
       "保留后续调整空间，不生成固定章节表；章节数量只能作为资源估计，不是质量目标",
     ],
-    structuredDataHint: "architecture: {structure, volumes: [{name, theme, function, entryState, exitState, pressures, promiseWindows, chapterCount?}], povStrategy, timeSpan, longHorizonBoundaries, endingEnvelope?, lineHierarchy?, uncertainty?}",
+    structuredDataHint: "architecture: {structure, structureType?: linear|tree|network, volumes: [{name, theme, function, entryState, exitState, pressures, promiseWindows: [{promiseRef|id|description, windowOrdinals|window|payoffWindow}], chapterCount?}], povStrategy, timeSpan, longHorizonBoundaries, endingEnvelope?, lineHierarchy?, uncertainty?}",
     root: "architecture",
   },
   characters: {
@@ -37,14 +38,14 @@ const TASK_KEY_GUIDANCE: Record<string, FoundationGuidance> = {
   },
   worldview: {
     dimension: "构建世界事实、规则、代价、边界和社会质地。",
-    focus: ["地理、制度、势力与生活环境如何改变行动成本和人物选择", "可预测的规则、限制、例外来源与违规后果", "规则的代价与边界，谁承担代价以及制度如何反应", "文化、语言、行业、信仰和历史记忆的具体来源", "外部威胁与内部矛盾", "哪些内容是冻结事实，哪些仍待故事中发现"],
-    structuredDataHint: "worldview: {geography, politics, factions, rules, threats, socialTexture}",
+    focus: ["地理、制度、势力与生活环境如何改变行动成本和人物选择", "可预测的规则、限制、例外来源与违规后果", "规则的代价与边界，谁承担代价以及制度如何反应", "资源与技术的分配：力量、信息、交通、医疗、货币、生产和传播谁掌握、谁稀缺、谁可及", "价值与冲突：世界奖励什么、惩罚什么，哪些规则对不同阶层/职业/性格的人不公平，不公平的后果", "文化、语言、行业、信仰和历史记忆的具体来源", "外部威胁与内部矛盾", "哪些内容是冻结事实，哪些仍待故事中发现"],
+    structuredDataHint: "worldview: {geography, politics, factions, rules: [{statement, cost, boundary}], resourcesAndTechnology?: [{name, distribution, scarcity, access}], valuesAndConflicts?: [{value, rewardedBy, punishedBy, unequalFor, consequence}], threats?, socialTexture?}",
     root: "worldview",
   },
   "plot-design": {
     dimension: "形成可长期校准的主线、支线、信息释放和终局战略。",
-    focus: ["叙事承诺的长期回应：读者问题、建立证据、回收窗口、意义变化和代价", "主线、支线、关系线与世界压力的因果方向、交汇/退出/转化条件", "人物终点区间、独立欲望和不可接受的捷径", "区分隐藏信息、尚未设计的信息和开放问题；记录不可提前消费的边界", "必须解决、允许开放和可多路径抵达的终局条件", "每项战略决策如何改变人物选择或读者理解"],
-    structuredDataHint: "plotStrategy: {narrativePromises, longHorizonThreads, characterDestinations, informationBoundaries, endingEnvelope, nonNegotiables}",
+    focus: ["叙事承诺的长期回应：读者问题、建立证据、回收窗口、意义变化和代价", "主线、支线、关系线与世界压力的因果方向、耦合机制、交汇/退出/转化条件", "每条长线的耦合机制：它改变人物选择、资源、认知、关系或世界规则中的至少一项；无法说明耦合的支线应当合并、缩短或删除", "人物终点区间、独立欲望和不可接受的捷径", "区分隐藏信息、尚未设计的信息和开放问题；记录不可提前消费的边界", "必须解决、允许开放和可多路径抵达的终局条件", "每项战略决策如何改变人物选择或读者理解"],
+    structuredDataHint: "plotStrategy: {narrativePromises, longHorizonThreads: [{threadRef, direction, closureCondition, doNotConsumeBefore, responsibleVolumeOrdinals, nextResponsibility, coupling?, mergePoint?, exitPoint?, transformPoint?}], characterDestinations, informationBoundaries, endingEnvelope, nonNegotiables}",
     root: "plotStrategy",
   },
 };

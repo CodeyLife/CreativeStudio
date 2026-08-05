@@ -50,6 +50,7 @@ import {
 import { checkGate, submitReview } from "./review-gate";
 import { buildChapterReviewPromptPackage } from "../prompts/chapter-review";
 import { reviewerSchema, type ReviewerOutput } from "../prompts/schemas";
+import { normalizeReviewIssueReaderEvidence } from "../reader-reconstruction";
 
 // ===== 幂等检查 =====
 
@@ -185,17 +186,21 @@ function reviewerOutputToCreativeInput(
     subjectArtifactId: artifactId,
     reviewer: "internal",
     verdict: output.verdict,
-    issues: output.issues.map((issue) => ({
-      severity: issue.severity,
-      title: issue.title,
-      description: issue.description,
-      evidence: issue.excerpt ?? issue.description,
-      excerpt: issue.excerpt,
-      paragraph: issue.paragraph,
-      revisionRanges: issue.revisionRanges,
-      rule: issue.rule,
-      sourceId: issue.sourceId,
-    })),
+    issues: output.issues.map((issue) => {
+      const normalized = normalizeReviewIssueReaderEvidence(issue);
+      return {
+        severity: normalized.severity,
+        title: normalized.title,
+        description: normalized.description,
+        evidence: normalized.excerpt ?? normalized.description,
+        excerpt: normalized.excerpt,
+        paragraph: normalized.paragraph,
+        revisionRanges: normalized.revisionRanges,
+        rule: normalized.rule,
+        sourceId: normalized.sourceId,
+        readerReconstruction: normalized.readerReconstruction,
+      };
+    }),
     summary: output.issues.length === 0
       ? `verdict=${output.verdict}，score=${output.score}`
       : `${output.issues.length} 个问题，verdict=${output.verdict}`,

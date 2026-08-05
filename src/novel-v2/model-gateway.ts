@@ -194,7 +194,10 @@ export function normalizeProviderJsonSchema(value: unknown): unknown {
   if (!value || typeof value !== "object") return value;
   const source = value as Record<string, unknown>;
   const normalized = Object.fromEntries(Object.entries(source).map(([key, item]) => [key, normalizeProviderJsonSchema(item)])) as Record<string, unknown>;
-  if (typeof normalized.type === "string") return normalized;
+  // Preserve standard nullable unions such as ["object", "null"]. The
+  // native schema validator accepts only a single value or this narrow union;
+  // replacing it with object here would make null outputs fail AJV validation.
+  if (typeof normalized.type === "string" || Array.isArray(normalized.type)) return normalized;
 
   const candidates = Array.isArray(normalized.enum)
     ? normalized.enum.map(jsonSchemaPrimitiveType).filter((type): type is string => Boolean(type))

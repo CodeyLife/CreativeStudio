@@ -49,6 +49,29 @@ describe("foundation task semantic contracts", () => {
     ]));
   });
 
+  it("accepts optional thread coupling and lifecycle fields and explicit structure type", () => {
+    const structuredData = {
+      architecture: { structure: "网状群像", structureType: "network", volumes: [{ name: "寻找", theme: "查明", function: "建立问题", entryState: "未知", exitState: "开始追查", pressures: ["制度追责"], promiseWindows: [] }], povStrategy: "限知视角", timeSpan: "两年" },
+    };
+    expect(validateFoundationTaskContract(output(structuredData), "architecture")).toEqual([]);
+
+    const plotData = output({ plotStrategy: { narrativePromises: ["真相改变关系"], characterDestinations: ["甲承担后果"], longHorizonThreads: [{ threadRef: "side", direction: "调查失踪者", closureCondition: "查明去向", doNotConsumeBefore: "中期", responsibleVolumeOrdinals: [2], nextResponsibility: "与主线交汇前确认线索", coupling: "改变人物认知", mergePoint: "第二卷中段", exitPoint: "第二卷末", transformPoint: "真相公开后并入责任线" }], informationBoundaries: { hidden: [], notDesigned: [], open: [] }, endingEnvelope: "开放但不否定代价", nonNegotiables: ["不抹除已付出的代价"] } });
+    expect(validateFoundationTaskContract(plotData, "plot-design")).toEqual([]);
+  });
+
+  it("keeps legacy threads without coupling fields valid", () => {
+    const value = output({ plotStrategy: { narrativePromises: ["真相"], characterDestinations: ["甲"], longHorizonThreads: [{ threadRef: "main", direction: "查明", closureCondition: "完成", doNotConsumeBefore: "后期", responsibleVolumeOrdinals: [1], nextResponsibility: "下一阶段推进" }], informationBoundaries: { hidden: [], notDesigned: [], open: [] }, endingEnvelope: "开放", nonNegotiables: ["保留代价"] } });
+    expect(validateFoundationTaskContract(value, "plot-design")).toEqual([]);
+  });
+
+  it("accepts optional worldview pressure layers and keeps legacy worldview valid", () => {
+    const layered = output({ worldview: { geography: "沿江城市", politics: "地方机构", factions: ["调查组"], rules: [{ statement: "证据必须付出关系代价", cost: "失去盟友", boundary: "不能凭空恢复被毁证据" }], resourcesAndTechnology: [{ name: "卷宗权限", distribution: "集中在核心机构", scarcity: "普通调查者无法调取", access: "需要担保与审批" }], valuesAndConflicts: [{ value: "真相优先于人情", rewardedBy: "升职与信任", punishedBy: "孤立与排挤", unequalFor: "底层调查者", consequence: "多数人选择沉默" }] } });
+    expect(validateFoundationTaskContract(layered, "worldview")).toEqual([]);
+
+    const legacy = output({ worldview: { geography: "沿江城市", politics: "地方机构", factions: ["调查组"], rules: [{ statement: "证据必须付出关系代价", cost: "失去盟友", boundary: "不能凭空恢复被毁证据" }] } });
+    expect(validateFoundationTaskContract(legacy, "worldview")).toEqual([]);
+  });
+
   it("keeps the native envelope compact and validates task data after decoding", () => {
     const validate = new Ajv({ allErrors: true, strict: false }).compile(foundationSchemaForTask("architecture"));
     const base = { title: "架构", summary: "这是一段足够长的规划摘要，用于说明结构决策、冲突来源、人物方向、信息释放、卷级职责、视角边界、时间跨度和后续修订边界。", sections: [] };

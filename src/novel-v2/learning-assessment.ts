@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { Artifact, Review, RuntimeLearningAssessmentV2, SkillBundle, SkillExecutionPoint, SkillResolutionManifest } from "./protocol";
+import type { Artifact, RecentIssueCluster, Review, RuntimeLearningAssessmentV2, SerialContextSnapshot, SkillBundle, SkillExecutionPoint, SkillResolutionManifest } from "./protocol";
 import type { ModelGateway, ModelUsage } from "./model-gateway";
 import { ExternalMcpRequiredError, type ModelRoutingSnapshot } from "./model-routing";
 import { compileStageContext } from "./stage-context";
@@ -166,6 +166,18 @@ export function buildRuntimeLearningPrompt(input: {
    * skill definition 而抛错。注入实际列表从源头消除 ID 不匹配。
    */
   availableSkills?: Array<{ skillId: string; capabilities: string[]; executionPoints?: SkillExecutionPoint[] }>;
+  /**
+   * 跨章序列证据（近 N 章状态跨度/功能密度/主题跨度统计）。
+   * 设计依据：AGENTS.md「问题要在机制层解决」——单章审核结构上看不见跨章模式
+   * （状态等幅重述、连续观察章、群像单薄），必须把序列统计注入 learning 才能判定
+   * "持续模式"。这些是描述性信号，不是短语黑名单。
+   */
+  serialContext?: SerialContextSnapshot;
+  /**
+   * 近 N 章审核 issue 按 rule 聚类的模式信号：同 rule 类在多个章节出现 → 持续模式，
+   * 即使当前章无 blocker/major 也应 propose-improvement。
+   */
+  recentIssueClusters?: RecentIssueCluster[];
 }): string {
   // P0-B3: 汇总所有 issue（含 warning），让 LLM 判断是否形成可迁移的共享缺陷模式
   const issues = reviewIssuesForLearning(input.reviews)
@@ -183,6 +195,9 @@ export function buildRuntimeLearningPrompt(input: {
 ## 证据
 ${issues || "无审核问题"}
 
+## 跨章模式（近 N 章序列信号，只作描述性统计，不是短语黑名单）
+${renderSerialPatterns(input.serialContext, input.recentIssueClusters)}
+
 ## 可用改进目标
 targetKind=skill 时，targetId 必须从以下 skill_definitions 中选择（不可自行编造 ID）：
 ${skillList}
@@ -194,6 +209,13 @@ targetKind=system-prompt 时，targetId 格式为 "<projectId>:<templateId>"，�
 - warning 只有在形成持续模式时才 propose-improvement（如多个 warning 指向同一底层机制）。
   典型场景：审校者报告连续章节的兑现或因果承接不足——
   这可能是 skill/prompt 未引导 drafting 安排爽点的共享缺陷，值得 propose-improvement。
+- 跨章模式是持续模式的最强证据：同 rule 类在近 N 章出现 ≥2 次，或序列信号显示
+  同一状态/物件跨章等幅重述、连续同类功能章节缺少压力推进时，即使当前章无 blocker/major
+  也应 propose-improvement（问题已跨章重复，单章修正无法根治）。单章偶发、序列信号无持续
+  证据的，返回 no-shared-learning。
+- 连续低行动/观察型章节密度类问题，failingLayer 优先定位到 story-arc planning 层：
+  candidate 应指向规划类 skill 的 planning 执行点（或规划相关 system-prompt），
+  而不是只修 drafting——根因在规划批准了被动功能序列，正文修订只能事后补救。
 - 只有当问题来自可复用的 skill、system-prompt 或 workflow 规则缺陷时，返回 propose-improvement。
 - propose-improvement 必须填写 symptom、failingLayer、underlyingMechanism、affectedInputClass、boundaries、regressionRisks。
   - underlyingMechanism：底层机制（如"drafting prompt 未注入前章爽点统计，writer 无法感知干旱"），不要只复述症状。
@@ -204,6 +226,38 @@ targetKind=system-prompt 时，targetId 格式为 "<projectId>:<templateId>"，�
 - 不要把具体书名、人物名、章节号、固定句子或本次样例当成规则。
 
 输出 JSON，必须匹配 schema。所有字段都必须返回；conclusion=no-shared-learning 时将 candidate.targetKind 设为 none，其余无关字段使用空字符串或空数组；conclusion=propose-improvement 时所有 mechanism 字段和 candidate 内容必须真实完整。`;
+}
+
+function renderSerialPatterns(serialContext?: SerialContextSnapshot, recentIssueClusters?: RecentIssueCluster[]): string {
+  const lines: string[] = [];
+  if (recentIssueClusters?.length) {
+    lines.push(
+      `- 近章 issue 聚类（同 rule/title 出现 ≥2 章）：${recentIssueClusters.map((cluster) =>
+        `${cluster.key}×${cluster.chapterCount}（第${cluster.narrativeOrders.join("、")}章，severity=${cluster.severities.join("/")}）`).join("；")}`,
+    );
+  } else {
+    lines.push("- 近章 issue 聚类：无跨章重复的 rule/title 类别。");
+  }
+  if (serialContext?.functionRuns.length) {
+    lines.push(
+      `- 连续同类功能：${serialContext.functionRuns.map((run) =>
+        `${run.narrativeFunction}×${run.narrativeOrders.length}（第${run.narrativeOrders.join("、")}章）`).join("；")}；连续同类功能不等于问题，检查是否缺少压力推进或回报。`,
+    );
+  }
+  if (serialContext?.characterSpans.length) {
+    lines.push(
+      `- 角色状态跨度：${serialContext.characterSpans.map((span) =>
+        `${span.characterId}（第${span.states.map((state) => state.narrativeOrder).join("、")}章）`).join("；")}；同一状态连续多章出现时，检查是否有恶化/愈合/消耗/转移等可观察增量。`,
+    );
+  }
+  if (serialContext?.subjectSpans.length) {
+    lines.push(
+      `- 物件/主题跨度：${serialContext.subjectSpans.map((span) =>
+        `${span.subject}（第${span.narrativeOrders.join("、")}章）`).join("；")}；同一物件/主题跨章出现是正常的，检查每次出现是否承担新选择/新因果/新信息。`,
+    );
+  }
+  if (lines.length === 1) lines.push("- 无跨章序列信号（窗口内没有可判别的跨章模式）。");
+  return lines.join("\n");
 }
 
 function validateSkillCandidatePatch(
@@ -242,6 +296,10 @@ export async function assessRuntimeLearningWithModel(input: {
   now?: number;
   /** 透传到 buildRuntimeLearningPrompt，让 LLM 使用真实 skill ID */
   availableSkills?: Array<{ skillId: string; capabilities: string[]; executionPoints?: SkillExecutionPoint[] }>;
+  /** 跨章序列证据（近 N 章状态/功能/主题统计），注入学习评估 prompt。 */
+  serialContext?: SerialContextSnapshot;
+  /** 近 N 章审核 issue 按 rule 聚类（持续模式证据）。 */
+  recentIssueClusters?: RecentIssueCluster[];
   /** 当前 learning Skill bundle；由 compileStageContext 负责实际注入和 manifest 对账。 */
   skillBundle?: SkillBundle;
   skillManifest?: SkillResolutionManifest;
@@ -265,12 +323,20 @@ export async function assessRuntimeLearningWithModel(input: {
   const issues = reviewIssuesForLearning(input.reviews);
   // P0-B3: 不再因无 blocker/major 直接短路；只有完全无 issue 时才返回 no-shared-learning。
   // warning-only 模式也调用 LLM，让其判断是否形成可迁移的共享缺陷模式。
-  if (issues.length === 0) return { assessment: fallback() };
+  // P0-B4: 跨章模式信号（issue 聚类 ≥2 章、连续同功能游程）即使当前章零 issue
+  // 也构成"持续模式"候选，不能直接短路——跨章模式正是单章审核看不见的那类问题。
+  // 状态/主题跨度（characterSpans/subjectSpans）不参与零 issue 触发：
+  // 它们只是"同一角色/物件在窗口内出现 ≥2 章"的在场统计，POV 主角与核心物件在
+  // 长篇小说中段必然满足，作为触发信号会让零 issue 短路径恒真失效；真正的判别
+  // 力在"有 issue 时作为持续模式证据注入 prompt"（renderSerialPatterns 仍渲染）。
+  const hasSerialSignal = (input.recentIssueClusters?.length ?? 0) > 0
+    || (input.serialContext?.functionRuns.length ?? 0) > 0;
+  if (issues.length === 0 && !hasSerialSignal) return { assessment: fallback() };
   try {
     if (!input.model) throw new Error("模型网关未配置");
     const system = "你是长篇小说 Runtime 的学习闭环审计员，只在能说明底层机制和影响输入类时提出可复用规则改进。";
     const skillSections = input.skillBundle ? buildSkillContextSections(input.skillBundle, "learning.assessment", "学习评估 Skill") : [];
-    const promptPackage = compileStageContext({ projectId: input.projectId, workflowId: input.workflowId, purpose: "learning.assess", stage: "review", system, schema: runtimeLearningAssessmentSchema, maxInputTokens: 128_000, reservedOutputTokens: 4_096, skillManifest: input.skillBundle?.resolution ?? input.skillManifest, sections: [{ id: "learning-evidence", kind: "review", title: "学习评估证据与规则", text: buildRuntimeLearningPrompt({ artifact: input.artifact, reviews: input.reviews, availableSkills: input.availableSkills }), priority: "required", provenanceRefs: [input.artifact.id, ...input.reviews.map((review) => review.id)] }, ...skillSections] });
+    const promptPackage = compileStageContext({ projectId: input.projectId, workflowId: input.workflowId, purpose: "learning.assess", stage: "review", system, schema: runtimeLearningAssessmentSchema, maxInputTokens: 128_000, reservedOutputTokens: 4_096, skillManifest: input.skillBundle?.resolution ?? input.skillManifest, sections: [{ id: "learning-evidence", kind: "review", title: "学习评估证据与规则", text: buildRuntimeLearningPrompt({ artifact: input.artifact, reviews: input.reviews, availableSkills: input.availableSkills, serialContext: input.serialContext, recentIssueClusters: input.recentIssueClusters }), priority: "required", provenanceRefs: [input.artifact.id, ...input.reviews.map((review) => review.id)] }, ...skillSections] });
     const result = await input.model.generateStructured<Record<string, unknown>>({
       purpose: "learning.assess",
       system,

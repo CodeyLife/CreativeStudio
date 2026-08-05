@@ -228,6 +228,29 @@ describe("validateToolArgs pure function", () => {
       });
       expect(result.valid).toBe(false);
     });
+
+    it("accepts optional reader reconstruction evidence", () => {
+      const base = {
+        runId: "r-1",
+        workItemId: "w-1",
+        review: {
+          subjectArtifactId: "a-1",
+          reviewer: "internal",
+          verdict: "revise",
+          issues: [{
+            severity: "major",
+            title: "现场承接不足",
+            evidence: "他停住了。",
+            readerReconstruction: { impact: "core", missingEvidence: ["consequence"], blockedQuestion: "读者无法判断停顿造成的变化" },
+          }],
+          summary: "需要补足现场证据",
+        },
+        idempotencyKey: "k-reader-reconstruction",
+      };
+      expect(validateToolArgs("novel_review_submit", base).valid).toBe(true);
+      expect(validateToolArgs("novel_review_submit", { ...base, review: { ...base.review, issues: [{ ...base.review.issues[0], readerReconstruction: null }] } }).valid).toBe(true);
+      expect(validateToolArgs("novel_review_submit", { ...base, review: { ...base.review, issues: [{ ...base.review.issues[0], readerReconstruction: { impact: "core", missingEvidence: ["unknown"], blockedQuestion: "问题" } }] } }).valid).toBe(false);
+    });
   });
 });
 

@@ -6,6 +6,7 @@ import type { ContentObjectStore } from "../object-store";
 import type { CommitService } from "../commit-service";
 import type { NovelPostgresRepository } from "../postgres-repository";
 import { createNovelWorkflowActivities } from "../temporal/activities";
+import { READER_RECONSTRUCTION_CONTRACT } from "../reader-reconstruction";
 
 const memory: MemoryBundle = {
   id: "m", projectId: "p", preflightId: "pf", claims: [], conflicts: [], missingFacets: [], tokenBudget: 1000,
@@ -97,8 +98,8 @@ describe("chapter revision", () => {
     }).instruction;
     expect(prompt).toContain("让动作更有停顿感。");
     expect(prompt).toContain("因果跳步");
-    expect(prompt).toContain("至少两类相互独立的可观察锚点");
-    expect(prompt).toContain("技术认知应建立在已经发生的感官或动作之上");
+    expect(prompt).toContain(READER_RECONSTRUCTION_CONTRACT);
+    expect(prompt).toContain("不机械凑齐证据类别");
     expect(prompt).toContain("不得删除、回答或合并其中的问题");
     expect(prompt).not.toContain("narrativeScale");
     expect(prompt).not.toContain("必须有新鲜贡献");

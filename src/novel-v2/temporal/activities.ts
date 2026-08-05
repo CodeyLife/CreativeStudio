@@ -23,6 +23,7 @@ import { extractFactsWithStats, projectFactExtractionOutput } from "../fact-extr
 import { enrichCharactersFromChapter, parseCharacterEnrichmentOutput } from "../character-enrichment";
 import { characterEnrichmentSchema } from "../prompts/schemas";
 import { buildFactExtractionPrompt } from "../fact-extraction/prompt";
+import { styleContractAsMemoryHit } from "../style-contract";
 import { createCraftRuleCandidate } from "../craft-rule";
 import { countNovelCharacters } from "../word-count";
 import { buildFoundationPrompt, FOUNDATION_SYSTEM_PROMPT } from "../prompts/foundation";
@@ -200,6 +201,15 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       return undefined;
     }
   };
+  const loadSerialContext = async (projectId: string, documentId: string, narrativeCutoff: number) => {
+    if (typeof deps.repository.getSerialContextSnapshot !== "function") return undefined;
+    try {
+      return await deps.repository.getSerialContextSnapshot(projectId, documentId, narrativeCutoff);
+    } catch (error) {
+      console.warn(`[serial-context] 跨章序列证据快照加载失败，继续使用既有记忆：${(error as Error).message}`);
+      return undefined;
+    }
+  };
   // TODO P2: 修订 temperature 应可配置——当前 0.3 是创作多样性与指令遵循的折中值，
   // 未来应由 model routing 配置或 blueprint budget 决定，而非硬编码。
   const REVISION_TEMPERATURE = 0.3;
@@ -230,6 +240,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       const tokenBudget = computeTokenBudget(input.plan.taskClass, totalChapters);
       let narrativeHits: MemoryHit[] = [];
       let openNarrativeHits: MemoryHit[] = [];
+      let styleContractHits: MemoryHit[] = [];
       if (input.plan.taskClass === "drafting" || input.plan.taskClass === "revision" || input.plan.taskClass === "planning") {
         narrativeHits = await deps.repository.getNarrativeStatePinnedClaims({
           projectId: input.projectId,
@@ -283,7 +294,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
               projectId: input.projectId,
               kind: "working" as const,
               title: `未兑现伏笔：${f.description.slice(0, 40)}`,
-              content: `伏笔内容：${f.description}\n触发关键词：${f.triggerKeywords.join("、")}\n预期兑现：${f.expectedPayoffWindow}\n埋设于：${f.plantedRevisionId}`,
+              content: `伏笔内容：${f.description}\n触发关键词：${f.triggerKeywords.join("、")}\n预期兑现：${f.expectedPayoffWindow}${f.readerQuestion ? `\n读者问题：${f.readerQuestion}` : ""}${f.possiblePayoffs?.length ? `\n可行兑现方向：${f.possiblePayoffs.join("、")}` : ""}${f.meaningDelta ? `\n意义增量：${f.meaningDelta}` : ""}${f.cost ? `\n代价：${f.cost}` : ""}\n埋设于：${f.plantedRevisionId}`,
               subjectRefs: [],
               knowledgeScope: "author" as const,
               authority: "derived" as const,
@@ -321,10 +332,28 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
           console.warn(`[memory] 开放伏笔/承诺注入失败，继续使用已有记忆：${(error as Error).message}`);
         }
       }
-      const bundle = await buildMemoryBundle(input.plan, { projectId: input.projectId, provider: deps.memoryProvider, tokenBudget, pinnedClaims: narrativeHits, additionalClaims: openNarrativeHits });
+      // 文风契约注入：active 版本作为叙述声音的对照参考，走 ranked-fill（可被预算淘汰），不冻结。
+      if (input.plan.taskClass === "drafting" || input.plan.taskClass === "revision" || input.plan.taskClass === "review") {
+        try {
+          const contract = await deps.repository.getActiveStyleContract(input.projectId);
+          if (contract) styleContractHits.push(styleContractAsMemoryHit(contract, input.projectId));
+        } catch (error) {
+          console.warn(`[memory] 文风契约注入失败，继续使用已有记忆：${(error as Error).message}`);
+        }
+      }
+      const bundle = await buildMemoryBundle(input.plan, { projectId: input.projectId, provider: deps.memoryProvider, tokenBudget, pinnedClaims: narrativeHits, additionalClaims: [...openNarrativeHits, ...styleContractHits] });
       if (!input.plan.targetDocumentId || typeof input.plan.narrativeCutoff !== "number") return bundle;
-      const narrativeRhythm = await loadNarrativeRhythm(input.projectId, input.plan.targetDocumentId, input.plan.narrativeCutoff);
-      return narrativeRhythm ? { ...bundle, narrativeRhythm, fingerprint: canonicalSha256({ base: bundle.fingerprint, narrativeRhythm: narrativeRhythm.fingerprint }) } : bundle;
+      const [narrativeRhythm, serialContext] = await Promise.all([
+        loadNarrativeRhythm(input.projectId, input.plan.targetDocumentId, input.plan.narrativeCutoff),
+        loadSerialContext(input.projectId, input.plan.targetDocumentId, input.plan.narrativeCutoff),
+      ]);
+      if (!narrativeRhythm && !serialContext) return bundle;
+      return {
+        ...bundle,
+        ...(narrativeRhythm ? { narrativeRhythm } : {}),
+        ...(serialContext ? { serialContext } : {}),
+        fingerprint: canonicalSha256({ base: bundle.fingerprint, narrativeRhythm: narrativeRhythm?.fingerprint, serialContext: serialContext?.fingerprint }),
+      };
     },
     resolveSkills: (input: { projectId: string; plan: PreflightPlan; memory: MemoryBundle; requestedCapabilities?: string[]; genre?: string }) => {
       const executionPointByTaskClass: Record<PreflightPlan["taskClass"], SkillExecutionPoint> = {
@@ -826,11 +855,24 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
     },
     approveFacts: (input: { workflowId: string; projectId: string; artifact: Artifact }) =>
       deps.repository.recordFactApprovalPolicy({ workflowId: input.workflowId, projectId: input.projectId, artifactId: input.artifact.id }),
-    assessLearning: async (input: { projectId: string; workflowId: string; assessmentKey: string; artifact: Artifact; reviews: Review[]; routingSnapshot: ModelRoutingSnapshot; candidateStartIndex?: number }): Promise<GeneratedLearningResult> => {
+    assessLearning: async (input: { projectId: string; workflowId: string; assessmentKey: string; artifact: Artifact; reviews: Review[]; routingSnapshot: ModelRoutingSnapshot; candidateStartIndex?: number; narrativeOrder?: number; documentId?: string }): Promise<GeneratedLearningResult> => {
       const learningSkills = await resolveCurrentSkills({ projectId: input.projectId, executionPoint: "learning.assessment", role: "learning-auditor" });
       const availableSkills = learningSkills.availableSkills ?? learningSkills.skills.map((skill) => ({ skillId: skill.skillId, capabilities: skill.capabilities ?? [], executionPoints: skill.executionPoints }));
+      // L3: 跨章序列证据 + 近 N 章 issue 聚类（持续模式信号）。按目标章前一章计算 cutoff，
+      // 只让 learning 看到进入本章前的跨章模式，避免当前章自身的重复污染判定。
+      // documentId 由调用方透传（novelIntentWorkflow 的 intent.target.id / chapterReviewWorkflow 的 params.documentId）。
+      // 修复依据：artifact.taskId 是 "blueprint:<intent-uuid>:draft"，与 chapters.document_id 永不匹配，
+      // 用它查询必然返回 0 行导致 serialContext 恒为 undefined；documentId 缺失时不发起查询，
+      // 避免无意义查询与误导性空结果。
+      const serialContext = typeof input.narrativeOrder === "number" && input.documentId
+        ? await loadSerialContext(input.projectId, input.documentId, input.narrativeOrder - 1)
+        : undefined;
+      const recentIssueClusters = typeof input.narrativeOrder === "number"
+        ? await deps.repository.getRecentReviewIssueClusters(input.projectId, input.narrativeOrder - 1)
+        : undefined;
+      const learningEvidence = { serialContext, recentIssueClusters };
       try {
-        const { assessment, validationError } = await assessRuntimeLearningWithModel({ ...input, model, routingSnapshot: input.routingSnapshot, candidateStartIndex: input.candidateStartIndex, availableSkills, skillBundle: learningSkills });
+        const { assessment, validationError } = await assessRuntimeLearningWithModel({ ...input, ...learningEvidence, model, routingSnapshot: input.routingSnapshot, candidateStartIndex: input.candidateStartIndex, availableSkills, skillBundle: learningSkills });
         const recorded = validationError ? { ...assessment, validationError } : assessment;
         return { kind: "completed", assessment: await recordLearning(recorded) };
       } catch (error) {
@@ -838,7 +880,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
         const learningIssues = reviewIssuesForLearning(input.reviews);
         if (!learningIssues.length) throw error;
         const system = "你是长篇小说 Runtime 的学习闭环审计员，只在能说明底层机制和影响输入类时提出可复用规则改进。";
-        const promptPackage = compileSinglePrompt({ projectId: input.projectId, workflowId: input.workflowId, purpose: "learning.assess", stage: "review", system, prompt: buildRuntimeLearningPrompt({ artifact: input.artifact, reviews: input.reviews, availableSkills }), schema: runtimeLearningAssessmentSchema, reservedOutputTokens: 4_096, provenanceRefs: [input.artifact.id, ...input.reviews.map((review) => review.id)], skillBundle: learningSkills, skillExecutionPoint: "learning.assessment" });
+        const promptPackage = compileSinglePrompt({ projectId: input.projectId, workflowId: input.workflowId, purpose: "learning.assess", stage: "review", system, prompt: buildRuntimeLearningPrompt({ artifact: input.artifact, reviews: input.reviews, availableSkills, ...learningEvidence }), schema: runtimeLearningAssessmentSchema, reservedOutputTokens: 4_096, provenanceRefs: [input.artifact.id, ...input.reviews.map((review) => review.id)], skillBundle: learningSkills, skillExecutionPoint: "learning.assessment" });
         const task = await externalTask({ workflowId: input.workflowId, taskId: `${input.artifact.taskId}:learning:${input.assessmentKey}`, purpose: "learning.assess", candidateIndex: error.candidateIndex, routingSnapshot: input.routingSnapshot, outputKind: "structured", system, instruction: promptPackage.instruction, schema: runtimeLearningAssessmentSchema, schemaName: "runtime-learning-assessment", baseRevision: input.artifact.baseRevision, contextRefs: { artifactId: input.artifact.id, reviewIds: input.reviews.map((review) => review.id).join(",") }, promptContext: promptPackage.manifest });
         return { kind: "external", task };
       }
@@ -1097,14 +1139,17 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       // 否则旧版当前章事实会反向约束重写，形成自我复制。
       const targetNarrativeOrder = await deps.repository.getDocumentNarrativeOrder(input.projectId, input.documentId);
       const narrativeCutoff = targetNarrativeOrder === undefined ? undefined : targetNarrativeOrder - 1;
-      const narrativeRhythm = typeof narrativeCutoff === "number"
-        ? await loadNarrativeRhythm(input.projectId, input.documentId, narrativeCutoff)
-        : undefined;
+      const [narrativeRhythm, serialContext] = typeof narrativeCutoff === "number"
+        ? await Promise.all([
+            loadNarrativeRhythm(input.projectId, input.documentId, narrativeCutoff),
+            loadSerialContext(input.projectId, input.documentId, narrativeCutoff),
+          ])
+        : [undefined, undefined];
       const latestBundle = await deps.repository.getLatestMemoryBundle(input.projectId);
       if (!latestBundle) {
         // 即使没有历史记忆，也持久化不可变空快照；按引用执行不能依赖只存在于 workflow 内存的对象。
         const createdAt = Date.now();
-        const fingerprint = canonicalSha256({ projectId: input.projectId, preflightId: input.blueprint.preflightId, narrativeCutoff, claims: [], narrativeRhythm: narrativeRhythm?.fingerprint });
+        const fingerprint = canonicalSha256({ projectId: input.projectId, preflightId: input.blueprint.preflightId, narrativeCutoff, claims: [], narrativeRhythm: narrativeRhythm?.fingerprint, serialContext: serialContext?.fingerprint });
         return deps.repository.putMemoryBundle({
           id: `review-memory:${input.documentId}:${fingerprint.slice(0, 20)}`,
           projectId: input.projectId,
@@ -1117,6 +1162,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
           narrativeCutoff,
           selectionReceipts: [],
           narrativeRhythm,
+          serialContext,
           fingerprint,
           createdAt,
         });
@@ -1173,6 +1219,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
         tokenBudget: bundle.tokenBudget,
         selectionReceipts,
         narrativeRhythm: narrativeRhythm?.fingerprint,
+        serialContext: serialContext?.fingerprint,
       };
       const fingerprint = canonicalSha256(snapshotShape);
       const reviewBundle: MemoryBundle = {
@@ -1183,6 +1230,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
         narrativeCutoff,
         selectionReceipts,
         narrativeRhythm,
+        serialContext,
         fingerprint,
         createdAt: Date.now(),
       };

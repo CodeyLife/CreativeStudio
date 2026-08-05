@@ -78,7 +78,7 @@ describe("story arc batch reconciliation integration", () => {
       await repository.pool.query("INSERT INTO volumes(id,book_id,title,ordinal) VALUES($1,$2,$3,1)", [`volume-${projectId}`, `book-${projectId}`, "Test volume"]);
       await repository.pool.query(
         `INSERT INTO arcs(id,volume_id,project_id,title,ordinal,planning_status,execution_status,payload)
-         VALUES($1,$2,$3,'测试弧',1,'approved','active','{}'::jsonb)`,
+         VALUES($1,$2,$3,'测试弧',1,'approved','active','{"title":"测试弧","objective":"测试创作目的"}'::jsonb)`,
         [arcId, `volume-${projectId}`, projectId],
       );
       available = true;

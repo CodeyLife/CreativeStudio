@@ -943,6 +943,29 @@ const server = createServer(async (request, response) => {
       return send(response, 200, { result: await repository.reconcileStoryArcBatchRanges(projectId, arcId, "web-author") });
     }
     const storyArcListMatch = requestPath.match(/^\/v2\/projects\/([^/?]+)\/story-arcs$/);
+    const styleContractActiveMatch = requestPath.match(/^\/v2\/projects\/([^/?]+)\/style-contracts\/active$/);
+    if (request.method === "GET" && styleContractActiveMatch) {
+      const projectId = decodeURIComponent(styleContractActiveMatch[1]);
+      return send(response, 200, { contract: (await repository.getActiveStyleContract(projectId)) ?? null });
+    }
+    const styleContractListMatch = requestPath.match(/^\/v2\/projects\/([^/?]+)\/style-contracts$/);
+    if (request.method === "GET" && styleContractListMatch) {
+      const projectId = decodeURIComponent(styleContractListMatch[1]);
+      return send(response, 200, { contracts: await repository.listStyleContracts(projectId) });
+    }
+    if (request.method === "POST" && styleContractListMatch) {
+      const projectId = decodeURIComponent(styleContractListMatch[1]);
+      const input = await readJson(request);
+      const label = asString(input.label);
+      if (!label) return send(response, 400, { error: "label 必填" });
+      return send(response, 201, { contract: await repository.createStyleContract(projectId, { label, payload: input.payload, sourceArtifactId: asString(input.sourceArtifactId) }) });
+    }
+    const styleContractActivateMatch = requestPath.match(/^\/v2\/projects\/([^/?]+)\/style-contracts\/([^/?]+)\/activate$/);
+    if (request.method === "POST" && styleContractActivateMatch) {
+      const projectId = decodeURIComponent(styleContractActivateMatch[1]);
+      const contractId = decodeURIComponent(styleContractActivateMatch[2]);
+      return send(response, 200, { contract: await repository.activateStyleContract(projectId, contractId) });
+    }
     const memoryRebuildMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/memory\/rebuild$/);
     if (request.method === "POST" && memoryRebuildMatch) {
       const projectId = decodeURIComponent(memoryRebuildMatch[1]);

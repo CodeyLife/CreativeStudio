@@ -30,7 +30,7 @@ const baseBundle: StoryArcBundle = {
 
 describe("story arc execution contract", () => {
   it("keeps chapter blueprints to causal state and observable scene material", () => {
-    const chapter = parseStoryArcBundle(baseBundle).chapters[0];
+    const chapter = parseStoryArcBundle({ ...baseBundle, chapters: [{ ...baseBundle.chapters[0], scenes: [{ ...baseBundle.chapters[0].scenes[0], planningRationale: "把身体视作模块并推演最小路径" }] } ] }).chapters[0];
     expect(projectChapterForExecution(chapter)).toMatchObject({
       narrativeFunction: "relationship",
       stateTransition: baseBundle.chapters[0].stateTransition,
@@ -39,6 +39,8 @@ describe("story arc execution contract", () => {
     expect(chapter).not.toHaveProperty("readerExperience");
     expect(chapter).not.toHaveProperty("thematicTreatment");
     expect(chapter).not.toHaveProperty("narrativeScale");
+    expect(chapter.scenes[0].planningRationale).toContain("最小路径");
+    expect(projectChapterForExecution(chapter).scenes[0]).not.toHaveProperty("planningRationale");
   });
 
   it("allows quiet relationship chapters without opposition, decision or cost", () => {

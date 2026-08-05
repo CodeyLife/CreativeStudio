@@ -393,6 +393,8 @@ export const novelKeys = {
   chapterWorkspace: (id: string, docId: string) => ["novel", "doc", id, docId, "workspace"] as const,
   factCandidates: (id: string, docId: string) => ["novel", "facts", id, docId] as const,
   learningCenter: (id: string) => ["novel", "learning-center", id] as const,
+  styleContracts: (id: string) => ["novel", "project", id, "style-contracts"] as const,
+  activeStyleContract: (id: string) => ["novel", "project", id, "style-contracts", "active"] as const,
 };
 
 const isTerminalStatus = (status?: string) => Boolean(status) && !isActiveStatus(status);
@@ -571,6 +573,72 @@ async function postCraftRuleOperation<T>(projectId: string, candidateId: string,
     body: JSON.stringify(input),
   });
 }
+
+// ---------- 文风契约 ----------
+export interface StyleDimensionView {
+  value: string;
+  note?: string;
+}
+
+export interface StyleContractView {
+  id: string;
+  projectId: string;
+  version: number;
+  label: string;
+  payload: {
+    dimensions: Partial<Record<"pov" | "narrationDistance" | "timeMode" | "sentenceRhythm" | "vocabularyLevel" | "sensoryFocus" | "metaphorDensity" | "dialogueRatio" | "restraintLevel" | "narrationAttitude", StyleDimensionView>>;
+    note?: string;
+  };
+  fingerprint: string;
+  status: "draft" | "active";
+  createdAt: string;
+  updatedAt?: string;
+}
+
+export function useStyleContracts(projectId: string) {
+  return useQuery({
+    queryKey: novelKeys.styleContracts(projectId),
+    queryFn: async () => (await novelFetch<{ contracts: StyleContractView[] }>(`/v2/projects/${enc(projectId)}/style-contracts`)).contracts ?? [],
+    enabled: Boolean(projectId),
+  });
+}
+
+export function useActiveStyleContract(projectId: string) {
+  return useQuery({
+    queryKey: novelKeys.activeStyleContract(projectId),
+    queryFn: async () => (await novelFetch<{ contract: StyleContractView | null }>(`/v2/projects/${enc(projectId)}/style-contracts/active`)).contract ?? null,
+    enabled: Boolean(projectId),
+  });
+}
+
+export function useCreateStyleContract(projectId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { label: string; payload: StyleContractView["payload"]; sourceArtifactId?: string }) =>
+      novelFetch<{ contract: StyleContractView }>(`/v2/projects/${enc(projectId)}/style-contracts`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(input),
+      }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: novelKeys.styleContracts(projectId) });
+      void queryClient.invalidateQueries({ queryKey: novelKeys.activeStyleContract(projectId) });
+    },
+  });
+}
+
+export function useActivateStyleContract(projectId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (contractId: string) =>
+      novelFetch<{ contract: StyleContractView }>(`/v2/projects/${enc(projectId)}/style-contracts/${enc(contractId)}/activate`, { method: "POST" }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: novelKeys.styleContracts(projectId) });
+      void queryClient.invalidateQueries({ queryKey: novelKeys.activeStyleContract(projectId) });
+    },
+  });
+}
+
 
 export function useRunCraftRuleCandidateExperiment(projectId: string) {
   const queryClient = useQueryClient();

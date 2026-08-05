@@ -77,6 +77,31 @@ function auditVolumes(architecture: JsonRecord | undefined, issues: FullBookArch
     const missing = ["entryState", "exitState", "pressures", "promiseWindows"]
       .filter((key) => key === "pressures" || key === "promiseWindows" ? !Array.isArray(volume[key]) : !text(volume[key]));
     if (missing.length) incomplete.push(`${name}: ${missing.join(", ")}`);
+    const promiseWindows = list(volume.promiseWindows);
+    if (promiseWindows.length) {
+      const ungrounded: string[] = [];
+      for (const [windowIndex, windowValue] of promiseWindows.entries()) {
+        const window = record(windowValue);
+        if (!window) {
+          ungrounded.push(`promiseWindows[${windowIndex}]`);
+          continue;
+        }
+        const hasReference = meaningful(window.promiseRef) || meaningful(window.id) || meaningful(window.description);
+        const hasWindow = meaningful(window.windowOrdinals) || meaningful(window.window) || meaningful(window.payoffWindow);
+        if (!hasReference || !hasWindow) ungrounded.push(`promiseWindows[${windowIndex}]${window.promiseRef ?? window.id ?? window.description ? `（${window.promiseRef ?? window.id ?? window.description}）` : ""}`);
+      }
+      if (ungrounded.length) {
+        issues.push(issue(
+          "promise-window-ungrounded",
+          "warning",
+          "architecture.volumes.promiseWindows",
+          `承诺窗口缺少可解析引用或阶段窗口：${ungrounded.join("、")}`,
+          "承诺窗口只写标题级占位时，故事弧无法把它转成可验证的兑现责任，长线回收仍依赖模型自行记忆。",
+          "卷级承诺窗口只有描述性占位、无法定位到具体伏笔/承诺或兑现阶段的长篇架构",
+          "每条承诺窗口至少提供 promiseRef/id/description 之一作为引用，并提供 windowOrdinals 或 payoffWindow 作为阶段边界；无法确定的边界保持 open，不编造窗口。",
+        ));
+      }
+    }
   }
   if (incomplete.length) {
     issues.push(issue(
@@ -148,6 +173,22 @@ function auditWorldview(worldview: JsonRecord | undefined, issues: FullBookArchi
       "把每条冻结规则写成 statement、cost、boundary；未知例外另标为待设计，不把例外偷偷写成事实。",
     ));
   }
+  const layers = [
+    { key: "resourcesAndTechnology", label: "资源与技术（力量/信息/交通/医疗/货币/生产如何分配）" },
+    { key: "valuesAndConflicts", label: "价值与冲突（世界奖励/惩罚什么、对谁不公平、后果）" },
+  ];
+  const missingLayers = layers.filter((layer) => !list(worldview?.[layer.key]).length);
+  if (missingLayers.length) {
+    issues.push(issue(
+      "worldview-pressure-layer-incomplete",
+      "warning",
+      "worldview",
+      `世界观压力层未结构化：${missingLayers.map((layer) => layer.key).join("、")}`,
+      "只有规则与地理而缺少资源分配和价值冲突时，设定只能提供‘能做什么’，不能稳定地改变人物‘必须选择什么’；资源稀缺与不公平会制造选择压力。",
+      "设定只回答规则、不回答资源与价值分配的长篇世界",
+      "为缺失层补充条目：资源层记录谁掌握/谁稀缺/谁可及，价值层记录奖励/惩罚/不公平及后果；确实不适用时保持 open，不编造条目。",
+    ));
+  }
 }
 
 function auditPlotStrategy(plotStrategy: JsonRecord | undefined, characterNames: Map<string, string[]>, issues: FullBookArchitectureIssue[]): number {
@@ -188,12 +229,16 @@ function auditPlotStrategy(plotStrategy: JsonRecord | undefined, characterNames:
     ));
   }
   const missingThreadWindow: string[] = [];
+  const missingThreadCoupling: string[] = [];
   for (const [index, value] of threads.entries()) {
     const thread = record(value);
     const hasResponsibility = Array.isArray(thread?.responsibleVolumeOrdinals)
       || Array.isArray(thread?.volumeWindows)
       || text(thread?.nextResponsibility);
     if (!thread || !text(thread.threadRef) || !text(thread.direction) || !text(thread.closureCondition) || !hasResponsibility) missingThreadWindow.push(`longHorizonThreads[${index}]`);
+    if (thread && text(thread.threadRef) && !text(thread.coupling) && !text(thread.mergePoint) && !text(thread.exitPoint) && !text(thread.transformPoint)) {
+      missingThreadCoupling.push(`longHorizonThreads[${index}]（${thread.threadRef}）`);
+    }
   }
   if (missingThreadWindow.length) {
     issues.push(issue(
@@ -204,6 +249,17 @@ function auditPlotStrategy(plotStrategy: JsonRecord | undefined, characterNames:
       "只有方向和结局条件没有中间责任时，支线会在章节生成中反复被提及或长期悬空。",
       "跨卷推进、伏笔回收和支线交汇的长篇规划",
       "为每条线记录推动者、当前问题、负责卷/阶段、下一次可见变化、交汇/退出/转化条件。",
+    ));
+  }
+  if (missingThreadCoupling.length) {
+    issues.push(issue(
+      "long-horizon-thread-coupling-incomplete",
+      "warning",
+      "plotStrategy.longHorizonThreads",
+      `长线剧情线缺少耦合机制或生命周期条件：${missingThreadCoupling.join("、")}`,
+      "只有方向与责任而没有与主线的耦合方式和交汇/退出/转化条件时，支线可以维持存在却不改变主线选择、资源、认知、关系或世界规则。",
+      "多条支线长期并行、只靠新增角色和地点维持存在感的长篇架构",
+      "为每条线补充 coupling（改变人物选择/资源/认知/关系/世界规则之一）和 mergePoint/exitPoint/transformPoint 中的适用项；没有确定的交汇点保持 open，不编造窗口。",
     ));
   }
   const informationBoundaries = record(plotStrategy?.informationBoundaries);

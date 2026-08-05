@@ -84,7 +84,7 @@ export async function executeChapterReviewExperiment(input: {
         return generated;
       },
       assessLearning: async (current, reviews) => {
-        const generated = await activities.assessLearning({ projectId: input.projectId, workflowId: workflowRunId, assessmentKey: `${current.artifact.id}:${reviews.length}`, artifact: current.artifact, reviews, routingSnapshot });
+        const generated = await activities.assessLearning({ projectId: input.projectId, workflowId: workflowRunId, assessmentKey: `${current.artifact.id}:${reviews.length}`, artifact: current.artifact, reviews, routingSnapshot, narrativeOrder: snapshot.targetDocumentOrder, documentId: input.documentId });
         if (generated.kind !== "completed") throw new Error(`实验学习评估不允许等待 external-mcp：${generated.task.id}`);
         latestLearning = generated.assessment;
         return generated.assessment;

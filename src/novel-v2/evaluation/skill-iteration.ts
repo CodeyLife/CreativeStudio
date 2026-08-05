@@ -274,11 +274,15 @@ export async function runSkillIteration(input: {
     return [];
   }
 
-  // 2. 检查是否有 blocker/major issues
+  // 2. 检查是否有 blocker/major issues，或 learning 已判定 propose-improvement。
+  // P0-B4: 门禁与 learning 打通——跨章模式（同 rule 类重复、状态/功能密度信号）经
+  // L3 聚合后即使当前章无 blocker/major 也会 propose-improvement，迭代必须跟进，
+  // 否则 learning 提出的改进永远停在候选队列（AGENTS.md「learning 闭环必须可迭代」）。
   const hasBlockingIssues = reviews.some((review) =>
     review.issues.some((issue) => issue.severity === "blocker" || issue.severity === "major"),
   );
-  if (!hasBlockingIssues) {
+  const learningRequestsIteration = learningAssessment?.conclusion === "propose-improvement";
+  if (!hasBlockingIssues && !learningRequestsIteration) {
     return [];
   }
 

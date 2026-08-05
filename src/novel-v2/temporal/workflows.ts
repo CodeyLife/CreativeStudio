@@ -111,7 +111,7 @@ export interface NovelWorkflowActivities {
   approveFacts(input: { workflowId: string; projectId: string; artifact: Artifact }): Promise<FactApprovalSummary>;
   /** P0 #1: 人工事实审批门通过后，批量批准 pending 事实候选（candidate → approved）。 */
   approveFactClaims(input: { projectId: string; ids: string[] }): Promise<MemoryClaim[]>;
-  assessLearning(input: { projectId: string; workflowId: string; assessmentKey: string; artifact: Artifact; reviews: Review[]; routingSnapshot: ModelRoutingSnapshot; candidateStartIndex?: number }): Promise<{ kind: "completed"; assessment: RuntimeLearningAssessmentV2 } | { kind: "external"; task: ModelTaskRecord }>;
+  assessLearning(input: { projectId: string; workflowId: string; assessmentKey: string; artifact: Artifact; reviews: Review[]; routingSnapshot: ModelRoutingSnapshot; candidateStartIndex?: number; narrativeOrder?: number; documentId?: string }): Promise<{ kind: "completed"; assessment: RuntimeLearningAssessmentV2 } | { kind: "external"; task: ModelTaskRecord }>;
   materializeExternalLearning(input: { modelTaskId: string; projectId: string; workflowId: string; artifact: Artifact; reviews: Review[] }): Promise<RuntimeLearningAssessmentV2>;
   commit(input: { projectId: string; documentId: string; artifact: Artifact; factArtifact?: Artifact; narrativeOrder?: number; text: string; reviews: Review[]; structuralReport: ManuscriptStructuralReport; baseRevision: number; idempotencyKey: string }): Promise<CommitResult>;
   commitAuthorApproved(input: { projectId: string; documentId: string; artifact: Artifact; factArtifact?: Artifact; narrativeOrder?: number; text: string; reviews: Review[]; structuralReport: ManuscriptStructuralReport; baseRevision: number; idempotencyKey: string; approvalEvidenceId: string }): Promise<CommitResult>;
@@ -329,7 +329,7 @@ export async function novelIntentWorkflow(intent: NovelIntent, workflowId = `nov
       const assessmentKey = String(++learningSequence);
       let candidateStartIndex = 0;
       while (true) {
-        const generated = await activities.assessLearning({ projectId: intent.projectId, workflowId, assessmentKey, artifact: current.artifact, reviews, routingSnapshot, candidateStartIndex });
+        const generated = await activities.assessLearning({ projectId: intent.projectId, workflowId, assessmentKey, artifact: current.artifact, reviews, routingSnapshot, candidateStartIndex, narrativeOrder: snapshot.targetDocumentOrder, documentId: intent.target?.id });
         if (generated.kind === "completed") return generated.assessment;
         const external = await waitForExternal(generated.task);
         if (external.failed) { candidateStartIndex = generated.task.candidateIndex + 1; continue; }
@@ -1670,6 +1670,8 @@ export async function chapterReviewWorkflow(params: {
           reviews: reviewList,
           routingSnapshot,
           candidateStartIndex,
+          narrativeOrder: snapshot.targetDocumentOrder,
+          documentId: params.documentId,
         });
         if (generated.kind === "completed") return generated.assessment;
         const external = await waitForExternal(generated.task);

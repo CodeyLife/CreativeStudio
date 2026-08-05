@@ -91,6 +91,20 @@ describe("foreshadowing narrative visibility", () => {
         createdAt: Date.now(),
       },
     });
+    // 与 commit 阶段一致：先持久化 chapter memory，POV 章末状态才会进入 pinned claims。
+    await repository.createChapterMemory({
+      id: `memory-persist-${randomUUID()}`,
+      projectId,
+      documentId,
+      revisionId: revisionIds[0],
+      narrativeRange: { start: 5, end: 5 },
+      summary: "甲与乙确认继续同行，但尚未处理过去的承诺。",
+      keyEvents: ["双方继续同行"],
+      characterStates: [{ characterId: "甲", stateSnapshot: "仍然保持戒备" }],
+      unresolvedThreads: ["承诺是否兑现"],
+      fingerprint: "memory-fingerprint",
+      createdAt: Date.now(),
+    });
     const pinned = await repository.getNarrativeStatePinnedClaims({ projectId, narrativeCutoff: 5, povCharacterId: "甲" });
     expect(snapshot.openPromises.map((item) => item.statement)).toEqual(["过去承诺"]);
     expect(pinned).toEqual(expect.arrayContaining([
@@ -100,6 +114,76 @@ describe("foreshadowing narrative visibility", () => {
     const stateClaim = pinned.find((item) => item.id === snapshot.id);
     expect(stateClaim?.content).toContain(snapshot.openForeshadowings[0].id);
     expect(stateClaim?.content).toContain(snapshot.openPromises[0].id);
+  });
+
+  it("persists and projects enriched foreshadowing ledger fields", async () => {
+    if (!available) return;
+    const documentId = `document-enrich-${randomUUID()}`;
+    const revisionId = `revision-enrich-${randomUUID()}`;
+    const contentHash = `content-enrich-${randomUUID()}`;
+    await repository.pool.query("INSERT INTO manuscript_documents(id,project_id,title,narrative_order) VALUES($1,$2,$3,2)", [documentId, projectId, "账本测试章节"]);
+    await repository.pool.query("INSERT INTO content_blobs(content_hash,object_key,byte_length) VALUES($1,$2,0)", [contentHash, `test/${contentHash}`]);
+    await repository.pool.query(
+      "INSERT INTO manuscript_revisions(id,project_id,document_id,revision,base_revision,content_hash) VALUES($1,$2,$3,1,0,$4)",
+      [revisionId, projectId, documentId, contentHash],
+    );
+    const artifact = { id: `artifact-enrich-${randomUUID()}` } as never;
+    await repository.recordNarrativeElements({
+      projectId,
+      documentId,
+      revisionId,
+      artifact,
+      narrativeOrder: 2,
+      narrativeElements: {
+        foreshadowings: [{
+          description: "旧门上的刻痕在月圆夜会渗出寒气",
+          triggerKeywords: ["刻痕", "月圆"],
+          expectedPayoffWindow: "本卷末",
+          readerQuestion: "刻痕与失踪的守门人有什么关系？",
+          possiblePayoffs: ["刻痕是封印的地图", "刻痕是守门人留下的求救信号"],
+          meaningDelta: "刻痕从装饰变为通往密室的门",
+          cost: "开门会唤醒被封印的存在",
+          evidence: "她注意到旧门上的刻痕在月圆夜渗出寒气。",
+        }],
+        promises: [],
+        payoffs: [],
+      },
+    });
+    const open = await repository.getOpenForeshadowingAndPromises(projectId);
+    const stored = open.foreshadowings.find((candidate) => candidate.description.includes("刻痕"));
+    expect(stored).toMatchObject({
+      readerQuestion: "刻痕与失踪的守门人有什么关系？",
+      possiblePayoffs: ["刻痕是封印的地图", "刻痕是守门人留下的求救信号"],
+      meaningDelta: "刻痕从装饰变为通往密室的门",
+      cost: "开门会唤醒被封印的存在",
+    });
+
+    const snapshot = await repository.recordNarrativeStateSnapshot({
+      projectId,
+      documentId,
+      revisionId,
+      narrativeOrder: 2,
+      chapterMemory: {
+        id: `memory-enrich-${randomUUID()}`,
+        projectId,
+        documentId,
+        revisionId,
+        narrativeRange: { start: 2, end: 2 },
+        summary: "发现旧门刻痕",
+        keyEvents: [],
+        characterStates: [],
+        unresolvedThreads: [],
+        fingerprint: "memory-enrich-fingerprint",
+        createdAt: Date.now(),
+      },
+    });
+    const projected = snapshot.openForeshadowings.find((candidate) => candidate.description.includes("刻痕"));
+    expect(projected).toMatchObject({
+      readerQuestion: "刻痕与失踪的守门人有什么关系？",
+      possiblePayoffs: ["刻痕是封印的地图", "刻痕是守门人留下的求救信号"],
+      meaningDelta: "刻痕从装饰变为通往密室的门",
+      cost: "开门会唤醒被封印的存在",
+    });
   });
 
   it("requires an exact payoff ID or a unique legacy fallback before closing a promise", async () => {

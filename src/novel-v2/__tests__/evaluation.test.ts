@@ -416,7 +416,14 @@ describe("evaluation integration", () => {
       iterations: [
         {
           skillId: "longform-continuity",
-          promptSections: { drafting: "根据章节功能与情绪弧线动态分配段落长度；场景推进时压缩重复描写，沉浸与心理转折段保留必要细节，并以可验证的动作、感官和因果变化承载节奏。每次调整都应维持视角知识边界、人物行动动机与前后事实连续，不得为了缩短篇幅删除关键铺垫。" },
+          promptSections: {
+            foundation: "根据章节功能与情绪弧线动态分配段落长度；场景推进时压缩重复描写，沉浸与心理转折段保留必要细节，并以可验证的动作、感官和因果变化承载节奏。每次调整都应维持视角知识边界、人物行动动机与前后事实连续，不得为了缩短篇幅删除关键铺垫。",
+            planning: "根据章节功能与情绪弧线动态分配段落长度；场景推进时压缩重复描写，沉浸与心理转折段保留必要细节，并以可验证的动作、感官和因果变化承载节奏。每次调整都应维持视角知识边界、人物行动动机与前后事实连续，不得为了缩短篇幅删除关键铺垫。",
+            drafting: "根据章节功能与情绪弧线动态分配段落长度；场景推进时压缩重复描写，沉浸与心理转折段保留必要细节，并以可验证的动作、感官和因果变化承载节奏。每次调整都应维持视角知识边界、人物行动动机与前后事实连续，不得为了缩短篇幅删除关键铺垫。",
+            review: "根据章节功能与情绪弧线动态分配段落长度；场景推进时压缩重复描写，沉浸与心理转折段保留必要细节，并以可验证的动作、感官和因果变化承载节奏。每次调整都应维持视角知识边界、人物行动动机与前后事实连续，不得为了缩短篇幅删除关键铺垫。",
+            revision: "根据章节功能与情绪弧线动态分配段落长度；场景推进时压缩重复描写，沉浸与心理转折段保留必要细节，并以可验证的动作、感官和因果变化承载节奏。每次调整都应维持视角知识边界、人物行动动机与前后事实连续，不得为了缩短篇幅删除关键铺垫。",
+            "fact-extraction": "根据章节功能与情绪弧线动态分配段落长度；场景推进时压缩重复描写，沉浸与心理转折段保留必要细节，并以可验证的动作、感官和因果变化承载节奏。每次调整都应维持视角知识边界、人物行动动机与前后事实连续，不得为了缩短篇幅删除关键铺垫。",
+          },
           rationale: "增加段落长度约束，解决节奏拖沓问题",
           triggeredByIssueIds: ["review-1-0"],
         },
@@ -624,6 +631,74 @@ describe("evaluation integration", () => {
         expect(iterated[0].learningMechanism).toBe("prompt 缺少段落长度约束");
         expect(iterated[0].beforePrompt).not.toBe(iterated[0].afterPrompt);
         expect(iterated[0].rationale).toBeTruthy();
+      } finally {
+        await workspace.delete();
+      }
+    });
+
+    integrationIt("runs skill iteration on propose-improvement even without blocker/major issues", async () => {
+      // L4 门禁契约：learning 判定 propose-improvement（如跨章模式聚合触发）时，
+      // 即使当前章只有 warning 或无 issue，迭代也必须跟进，否则 learning 提出的
+      // 改进永远停在候选队列。与「无任何信号则不迭代」构成双向守卫。
+      const projectId = `skill-iter-warn-${randomUUID().slice(0, 8)}`;
+      await repository.ensureProject(projectId, "Skill Iteration Warning");
+      const snapshot = await captureProjectSnapshot(repository, projectId);
+      const workspace = await createExperimentWorkspace(repository, snapshot);
+      try {
+        const learningAssessment: RuntimeLearningAssessmentV2 = {
+          id: "la-warn-test",
+          projectId,
+          source: { workflowId: "wf-warn", reviewIds: ["r-warn"], fingerprint: "fp" },
+          conclusion: "propose-improvement",
+          underlyingMechanism: "连续观察章缺少压力推进，根因在故事弧规划层批准了被动功能序列",
+          affectedInputClass: "长篇中后段连续铺陈/观察章",
+          createdAt: Date.now(),
+        };
+        const warningOnlyReview = makeReview({
+          issues: [{ severity: "warning", title: "状态重述", description: "同一状态以相近措辞重复出现", evidence: "跨章序列证据", suggestion: "检查可观察增量" }],
+        });
+
+        const iterated = await runSkillIteration({
+          workspace,
+          repository,
+          reviews: [warningOnlyReview],
+          learningAssessment,
+          model,
+        });
+
+        expect(iterated.length).toBeGreaterThan(0);
+        expect(iterated[0].learningMechanism).toContain("故事弧规划");
+      } finally {
+        await workspace.delete();
+      }
+    });
+
+    integrationIt("skips skill iteration when neither blocker/major nor propose-improvement exists", async () => {
+      const projectId = `skill-iter-skip-${randomUUID().slice(0, 8)}`;
+      await repository.ensureProject(projectId, "Skill Iteration Skip");
+      const snapshot = await captureProjectSnapshot(repository, projectId);
+      const workspace = await createExperimentWorkspace(repository, snapshot);
+      try {
+        const warningOnlyReview = makeReview({
+          issues: [{ severity: "warning", title: "轻微冗余", description: "一处表达略重复", evidence: "段落 3", suggestion: "精简" }],
+        });
+        const noSharedLearning: RuntimeLearningAssessmentV2 = {
+          id: "la-skip-test",
+          projectId,
+          source: { workflowId: "wf-skip", reviewIds: [], fingerprint: "fp" },
+          conclusion: "no-shared-learning",
+          createdAt: Date.now(),
+        };
+
+        const iterated = await runSkillIteration({
+          workspace,
+          repository,
+          reviews: [warningOnlyReview],
+          learningAssessment: noSharedLearning,
+          model,
+        });
+
+        expect(iterated.length).toBe(0);
       } finally {
         await workspace.delete();
       }

@@ -10,6 +10,8 @@
  * - 所有字段都在 `required` 中（strict-mode 不支持 optional fields）
  */
 
+import { readerReconstructionStrictSchema } from "../reader-reconstruction-schema";
+
 /** 五大质量维度由三个审校角色覆盖，但不再要求模型逐项评分。 */
 export const REVIEW_COVERAGE = {
   "structure-reviewer": ["D1-world", "D2-story"],
@@ -22,7 +24,7 @@ export type ReviewerRole = keyof typeof REVIEW_COVERAGE;
 const reviewIssueSchema = {
   type: "object",
   additionalProperties: false,
-  required: ["severity", "title", "description", "excerpt", "revisionRanges", "rule", "suggestion"],
+  required: ["severity", "title", "description", "excerpt", "revisionRanges", "rule", "suggestion", "readerReconstruction"],
   properties: {
     severity: { type: "string", enum: ["blocker", "major", "warning"], description: "问题严重程度；只使用 schema 中的字符串枚举" },
     title: { type: "string", minLength: 1 },
@@ -31,6 +33,7 @@ const reviewIssueSchema = {
     revisionRanges: { type: "array", description: "1-based正文段落编号范围，不是字符、token或字节偏移", items: { type: "object", additionalProperties: false, required: ["start", "end"], properties: { start: { type: "integer", minimum: 1, description: "起始段落编号" }, end: { type: "integer", minimum: 1, description: "结束段落编号" } } } },
     rule: { type: "string", minLength: 1 },
     suggestion: { type: "string", minLength: 1 },
+    readerReconstruction: readerReconstructionStrictSchema,
   },
 } as const;
 
@@ -58,6 +61,11 @@ export interface ReviewerOutput {
     rule: string;
     sourceId?: string;
     suggestion: string;
+    readerReconstruction: {
+      impact: "core" | "local";
+      missingEvidence: Array<"body" | "space" | "object" | "action" | "consequence" | "relationship">;
+      blockedQuestion: string;
+    } | null;
   }>;
 }
 
@@ -129,7 +137,7 @@ export const factExtractionSchema = {
           items: {
             type: "object",
             additionalProperties: false,
-            required: ["description", "triggerKeywords", "expectedPayoffWindow", "evidence"],
+            required: ["description", "triggerKeywords", "expectedPayoffWindow", "readerQuestion", "possiblePayoffs", "meaningDelta", "cost", "evidence"],
             properties: {
               description: { type: "string", minLength: 1, description: "伏笔内容描述" },
               triggerKeywords: {
@@ -138,6 +146,14 @@ export const factExtractionSchema = {
                 description: "触发关键词（后续章节兑现时应出现的关键词）",
               },
               expectedPayoffWindow: { type: "string", minLength: 1, description: "预期兑现窗口（如 5 章内、本卷末、长篇后期）" },
+              readerQuestion: { type: "string", description: "读者会自然产生的具体问题；无法确定时留空" },
+              possiblePayoffs: {
+                type: "array",
+                items: { type: "string", minLength: 1 },
+                description: "一个或多个可行的兑现方向，属于设计态而非事实；未确定时为空数组",
+              },
+              meaningDelta: { type: "string", description: "兑现后相较埋设时预期增加的新意义或变化；无法判断时留空" },
+              cost: { type: "string", description: "兑现会改变的关系、资源、真相或人物选择代价；无法判断时留空" },
               evidence: { type: "string", minLength: 1, description: "正文逐字证据" },
             },
           },
@@ -209,6 +225,10 @@ export interface FactExtractionOutput {
       description: string;
       triggerKeywords: string[];
       expectedPayoffWindow: string;
+      readerQuestion?: string;
+      possiblePayoffs?: string[];
+      meaningDelta?: string;
+      cost?: string;
       evidence: string;
     }>;
     promises: Array<{
@@ -399,7 +419,7 @@ export interface FactExtractionModelOutput {
     conflict: boolean;
   }>;
   narrativeElements: {
-    foreshadowings: Array<{ description: string; triggerKeywords: string[]; expectedPayoffWindow: string; evidence: string }>;
+    foreshadowings: Array<{ description: string; triggerKeywords: string[]; expectedPayoffWindow: string; readerQuestion?: string; possiblePayoffs?: string[]; meaningDelta?: string; cost?: string; evidence: string }>;
     promises: Array<{ promiser: string; promisee: string; statement: string; evidence: string }>;
     payoffs: Array<{
       description: string;

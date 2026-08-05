@@ -1,9 +1,10 @@
 import type { Artifact, ExecutionBlueprint, MemoryBundle, NovelIntent, SkillBundle, StagePromptPackage } from "../protocol";
 import type { ChapterPlanningContext } from "../application/story-arc";
-import { dedupeNarrativeRhythmMemory, memoryClaimPriority, renderChapterExecutionContract, renderExecutionMemoryClaim, renderNarrativeRhythm } from "./chapter-planning-context";
+import { dedupeNarrativeRhythmMemory, memoryClaimPriority, renderChapterExecutionContract, renderExecutionMemoryClaim, renderNarrativeRhythm, renderSerialContext } from "./chapter-planning-context";
 import { buildBlueprintSummary } from "./chapter-review";
 import { compileStageContext } from "../stage-context";
 import { buildSkillContextSections } from "../skill-runtime";
+import { READER_RECONSTRUCTION_CONTRACT } from "../reader-reconstruction";
 
 export interface DraftPromptInput {
   intent: NovelIntent;
@@ -77,6 +78,7 @@ function buildWritingContract(): string {
     "只输出连续的小说正文，不输出标题、Markdown、作者说明、审核意见、指令回显或元注释。",
     "遵守冻结事实、当前 POV、人物知识边界和已确定的因果状态；未知信息只能通过正文中真实发生的告知、观察或推断获得。",
     "完成当前章节执行合同，但把它转化为自然的场景、行动、对白和体验，不逐条复述规划，也不添加合同外的事实。",
+    READER_RECONSTRUCTION_CONTRACT,
     "状态可以保持稳定；关系、理解、情绪、资源、知识或处境的细微变化同样可以构成章节完成感。",
     "在体验自然完成的位置收束，保留必要的铺陈、内省和余波，不按固定字数、段落数量、钩子类型或节奏公式停笔。",
   ].join("\n");
@@ -100,6 +102,7 @@ export function buildChapterDraftPromptPackage(input: DraftPromptInput & { workf
     { id: "blueprint", kind: "blueprint" as const, title: "工作流蓝图引用", text: buildBlueprintSummary(input.blueprint, input.planningContext), priority: "normal" as const, provenanceRefs: [input.blueprint.id] },
     ...memory.claims.map((claim) => ({ id: `memory:${claim.id}`, kind: "fact" as const, title: `冻结事实：${claim.title}`, text: renderExecutionMemoryClaim(claim).text, priority: memoryClaimPriority(memory, claim), provenanceRefs: [claim.id, ...claim.sourceRevisionIds] })),
     ...(memory.narrativeRhythm ? [{ id: "narrative-rhythm", kind: "planning" as const, title: "连续章节位置", text: renderNarrativeRhythm(memory.narrativeRhythm), priority: "normal" as const, provenanceRefs: [memory.narrativeRhythm.fingerprint] }] : []),
+    ...(memory.serialContext ? [{ id: "serial-context", kind: "planning" as const, title: "跨章序列证据", text: renderSerialContext(memory.serialContext), priority: "normal" as const, provenanceRefs: [memory.serialContext.fingerprint] }] : []),
     ...buildSkillContextSections(input.skills, "chapter.drafting", "写作 Skill"),
   ];
   return compileStageContext({

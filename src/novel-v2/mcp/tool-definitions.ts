@@ -16,6 +16,7 @@
  * - 评估闭环（1，v2 新增）
  */
 import type { ToolDefinition } from "./types";
+import { readerReconstructionSchema } from "../reader-reconstruction-schema";
 
 // ===== 共享 Schema 片段 =====
 
@@ -43,6 +44,7 @@ const issueSchema: Record<string, unknown> = {
     rule: { type: "string" },
     sourceId: { type: "string" },
     suggestion: { type: "string" },
+    readerReconstruction: readerReconstructionSchema,
   },
   required: ["severity", "title", "evidence"],
   additionalProperties: false,

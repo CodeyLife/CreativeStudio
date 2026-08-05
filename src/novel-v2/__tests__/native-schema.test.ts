@@ -39,6 +39,29 @@ describe("native structured schema compatibility", () => {
     }
   });
 
+  it("accepts nullable primitive and object fields without allowing arbitrary unions", () => {
+    expect(() => assertNativeJsonSchema({
+      type: "object",
+      additionalProperties: false,
+      required: ["rationale", "evidence"],
+      properties: {
+        rationale: { type: ["string", "null"] },
+        evidence: {
+          type: ["object", "null"],
+          additionalProperties: false,
+          required: ["impact"],
+          properties: { impact: { enum: ["core", "local"] } },
+        },
+      },
+    }, "nullable")).not.toThrow();
+    expect(() => assertNativeJsonSchema({
+      type: "object",
+      additionalProperties: false,
+      required: ["value"],
+      properties: { value: { type: ["object", "string"] } },
+    }, "arbitrary-union")).toThrow(NativeSchemaCompatibilityError);
+  });
+
   it("rejects optional properties, dynamic objects, empty objects and combinators", () => {
     const invalidSchemas = [
       { type: "object", additionalProperties: false, required: [], properties: {} },

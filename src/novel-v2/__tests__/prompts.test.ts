@@ -274,7 +274,7 @@ describe("long-form prompt contracts", () => {
         narrativeFunction: "unspecified",
         povCharacterId: "",
         stateTransition: { before: "入口", after: "状态仍在", evidence: "观察与相处留下可见证据" },
-        scenes: [{ title: "室内", participants: ["主角"], situation: "两人等待消息", observableActions: ["主角把未寄出的信收回抽屉"], opposition: "", decision: "", outcome: "关系和信息边界保持开放", cost: "" }],
+        scenes: [{ title: "室内", participants: ["主角"], situation: "两人等待消息", observableActions: ["主角把未寄出的信收回抽屉"], planningRationale: "", opposition: "", decision: "", outcome: "关系和信息边界保持开放", cost: "" }],
         continuityConstraints: [],
         unresolvedAtClose: [],
       }],
@@ -304,7 +304,7 @@ describe("long-form prompt contracts", () => {
         narrativeFunction: "unspecified",
         povCharacterId: "",
         stateTransition: { before: "tired", after: "rested", evidence: "sleep" },
-        scenes: [{ title: "rest", participants: ["person"], situation: "at home", observableActions: ["sleep"], opposition: "", decision: "", outcome: "rested", cost: "" }],
+        scenes: [{ title: "rest", participants: ["person"], situation: "at home", observableActions: ["sleep"], planningRationale: "", opposition: "", decision: "", outcome: "rested", cost: "" }],
         continuityConstraints: [],
         unresolvedAtClose: [],
       }],
@@ -339,6 +339,8 @@ describe("long-form prompt contracts", () => {
     expect(getReviewFocus("character-reviewer")).toContain("D3 群像与 D4 感情线");
     expect(getReviewFocus("prose-reviewer")).toContain("D5 幽默");
     expect(getReviewFocus("prose-reviewer")).toContain("专业化、制度化或理论化术语");
+    expect(getReviewFocus("prose-reviewer")).toContain("对技术认知做删除测试");
+    expect(getReviewFocus("prose-reviewer")).toContain("即使动作仍可复原，这仍然是正文质量问题");
   });
 
   it("preserves reviewer issues and score without exact excerpt matching", () => {
@@ -357,6 +359,7 @@ describe("long-form prompt contracts", () => {
           revisionRanges: [{ start: 2, end: 2 }],
           rule: "关键变化需要由场景过程承载。",
           suggestion: "补足动作和即时反馈。",
+          readerReconstruction: null,
         }],
       },
     });

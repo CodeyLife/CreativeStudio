@@ -19,7 +19,7 @@ describe("chapter status projection", () => {
       await repository.pool.query(
         `INSERT INTO arcs(id,volume_id,project_id,title,ordinal,planning_status,execution_status,payload)
          VALUES($1,$2,$3,$4,1,'approved','active',$5::jsonb)`,
-        [`arc-${projectId}`, `volume-${projectId}`, projectId, "Test arc", JSON.stringify({ title: "Test arc" })],
+        [`arc-${projectId}`, `volume-${projectId}`, projectId, "Test arc", JSON.stringify({ title: "Test arc", objective: "Test objective" })],
       );
       available = true;
     } catch (error) {
@@ -92,7 +92,7 @@ describe("chapter status projection", () => {
     await repository.pool.query(
       `INSERT INTO arcs(id,volume_id,project_id,title,ordinal,planning_status,execution_status,payload)
        VALUES($1,$2,$3,$4,2,'approved','active',$5::jsonb)`,
-      [arcId, `volume-${projectId}`, projectId, "Unlinked arc", JSON.stringify({ title: "Unlinked arc", expectedChapterCount: 1 })],
+      [arcId, `volume-${projectId}`, projectId, "Unlinked arc", JSON.stringify({ title: "Unlinked arc", objective: "验证未归属章节不完成弧", expectedChapterCount: 1 })],
     );
     const batchId = `batch-${arcId}`;
     await repository.pool.query(
@@ -121,7 +121,7 @@ describe("chapter status projection", () => {
     await repository.pool.query(
       `INSERT INTO arcs(id,volume_id,project_id,title,ordinal,planning_status,execution_status,payload)
        VALUES($1,$2,$3,$4,3,'approved','active',$5::jsonb)`,
-      [arcId, `volume-${projectId}`, projectId, "Failed later arc", JSON.stringify({ title: "Failed later arc", expectedChapterCount: 1 })],
+      [arcId, `volume-${projectId}`, projectId, "Failed later arc", JSON.stringify({ title: "Failed later arc", objective: "验证失败批次不阻塞完成", expectedChapterCount: 1 })],
     );
     await repository.pool.query(
       `INSERT INTO story_arc_batches(id,arc_id,project_id,batch_index,start_chapter_index,end_chapter_index,status,entry_fingerprint,payload)
@@ -131,13 +131,13 @@ describe("chapter status projection", () => {
     );
     await repository.pool.query(
       `INSERT INTO manuscript_documents(id,project_id,title,narrative_order,status,current_revision_id)
-       VALUES($1,$2,$3,1,'final',$4)`,
+       VALUES($1,$2,$3,4,'final',$4)`,
       [documentId, projectId, "Completed chapter", `revision-${chapterId}`],
     );
     await repository.pool.query(
       `INSERT INTO chapters(id,arc_id,project_id,document_id,title,ordinal,status,payload)
-       VALUES($1,$2,$3,$4,$5,1,'planned',$6::jsonb)`,
-      [chapterId, arcId, projectId, documentId, "Completed chapter", JSON.stringify({ index: 1, title: "Completed chapter", scenes: [] })],
+       VALUES($1,$2,$3,$4,$5,4,'planned',$6::jsonb)`,
+      [chapterId, arcId, projectId, documentId, "Completed chapter", JSON.stringify({ index: 4, title: "Completed chapter", scenes: [] })],
     );
 
     await repository.migrate();

@@ -18,7 +18,7 @@ export interface FactExtractionPromptInput {
   text: string;
   existingClaimsDigest?: string;
   openNarrativeElements?: {
-    foreshadowings: Array<{ id: string; description: string; triggerKeywords: string[]; expectedPayoffWindow: string }>;
+    foreshadowings: Array<{ id: string; description: string; triggerKeywords: string[]; expectedPayoffWindow: string; readerQuestion?: string; possiblePayoffs?: string[]; meaningDelta?: string; cost?: string }>;
     promises: Array<{ id: string; promiser: string; promisee: string; statement: string }>;
   };
 }
@@ -65,6 +65,10 @@ export function buildFactExtractionPrompt(input: FactExtractionPromptInput): str
     `- 只提取正文实际暗示但未明确揭示的内容（如"她注意到墙上那幅画似乎在动"）。`,
     `- triggerKeywords 是后续兑现时应出现的关键词（如"画""动""隐藏"）。`,
     `- expectedPayoffWindow 是预期兑现时机（如"5 章内""本卷末""长篇后期"）。`,
+    `- readerQuestion 是读者读到此处会自然产生的具体问题；无法可靠判断时留空。`,
+    `- possiblePayoffs 是 0 到多个可行的兑现方向（设计态，不是事实），用于后续规划安排兑现；没有明确可行方向时使用空数组。`,
+    `- meaningDelta 是兑现后相较埋设时预期增加的新意义或变化（如"物件易主""关系破裂"）；无法判断时留空。`,
+    `- cost 是兑现会改变的关系、资源、真相或人物选择代价；无法判断时留空。`,
     `- 不提取：明显的剧情推进、角色内心独白、修辞意象。`,
     "",
     `### promises（本章作出的承诺）`,
