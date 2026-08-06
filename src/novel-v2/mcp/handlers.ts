@@ -236,14 +236,27 @@ const novel_action_execute: ToolHandler = async (args, ctx) => {
   const command = buildCreativeCommand(args, runId, action, idempotencyKey);
   const result = await executeCreativeCommand(ctx.repository, command, ctx.model);
 
-  // review.submit / work.accept 落库后向 creativeRunWorkflow 发 reviewSubmitted 信号。
-  // 唤醒 manual-gate 等待循环(与 novel_review_submit 对齐,补齐信号通道)。
-  // reviewGate=none/auto 的 run 信号会被静默忽略。workItemId 从 command 提取;
+  // 落库后向 creativeRunWorkflow 发 reviewSubmitted 信号，唤醒 manual-gate 等待循环
+  //（与 novel_review_submit 对齐，补齐信号通道）。
+  // reviewGate=none/auto 的 run 信号会被静默忽略。workItemId 从 command 提取；
   // review.request 仅返回只读预览，不落库也不能唤醒门禁。
   // work.accept 也需要发信号:外部 accept 命令绕过 gate 直接改状态后,
   // workflow 仍阻塞在 manual-gate while 循环;信号唤醒后 processWorkItem 检查
   // status===accepted 短路返回,让 loop 推进下游 work items。
-  if (action === "review.submit" || action === "work.accept") {
+  // plan.approve 发信号:作者确认后唤醒 workflow 重新检查 foundationAuthorApproved,
+  // 满足(独立审核 passed + section approved)后自动 accept 推进。
+  // work.revise / work.start / work.retry 发信号（根因修复）：外部命令只改 DB 状态，
+  // workflow 的 processWorkItem 仍阻塞在旧的等待循环中，主循环 Promise.all 挂起后
+  // 永远走不到"重新扫描 pending"；信号唤醒后 processWorkItem 检测到状态已变更
+  //（非 running）即短路返回，主循环重新 listPendingWork 拾取被修订的 work item。
+  if (
+    action === "review.submit" ||
+    action === "work.accept" ||
+    action === "plan.approve" ||
+    action === "work.revise" ||
+    action === "work.start" ||
+    action === "work.retry"
+  ) {
     const workItemId = asString(args.workItemId);
     if (workItemId) await signalReviewSubmitted(ctx, workItemId);
   }
@@ -268,7 +281,8 @@ function buildCreativeCommand(
   switch (action) {
     case "work.start":
     case "work.accept":
-    case "work.retry": {
+    case "work.retry":
+    case "plan.approve": {
       const workItemId = asString(args.workItemId);
       if (!workItemId) throw new Error(`${action} 需要 workItemId`);
       return { type: action, workItemId, ...base } as CreativeCommand & { runId: string };
@@ -679,6 +693,11 @@ const novel_bootstrap_run: ToolHandler = async (args, ctx) => {
   // 解析 reviewGate/progression,使 foundation 5 阶段支持人工审核门禁(架构阶段必备)。
   // 未提供时由 startNovelBootstrap 兜底为质量优先的 manual / automatic。
   const { reviewGate, progression } = parseBootstrapPolicy(args);
+  // 聚焦重生成：只重跑白名单阶段，其余 approved 阶段作为 prior context。
+  const focusedTaskKeys = asStringArray(args.focusedTaskKeys)?.filter(Boolean) as
+    | Array<"project-positioning" | "architecture" | "characters" | "worldview" | "plot-design">
+    | undefined;
+  const revisionInstructions = asRecord(args.revisionInstructions) as Record<string, string> | undefined;
 
   if (!ctx.temporal) throw new Error("novel_bootstrap_run 需要 ToolContext.temporal 才能启动 Temporal 工作流");
   return startNovelBootstrap(ctx.repository, ctx.temporal, {
@@ -689,6 +708,8 @@ const novel_bootstrap_run: ToolHandler = async (args, ctx) => {
     reviewGate,
     progression,
     taskQueue: ctx.taskQueue,
+    focusedTaskKeys,
+    revisionInstructions,
   });
 };
 

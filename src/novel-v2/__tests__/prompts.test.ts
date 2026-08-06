@@ -192,6 +192,18 @@ describe("long-form prompt contracts", () => {
     expect(prompt).toContain("不生成逐章章节表");
   });
 
+  it("forbids preset per-volume chapter counts and only allows relative pacing hints", () => {
+    const prompt = buildFoundationPrompt({
+      taskKey: "architecture",
+      instruction: "形成全书架构",
+      projectTitle: "测试项目",
+      priorArtifacts: [],
+    });
+    expect(prompt).toContain("不得在架构层预设每卷的固定章节数量");
+    expect(prompt).toContain("章节数量不是质量目标");
+    expect(prompt).not.toContain("chapterCount");
+  });
+
   it("keeps every active foundation prompt aligned with its required data root", () => {
     const cases = [
       ["project-positioning", ["sellingPoints", "activePressureSource", "emotionalContract", "themeQuestion"]],
@@ -214,6 +226,40 @@ describe("long-form prompt contracts", () => {
     expect(prompt).toContain("规划契约是否完整");
     expect(prompt).toContain("审查不确定性");
     expect(prompt).toContain("问题机制、影响范围和最小修复方向");
+  });
+
+  it("binds foundation review to the current stage and keeps revise within its own responsibility", () => {
+    const prompt = buildFoundationReviewPrompt({
+      taskKey: "project-positioning",
+      artifact: { id: "artifact-1", fingerprint: "fingerprint-1", taskId: "project-positioning", structuredData: {} } as never,
+    });
+    expect(prompt).toContain("跨阶段职责判定");
+    expect(prompt).toContain("只对当前 taskKey 的核心职责负责");
+    expect(prompt).toContain("下游阶段");
+    expect(prompt).toContain("判 revise 的唯一依据");
+    expect(prompt).toContain("待确认项");
+  });
+
+  it("keeps foundation review opinion safe to flow back as a regeneration instruction", () => {
+    const prompt = buildFoundationReviewPrompt({
+      taskKey: "worldview",
+      artifact: { id: "artifact-1", fingerprint: "fingerprint-1", taskId: "worldview", structuredData: {} } as never,
+    });
+    expect(prompt).toContain("意见回流卫生");
+    expect(prompt).toContain("禁止使用中文全角引号");
+    expect(prompt).toContain("不要求模型增加特定的 structuredData 字段名");
+    expect(prompt).toContain("只针对当前阶段可修复的问题");
+  });
+
+  it("binds foundation review to convergence discipline so revise loops terminate", () => {
+    const prompt = buildFoundationReviewPrompt({
+      taskKey: "project-positioning",
+      artifact: { id: "artifact-1", fingerprint: "fingerprint-1", taskId: "project-positioning", structuredData: {} } as never,
+    });
+    expect(prompt).toContain("判定纪律");
+    expect(prompt).toContain("只报阻断项");
+    expect(prompt).toContain("修订循环要收敛");
+    expect(prompt).toContain("默认倾向是放行");
   });
 
   it("subjects foundation planning to a strict reader-view baseline audit", () => {
@@ -242,14 +288,16 @@ describe("long-form prompt contracts", () => {
       openThreads: [],
     });
     const review = buildStoryArcReviewPrompt({ chapters: [] } as never, "上下文");
-    const revision = buildStoryArcRevisionPrompt({ chapters: [] } as never, { issues: [] } as never, "上下文");
+    const revision = buildStoryArcRevisionPrompt({ chapters: [] } as never, { verdict: "revise", opinion: "逐章意见" } as never, "上下文");
     expect(planning).toContain("关键选择、代价、退出状态和新问题");
     expect(planning).toContain("安静场景也要有可感知的");
     expect(review).toContain("前置证据、行动代价和意义变化");
     expect(review).toContain("跨章节持续的物件、伤势、资源、关系、知识或限制");
     expect(review).toContain("故事弧按批次滚动审核");
-    expect(review).toContain("certaintyUpgrades 只记录证据不足却越过冻结边界的确定性升级");
+    expect(review).toContain("对每章按其权威路径逐一核对证据边界");
+    expect(review).toContain("PASSED");
     expect(revision).toContain("保留已经成立的人物选择、关系积累");
+    expect(revision).toContain("审核意见：逐章意见");
   });
 
   it("projects story arc context into auditable sections with cutoff and provenance", () => {
@@ -382,15 +430,17 @@ describe("long-form prompt contracts", () => {
     expect(validate(value)).toBe(true);
   });
 
-  it("declares canonical review vocabulary instead of leaving provider aliases ambiguous", () => {
+  it("declares the text review contract with an explicit PASSED marker", () => {
     const prompt = buildStoryArcReviewPrompt({
       arc: { title: "arc", objective: "objective", entryState: "entry", centralConflict: "conflict", development: [], resolution: "resolution", exitState: "exit", threadResponsibilities: [], foreshadowingRefs: [], expectedChapterCount: 1, phases: [] },
       batch: { batchIndex: 1, startChapterIndex: 1, complete: false },
       chapters: [{ index: 1, title: "chapter", stateTransition: { before: "before", after: "after", evidence: "evidence" }, scenes: [{ title: "scene", participants: ["person"], situation: "situation", observableActions: ["action"], outcome: "outcome" }], continuityConstraints: [] }],
     }, "context");
-    expect(prompt).toContain("verdict 只能是 passed、revise、blocked");
-    expect(prompt).toContain("certaintyUpgrades 的字段必须是 candidateClaim、frozenBoundary、reason");
-    expect(prompt).toContain("chapterChecks 对每个章节分别输出四个 dimension");
+    expect(prompt).toContain("只输出一行：PASSED");
+    expect(prompt).toContain("若存在问题，输出审核意见");
+    expect(prompt).toContain("不要输出 JSON、Markdown 代码块或 Schema");
+    expect(prompt).not.toContain("verdict 只能是");
+    expect(prompt).not.toContain("chapterChecks 对每个章节分别输出四个 dimension");
   });
 
   it("puts scene experience and applicability into draft and three-role review contracts", () => {

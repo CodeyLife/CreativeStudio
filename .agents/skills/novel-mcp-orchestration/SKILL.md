@@ -50,9 +50,58 @@ novel_catalog_get(projectId, compact)        # 确认规划状态
 - 你可以在 creativeBrief 里写清读者承诺、主角欲望/矛盾、核心对抗、结局包络，
   系统会把它投影进每个规划阶段。
 - manual 门禁：每阶段生成后等你的 `novel_action_execute(action=review.submit,
-  reviewer=independent|human, verdict=passed|revise|blocked, issues[], summary)`
+  reviewer=independent|human, verdict=passed|revise, issues[], summary)`
   才会推进。auto 门禁由系统按 foundation review + score 自动判定。
+- 规划级审核契约（2026-08-06 起）：系统内部 Foundation / Story Arc 审核为
+  文本意见契约——通过只输出单行 `PASSED`，不通过输出可执行审核意见
+  （verdict 只保留 passed/revise，意见会作为重新生成的 instruction 回流）。
+  你作为外部审核者提交 review 时，用 verdict=passed|revise + summary/issues
+  承载意见即可；`work.revise` 的 instruction 会被注入重新生成 prompt。
 - 对规划方向不满：`novel_action_execute(work.revise, workItemId, instruction)`。
+
+### 阶段 0.5 foundation manual-gate 推进协议（实战验证）
+
+manual reviewGate 下，bootstrap 的 5 个 foundation 阶段每阶段都要走"生成 → 审核 →
+作者确认 → accept"。标准序列（approve 与 passed review 顺序不敏感）：
+
+```
+1. 生成后先读 artifact（novel_artifact_get）细读评估；放行前必须核对：
+   语言契约（表层有无英文/技术原词，卷名/章节名是重点）、揭示物分层、
+   跨产物一致性（卷数/实体关系/势力命名/地点）。
+2. approve section（作者确认）：novel_action_execute(action=plan.approve,
+   runId, workItemId)。等价于 repository 的 approveProjectPlanSection
+   （actor=author），落库后发 reviewSubmitted 信号唤醒 workflow。
+3. 提交独立审核：novel_review_submit(reviewer=independent, verdict=passed,
+   issues=[跨阶段缺口登记清单])。落库即触发 reviewSubmitted 信号。
+4. workflow 醒来 → recheckGate → acceptWork（校验：当前 artifact 存在
+   passed independent review + section approved）→ accept → 下游阶段自动启动。
+```
+
+关键决策规则：
+
+- **作者确认 ≠ human review**。作者确认 = `project_plan_sections` 该 section
+  status=approved 且 sourceArtifactId=当前 artifact。human passed review 只是
+  门禁签收之一，不能替代 approve；反之亦然。
+- **approve 与 passed review 顺序不敏感**：workflow 对两个条件分别有等待循环
+  （foundationAuthorApproved 检查 + reviewSubmittedSignal），二者都落库即自动
+  accept；先 approve 或先 review 均不会失败（workflows.ts 的 accept 路径先等待
+  作者确认再 accept，manual gate 路径先等待 reviewSubmitted 再 recheckGate）。
+- **不必等自动独立审核落库**。自动审核（workflow 内部 reviewFoundationWork）
+  落库与否不影响放行：只要 approve + 你的 passed review 就绪，acceptWork 即通过。
+  自动审核若之后落库 revise，不会推翻已 accept 的产物（bind 到 artifact）。
+- **绝不手动 work.start / work.revise 干扰自动循环**。自动审核给出 revise 后
+  系统会自动修订；此时手动 start/revise 会与 workflow 竞态，触发
+  "CreativeWorkItem 状态非法" → workflow failed 且不可恢复。
+- **跨阶段职责判定**：自动独立审核常把下游阶段职责（能力边界→worldview、
+  主题入选择→plot-design、群像横向关系→故事弧）判为 blocker。判定规则：
+  本阶段核心职责是否达标 + 缺口是否登记为跨阶段审核清单 → 达标即可放行，
+  不必在当阶段解决下游职责；清单在对应阶段审核时核对落地。
+- **workflow failed 不可恢复**（Temporal 终态）。常见原因：模型服务 503 /
+  状态竞态。缺作者确认不会导致 failed——workflow 会持久等待 approve（或暂停/
+  取消时退出等待）。处理：模型服务恢复后 `novel_bootstrap_run` 重启
+  （同项目幂等），已批准产物会被新 run 重新生成覆盖。
+- **learning 记录**：review 落库后按 AGENTS.md 汇总 issue 模式；可复用机制
+  沉淀走 novel_rule_candidate_create（scope 四件套）。
 
 ### 阶段 1 故事弧规划（两种模式）
 

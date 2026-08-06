@@ -170,14 +170,14 @@ describe("story arc review authority boundary", () => {
     expect(block).toContain("storyArcModelActivities.generateStoryArcBundle");
   });
 
-  it("feeds warning-only story-arc review evidence into learning", () => {
+  it("feeds story-arc review opinion into learning only when the review revises", () => {
     const source = readFileSync(fileURLToPath(new URL("../temporal/workflows.ts", import.meta.url)), "utf8");
     const start = source.indexOf("const runStoryArcLearning = async");
     const end = source.indexOf("  try {", start);
     const block = source.slice(start, end);
 
-    expect(block).toContain("if (!reviewed.review.issues.length) return;");
-    expect(block).not.toContain('issue.severity === "blocker" || issue.severity === "major"');
+    expect(block).toContain('if (reviewed.review.verdict !== "revise" || !reviewed.review.opinion.trim()) return;');
+    expect(block).not.toContain("reviewed.review.issues");
   });
 
   it("keeps Temporal cancellation on the cancellation lifecycle", () => {

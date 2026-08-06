@@ -1,90 +1,12 @@
 import type { Artifact } from "../protocol";
 import { FOUNDATION_TASK_CONTRACTS } from "../application/foundation-contract";
-
-export const FOUNDATION_REVIEW_DIMENSIONS = [
-  "worldbuilding",
-  "story",
-  "ensemble",
-  "romance",
-  "humor",
-] as const;
-
-export type FoundationReviewDimension = (typeof FOUNDATION_REVIEW_DIMENSIONS)[number];
-
-export interface FoundationReviewOutput {
-  artifactFingerprint: string;
-  verdict: "passed" | "revise" | "blocked";
-  summary: string;
-  scores: Record<FoundationReviewDimension, number>;
-  issues: Array<{
-    dimension: FoundationReviewDimension;
-    severity: "blocker" | "major" | "warning";
-    title: string;
-    description: string;
-    evidence: string;
-    suggestion: string;
-  }>;
-  consistencyChecks: Array<{
-    check: string;
-    verdict: "passed" | "revise" | "blocked";
-    evidence: string;
-    reason: string;
-  }>;
-}
-
-export const foundationReviewSchema = {
-  type: "object",
-  additionalProperties: false,
-  required: ["artifactFingerprint", "verdict", "summary", "scores", "issues", "consistencyChecks"],
-  properties: {
-    artifactFingerprint: { type: "string", minLength: 1 },
-    verdict: { enum: ["passed", "revise", "blocked"] },
-    summary: { type: "string", minLength: 1 },
-    scores: {
-      type: "object",
-      additionalProperties: false,
-      required: FOUNDATION_REVIEW_DIMENSIONS,
-      properties: Object.fromEntries(FOUNDATION_REVIEW_DIMENSIONS.map((dimension) => [dimension, { type: "number", minimum: 0, maximum: 5 }])),
-    },
-    issues: {
-      type: "array",
-      items: {
-        type: "object",
-        additionalProperties: false,
-        required: ["dimension", "severity", "title", "description", "evidence", "suggestion"],
-        properties: {
-          dimension: { enum: FOUNDATION_REVIEW_DIMENSIONS },
-          severity: { enum: ["blocker", "major", "warning"] },
-          title: { type: "string", minLength: 1 },
-          description: { type: "string", minLength: 1 },
-          evidence: { type: "string", minLength: 1 },
-          suggestion: { type: "string", minLength: 1 },
-        },
-      },
-    },
-    consistencyChecks: {
-      type: "array",
-      minItems: 1,
-      items: {
-        type: "object",
-        additionalProperties: false,
-        required: ["check", "verdict", "evidence", "reason"],
-        properties: {
-          check: { type: "string", minLength: 1 },
-          verdict: { enum: ["passed", "revise", "blocked"] },
-          evidence: { type: "string", minLength: 1 },
-          reason: { type: "string", minLength: 1 },
-        },
-      },
-    },
-  },
-} as const;
+import { TEXT_REVIEW_PASSED_MARKER } from "../text-review";
 
 export function buildFoundationReviewPrompt(input: { taskKey: string; artifact: Artifact; premise?: string; genre?: string }): string {
   const contract = FOUNDATION_TASK_CONTRACTS[input.taskKey];
   return [
     "以独立长篇策划编辑身份审核 Foundation 架构产出。审核对象是项目级结构化规划，不是章节正文，因此不得使用章节钩子、语言润色或字数作为主要判据。",
-    "必须从 D1 世界观、D2 故事性、D3 群像、D4 感情线、D5 幽默五个维度分别评分。感情线或幽默不适用时，检查是否明确记录了不适用边界，不因没有强行加入而扣分。",
+    "必须从 D1 世界观、D2 故事性、D3 群像、D4 感情线、D5 幽默五个维度分别评估。感情线或幽默不适用时，检查是否明确记录了不适用边界，不因没有强行加入而扣分。",
     "先检查规划契约是否完整：读者承诺、主题问题、主角需要与矛盾、核心对抗、情感契约、世界压力、终局边界、不可违背项和待确认项是否互相支持。",
     "再检查层级与因果：全书方向是否能下传到故事弧，人物欲望与外部压力是否产生选择和代价，卷/线/伏笔是否有状态变化、回收窗口和后果，是否给下层创作保留真实空间。",
     "审查多线与结构承诺：每条长线是否说明它与主线的耦合机制（改变人物选择/资源/认知/关系/世界规则之一）以及交汇/退出/转化条件；无法说明耦合或生命周期、只能靠新增角色和地点维持存在的支线应被指出。全书结构类型（linear/tree/network）若已声明，检查其与读者承诺是否匹配。",
@@ -102,12 +24,21 @@ export function buildFoundationReviewPrompt(input: { taskKey: string; artifact: 
     "- 表层大众化：卷名、章节名、概念与术语命名是否面向大众读者、落在大众认知范围内；专业/技术概念若出现在表面是否有江湖化转译且全篇同译名。机制层可以技术化，读者可见表面不得技术化（D1）。",
     "- 揭示物分层：核心创意与世界观真相是否被写成剧情揭示物而非开篇设定——规划是否区分世界表面事实（开局成立）、异常现象（主角逐步发现）与底层真相（长线揭示）；若真相被当作既定的世界观基石直接铺开，检查删除该真相后开局是否仍成立（D1/D2）。",
     "每个问题必须引用 structuredData、sections 或 summary 的精确路径/片段，并说明问题机制、影响范围和最小修复方向。不得用抽象偏好替代证据，也不得通过增加固定章节数量、固定爽点密度或强制感情线来修复问题。",
-    `审核结果必须原样回填当前 artifact fingerprint：${input.artifact.fingerprint}。若 fingerprint 不匹配，结果无效。`,
     `当前 taskKey：${input.taskKey}`,
     `当前任务应覆盖：${contract?.qualityFocus.join("；") || "通用架构完整性与上下游一致性"}`,
+    "## 跨阶段职责判定（必须遵守）",
+    "Foundation 规划按任务分阶段推进（如项目定位、叙事架构、人物、世界观、剧情设计），你只对当前 taskKey 的核心职责负责，职责范围见上方‘当前任务应覆盖’。",
+    "凡属于其他规划阶段才需要落地的细节——例如概念译名表、境界-算力量化映射、配角独立欲望与关系网络、初期技术突破口、感情线边界等——只要当前阶段产物已将其登记为‘待确认项’或跨阶段清单，即视为已尽责。",
+    "不得以这些下游阶段的缺口作为判 revise 的依据，也不得要求当前阶段代行下游阶段的职责。判 revise 的唯一依据是：当前 taskKey 的核心职责缺失、自相矛盾，或与既有冻结事实冲突，且该缺口无法通过登记待确认项解决。",
+    "## 判定纪律：只报阻断项，放行达标项（必须遵守）",
+    "规划级审核的默认倾向是放行：只要当前阶段核心职责已确立、因果可推演、与冻结事实无冲突，即应输出 PASSED。每条意见在判为 major 前先自问：这一项缺失是否会让下游无法开展工作，或让读者体验在本阶段承诺的功能上直接受损？",
+    "能通过登记待确认项、在后续阶段细化、或在故事弧/正文中兑现的改进建议，属于非阻断项，只能作为改进提示，不得触发 revise。只有当前阶段的核心契约缺项、自相矛盾或与既有事实冲突时，才判 revise。",
+    "修订循环要收敛：每次修订后，若上一轮提出的主要问题已被处理、本轮仅剩新增的非阻断建议，应判 PASSED，而不是继续追加 revise 追求无上限的完善。规划追求可执行与自洽，不追求完美。",
+    "## 意见回流卫生（必须遵守）",
+    "你的意见会作为指令回流到重新生成阶段，因此必须满足：只针对当前阶段可修复的问题并给出最小修复方向；不输出 Markdown 列表、代码围栏或 JSON 结构；不要求模型增加特定的 structuredData 字段名；示例值使用中文直角引号『』或描述性语言，禁止使用中文全角引号（“”）包裹示例，防止模型在 JSON 输出中回显污染导致解析失败。",
     input.premise ? `项目 premise：${input.premise}` : "项目 premise：未提供",
     input.genre ? `题材：${input.genre}` : "题材：未提供",
-    "审核输出必须符合 foundationReviewSchema。consistencyChecks 至少检查一组跨字段关系，并优先覆盖契约→架构、架构→故事弧、人物→剧情线、世界规则→行动代价中的实际适用项。",
+    `## 输出约定\n若规划通过审核，只输出一行：${TEXT_REVIEW_PASSED_MARKER}\n若存在问题，输出审核意见（不输出 PASSED 标记）：按影响严重度列出问题，每个问题说明现象、涉及的规划内容（引用 structuredData/sections/summary 的路径或片段）、影响机制与最小修复方向。意见必须可执行、可定位，不得只表达抽象偏好；不要把本次审核结果包装成 JSON、Markdown 代码块或 Schema。`,
     "## 待审 artifact",
     JSON.stringify({ id: input.artifact.id, fingerprint: input.artifact.fingerprint, taskId: input.artifact.taskId, structuredData: input.artifact.structuredData }, null, 2),
   ].join("\n\n");

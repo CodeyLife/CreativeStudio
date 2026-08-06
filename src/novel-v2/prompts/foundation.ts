@@ -5,15 +5,15 @@ type FoundationGuidance = {
   dimension: string;
   focus: string[];
   structuredDataHint: string;
-  root: string;
+  /** 数组型 task 的集合容器键（如 characters）；对象型 task 平铺无容器，省略。 */
+  root?: string;
 };
 
 const TASK_KEY_GUIDANCE: Record<string, FoundationGuidance> = {
   "project-positioning": {
     dimension: "确立作品定位、核心承诺、读者方向和作者边界。",
     focus: ["正式书名与命名依据", "核心叙事承诺", "目标读者与阅读期待", "基调、差异化和核心冲突", "区分已确认决策、推导判断和待确认事项"],
-    structuredDataHint: "positioning: {bookTitle, namingRationale, sellingPoints, corePromise, targetReader, tone, differentiation, coreConflict, activePressureSource, themeQuestion, protagonistNeed, centralOpposition, emotionalContract}",
-    root: "positioning",
+    structuredDataHint: "{bookTitle, namingRationale, sellingPoints, corePromise, targetReader, tone, differentiation, coreConflict, activePressureSource, themeQuestion, protagonistNeed, centralOpposition, emotionalContract}",
   },
   architecture: {
     dimension: "设计全书层级、长期承诺和阶段边界，为故事弧与章节蓝图提供方向，而不是把未来正文压缩成固定目录。",
@@ -27,8 +27,7 @@ const TASK_KEY_GUIDANCE: Record<string, FoundationGuidance> = {
       "时间跨度与长期收束：记录故事时间、叙事顺序和状态证据，不以章节数量或固定密度代替结构",
       "保留后续调整空间，不生成固定章节表；章节数量只能作为资源估计，不是质量目标",
     ],
-    structuredDataHint: "architecture: {structure, structureType?: linear|tree|network, volumes: [{name, theme, function, entryState, exitState, pressures, promiseWindows: [{promiseRef|id|description, windowOrdinals|window|payoffWindow}], chapterCount?}], povStrategy, timeSpan, longHorizonBoundaries, endingEnvelope?, lineHierarchy?, uncertainty?}",
-    root: "architecture",
+    structuredDataHint: "{structure, structureType?: linear|tree|network, volumes: [{name, theme, function, entryState, exitState, pressures, promiseWindows: [{promiseRef|id|description, windowOrdinals|window|payoffWindow}], paceHint?}], povStrategy, timeSpan, longHorizonBoundaries, endingEnvelope?, lineHierarchy?, uncertainty?}",
   },
   characters: {
     dimension: "设计主要人物、动机、声部、知识边界、关系压力和变化可能。",
@@ -38,15 +37,13 @@ const TASK_KEY_GUIDANCE: Record<string, FoundationGuidance> = {
   },
   worldview: {
     dimension: "构建世界事实、规则、代价、边界和社会质地。",
-    focus: ["地理、制度、势力与生活环境如何改变行动成本和人物选择", "可预测的规则、限制、例外来源与违规后果", "规则的代价与边界，谁承担代价以及制度如何反应", "资源与技术的分配：力量、信息、交通、医疗、货币、生产和传播谁掌握、谁稀缺、谁可及", "价值与冲突：世界奖励什么、惩罚什么，哪些规则对不同阶层/职业/性格的人不公平，不公平的后果", "文化、语言、行业、信仰和历史记忆的具体来源", "外部威胁与内部矛盾", "哪些内容是冻结事实，哪些仍待故事中发现"],
-    structuredDataHint: "worldview: {geography, politics, factions, rules: [{statement, cost, boundary}], resourcesAndTechnology?: [{name, distribution, scarcity, access}], valuesAndConflicts?: [{value, rewardedBy, punishedBy, unequalFor, consequence}], threats?, socialTexture?}",
-    root: "worldview",
+    focus: ["地理、制度、势力与生活环境如何改变行动成本和人物选择", "可预测的规则、限制、例外来源与违规后果", "规则的代价与边界，谁承担代价以及制度如何反应", "资源与技术的分配：力量、信息、交通、医疗、货币、生产和传播谁掌握、谁稀缺、谁可及", "价值与冲突：世界奖励什么、惩罚什么，哪些规则对不同阶层/职业/性格的人不公平，不公平的后果", "文化、语言、行业、信仰和历史记忆的具体来源", "外部威胁与内部矛盾", "哪些内容是冻结事实，哪些仍待故事中发现", "核心创意的机制层：若题材依赖某底层机制（如灵气=逻辑单元），需在 mechanics 中冻结该机制的运行约束（如灵气浓度差异、修炼的算力/资源成本、错误运行的代价），作为可推导的规则而非名词堆砌；机制细节可作为长线揭示物逐步展开，但其运行边界需在本阶段确立，确保人物选择受世界规则约束"],
+    structuredDataHint: "{geography, politics, factions, rules: [{statement, cost, boundary}], resourcesAndTechnology?: [{name, distribution, scarcity, access}], valuesAndConflicts?: [{value, rewardedBy, punishedBy, unequalFor, consequence}], threats?, socialTexture?, mechanics?: [{surface, mechanism, note}]}",
   },
   "plot-design": {
     dimension: "形成可长期校准的主线、支线、信息释放和终局战略。",
     focus: ["叙事承诺的长期回应：读者问题、建立证据、回收窗口、意义变化和代价", "主线、支线、关系线与世界压力的因果方向、耦合机制、交汇/退出/转化条件", "每条长线的耦合机制：它改变人物选择、资源、认知、关系或世界规则中的至少一项；无法说明耦合的支线应当合并、缩短或删除", "人物终点区间、独立欲望和不可接受的捷径", "区分隐藏信息、尚未设计的信息和开放问题；记录不可提前消费的边界", "必须解决、允许开放和可多路径抵达的终局条件", "每项战略决策如何改变人物选择或读者理解"],
-    structuredDataHint: "plotStrategy: {narrativePromises, longHorizonThreads: [{threadRef, direction, closureCondition, doNotConsumeBefore, responsibleVolumeOrdinals, nextResponsibility, coupling?, mergePoint?, exitPoint?, transformPoint?}], characterDestinations, informationBoundaries, endingEnvelope, nonNegotiables}",
-    root: "plotStrategy",
+    structuredDataHint: "{narrativePromises, longHorizonThreads: [{threadRef, direction, closureCondition, doNotConsumeBefore, responsibleVolumeOrdinals, nextResponsibility, coupling?, mergePoint?, exitPoint?, transformPoint?}], characterDestinations, informationBoundaries, endingEnvelope, nonNegotiables}",
   },
 };
 
@@ -92,8 +89,11 @@ export function buildFoundationPrompt(input: {
   lines.push(
     "",
     "## 输出边界",
-    "title、summary、sections 和 structuredData 必须相互一致；structuredData 必须是可解析为 JSON 对象的字符串，根键使用当前 taskKey 对应的结构化数据容器。sections[].items 没有条目时返回空数组。",
-    guidance ? "structuredData 的主要容器为 " + guidance.root + "，不得把未确认内容写成确定事实。" : "",
+    "title、summary、sections 和 structuredData 必须相互一致；structuredData 必须是可解析为 JSON 对象的字符串，根对象直接承载当前阶段的结构化数据。sections[].items 没有条目时返回空数组。",
+    "不得在架构层预设每卷的固定章节数量：卷的实际长度应由故事弧滚动创作根据剧情推进自然决定，架构只表达卷级状态边界（入口/退出/压力/承诺窗口）与篇幅倾向（如‘相对紧凑’、‘铺陈较多’的相对描述）。全书规划不生成固定章节表，章节数量不是质量目标，只能作为资源估计。",
+    guidance ? (guidance.root
+      ? `structuredData 的根对象必须包含 ${guidance.root} 数组，不得把未确认内容写成确定事实。`
+      : `structuredData 的根对象直接承载当前阶段的结构化数据，不要再包一层与阶段同名的容器键；不得把未确认内容写成确定事实。`) : "",
     "对主要决策尽量显式记录‘欲望/压力 → 选择 → 代价 → 可观察状态变化 → 新问题或承诺’；没有自然变化时说明其体验功能。",
     "区分已确认事实、基于事实的推导方案和待作者确认项；不以章节数、钩子密度、爽点密度或感情线数量掩盖因果、人物或世界压力缺口。",
     "不为满足数量、篇幅或形式而填充空洞内容；不生成逐章章节表。",

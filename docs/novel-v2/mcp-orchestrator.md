@@ -36,6 +36,22 @@ novel_context_get(projectId)                      # 读取宏观规划摘要 + �
 - manual 门禁下用 `novel_action_execute(review.submit, reviewer=independent|human)` 对 work item 出具审核并推进；
 - 对规划方向不满时用 `novel_action_execute(work.revise, instruction)` 下达修订指令。
 
+**manual-gate 推进协议**：manual reviewGate 下每个 foundation 阶段走「生成 → 审核 → 作者确认 → accept」：
+
+```
+1. novel_artifact_get(artifactId) 细读评估（语言契约、揭示物分层、跨产物一致性）；
+2. novel_action_execute(action=plan.approve, runId, workItemId)   # 作者确认，等价 approveProjectPlanSection(actor=author)
+3. novel_review_submit(reviewer=independent, verdict=passed, issues=[跨阶段缺口登记清单], summary)
+4. workflow 收到信号 → recheckGate → acceptWork（passed 审核 + section approved 都就绪）→ 下游阶段自动启动
+```
+
+- approve 与 passed review **顺序不敏感**：workflow 对两个条件各有等待循环，二者都落库即自动 accept。
+- 作者确认 ≠ human review：approve 只批准 section 定稿，不替代独立审核签收。
+- **外部修订驱动（2026-08-06 起修复）**：
+  - `review.submit(verdict=revise)` 在 manual gate 下会正确触发自动修订（workflow 的"作者确认等待"循环收到信号后重新 checkGate，未通过即 reviseWork，审核意见作为重新生成的 instruction 回流）；
+  - `work.revise` / `work.start` / `work.retry` 落库后也会唤醒 workflow 重判（processWorkItem 检测到状态已变更即退出当前实例，主循环重新扫描），不再出现"外部命令改状态但 workflow 永久等待"的卡死；
+  - 首选 `review.submit(verdict=revise, issues=[意见])` 驱动修订（意见自动回流）；仅当需要注入自定义指令（如"只恢复某角色定位、保留其他内容"）时才用 `work.revise(instruction)`，且等待系统进入修订循环后不要再手动 start。
+
 ### 阶段 1 故事弧规划（两种创作模式）
 
 **模式 A：系统自规划（默认）**
@@ -106,9 +122,10 @@ novel_receipt_get(receiptId)
 2. **审核要指向证据**：issue 必须带 evidence / excerpt / revisionRanges（1-based 段落号），同机制多处用 revisionRanges 一次覆盖，避免只修首段。
 3. **approve 覆盖严重问题必须给 feedback**：`novel_chapter_review_decision` 在 approve 且审核存在 blocker/major 时需要作者理由。
 4. **修订是定向的**：`work.revise` / targeted 审校只修问题机制相关范围；`unresolvedAtClose` 是冻结未解边界，局部修订不得回答或删除。
-5. **学习候选要完整 scope**：`observedSymptom / failingLayer / underlyingMechanism / affectedInputClass` 必填，`boundaries / regressionRisks` 建议填写；promote 前必须有原失败场景 + 异构场景回归证据。
-6. **串行约束**：同项目章节审校互斥（`projectActiveReviewWorkflowId`），外部模型必须等当前审校完成后启动下一个。
-7. **编排权威顺序**：已定稿事实 / 叙事状态账本 / 作者边界 > 外部剧情编排 > 模型自行发挥；编排只给方向，不给假事实。
+5. **规划级审核是文本意见契约**：Foundation 与 Story Arc 的模型审核只返回单行 `PASSED`（通过）或可执行审核意见（不通过，verdict=revise），verdict 只保留 passed/revise 二值；意见会作为重新生成的 instruction 回流。外部模型作为审核者提交意见时同样遵守该契约。
+6. **学习候选要完整 scope**：`observedSymptom / failingLayer / underlyingMechanism / affectedInputClass` 必填，`boundaries / regressionRisks` 建议填写；promote 前必须有原失败场景 + 异构场景回归证据。
+7. **串行约束**：同项目章节审校互斥（`projectActiveReviewWorkflowId`），外部模型必须等当前审校完成后启动下一个。
+8. **编排权威顺序**：已定稿事实 / 叙事状态账本 / 作者边界 > 外部剧情编排 > 模型自行发挥；编排只给方向，不给假事实。
 
 ## 4. 工具清单（35 个）
 

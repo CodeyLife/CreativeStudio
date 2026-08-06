@@ -1027,6 +1027,7 @@ export type CreativeCommand =
   | { type: "work.accept"; workItemId: string; idempotencyKey: string }
   | { type: "review.request"; workItemId: string; idempotencyKey: string }
   | { type: "review.submit"; workItemId: string; review: CreativeReviewInput; idempotencyKey: string }
+  | { type: "plan.approve"; workItemId: string; idempotencyKey: string }
   | { type: "run.pause" | "run.resume" | "run.cancel"; idempotencyKey: string };
 
 export interface CreativeReviewGate {

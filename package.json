@@ -13,6 +13,7 @@
     "novel:v2:api": "node scripts/run-v2-service.mjs api",
     "novel:v2:worker": "node scripts/run-v2-service.mjs worker",
     "novel:mcp:v2": "node --import tsx scripts/novel-v2-mcp-server.mjs",
+    "novel:mcp:v2:http": "node --import tsx scripts/novel-v2-mcp-server.mjs --http",
     "novel:v2:compose": "node scripts/novel-v2-compose.mjs",
     "novel:v2:doctor": "node --import tsx scripts/novel-v2-doctor.ts",
     "novel:v2:migrations": "node --import tsx scripts/novel-v2-migrations.ts",

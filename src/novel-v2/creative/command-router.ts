@@ -48,6 +48,7 @@ import {
   startWork,
 } from "./work-item";
 import { checkGate, submitReview } from "./review-gate";
+import { requiresFoundationAuthorConfirmation, type ProjectPlanTaskKey } from "../application/project-plan";
 import { buildChapterReviewPromptPackage } from "../prompts/chapter-review";
 import { reviewerSchema, type ReviewerOutput } from "../prompts/schemas";
 import { normalizeReviewIssueReaderEvidence } from "../reader-reconstruction";
@@ -548,6 +549,34 @@ export async function executeCreativeCommand(
         reviewId: review.id,
         reviewGate: gate,
         summary: `Review ${review.id} submitted (verdict=${review.verdict})`,
+      });
+      break;
+    }
+
+    case "plan.approve": {
+      // 作者确认：将当前 work item 的 foundation 产物批准为规划阶段定稿。
+      // 校验 work item 存在、taskKey 属于 foundation 规划阶段、有最新 artifact，
+      // 调用 approveProjectPlanSection（与 web-author 通道等效，actor=author）。
+      const workItem = await getWorkItem(repository, command.workItemId);
+      if (!workItem) throw new Error(`Work item 不存在：${command.workItemId}`);
+      // 仅接受需要作者确认的 Foundation 阶段（FOUNDATION_AUTHOR_CONFIRMATION_TASK_KEYS）；
+      // isProjectPlanTaskKey 会把退役的 chapter-plan 也判为真，不能用于此校验。
+      if (!workItem.taskKey || !requiresFoundationAuthorConfirmation(workItem.taskKey)) {
+        throw new Error(`plan.approve 仅适用于 Foundation 规划阶段，当前 taskKey=${workItem.taskKey ?? "unknown"}`);
+      }
+      const latestArtifactId = workItem.artifactRefs.at(-1);
+      if (!latestArtifactId) throw new Error(`Work item ${workItem.id} 无关联 artifact，无法批准`);
+      // requiresFoundationAuthorConfirmation 已保证 taskKey 属于 5 个 Foundation 阶段，
+      // 是 ProjectPlanTaskKey 的合法子集；此处收窄以匹配 approveProjectPlanSection 签名。
+      await repository.approveProjectPlanSection(run.projectId, workItem.taskKey as ProjectPlanTaskKey, latestArtifactId, "author");
+      result = buildResult({
+        runId,
+        commandType: command.type,
+        status: run.status,
+        workItemId: workItem.id,
+        workStatus: workItem.status,
+        artifactRefs: workItem.artifactRefs,
+        summary: `Foundation 阶段 ${workItem.taskKey} 已批准（作者确认）`,
       });
       break;
     }

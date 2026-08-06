@@ -8,9 +8,8 @@ import type { ModelGateway } from "../model-gateway";
 import { ExternalMcpRequiredError, type ModelExecutionProvenance, type ModelPurpose, type ModelRoutingSnapshot, type ModelTaskRecord, type ModelWorkPackage } from "../model-routing";
 import { ContentObjectStore } from "../object-store";
 import { normalizeStoryArcRebaseBundle, parseStoryArcBundle, validateChapterExecutionContract, validateStoryArcExecutionContracts, validateStoryArcRebaseBundle, type ChapterPlanningContext, type StoryArcBundle } from "../application/story-arc";
-import { mergeStoryArcReviews, normalizeStoryArcReviewAuthority } from "../application/story-arc-review-policy";
 import { inspectManuscript, structuralReviewFromReport, type ManuscriptStructuralReport } from "../application/manuscript-structure";
-import { buildStoryArcChaptersPrompt, buildStoryArcPlanPrompt, buildStoryArcPlanningContextSections, buildStoryArcReviewPrompt, buildStoryArcRevisionPrompt, storyArcBundleSchema, storyArcChaptersOutputSchema, storyArcPlanBatchSchema, storyArcReviewSchema, validateStoryArcReview, type StoryArcReviewOutput } from "../prompts/story-arc";
+import { buildStoryArcChaptersPrompt, buildStoryArcPlanPrompt, buildStoryArcPlanningContextSections, buildStoryArcReviewPrompt, buildStoryArcRevisionPrompt, storyArcBundleSchema, storyArcChaptersOutputSchema, storyArcPlanBatchSchema, type StoryArcReviewOutput } from "../prompts/story-arc";
 import { foundationArtifactToMemoryClaim } from "../foundation-memory";
 import { CommitService } from "../commit-service";
 import type { MemoryIndex } from "../qdrant-memory";
@@ -66,10 +65,11 @@ import {
   submitReview as creativeSubmitReview,
 } from "../creative";
 import { parseCreativeBrief } from "../application/creative-brief";
-import { assertFoundationTaskContract, foundationSchemaForTask, normalizeFoundationModelOutput } from "../application/foundation-contract";
+import { assertFoundationTaskContract, foundationSchemaForTask, normalizeFoundationModelOutput, validateFoundationTaskContract } from "../application/foundation-contract";
 import { hasPassedIndependentReviewForArtifact } from "../creative/review-gate";
 import { isProjectPlanTaskKey, isRetiredFoundationTaskKey, requiresFoundationAuthorConfirmation } from "../application/project-plan";
-import { buildFoundationReviewPrompt, foundationReviewSchema, type FoundationReviewOutput } from "../prompts/foundation-review";
+import { buildFoundationReviewPrompt } from "../prompts/foundation-review";
+import { extractReviewText, opinionToReviewIssue, parseTextReview } from "../text-review";
 
 function assertStructuredSchema(value: unknown, schema: Record<string, unknown>, label: string): void {
   const validate = new Ajv({ allErrors: true, strict: false }).compile(schema);
@@ -899,13 +899,9 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       return recordLearning(assessment);
     },
     assessStoryArcLearning: async (input: { projectId: string; workflowId: string; artifact: Artifact; reviewArtifact: Artifact; review: StoryArcReviewOutput; routingSnapshot: ModelRoutingSnapshot; candidateStartIndex?: number }): Promise<GeneratedLearningResult> => {
-      const issues = input.review.issues.map((issue): ReviewIssue => ({
-        severity: issue.severity,
-        title: issue.title,
-        description: issue.suggestion,
-        evidence: issue.evidence,
-        suggestion: issue.suggestion,
-      }));
+      const issues: ReviewIssue[] = input.review.verdict === "revise"
+        ? [opinionToReviewIssue(input.review.opinion, input.reviewArtifact.fingerprint)]
+        : [];
       const review: Review = {
         id: createHash("sha256").update(`${input.reviewArtifact.id}:story-arc-learning`).digest("hex"),
         projectId: input.projectId,
@@ -934,10 +930,10 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       }
     },
     materializeExternalStoryArcLearning: async (input: { modelTaskId: string; projectId: string; workflowId: string; artifact: Artifact; reviewArtifact: Artifact; review: StoryArcReviewOutput; value: unknown }): Promise<RuntimeLearningAssessmentV2> => {
-      const issues = input.review.issues.map((issue): ReviewIssue => ({ severity: issue.severity, title: issue.title, description: issue.suggestion, evidence: issue.evidence, suggestion: issue.suggestion }));
+      const hasOpinion = input.review.verdict === "revise" && Boolean(input.review.opinion.trim());
       const reviewId = createHash("sha256").update(`${input.reviewArtifact.id}:story-arc-learning`).digest("hex");
       const assessment = parseRuntimeLearningAssessmentV2(input.value, { id: `learning:${input.reviewArtifact.id}:story-arc`, projectId: input.projectId, source: { workflowId: input.workflowId, artifactId: input.artifact.id, reviewIds: [reviewId], fingerprint: input.artifact.fingerprint }, createdAt: Date.now() });
-      return recordLearning({ ...assessment, source: { ...assessment.source, reviewIds: issues.length ? [reviewId] : [] } });
+      return recordLearning({ ...assessment, source: { ...assessment.source, reviewIds: hasOpinion ? [reviewId] : [] } });
     },
     commit: async (input: { projectId: string; documentId: string; artifact: Artifact; factArtifact?: Artifact; narrativeOrder?: number; text: string; reviews: Review[]; structuralReport: ManuscriptStructuralReport; baseRevision: number; idempotencyKey: string }) => {
       const chapterMemorySkills = await resolveCurrentSkills({ projectId: input.projectId, executionPoint: "chapter.fact-extraction", role: "fact-extractor", preflightId: input.artifact.taskId });
@@ -1307,6 +1303,10 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       return creativeCheckGate(deps.repository, input.workItemId, run.policy);
     },
 
+    listWorkReviews: async (input: { workItemId: string }): Promise<import("../protocol").CreativeReview[]> => {
+      return creativeListReviews(deps.repository, input.workItemId);
+    },
+
     /**
      * 接受 work item（running → accepted 终态）。
      * 包装 creative.acceptWork，内部触发 updateRunStatusFromWork 派生 run 状态。
@@ -1333,6 +1333,18 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       if (section?.status !== "approved" || section.sourceArtifactId !== input.artifactId) return false;
       const reviews = await creativeListReviews(deps.repository, section.workItemId ?? "");
       return hasPassedIndependentReviewForArtifact(reviews, input.artifactId);
+    },
+
+    /**
+     * 检查规划阶段是否已由作者批准为当前 artifact（仅批准事实，不含独立审核通过要求）。
+     * 用于 manual-gate 等待循环区分 plan.approve 唤醒与 review 唤醒：作者已批准的
+     * foundation 产物不应被自动 revise 覆盖，继续等待独立 passed review 或作者后续命令。
+     */
+    planSectionApproved: async (input: { runId: string; taskKey: string; artifactId: string }): Promise<boolean> => {
+      const run = await getCreativeRun(deps.repository, input.runId);
+      if (!run) return false;
+      const section = await deps.repository.getProjectPlanSection(run.projectId, input.taskKey as import("../application/project-plan").ProjectPlanTaskKey);
+      return section?.status === "approved" && section.sourceArtifactId === input.artifactId;
     },
 
     /**
@@ -1673,20 +1685,20 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       const rebaseTarget = input.rebase ? await deps.repository.getStoryArcRebaseTarget(input.projectId, input.arcId) : undefined;
       const prompt = buildStoryArcReviewPrompt(input.bundle, "", rebaseTarget);
       const contextSections = buildStoryArcPlanningContextSections(planning);
-      const system = "你是独立长篇故事弧审核员。";
-      const promptPackage = compileSinglePrompt({ projectId: input.projectId, workflowId: input.workflowId, purpose: "review.arc", stage: "review", system, prompt, contextSections, schema: storyArcReviewSchema as unknown as Record<string, unknown>, provenanceRefs: [input.arcId, input.artifact.id], skillBundle: skills, skillExecutionPoint: "arc.review" });
+      const system = "你是独立长篇故事弧审核员。只输出审核结论文本，不输出 JSON 或 Schema。";
+      const promptPackage = compileSinglePrompt({ projectId: input.projectId, workflowId: input.workflowId, purpose: "review.arc", stage: "review", system, prompt, contextSections, provenanceRefs: [input.arcId, input.artifact.id], skillBundle: skills, skillExecutionPoint: "arc.review" });
       const prompts = rebaseTarget
         ? [
           { suffix: "", lens: "balanced" },
-          { suffix: "\n\n## 对抗式复核\n从每章 unresolvedAtClose 倒推检查所有指定路径。把候选当作待证明命题而非合理剧情；只要冻结证据不能蕴含，就列入 certaintyUpgrades。尤其检查来源归属、内心动机、危险性质、决定与实际行动之间的状态跨越。", lens: "adversarial-authority" },
+          { suffix: "\n\n## 对抗式复核\n从每章 unresolvedAtClose 倒推检查所有权威路径，把候选当作待证明命题而非合理剧情；只要冻结证据不能蕴含候选主张，就列为越界问题。尤其检查来源归属、内心动机、危险性质、决定与实际行动之间的状态跨越。", lens: "adversarial-authority" },
         ]
         : [{ suffix: "", lens: "balanced" }];
       try {
         const attempts = await Promise.allSettled(prompts.map((pass, passIndex) => {
-          const passPackage = passIndex === 0 ? promptPackage : compileSinglePrompt({ projectId: input.projectId, workflowId: input.workflowId, purpose: "review.arc", stage: "review", system, prompt: `${prompt}${pass.suffix}`, contextSections, schema: storyArcReviewSchema as unknown as Record<string, unknown>, provenanceRefs: [input.arcId, input.artifact.id, pass.lens], skillBundle: skills, skillExecutionPoint: "arc.review" });
+          const passPackage = passIndex === 0 ? promptPackage : compileSinglePrompt({ projectId: input.projectId, workflowId: input.workflowId, purpose: "review.arc", stage: "review", system, prompt: `${prompt}${pass.suffix}`, contextSections, provenanceRefs: [input.arcId, input.artifact.id, pass.lens], skillBundle: skills, skillExecutionPoint: "arc.review" });
           const controller = new AbortController();
           const timeout = setTimeout(() => controller.abort(new Error(`故事弧审核轮次超过 ${ARC_REVIEW_PASS_TIMEOUT_MS}ms`)), ARC_REVIEW_PASS_TIMEOUT_MS);
-          return model.generateStructured<StoryArcReviewOutput>({ purpose: "review.arc", system, prompt: passPackage.instruction, schema: storyArcReviewSchema as unknown as Record<string, unknown>, schemaName: "story-arc-review", workflowRunId: input.workflowId, taskId: `${input.arcId}:story-arc-review:${input.artifact.id}:${pass.lens}`, routingSnapshot: input.routingSnapshot, candidateStartIndex: (input.candidateStartIndex ?? 0) + passIndex, promptContext: passPackage.manifest, signal: controller.signal }).finally(() => clearTimeout(timeout));
+          return model.generateText({ purpose: "review.arc", system, prompt: passPackage.instruction, workflowRunId: input.workflowId, taskId: `${input.arcId}:story-arc-review:${input.artifact.id}:${pass.lens}`, routingSnapshot: input.routingSnapshot, candidateStartIndex: (input.candidateStartIndex ?? 0) + passIndex, promptContext: passPackage.manifest, signal: controller.signal }).finally(() => clearTimeout(timeout));
         }));
         const failedPasses = attempts.flatMap((result, index) => result.status === "rejected" ? [{ index, lens: prompts[index].lens, reason: result.reason }] : []);
         const externalFailure = failedPasses.find((pass) => pass.reason instanceof ExternalMcpRequiredError);
@@ -1699,45 +1711,35 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
           if (externalFailure) throw externalFailure.reason;
           throw failedPasses[0]?.reason ?? new Error("故事弧审核没有成功候选");
         }
-        const acceptedReviews: Array<{ lens: string; review: StoryArcReviewOutput }> = [];
-        const discardedReviews: Array<{ lens: string; reason: string }> = [];
-        generated.forEach(({ index, result }) => {
-          const review = normalizeStoryArcReviewAuthority(input.bundle, result.value, rebaseTarget);
-          try {
-            validateStoryArcReview(input.bundle, review);
-            acceptedReviews.push({ lens: prompts[index]?.lens ?? `pass-${index + 1}`, review });
-          } catch (error) {
-            // Provider JSON can satisfy the permissive array schema while omitting
-            // the cross-product coverage enforced by the shared review contract.
-            // Keep that evidence in metadata, but do not let one malformed lens
-            // discard a complete independent review of the same architecture.
-            discardedReviews.push({ lens: prompts[index]?.lens ?? `pass-${index + 1}`, reason: error instanceof Error ? error.message : String(error) });
-          }
-        });
-        if (!acceptedReviews.length) throw new Error(`故事弧审核没有完整候选：${discardedReviews.map((item) => `${item.lens}：${item.reason}`).join("；")}`);
-        const review = mergeStoryArcReviews(input.bundle, acceptedReviews.map((item) => item.review), rebaseTarget);
-        validateStoryArcReview(input.bundle, review);
-        const artifact = await makeArtifact({ projectId: input.projectId, taskId: `${input.arcId}:story-arc-review`, kind: "review", baseRevision: 0, text: JSON.stringify(review, null, 2), structuredData: { ...review, subjectArtifactId: input.artifact.id, workflowId: input.workflowId, modelProvenance: generated.map(({ result }) => result.provenance), reviewLenses: acceptedReviews.map((item) => item.lens), discardedReviewLenses: [...discardedReviews, ...failedPasses.map((pass) => ({ lens: pass.lens, reason: pass.reason instanceof Error ? pass.reason.message : String(pass.reason) }))] } });
+        const lensReviews: Array<{ lens: string; review: StoryArcReviewOutput }> = generated.map(({ index, result }) => ({
+          lens: prompts[index]?.lens ?? `pass-${index + 1}`,
+          review: parseTextReview(result.text),
+        }));
+        const opinions = lensReviews
+          .map((item) => item.review.verdict === "revise" ? `【${item.lens}】\n${item.review.opinion}` : "")
+          .filter(Boolean);
+        const review: StoryArcReviewOutput = {
+          verdict: opinions.length ? "revise" : "passed",
+          opinion: opinions.join("\n\n"),
+        };
+        const artifact = await makeArtifact({ projectId: input.projectId, taskId: `${input.arcId}:story-arc-review`, kind: "review", baseRevision: 0, text: JSON.stringify(review, null, 2), structuredData: { ...review, subjectArtifactId: input.artifact.id, workflowId: input.workflowId, modelProvenance: generated.map(({ result }) => result.provenance), reviewLenses: lensReviews.map((item) => item.lens), discardedReviewLenses: failedPasses.map((pass) => ({ lens: pass.lens, reason: pass.reason instanceof Error ? pass.reason.message : String(pass.reason) })) } });
         return { kind: "completed", artifact, review };
       } catch (error) {
         if (!(error instanceof ExternalMcpRequiredError)) throw error;
         const externalPromptPackage = rebaseTarget
-          ? compileSinglePrompt({ projectId: input.projectId, workflowId: input.workflowId, purpose: "review.arc", stage: "review", system, prompt: `${prompt}${prompts[1].suffix}`, contextSections, schema: storyArcReviewSchema as unknown as Record<string, unknown>, provenanceRefs: [input.arcId, input.artifact.id, prompts[1].lens], skillBundle: skills, skillExecutionPoint: "arc.review" })
+          ? compileSinglePrompt({ projectId: input.projectId, workflowId: input.workflowId, purpose: "review.arc", stage: "review", system, prompt: `${prompt}${prompts[1].suffix}`, contextSections, provenanceRefs: [input.arcId, input.artifact.id, prompts[1].lens], skillBundle: skills, skillExecutionPoint: "arc.review" })
           : promptPackage;
-        return { kind: "external", task: await externalTask({ workflowId: input.workflowId, taskId: `${input.arcId}:story-arc-review:${input.artifact.id}`, purpose: "review.arc", candidateIndex: error.candidateIndex, routingSnapshot: input.routingSnapshot, outputKind: "review", system, instruction: externalPromptPackage.instruction, schema: storyArcReviewSchema as unknown as Record<string, unknown>, schemaName: "story-arc-review", baseRevision: 0, contextRefs: { arcId: input.arcId, artifactId: input.artifact.id, skillBundleId: skills.id }, promptContext: externalPromptPackage.manifest }) };
+        return { kind: "external", task: await externalTask({ workflowId: input.workflowId, taskId: `${input.arcId}:story-arc-review:${input.artifact.id}`, purpose: "review.arc", candidateIndex: error.candidateIndex, routingSnapshot: input.routingSnapshot, outputKind: "review", system, instruction: externalPromptPackage.instruction, baseRevision: 0, contextRefs: { arcId: input.arcId, artifactId: input.artifact.id, skillBundleId: skills.id }, promptContext: externalPromptPackage.manifest }) };
       }
     },
 
     materializeExternalStoryArcReview: async (input: { modelTaskId: string; projectId: string; arcId: string; subjectArtifactId: string; value: unknown; rebase?: boolean }): Promise<{ artifact: Artifact; review: StoryArcReviewOutput }> => {
       const task = await deps.repository.getModelTask(input.modelTaskId);
       if (!task) throw new Error("外部故事弧审核任务不存在");
-      assertStructuredSchema(input.value, storyArcReviewSchema as unknown as Record<string, unknown>, "外部故事弧审核结果");
       const subjectArtifact = await deps.repository.getArtifact(input.subjectArtifactId);
       if (!subjectArtifact) throw new Error("外部故事弧审核对应的蓝图不存在");
-      const bundle = parseStoryArcBundle(subjectArtifact.structuredData);
-      const rebaseTarget = input.rebase ? await deps.repository.getStoryArcRebaseTarget(input.projectId, input.arcId) : undefined;
-      const review = normalizeStoryArcReviewAuthority(bundle, input.value as StoryArcReviewOutput, rebaseTarget);
-      validateStoryArcReview(bundle, review);
+      const rawText = extractReviewText(input.value);
+      const review = parseTextReview(rawText);
       const artifact = await makeArtifact({ projectId: input.projectId, taskId: task.taskId, kind: "review", baseRevision: 0, text: JSON.stringify(review, null, 2), structuredData: { ...review, subjectArtifactId: input.subjectArtifactId, workflowId: task.workflowRunId, externalModelTaskId: task.id, rebase: Boolean(input.rebase), reviewLenses: input.rebase ? ["balanced", "adversarial-authority"] : ["balanced"] } });
       return { artifact, review };
     },
@@ -1849,8 +1851,20 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
           routingSnapshot,
           candidateStartIndex: input.candidateStartIndex,
           promptContext: promptPackage.manifest,
+          extraValidate: (value) => {
+            // generateStructured 的 parsed 中 structuredData 仍是 JSON 字符串，
+            // validateFoundationTaskContract 期望对象形态；先 normalize 再校验，
+            // 避免对字符串形态误判所有字段为空。
+            let normalizedValue: unknown = value;
+            try {
+              normalizedValue = normalizeFoundationModelOutput(value as unknown, work.taskKey ?? "");
+            } catch (error) {
+              return [`structuredData 无法解析为对象：${error instanceof Error ? error.message : String(error)}`];
+            }
+            return validateFoundationTaskContract(normalizedValue as FoundationOutput, work.taskKey ?? "");
+          },
         });
-        const normalizedFoundation = normalizeFoundationModelOutput(generated.value);
+        const normalizedFoundation = normalizeFoundationModelOutput(generated.value, work.taskKey ?? "");
         assertFoundationTaskContract(normalizedFoundation, work.taskKey);
 
         const artifact = await makeArtifact({
@@ -1944,7 +1958,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       const stubArtifact = work.artifactRefs.at(-1) ? await deps.repository.getArtifact(work.artifactRefs.at(-1)!) : undefined;
       const taskSchema = foundationSchemaForTask(work.taskKey ?? "");
       assertStructuredSchema(input.value, taskSchema, "外部 foundation 结果");
-      const normalizedFoundation = normalizeFoundationModelOutput(input.value);
+      const normalizedFoundation = normalizeFoundationModelOutput(input.value, work.taskKey ?? "");
       assertFoundationTaskContract(normalizedFoundation, work.taskKey ?? "");
 
       const artifact = await makeArtifact({
@@ -2006,50 +2020,37 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
         premise: typeof project.metadata?.premise === "string" ? project.metadata.premise : undefined,
         genre: typeof project.metadata?.genre === "string" ? project.metadata.genre : undefined,
       });
-      const system = "你是独立的长篇小说 Foundation 规划审核编辑。只输出符合 foundationReviewSchema 的 JSON。";
+      const system = "你是独立的长篇小说 Foundation 规划审核编辑。只输出审核结论文本，不输出 JSON 或 Schema。";
       const skills = await resolveCurrentSkills({ projectId: run.projectId, executionPoint: "foundation.book-plan", role: "foundation-reviewer" });
       const routingSnapshot = model.getRoutingSnapshot();
       const taskId = `${input.workItemId}:foundation-review:${artifact.id}`;
-      const promptPackage = compileSinglePrompt({ projectId: run.projectId, workflowId: input.runId, purpose: "review.foundation", stage: "review", system, prompt, schema: foundationReviewSchema as unknown as Record<string, unknown>, reservedOutputTokens: 4096, provenanceRefs: [input.workItemId, artifact.id], skillBundle: skills, skillExecutionPoint: "foundation.book-plan" });
+      const promptPackage = compileSinglePrompt({ projectId: run.projectId, workflowId: input.runId, purpose: "review.foundation", stage: "review", system, prompt, reservedOutputTokens: 4096, provenanceRefs: [input.workItemId, artifact.id], skillBundle: skills, skillExecutionPoint: "foundation.book-plan" });
       try {
-        const generated = await model.generateStructured<FoundationReviewOutput>({
+        const generated = await model.generateText({
           purpose: "review.foundation",
           system,
           prompt: promptPackage.instruction,
-          schema: foundationReviewSchema as unknown as Record<string, unknown>,
-          schemaName: "foundation-review",
-          maxTokens: 4096,
           workflowRunId: input.runId,
           taskId,
           routingSnapshot,
           candidateStartIndex: input.candidateStartIndex,
           promptContext: promptPackage.manifest,
         });
-        assertStructuredSchema(generated.value, foundationReviewSchema as unknown as Record<string, unknown>, "foundation 审核结果");
-        if (generated.value.artifactFingerprint !== artifact.fingerprint) throw new Error("foundation 审核结果与当前 artifact fingerprint 不一致");
-        const hasBlockingIssue = generated.value.issues.some((issue) => issue.severity === "blocker" || issue.severity === "major")
-          || generated.value.consistencyChecks.some((check) => check.verdict !== "passed");
+        const result = parseTextReview(generated.text);
         await makeArtifact({
           projectId: run.projectId,
           taskId: `${input.workItemId}:foundation-review`,
           kind: "review",
           baseRevision: artifact.baseRevision,
-          text: JSON.stringify(generated.value, null, 2),
-          structuredData: { ...generated.value, subjectArtifactId: artifact.id, artifactFingerprint: artifact.fingerprint, workflowId: input.runId },
+          text: JSON.stringify(result, null, 2),
+          structuredData: { ...result, subjectArtifactId: artifact.id, artifactFingerprint: artifact.fingerprint, workflowId: input.runId },
         });
         const review: CreativeReview = await creativeSubmitReview(deps.repository, input.workItemId, {
           subjectArtifactId: artifact.id,
           reviewer: "independent",
-          verdict: hasBlockingIssue && generated.value.verdict === "passed" ? "revise" : generated.value.verdict,
-          issues: generated.value.issues.map((issue) => ({
-            severity: issue.severity,
-            title: issue.title,
-            description: issue.description,
-            evidence: issue.evidence,
-            dimension: issue.dimension,
-            suggestion: issue.suggestion,
-          })),
-          summary: generated.value.summary,
+          verdict: result.verdict,
+          issues: result.verdict === "revise" ? [opinionToReviewIssue(result.opinion, artifact.fingerprint)] : [],
+          summary: result.opinion,
         });
         return { kind: "completed", review };
       } catch (error) {
@@ -2065,8 +2066,6 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
             outputKind: "review",
             system,
             instruction: promptPackage.instruction,
-            schema: foundationReviewSchema as unknown as Record<string, unknown>,
-            schemaName: "foundation-review",
             baseRevision: artifact.baseRevision,
             contextRefs: { workItemId: input.workItemId, artifactId: artifact.id, taskKey: work.taskKey },
             promptContext: promptPackage.manifest,
@@ -2084,11 +2083,8 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       if (!artifactId) throw new Error(`Foundation work item 尚无 artifact：${input.workItemId}`);
       const artifact = await deps.repository.getArtifact(artifactId);
       if (!artifact) throw new Error(`Foundation artifact 不存在：${artifactId}`);
-      assertStructuredSchema(input.value, foundationReviewSchema as unknown as Record<string, unknown>, "外部 foundation 审核结果");
-      const result = input.value as FoundationReviewOutput;
-      if (result.artifactFingerprint !== artifact.fingerprint) throw new Error("外部 foundation 审核结果与当前 artifact fingerprint 不一致");
-      const hasBlockingIssue = result.issues.some((issue) => issue.severity === "blocker" || issue.severity === "major")
-        || result.consistencyChecks.some((check) => check.verdict !== "passed");
+      const rawText = extractReviewText(input.value);
+      const result = parseTextReview(rawText);
       const run = await getCreativeRun(deps.repository, work.runId);
       if (!run) throw new Error(`CreativeRun 不存在：${work.runId}`);
       await makeArtifact({
@@ -2102,9 +2098,9 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       return creativeSubmitReview(deps.repository, input.workItemId, {
         subjectArtifactId: artifactId,
         reviewer: "independent",
-        verdict: hasBlockingIssue && result.verdict === "passed" ? "revise" : result.verdict,
-        issues: result.issues.map((issue) => ({ severity: issue.severity, title: issue.title, description: issue.description, evidence: issue.evidence, dimension: issue.dimension, suggestion: issue.suggestion })),
-        summary: result.summary,
+        verdict: result.verdict,
+        issues: result.verdict === "revise" ? [opinionToReviewIssue(result.opinion, artifact.fingerprint)] : [],
+        summary: result.opinion,
       });
     },
   };

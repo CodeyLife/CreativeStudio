@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { foundationArtifactToMemoryClaim } from "./foundation-memory";
+import { normalizeFoundationStructuredDataFlat } from "./application/foundation-contract";
 import { assertCompleteChapterReviewEvidence } from "./application/chapter-approval";
 import { ChapterStateRebuildConflictError } from "./application/chapter-state-rebuild-conflict";
 import {
@@ -62,7 +63,7 @@ import type { ObjectStoreIdentity } from "./object-store";
 import { normalizeManuscriptStructuralReview } from "./application/manuscript-structure";
 import { auditNamedReferences, auditStoryArcBatchRanges, canonicalReferenceId, normalizeThreadResponsibilityReferences, resolveNamedReference, type NamedReferenceCandidate, type StoryArcIntegrityIssue } from "./application/story-arc-integrity";
 import { auditFullBookArchitecture } from "./application/full-book-architecture";
-import { CHAPTER_NARRATIVE_FUNCTIONS, canGenerateNextStoryArcBatch, compileChapterPlanValidationReport, normalizeChapterPlanningContext, parseStoryArcBundle, parseStoryArcPlan, planningContextFingerprint, validateStoryArcPlanContracts, type ArcPlanningStatus, type ChapterBlueprint, type ChapterBlueprintRecord, type ChapterPlanningContext, type ChapterSceneBlueprint, type NarrativeArcPlan, type StoryArcBatchRecord, type StoryArcBundle, type StoryArcContextReceipt, type StoryArcPlotOutline, type StoryArcRebaseTarget, type StoryArcRecord } from "./application/story-arc";
+import { CHAPTER_NARRATIVE_FUNCTIONS, canGenerateNextStoryArcBatch, normalizeChapterPlanningContext, parseStoryArcBundle, parseStoryArcPlan, planningContextFingerprint, validateStoryArcPlanContracts, type ArcPlanningStatus, type ChapterBlueprint, type ChapterBlueprintRecord, type ChapterPlanningContext, type ChapterSceneBlueprint, type NarrativeArcPlan, type StoryArcBatchRecord, type StoryArcBundle, type StoryArcContextReceipt, type StoryArcPlotOutline, type StoryArcRebaseTarget, type StoryArcRecord } from "./application/story-arc";
 import type { StoryArcReviewOutput } from "./prompts/story-arc";
 import { aggregateChapterReviews, markEvidenceUnverified, reviewIssueFingerprint, type ChapterReviewIssueStatus } from "./chapter-review-snapshot";
 import {
@@ -2968,7 +2969,7 @@ export class NovelPostgresRepository {
     const foundationData = Object.fromEntries(sections.rows.map((section) => {
       const structuredData = section.payload?.structuredData;
       const root = structuredData && typeof structuredData === "object" && !Array.isArray(structuredData) ? structuredData as Record<string, unknown> : {};
-      return [section.task_key, root[section.task_key === "plot-design" ? "plotStrategy" : section.task_key]];
+      return [section.task_key, normalizeFoundationStructuredDataFlat(root, section.task_key)];
     }));
     const fullBookArchitecture = auditFullBookArchitecture({
       architecture: foundationData.architecture,
@@ -3485,7 +3486,6 @@ export class NovelPostgresRepository {
     if (!blueprintArtifact || !reviewArtifact || reviewArtifact.kind !== "review") throw new Error("故事弧缺少有效审核证据");
     if (reviewArtifact.structuredData?.subjectArtifactId !== artifactId) throw new Error("故事弧审核证据不属于当前蓝图");
     const review = reviewArtifact.structuredData as unknown as StoryArcReviewOutput;
-    const bundle = parseStoryArcBundle(blueprintArtifact.structuredData);
     const architectureHealth = await this.getArchitectureHealth(projectId);
     const missingFoundation = architectureHealth.foundation.missing;
     const blockingArchitectureIssues = architectureHealth.fullBookArchitecture.issues.filter((issue) => issue.severity === "blocker" || issue.severity === "major");
@@ -3500,9 +3500,7 @@ export class NovelPostgresRepository {
       ...(references?.foreshadowing.issues ?? []),
     ].filter((issue) => issue.severity === "blocking");
     if (blockingReferenceIssues.length) throw new Error(`故事弧存在未解决的结构引用：${blockingReferenceIssues.map((issue) => issue.message).join("；")}`);
-    const validation = compileChapterPlanValidationReport(bundle, Array.isArray(review.chapterChecks) ? review.chapterChecks : [], Array.isArray(review.arcChecks) ? review.arcChecks : []);
-    const hasBlockingIssue = Array.isArray(review.issues) && review.issues.some((item) => item.severity === "blocker" || item.severity === "major");
-    if (review.verdict !== "passed" || hasBlockingIssue || !validation.passed) throw new Error("故事弧审核尚未通过，不能批准");
+    if (review.verdict !== "passed") throw new Error("故事弧审核尚未通过，不能批准");
     const macro = await this.listCurrentFoundationArtifacts(projectId);
     const contextFingerprint = createHash("sha256").update(JSON.stringify({ macro: macro.map((item) => [foundationTaskKey(item), item.id, item.fingerprint]), artifactId })).digest("hex");
     const client = await this.pool.connect();
@@ -4582,7 +4580,7 @@ export class NovelPostgresRepository {
       const projectId = separator >= 0 ? target.targetId.slice(0, separator) : target.projectId;
       const templateId = separator >= 0 ? target.targetId.slice(separator + 1) : target.targetId;
       if (!projectId || !templateId) return undefined;
-      const result = await this.pool.query("SELECT project_id,template_id,version,stage,content,content_fingerprint,active,created_at,updated_at FROM prompt_templates WHERE project_id=$1 AND template_id=$2", [projectId, templateId]);
+      const result = await this.pool.query("SELECT project_id,template_id,version,stages,content,content_fingerprint,active,created_at,updated_at FROM prompt_templates WHERE project_id=$1 AND template_id=$2", [projectId, templateId]);
       return result.rows[0];
     }
     const result = await this.pool.query("SELECT skill_id,version,capabilities,applicable_tasks,required_memory_kinds,conflicts,quality_gates,prompt_sections,enabled,updated_at FROM skill_definitions WHERE skill_id=$1 ORDER BY version DESC LIMIT 1", [target.targetId]);

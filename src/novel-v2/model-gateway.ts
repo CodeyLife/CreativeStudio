@@ -13,6 +13,7 @@ import {
   resolveRoute,
 } from "./model-routing";
 import type { PromptContextManifest } from "./protocol";
+import { parseStructuredJson } from "./structured-json";
 
 export interface ModelUsage {
   model: string;
@@ -55,6 +56,14 @@ export interface GenerateStructuredInput<T> extends BaseModelInput {
   schema: Record<string, unknown>;
   schemaName?: string;
   maxRepairAttempts?: number;
+  /**
+   * 任务级契约校验：在 provider JSON schema 校验通过后追加执行。
+   * 失败时抛出 ModelTransportError("schema-validation")，进入 repair 循环
+   * 由模型依据错误信息自动修复后重试。用于 provider schema 无法表达的
+   * 嵌套/语义契约（如 foundation architecture 的 volumes 结构），
+   * 避免契约失败直接导致 workflow 终态 failed 而无修复机会。
+   */
+  extraValidate?: (value: T) => string[];
   __type?: T;
 }
 
@@ -393,11 +402,7 @@ async function requestTransport(input: TransportRequest): Promise<TransportRespo
 }
 
 function parseJsonCandidate(candidate: string): unknown {
-  try {
-    let value: unknown = JSON.parse(candidate.trim());
-    if (typeof value === "string") value = JSON.parse(value.trim());
-    return value;
-  } catch { return undefined; }
+  return parseStructuredJson(candidate);
 }
 
 function balancedJsonObjects(content: string): string[] {
@@ -646,6 +651,14 @@ export class RoutedModelGateway implements ModelGateway {
         let latest: Awaited<ReturnType<RoutedModelGateway["invokeCandidate"]>> | undefined;
         const repairs = input.maxRepairAttempts ?? 2;
         for (let repair = 0; repair <= repairs; repair += 1) {
+          const repairSystem = [input.system, "修复结构化输出时仍须遵守原始角色、任务目标和事实边界。只输出严格符合 JSON Schema 的 JSON，不使用 Markdown。"].filter(Boolean).join("\n\n");
+          const repairCandidate = route.candidates[index];
+          let repairInputLimit = Math.min(route.maxInputTokens ?? Number.MAX_SAFE_INTEGER, input.promptContext?.maxInputTokens ?? Number.MAX_SAFE_INTEGER);
+          if (repairCandidate?.executor === "api") {
+            const profile = this.resolveProfile(snapshot, repairCandidate.profileId);
+            const outputReserve = Math.max(1, Math.min(input.maxTokens ?? route.maxOutputTokens ?? 4_096, route.maxOutputTokens ?? Number.MAX_SAFE_INTEGER));
+            if (profile.contextWindow) repairInputLimit = Math.min(repairInputLimit, Math.max(0, profile.contextWindow - outputReserve));
+          }
           latest = await this.invokeCandidate({ ...input, system: currentSystem, prompt: currentPrompt }, snapshot, route, index);
           totalInput += latest.response.inputTokens;
           totalOutput += latest.response.outputTokens;
@@ -658,6 +671,17 @@ export class RoutedModelGateway implements ModelGateway {
           if (latest.response.providerCachedInputTokens !== undefined) { providerCachedInputSeen = true; providerCachedInputTotal += latest.response.providerCachedInputTokens; }
           const parsed = normalizeStructuredContent(latest.response.text, validate);
           if (parsed !== undefined) {
+            const taskErrors = input.extraValidate ? input.extraValidate(parsed) : [];
+            if (taskErrors.length > 0) {
+              if (repair === repairs) {
+                const error = new ModelTransportError(`结构化输出校验失败：${taskErrors.join("；")}`, false, "schema-validation");
+                await this.record({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, configRevision: snapshot.id, candidateIndex: index, executor: "api", profileId: latest.profile.id, providerLabel: latest.profile.label, protocol: latest.profile.protocol, model: latest.model, status: "failed", inputTokens: totalInput, outputTokens: totalOutput, providerInputTokens: providerInputSeen ? providerInputTotal : undefined, providerOutputTokens: providerOutputSeen ? providerOutputTotal : undefined, providerCachedInputTokens: providerCachedInputSeen ? providerCachedInputTotal : undefined, estimatedInputTokens: estimatedInputTotal, estimatedOutputTokens: estimatedOutputTotal, usageSource: providerInputComplete && providerOutputComplete ? "provider" : providerInputSeen || providerOutputSeen ? "mixed" : "estimated", latencyMs: latest.latencyMs, promptFingerprint: latest.provenance.promptFingerprint, responseId: latest.response.responseId, errorCategory: error.category, errorMessage: modelErrorMessage(error) });
+                throw error;
+              }
+              currentSystem = repairSystem;
+              currentPrompt = repairPrompt(input.prompt, latest.response.text, taskErrors.join("；"), repair, repairInputLimit, repairSystem);
+              continue;
+            }
             const providerInputTokens = providerInputSeen ? providerInputTotal : undefined;
             const providerOutputTokens = providerOutputSeen ? providerOutputTotal : undefined;
             const providerCachedInputTokens = providerCachedInputSeen ? providerCachedInputTotal : undefined;
@@ -671,14 +695,6 @@ export class RoutedModelGateway implements ModelGateway {
             const error = new ModelTransportError(`结构化输出校验失败：${errors}`, false, "schema-validation");
             await this.record({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, configRevision: snapshot.id, candidateIndex: index, executor: "api", profileId: latest.profile.id, providerLabel: latest.profile.label, protocol: latest.profile.protocol, model: latest.model, status: "failed", inputTokens: totalInput, outputTokens: totalOutput, providerInputTokens: providerInputSeen ? providerInputTotal : undefined, providerOutputTokens: providerOutputSeen ? providerOutputTotal : undefined, providerCachedInputTokens: providerCachedInputSeen ? providerCachedInputTotal : undefined, estimatedInputTokens: estimatedInputTotal, estimatedOutputTokens: estimatedOutputTotal, usageSource: providerInputComplete && providerOutputComplete ? "provider" : providerInputSeen || providerOutputSeen ? "mixed" : "estimated", latencyMs: latest.latencyMs, promptFingerprint: latest.provenance.promptFingerprint, responseId: latest.response.responseId, errorCategory: error.category, errorMessage: modelErrorMessage(error) });
             throw error;
-          }
-          const repairSystem = [input.system, "修复结构化输出时仍须遵守原始角色、任务目标和事实边界。只输出严格符合 JSON Schema 的 JSON，不使用 Markdown。"].filter(Boolean).join("\n\n");
-          const candidate = route.candidates[index];
-          let repairInputLimit = Math.min(route.maxInputTokens ?? Number.MAX_SAFE_INTEGER, input.promptContext?.maxInputTokens ?? Number.MAX_SAFE_INTEGER);
-          if (candidate?.executor === "api") {
-            const profile = this.resolveProfile(snapshot, candidate.profileId);
-            const outputReserve = Math.max(1, Math.min(input.maxTokens ?? route.maxOutputTokens ?? 4_096, route.maxOutputTokens ?? Number.MAX_SAFE_INTEGER));
-            if (profile.contextWindow) repairInputLimit = Math.min(repairInputLimit, Math.max(0, profile.contextWindow - outputReserve));
           }
           currentSystem = repairSystem;
           currentPrompt = repairPrompt(input.prompt, latest.response.text, errors, repair, repairInputLimit, repairSystem);

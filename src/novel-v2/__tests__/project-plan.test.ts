@@ -44,7 +44,7 @@ describe("project plan dependency contract", () => {
       premise: "归乡者追查一桩旧案",
       priorArtifacts: [],
     });
-    expect(prompt).toContain("plotStrategy");
+    expect(prompt).toContain("narrativePromises");
     expect(prompt).toContain("不生成固定章节表");
     expect(prompt).not.toContain("第一章的功能");
   });

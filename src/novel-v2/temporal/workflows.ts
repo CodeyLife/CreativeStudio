@@ -2,7 +2,8 @@ import { CancellationScope, condition, defineSignal, isCancellation, patched, pr
 import type { ApprovalEvidence, Artifact, CommitResult, ContextManifest, CreativeReview, CreativeRun, CreativeReviewGate, CreativeWorkItem, ExecutionBlueprint, FactApprovalSummary, MemoryBundle, MemoryClaim, NovelIntent, PreflightPlan, PreflightProjectSnapshot, Review, ReviewIssue, RuntimeLearningAssessmentV2, SkillBundle, TaskAttemptRecord } from "../protocol";
 import type { ChapterPlanningContext, StoryArcBundle, StoryArcPlotOutline } from "../application/story-arc";
 import type { ManuscriptStructuralReport } from "../application/manuscript-structure";
-import { storyArcReviewStrategy, validateStoryArcReview, type StoryArcReviewOutput } from "../application/story-arc-review-policy";
+import { storyArcReviewStrategy, type StoryArcReviewOutput } from "../application/story-arc-review-policy";
+import { opinionToReviewIssue } from "../text-review";
 import type { ReviewerRole } from "../prompts/chapter-review";
 import type { RevisionAttempt } from "../prompts/chapter-revision";
 import type { ModelRoutingSnapshot, ModelTaskRecord } from "../model-routing";
@@ -519,6 +520,10 @@ export async function novelIntentWorkflow(intent: NovelIntent, workflowId = `nov
  *    - 有 pending → 对每个 work item 执行 startWork → reviewGate → accept
  * 3. 支持 signals：pause/resume/cancel/reviewSubmitted
  * 4. manual gate：work item start 后等待 reviewSubmittedSignal 才继续 accept
+ *    - 等待循环收到信号后重判（外部命令同步）：
+ *      - 状态已非 running（外部 work.revise/work.accept 已接管）→ 退出当前实例，主循环重新扫描
+ *      - 重新 checkGate 未通过（外部 review.submit(revise) 已落库）→ reviseWork 触发修订
+ *      - 作者确认/外部签收满足 → acceptWork
  *
  * 与 command-router 的关系：
  * - command-router 处理单条命令（含幂等性）
@@ -542,10 +547,14 @@ export interface CreativeWorkflowActivities {
   startWork(input: { runId: string; workItemId: string }): Promise<CreativeWorkItem>;
   /** 检查 work item 的 review gate（调用 creative.checkGate） */
   checkGate(input: { runId: string; workItemId: string }): Promise<CreativeReviewGate>;
+  /** 列出 work item 的全部审核（按时间 ASC）。 */
+  listWorkReviews(input: { workItemId: string }): Promise<CreativeReview[]>;
   /** 接受 work item（调用 creative.acceptWork） */
   acceptWork(input: { runId: string; workItemId: string }): Promise<CreativeWorkItem>;
   /** 查询核心 Foundation 是否已由作者确认当前 artifact。 */
   foundationAuthorApproved(input: { runId: string; taskKey: string; artifactId: string }): Promise<boolean>;
+  /** 查询规划阶段是否已由作者批准为当前 artifact（不含独立审核通过要求）。 */
+  planSectionApproved(input: { runId: string; taskKey: string; artifactId: string }): Promise<boolean>;
   /** 修订 work item（调用 creative.reviseWork） */
   reviseWork(input: { runId: string; workItemId: string; instruction?: string }): Promise<CreativeWorkItem>;
   /** 重试 work item（调用 creative.retryWork） */
@@ -859,7 +868,7 @@ export async function storyArcPlanningWorkflow(params: StoryArcPlanningWorkflowI
   const routingSnapshot = await activities.getStoryArcRoutingSnapshot();
   await activities.updateWorkflowStatus({ workflowId: params.workflowId, status: "running", payload: { arcId: params.arcId, mode: params.mode, reviewPolicy, routingSnapshotId: routingSnapshot.id, orchestrated: Boolean(params.plotOutline) } });
   const runStoryArcLearning = async (current: { artifact: Artifact }, reviewed: { artifact: Artifact; review: StoryArcReviewOutput }, candidateStartIndex?: number): Promise<void> => {
-    if (!reviewed.review.issues.length) return;
+    if (reviewed.review.verdict !== "revise" || !reviewed.review.opinion.trim()) return;
     const generated = await storyArcModelActivities.assessStoryArcLearning({ projectId: params.projectId, workflowId: params.workflowId, artifact: current.artifact, reviewArtifact: reviewed.artifact, review: reviewed.review, routingSnapshot, candidateStartIndex });
     if (generated.kind === "completed") return;
     await activities.materializeExternalStoryArcLearning({ modelTaskId: generated.task.id, projectId: params.projectId, workflowId: params.workflowId, artifact: current.artifact, reviewArtifact: reviewed.artifact, review: reviewed.review, value: (await waitForExternal(generated.task)).value });
@@ -875,16 +884,15 @@ export async function storyArcPlanningWorkflow(params: StoryArcPlanningWorkflowI
     if (reviewStrategy.humanApproval) {
       const reviewed = await reviewBundle(current);
       await runStoryArcLearning(current, reviewed);
-      const planValidation = validateStoryArcReview(current.bundle, reviewed.review);
-      const blockingIssueCount = reviewed.review.issues.filter((issue) => issue.severity === "blocker" || issue.severity === "major").length + planValidation.blockingChecks.length;
+      const blockingIssueCount = reviewed.review.verdict === "revise" ? 1 : 0;
       await activities.updateWorkflowStatus({ workflowId: params.workflowId, status: "manual-review-required", payload: {
         arcId: params.arcId,
         artifactId: current.artifact.id,
         reviewArtifactId: reviewed.artifact.id,
         reviewVerdict: reviewed.review.verdict,
-        reviewSummary: reviewed.review.summary,
+        reviewSummary: reviewed.review.opinion,
         blockingIssueCount,
-        reviewIssues: reviewed.review.issues,
+        reviewIssues: reviewed.review.verdict === "revise" ? [opinionToReviewIssue(reviewed.review.opinion, current.artifact.id)] : [],
       } });
       await condition(() => approved);
       await activities.updateWorkflowStatus({ workflowId: params.workflowId, status: "completed", payload: { arcId: params.arcId, artifactId: current.artifact.id, reviewArtifactId: reviewed.artifact.id, reviewVerdict: reviewed.review.verdict, blockingIssueCount, approvedBy: "web-author" } });
@@ -895,12 +903,11 @@ export async function storyArcPlanningWorkflow(params: StoryArcPlanningWorkflowI
     const requireFinalAuthorApproval = params.mode === "web" && params.rebase === true;
     for (let iteration = 0; iteration <= maxRetries; iteration += 1) {
       const reviewed = await reviewBundle(current);
-      const planValidation = validateStoryArcReview(current.bundle, reviewed.review);
-      const blocking = reviewed.review.issues.some((issue) => issue.severity === "blocker" || issue.severity === "major") || !planValidation.passed;
+      const blocking = reviewed.review.verdict === "revise";
       await runStoryArcLearning(current, reviewed);
       if (reviewed.review.verdict === "passed" && !blocking) {
         if (requireFinalAuthorApproval) {
-          await activities.updateWorkflowStatus({ workflowId: params.workflowId, status: "manual-review-required", payload: { arcId: params.arcId, artifactId: current.artifact.id, reviewArtifactId: reviewed.artifact.id, reviewVerdict: reviewed.review.verdict, reviewSummary: reviewed.review.summary, blockingIssueCount: 0, reviewIssues: [], iterations: iteration, reason: "rebase-final-author-approval" } });
+          await activities.updateWorkflowStatus({ workflowId: params.workflowId, status: "manual-review-required", payload: { arcId: params.arcId, artifactId: current.artifact.id, reviewArtifactId: reviewed.artifact.id, reviewVerdict: reviewed.review.verdict, reviewSummary: reviewed.review.opinion, blockingIssueCount: 0, reviewIssues: [], iterations: iteration, reason: "rebase-final-author-approval" } });
           await condition(() => approved);
           await activities.updateWorkflowStatus({ workflowId: params.workflowId, status: "completed", payload: { arcId: params.arcId, artifactId: current.artifact.id, reviewArtifactId: reviewed.artifact.id, iterations: iteration, approvedBy: "web-author" } });
           return;
@@ -909,10 +916,9 @@ export async function storyArcPlanningWorkflow(params: StoryArcPlanningWorkflowI
         await activities.updateWorkflowStatus({ workflowId: params.workflowId, status: "completed", payload: { arcId: params.arcId, artifactId: current.artifact.id, reviewArtifactId: reviewed.artifact.id, iterations: iteration } });
         return;
       }
-      if (iteration >= maxRetries || reviewed.review.verdict === "blocked") {
-        const reason = reviewed.review.verdict === "blocked" ? reviewed.review.summary : "故事弧蓝图在最大修订次数内未通过审核";
-        await activities.failStoryArc({ projectId: params.projectId, arcId: params.arcId, reason });
-        await activities.updateWorkflowStatus({ workflowId: params.workflowId, status: "manual-review-required", payload: { arcId: params.arcId, artifactId: current.artifact.id, reviewArtifactId: reviewed.artifact.id, reason } });
+      if (iteration >= maxRetries) {
+        await activities.failStoryArc({ projectId: params.projectId, arcId: params.arcId, reason: "故事弧蓝图在最大修订次数内未通过审核" });
+        await activities.updateWorkflowStatus({ workflowId: params.workflowId, status: "manual-review-required", payload: { arcId: params.arcId, artifactId: current.artifact.id, reviewArtifactId: reviewed.artifact.id, reason: "故事弧蓝图在最大修订次数内未通过审核", reviewSummary: reviewed.review.opinion } });
         return;
       }
       current = await reviseBundle(current, reviewed.review);
@@ -1104,7 +1110,7 @@ export async function creativeRunWorkflow(runId: string): Promise<void> {
  * - retryCount >= maxRetries → 不再 revise，work item 留在 running 状态（人工介入）
  * - gate.passed=false 且 reviewGate=manual → 等待 reviewSubmittedSignal（最多 10 分钟）
  */
-async function processWorkItem(params: {
+export async function processWorkItem(params: {
   runId: string;
   work: CreativeWorkItem;
   reviewFoundation: boolean;
@@ -1117,6 +1123,18 @@ async function processWorkItem(params: {
   isPaused: () => boolean;
 }): Promise<void> {
   const { runId, work, reviewFoundation, activities, reviewedWorkItems, retryCount, maxRetries, waitForExternal, isCancelled, isPaused } = params;
+  // 规划级审核意见：审核不通过时作为重新生成的 instruction 回流（work.instruction
+  // 已被 buildFoundationPrompt 消费）；通过时为空白，不会传给 reviseWork。
+  let foundationOpinion = "";
+  // 修订指令优先级：最新"非通过"review 的 summary（覆盖外部 review.submit(revise)
+  // 信号落库后 foundationOpinion 仍停留在初始审核意见的问题）→ 回退缓存的内部审核意见。
+  const revisionOpinion = async (): Promise<string | undefined> => {
+    const reviews = await activities.listWorkReviews({ workItemId: work.id });
+    for (let i = reviews.length - 1; i >= 0; i--) {
+      if (reviews[i].verdict !== "passed") return reviews[i].summary || foundationOpinion || undefined;
+    }
+    return foundationOpinion || undefined;
+  };
 
   // 1. 启动 work item（若已 running 则跳过）
   if (work.status === "pending") {
@@ -1176,7 +1194,10 @@ async function processWorkItem(params: {
       await activities.recordEvent({ runId, eventType: "work.foundation-review.external-pending", payload: { workItemId: work.id, modelTaskId: foundationReview.task.id, taskKey: work.taskKey } });
       const external = await waitForExternal(foundationReview.task);
       if (external.failed) throw new Error(`外部 foundation 审核任务失败：${foundationReview.task.id}`);
-      await activities.materializeExternalFoundationReview({ modelTaskId: foundationReview.task.id, workItemId: work.id, value: external.result?.value ?? external.result });
+      const materialized = await activities.materializeExternalFoundationReview({ modelTaskId: foundationReview.task.id, workItemId: work.id, value: external.result?.value ?? external.result });
+      foundationOpinion = materialized.summary;
+    } else {
+      foundationOpinion = foundationReview.review.summary;
     }
   }
 
@@ -1188,9 +1209,29 @@ async function processWorkItem(params: {
       const currentWork = await activities.getWorkItem({ workItemId: work.id });
       const artifactId = currentWork?.artifactRefs.at(-1);
       if (!artifactId) throw new Error(`Foundation work item 缺少待确认 artifact：${work.id}`);
-      while (!(await activities.foundationAuthorApproved({ runId, taskKey: work.taskKey, artifactId })) && !isCancelled() && !isPaused()) {
+      while (!isCancelled() && !isPaused()) {
+        if (await activities.foundationAuthorApproved({ runId, taskKey: work.taskKey, artifactId })) break;
         await condition(() => reviewedWorkItems.has(work.id) || isCancelled() || isPaused());
         reviewedWorkItems.delete(work.id);
+        if (isCancelled() || isPaused()) return;
+        // 外部信号后重判（根因修复）：
+        // - 外部 review.submit(revise) 已落库 → checkGate 未通过 → 走修订，而不是被
+        //   "作者确认等待"循环无视（此前 manual gate + 系统自动审核 passed 进入本分支后，
+        //   外部 revise review 信号只会被当作"唤醒检查 approve"，永不触发 reviseWork）。
+        // - 外部命令已接管状态（work.revise → pending / work.accept → accepted）→ 退出
+        //   当前处理实例，让主循环重新 listPendingWork 扫描，避免与 workflow 状态机脱节。
+        const signalWork = await activities.getWorkItem({ workItemId: work.id });
+        if (!signalWork) throw new Error(`Foundation work item 不存在：${work.id}`);
+        if (signalWork.status !== "running") return;
+        const recheckedGate = await activities.checkGate({ runId, workItemId: work.id });
+        if (!recheckedGate.passed) {
+          const current = retryCount.get(work.id) ?? 0;
+          if (current < maxRetries) {
+            await activities.reviseWork({ runId, workItemId: work.id, instruction: await revisionOpinion() });
+            retryCount.set(work.id, current + 1);
+          }
+          return;
+        }
       }
       if (isCancelled() || isPaused()) return;
     }
@@ -1200,43 +1241,57 @@ async function processWorkItem(params: {
   }
 
   // 3. gate 未通过：根据 reason 决定后续动作
-    // manual gate：持久等待 reviewSubmittedSignal；作者审批可能跨越任意时长。
+  // manual gate：持久等待 reviewSubmittedSignal；作者审批可能跨越任意时长。
   if (gate.reason.includes("manual gate")) {
-      while (!reviewedWorkItems.has(work.id) && !isCancelled() && !isPaused()) {
+    while (!isCancelled() && !isPaused()) {
+      if (!reviewedWorkItems.has(work.id)) {
         await condition(() => reviewedWorkItems.has(work.id) || isCancelled() || isPaused());
       }
-
-    if (reviewedWorkItems.has(work.id)) {
-      // 外部 accept 短路检查：work.accept 命令可能已将 work item 改为 accepted，
-      // 此时 checkGate 仍可能返回 not passed（新 artifact 无 review），
-      // 但 reviseWork 会把已 accepted 的 work item 打回 pending 造成不必要的重生。
-      // 根因：work.accept 外部命令与 workflow 的 manual gate 等待循环没有状态同步。
+      if (isCancelled() || isPaused()) return;
+      reviewedWorkItems.delete(work.id);
+      // 外部命令已接管状态（work.accept → accepted / work.revise → pending）：
+      // 退出当前处理实例，让主循环重新扫描；避免对 pending 调 reviseWork 报错
+      //（reviseWork 只接受 running/accepted，此前会抛"状态非法"并使 workflow 卡死）。
       const currentWork = await activities.getWorkItem({ workItemId: work.id });
-      if (currentWork?.status === "accepted") {
-        reviewedWorkItems.delete(work.id);
-        return;
+      if (currentWork && currentWork.status !== "running") return;
+      // 需要作者确认的 foundation 阶段：优先处理作者批准唤醒（reviewSubmitted 信号
+      // 不区分来源，plan.approve / review.submit / work.* 都走同一信号通道）。
+      if (work.taskKey && requiresFoundationAuthorConfirmation(work.taskKey) && work.parameters.bootstrap === true) {
+        const artifactId = currentWork?.artifactRefs.at(-1) ?? work.artifactRefs.at(-1);
+        if (artifactId) {
+          // 作者确认 + 独立 passed review 均满足 → 接受（等价 gate.passed 分支的作者确认）。
+          if (await activities.foundationAuthorApproved({ runId, taskKey: work.taskKey, artifactId })) {
+            await activities.acceptWork({ runId, workItemId: work.id });
+            return;
+          }
+          // 作者已批准但独立审核未通过（plan.approve 与 review 顺序不敏感）：
+          // 不自动 revise 覆盖作者认可的 artifact，继续等待独立 passed review / 作者命令。
+          if (await activities.planSectionApproved({ runId, taskKey: work.taskKey, artifactId })) {
+            continue;
+          }
+        }
       }
       // 收到 review → 重新检查 gate
       const recheckedGate = await activities.checkGate({ runId, workItemId: work.id });
       if (recheckedGate.passed) {
         await activities.acceptWork({ runId, workItemId: work.id });
       } else {
-        // review 后仍未通过 → revise（若未达重试上限）
+        // review 后仍未通过 → revise（若未达重试上限），携带规划审核意见回流重新生成
         const current = retryCount.get(work.id) ?? 0;
         if (current < maxRetries) {
-          await activities.reviseWork({ runId, workItemId: work.id });
+          await activities.reviseWork({ runId, workItemId: work.id, instruction: await revisionOpinion() });
           retryCount.set(work.id, current + 1);
         }
       }
-      reviewedWorkItems.delete(work.id);
+      return;
     }
     return;
   }
 
-  // auto gate：自动 revise（若未达重试上限）
+  // auto gate：自动 revise（若未达重试上限），携带规划审核意见回流重新生成
   const current = retryCount.get(work.id) ?? 0;
   if (current < maxRetries) {
-    await activities.reviseWork({ runId, workItemId: work.id });
+    await activities.reviseWork({ runId, workItemId: work.id, instruction: await revisionOpinion() });
     retryCount.set(work.id, current + 1);
     return;
   }

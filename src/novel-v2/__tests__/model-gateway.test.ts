@@ -147,6 +147,38 @@ describe("RoutedModelGateway structured candidate fallback", () => {
       vi.unstubAllGlobals();
     }
   });
+
+  it("repairs task-contract violations on the same candidate when extraValidate fails then passes", async () => {
+    const config = {
+      version: 1 as const,
+      profiles: [
+        { id: "only", label: "only", protocol: "responses" as const, baseUrl: "https://only.test/v1", model: "only", responseMode: "json" as const, capabilities: ["text", "structured", "stream", "responses-continuation", "embedding", "rerank"], enabled: true },
+      ],
+      routes: { "*": { conversationPolicy: "stateless" as const, candidates: [{ executor: "api" as const, profileId: "only" }] } },
+    } as unknown as ModelRoutingConfig;
+    const store = new ModelConfigStore(".tmp-model-config-do-not-read.yaml", config);
+    let call = 0;
+    const fetchMock = vi.fn(async () => {
+      call += 1;
+      const output = call === 1 ? { name: "", score: 4 } : { name: "fixed", score: 4 };
+      return new Response(JSON.stringify({ output_text: JSON.stringify(output) }), { status: 200, headers: { "content-type": "application/json" } });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const result = await new RoutedModelGateway(store).generateStructured<Passthrough>({
+        purpose: "facts.extract",
+        prompt: "p",
+        schema: passthroughSchema as unknown as Record<string, unknown>,
+        schemaName: "passthrough",
+        maxRepairAttempts: 2,
+        extraValidate: (value) => (value.name.length > 0 ? [] : ["name 不能为空"]),
+      });
+      expect(result.value).toEqual({ name: "fixed", score: 4 });
+      expect(call).toBe(2);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
 });
 
 describe("structured response normalization", () => {

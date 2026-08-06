@@ -56,7 +56,7 @@
 
 本次项目运行 `novel-create-wanfa-20260801` 的架构审计结果：6 卷、估计 670 章、6 名核心人物、3 条长线，`passed=true` 且结构问题为空。四个被补强的 Foundation section 已完成独立审核和作者确认；原有 6 个 final 章节未被该修复重写。迁移后的正式 rebase、Story Arc 审核与作者确认均已完成：当前 blueprint 为 `85957d3f-20c1-473e-bddb-a892d33767d5`，review artifact 为 `9855c6e0-e316-4bcc-a4b3-4ab2f96921f1`，弧级审核 `passed` 且无 blocking issue，当前弧为 `approved/active`。
 
-弧级审核证据账本区分历史规划与当前架构：`frozenEvidence` 只说明历史批准蓝图的冻结边界，`candidateClaims` 由当前候选蓝图确定性投影，二者不是同一份正文快照；定稿事实以 `chapterMemory`、`authoritativeFacts` 和正文 revision 为权威。这样可以修正陈旧的章节规划而不把规划修正误报为正文修订，也不让模型回显动态路径的遗漏伪装成完整审核。
+弧级审核契约（2026-08-06 更新）：规划级审核（Foundation 与 Story Arc）改为文本意见契约——通过时只输出单行 `PASSED`，不通过时输出可执行审核意见，verdict 只保留 `passed`/`revise`；意见作为重新生成的 instruction 回流（Foundation 经 `reviseWork`，Story Arc 经修订 prompt）。原结构化证据账本（逐章四维度校验、authorityChecks、`certaintyUpgrades`、`frozenEvidence`/`candidateClaims` 归一化）随契约移除，审核完整性由审核 prompt 的逐章检查清单承载。历史 review artifact 只读保留，不被新运行消费。
 
 ### 2.2 Story Arc
 

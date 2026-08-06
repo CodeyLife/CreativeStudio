@@ -1,5 +1,6 @@
 import Ajv from "ajv";
 import { foundationSchema, type FoundationOutput } from "../prompts/schemas";
+import { parseStructuredJson } from "../structured-json";
 
 export const FOUNDATION_TASK_CONTRACTS: Record<string, {
   dataRoot: string;
@@ -9,22 +10,22 @@ export const FOUNDATION_TASK_CONTRACTS: Record<string, {
   "project-positioning": {
     dataRoot: "positioning",
     requiredPaths: [
-      "positioning.bookTitle",
-      "positioning.sellingPoints",
-      "positioning.targetReader",
-      "positioning.coreConflict",
-      "positioning.activePressureSource",
-      "positioning.corePromise",
-      "positioning.protagonistNeed",
-      "positioning.centralOpposition",
-      "positioning.emotionalContract",
-      "positioning.themeQuestion",
+      "bookTitle",
+      "sellingPoints",
+      "targetReader",
+      "coreConflict",
+      "activePressureSource",
+      "corePromise",
+      "protagonistNeed",
+      "centralOpposition",
+      "emotionalContract",
+      "themeQuestion",
     ],
     qualityFocus: ["读者承诺与目标读者", "主角核心矛盾与中央对抗", "情感契约", "主题问题或明确待确认边界"],
   },
   architecture: {
     dataRoot: "architecture",
-    requiredPaths: ["architecture.structure", "architecture.volumes", "architecture.povStrategy", "architecture.timeSpan"],
+    requiredPaths: ["structure", "volumes", "povStrategy", "timeSpan"],
     qualityFocus: ["长程层级", "卷级职责", "视角一致性", "节奏与信息释放边界"],
   },
   characters: {
@@ -34,7 +35,7 @@ export const FOUNDATION_TASK_CONTRACTS: Record<string, {
   },
   worldview: {
     dataRoot: "worldview",
-    requiredPaths: ["worldview.geography", "worldview.politics", "worldview.factions", "worldview.rules"],
+    requiredPaths: ["geography", "politics", "factions", "rules"],
     qualityFocus: ["规则与代价", "社会纹理", "世界独立运行", "不可违背事实"],
   },
   relations: {
@@ -44,7 +45,7 @@ export const FOUNDATION_TASK_CONTRACTS: Record<string, {
   },
   "plot-threads": {
     dataRoot: "plotThreads",
-    requiredPaths: ["plotThreads.main", "plotThreads.subplots"],
+    requiredPaths: ["main", "subplots"],
     qualityFocus: ["主线因果", "支线独立价值", "人物与剧情线交叉", "情感线适用性"],
   },
   foreshadowing: {
@@ -54,23 +55,23 @@ export const FOUNDATION_TASK_CONTRACTS: Record<string, {
   },
   timeline: {
     dataRoot: "timeline",
-    requiredPaths: ["timeline.storyEvents"],
+    requiredPaths: ["storyEvents"],
     qualityFocus: ["故事时间与叙事顺序", "硬约束", "事件因果", "时间密度变化"],
   },
   "story-control": {
     dataRoot: "storyControl",
-    requiredPaths: ["storyControl.paceCurve", "storyControl.payoffDistribution"],
+    requiredPaths: ["paceCurve", "payoffDistribution"],
     qualityFocus: ["信息释放", "高潮与缓冲", "读者回报类型", "避免固定节拍"],
   },
   "plot-design": {
     dataRoot: "plotStrategy",
     requiredPaths: [
-      "plotStrategy.narrativePromises",
-      "plotStrategy.characterDestinations",
-      "plotStrategy.longHorizonThreads",
-      "plotStrategy.informationBoundaries",
-      "plotStrategy.endingEnvelope",
-      "plotStrategy.nonNegotiables",
+      "narrativePromises",
+      "characterDestinations",
+      "longHorizonThreads",
+      "informationBoundaries",
+      "endingEnvelope",
+      "nonNegotiables",
     ],
     qualityFocus: ["长期承诺", "人物终点区间", "终局边界", "适应性修订触发器"],
   },
@@ -79,8 +80,7 @@ export const FOUNDATION_TASK_CONTRACTS: Record<string, {
 export function foundationRequiredFields(taskKey: string): string[] {
   const contract = FOUNDATION_TASK_CONTRACTS[taskKey];
   if (!contract) return [];
-  const prefix = `${contract.dataRoot}.`;
-  return contract.requiredPaths.map((path) => path.startsWith(prefix) ? path.slice(prefix.length) : path);
+  return contract.requiredPaths;
 }
 
 type JsonSchema = Record<string, unknown>;
@@ -234,41 +234,73 @@ const foundationDataSchemas: Record<string, JsonSchema> = {
  * Keep the provider-facing envelope compact. Task-specific data schemas are
  * applied after JSON decoding by validateFoundationTaskContract, because
  * native provider schemas do not share one safe vocabulary for nested data.
+ *
+ * structuredData 根形态（平铺契约）：对象型 task（positioning/architecture/
+ * worldview/plotStrategy/plotThreads/timeline/storyControl）的根直接是 task 数据，
+ * 不再包一层与 task 同名的容器键；数组型 task（characters/relations/
+ * foreshadowings）的数据本质是数组，但 structuredData 根必须是对象，因此保留
+ * `{ [collectionKey]: [...] }` 集合容器（provider 与解析层都要求根为对象）。
  */
 export function foundationSchemaForTask(taskKey: string): JsonSchema {
   const contract = FOUNDATION_TASK_CONTRACTS[taskKey];
   if (!contract) return foundationSchema as unknown as JsonSchema;
+  const arrayRooted = foundationDataSchemaForTask(taskKey)?.type === "array";
   return {
     ...foundationSchema,
-    description: `Foundation ${taskKey} native output; structuredData is JSON text rooted at ${contract.dataRoot}`,
+    description: `Foundation ${taskKey} native output; structuredData is JSON text rooted at the task data${arrayRooted ? ` (wrapped in ${contract.dataRoot} collection)` : ""}`,
     properties: {
       ...foundationSchema.properties,
       structuredData: {
         ...(foundationSchema.properties?.structuredData as JsonSchema),
-        description: `JSON text whose root object contains ${contract.dataRoot}`,
+        description: arrayRooted
+          ? `JSON text whose root object contains the ${contract.dataRoot} array`
+          : `JSON text whose root object is the ${taskKey} task data (do not wrap it in an extra ${contract.dataRoot} key)`,
       },
     },
   };
 }
 
-/** Decode the compact native boundary without changing the persisted contract. */
-export function normalizeFoundationModelOutput(value: unknown): FoundationOutput {
+/**
+ * 把 provider 返回的 structuredData 根统一为平铺形态（对象型 task）。
+ *
+ * 契约演进：旧契约要求根包一层与 task 同名的容器键（如 {architecture: {...}}）；
+ * 部分 provider（如 GLM-5.2 经第三方中转站）在 strict json_schema 未被严格执行时
+ * 会省略该容器键，把 task 字段直接平铺在根上（如 {structure, volumes, ...}）。
+ * 新契约以平铺为规范：对象型 task 的根直接承载 task 数据；本函数同时接受
+ * 平铺与历史容器两种输入，统一输出平铺，保证校验与落库拿到一致形态。
+ *
+ * 判定基于纯结构特征（dataRoot 键），跨 provider/题材通用：
+ * - 数组型 task（dataRoot 承载集合）：根必须 object，集合容器是技术必需，保持原样
+ * - 对象型 task 根含 dataRoot 键（历史容器/模型遵守旧契约）→ 解包返回 root[dataRoot]
+ * - 对象型 task 根不含 dataRoot 键 → 已平铺，直接返回
+ * - 内容确实缺失时解包后仍是空对象，由契约校验如实报告，不掩盖内容问题
+ */
+export function normalizeFoundationStructuredDataFlat(root: Record<string, unknown>, taskKey: string): Record<string, unknown> {
+  const contract = FOUNDATION_TASK_CONTRACTS[taskKey];
+  if (!contract) return root;
+  if (foundationDataSchemaForTask(taskKey)?.type === "array") return root;
+  const container = root[contract.dataRoot];
+  if (container && typeof container === "object" && !Array.isArray(container)) {
+    return container as Record<string, unknown>;
+  }
+  return root;
+}
+
+/** Decode the compact native boundary; object-rooted tasks are flattened to the task data. */
+export function normalizeFoundationModelOutput(value: unknown, taskKey?: string): FoundationOutput {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Foundation 输出必须是对象");
   const source = value as Record<string, unknown>;
   const structuredData = typeof source.structuredData === "string"
     ? (() => {
-      try {
-        const parsed = JSON.parse(source.structuredData);
-        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("structuredData JSON 根必须是对象");
-        return parsed as Record<string, unknown>;
-      } catch (error) {
-        throw new Error(`Foundation structuredData JSON 无法解析：${error instanceof Error ? error.message : String(error)}`);
-      }
+      const parsed = parseStructuredJson(source.structuredData);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("structuredData JSON 根必须是对象");
+      return parsed as Record<string, unknown>;
     })()
     : source.structuredData && typeof source.structuredData === "object" && !Array.isArray(source.structuredData)
       ? source.structuredData as Record<string, unknown>
       : undefined;
   if (!structuredData) throw new Error("Foundation structuredData 缺失");
+  const containerData = taskKey ? normalizeFoundationStructuredDataFlat(structuredData, taskKey) : structuredData;
   return {
     title: typeof source.title === "string" ? source.title : "",
     summary: typeof source.summary === "string" ? source.summary : "",
@@ -283,7 +315,7 @@ export function normalizeFoundationModelOutput(value: unknown): FoundationOutput
         }) : [],
       };
     }) : [],
-    structuredData,
+    structuredData: containerData,
   };
 }
 
@@ -341,9 +373,7 @@ function validateRepeatedEntries(taskKey: string, structuredData: Record<string,
 }
 
 function validateWorldviewRules(structuredData: Record<string, unknown>, errors: string[]): void {
-  const worldview = structuredData.worldview;
-  if (!worldview || typeof worldview !== "object" || Array.isArray(worldview)) return;
-  const rules = (worldview as Record<string, unknown>).rules;
+  const rules = structuredData.rules;
   if (!Array.isArray(rules)) return;
   for (const [index, rule] of rules.entries()) {
     if (!rule || typeof rule !== "object" || Array.isArray(rule)) {
@@ -358,9 +388,7 @@ function validateWorldviewRules(structuredData: Record<string, unknown>, errors:
 }
 
 function validateArchitectureVolumes(structuredData: Record<string, unknown>, errors: string[]): void {
-  const architecture = structuredData.architecture;
-  if (!architecture || typeof architecture !== "object" || Array.isArray(architecture)) return;
-  const volumes = (architecture as Record<string, unknown>).volumes;
+  const volumes = structuredData.volumes;
   if (!Array.isArray(volumes)) return;
   for (const [index, volume] of volumes.entries()) {
     if (!volume || typeof volume !== "object" || Array.isArray(volume)) {
@@ -375,22 +403,27 @@ function validateArchitectureVolumes(structuredData: Record<string, unknown>, er
   }
 }
 
+/** Resolve the task data schema by taskKey or its dataRoot container key. */
+function foundationDataSchemaForTask(taskKey: string): JsonSchema | undefined {
+  const contract = FOUNDATION_TASK_CONTRACTS[taskKey];
+  return foundationDataSchemas[taskKey] ?? (contract ? foundationDataSchemas[contract.dataRoot] : undefined);
+}
+
 /** Validate semantic fields that generic foundationSchema cannot express. */
 export function validateFoundationTaskContract(value: FoundationOutput, taskKey: string): string[] {
   const contract = FOUNDATION_TASK_CONTRACTS[taskKey];
   if (!contract) return [];
   const errors: string[] = [];
-  const structuredData = value.structuredData ?? {};
-  const taskDataSchema = foundationDataSchemas[taskKey];
+  const structuredData = normalizeFoundationStructuredDataFlat(value.structuredData ?? {}, taskKey);
+  const taskDataSchema = foundationDataSchemaForTask(taskKey);
   if (taskDataSchema) {
-    const validate = new Ajv({ allErrors: true, strict: false }).compile({
-      type: "object",
-      additionalProperties: true,
-      required: [contract.dataRoot],
-      properties: { [contract.dataRoot]: taskDataSchema },
-    });
+    const arrayRooted = taskDataSchema.type === "array";
+    const validate = new Ajv({ allErrors: true, strict: false }).compile(arrayRooted
+      ? { type: "object", additionalProperties: true, required: [contract.dataRoot], properties: { [contract.dataRoot]: taskDataSchema } }
+      : taskDataSchema);
     for (const issue of validate.errors ?? []) {
-      const missingRoot = issue.keyword === "required"
+      const missingRoot = arrayRooted
+        && issue.keyword === "required"
         && issue.instancePath === ""
         && (issue.params as { missingProperty?: string }).missingProperty === contract.dataRoot;
       if (missingRoot) continue;
@@ -402,8 +435,8 @@ export function validateFoundationTaskContract(value: FoundationOutput, taskKey:
     if (!meaningful(valueAt(structuredData, path))) errors.push(`${path} 不能为空`);
   }
   if (taskKey === "project-positioning") {
-    validateNotApplicableAnnotation(valueAt(structuredData, "positioning.themeQuestion"), "positioning.themeQuestion", errors);
-    validateNotApplicableAnnotation(valueAt(structuredData, "positioning.emotionalContract"), "positioning.emotionalContract", errors);
+    validateNotApplicableAnnotation(valueAt(structuredData, "themeQuestion"), "themeQuestion", errors);
+    validateNotApplicableAnnotation(valueAt(structuredData, "emotionalContract"), "emotionalContract", errors);
   }
   validateRepeatedEntries(taskKey, structuredData, errors);
   if (taskKey === "worldview") validateWorldviewRules(structuredData, errors);

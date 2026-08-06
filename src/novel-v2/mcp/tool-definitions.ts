@@ -259,7 +259,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
 
   {
     name: "novel_action_execute",
-    description: "执行 CreativeRun action（work.start/accept/revise/retry/recover/review.request/review.submit/run.pause/resume/cancel/work.enqueue）。review.request 只返回只读审核预览；必须显式 review.submit 才会落库并参与门禁。",
+    description: "执行 CreativeRun action（work.start/accept/revise/retry/recover/review.request/review.submit/plan.approve/run.pause/resume/cancel/work.enqueue）。plan.approve=作者确认：批准当前 work item 的 foundation 产物为规划阶段定稿（approveProjectPlanSection，actor=author），approve 后发信号唤醒 workflow 完成 accept。review.request 只返回只读审核预览；必须显式 review.submit 才会落库并参与门禁。",
     inputSchema: {
       type: "object",
       properties: {
@@ -274,6 +274,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
             "work.recover",
             "review.request",
             "review.submit",
+            "plan.approve",
             "run.pause",
             "run.resume",
             "run.cancel",
@@ -584,6 +585,16 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
           type: "string",
           enum: ["automatic", "user-driven"],
           description: "可选,work item 推进方式。automatic=依赖就绪即自动推进(默认);user-driven=需显式请求才推进(配合 manual gate 做精细控制)",
+        },
+        focusedTaskKeys: {
+          type: "array",
+          items: { type: "string", enum: ["project-positioning", "architecture", "characters", "worldview", "plot-design"] },
+          description: "可选,聚焦重生成：只重新生成这些阶段，其余已 approved 阶段作为 prior context 读取、不重新生成。缺省时重跑全部 5 阶段。",
+        },
+        revisionInstructions: {
+          type: "object",
+          additionalProperties: { type: "string", minLength: 1 },
+          description: "可选,每阶段重生成意见：key 为 taskKey，value 为注入该阶段重新生成 prompt 的修订指令/审核意见（作者指令，优先级最高）。",
         },
         idempotencyKey: { type: "string", minLength: 1 },
       },

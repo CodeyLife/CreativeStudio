@@ -7,7 +7,7 @@
 - 上下文层：正文阶段获得上下文（全局规划投影、长记忆、冻结事实、剧情设计、角色关系）
 - 指引层：规划/剧情/正文/审核四阶段各有可执行指引，沉淀为 skill 执行点投影，以 novel-writing 技能为指导；学习闭环（learning → candidate → promote）是 skill 内容的增长通道。
 - 优化共识：任何优化先回答"增强哪一层、对哪些输入生效、边界在哪"，再回到基线检验，避免个案偏好固化为硬门。
-- 外部编排模式：外部大模型（或用户）作为任务编排、审核、推进、编辑与迭代优化者，通过 MCP 工具参与全流程（参考 `.agents/skills/novel-mcp-orchestration` 与 `docs/novel-v2/mcp-orchestrator.md`）。外部模型只给方向与意见（instruction / issue / plotOutline / review verdict），系统在正式工作流内完善与执行，不提供绕过质量门的直接改正文工具；故事弧外部编排（plotOutline）权威低于已定稿事实与作者边界，冲突时以事实为准。
+- 外部编排模式：外部大模型（或用户）作为任务编排、审核、推进、编辑与迭代优化者，通过 MCP 工具参与全流程（参考 `.agents/skills/novel-mcp-orchestration` 与 `docs/novel-v2/mcp-orchestrator.md`）。外部模型只给方向与意见（instruction / issue / plotOutline / review verdict），系统在正式工作流内完善与执行，不提供绕过质量门的直接改正文工具；故事弧外部编排（plotOutline）权威低于已定稿事实与作者边界，冲突时以事实为准。规划级审核（Foundation 与 Story Arc）采用文本意见契约：通过时只输出单行 `PASSED`，不通过时输出可执行审核意见（verdict 只保留 passed/revise），意见作为重新生成的 instruction 回流；该契约对 provider 的 strict json_schema 支持零依赖，解析基于结构特征（`src/novel-v2/text-review.ts`）。
 
 ## 根因分析与迭代改进
 

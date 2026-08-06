@@ -10,12 +10,12 @@ import type { Artifact, ExecutionBlueprint, MemoryBundle } from "../protocol";
 describe("workflow contract hardening", () => {
   it("derives plot-design prompt and schema requirements from the complete Foundation contract", () => {
     expect(FOUNDATION_TASK_CONTRACTS["plot-design"].requiredPaths).toEqual([
-      "plotStrategy.narrativePromises",
-      "plotStrategy.characterDestinations",
-      "plotStrategy.longHorizonThreads",
-      "plotStrategy.informationBoundaries",
-      "plotStrategy.endingEnvelope",
-      "plotStrategy.nonNegotiables",
+      "narrativePromises",
+      "characterDestinations",
+      "longHorizonThreads",
+      "informationBoundaries",
+      "endingEnvelope",
+      "nonNegotiables",
     ]);
     expect(foundationRequiredFields("plot-design")).toEqual([
       "narrativePromises",
@@ -34,7 +34,7 @@ describe("workflow contract hardening", () => {
       title: "长期规划",
       summary: "这是一段足够长的规划摘要，用于说明长期承诺、人物方向、信息边界、终局条件和后续适应性修订原则。",
       sections: [],
-      structuredData: { plotStrategy: { narrativePromises: ["回应核心问题"], characterDestinations: [{}], endingEnvelope: {}, nonNegotiables: ["保留代价"] } },
+      structuredData: { narrativePromises: ["回应核心问题"], characterDestinations: [{}], endingEnvelope: {}, nonNegotiables: ["保留代价"] },
     };
     expect(validate(envelope)).toBe(false);
   });

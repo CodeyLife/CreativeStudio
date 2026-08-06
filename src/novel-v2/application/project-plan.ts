@@ -1,4 +1,5 @@
 import type { Artifact } from "../protocol";
+import { normalizeFoundationStructuredDataFlat } from "./foundation-contract";
 
 export type ProjectPlanStatus =
   | "locked"
@@ -103,13 +104,15 @@ export function foundationTaskKey(artifact: Artifact): ProjectPlanTaskKey | unde
 /**
  * 从已通过人工/运行时审批的项目定位中读取正式中文书名。
  * 书名必须由 positioning 明确产出，不从摘要、题材或项目 ID 猜测。
+ *
+ * 兼容平铺契约与历史容器：新契约 structuredData 根直接是 positioning 数据；
+ * 历史容器形态是 { positioning: {...} }。用统一解包函数归一后再读取。
  */
 export function approvedProjectBookTitle(payload: Record<string, unknown>): string | undefined {
   const structuredData = payload.structuredData;
   if (!structuredData || typeof structuredData !== "object" || Array.isArray(structuredData)) return undefined;
-  const positioning = (structuredData as Record<string, unknown>).positioning;
-  if (!positioning || typeof positioning !== "object" || Array.isArray(positioning)) return undefined;
-  const raw = (positioning as Record<string, unknown>).bookTitle;
+  const positioning = normalizeFoundationStructuredDataFlat(structuredData as Record<string, unknown>, "project-positioning");
+  const raw = positioning.bookTitle;
   if (typeof raw !== "string") return undefined;
   const title = raw.trim().replace(/^《|》$/gu, "").trim();
   if (!title || title.length > 40 || !/\p{Script=Han}/u.test(title)) return undefined;

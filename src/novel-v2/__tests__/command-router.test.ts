@@ -298,4 +298,104 @@ describe("defaultReviewer integration", () => {
     expect(after.rows[0].count).toBe(before.rows[0].count);
     expect(work.rows[0].status).toBe("running");
   });
+
+  it("plan.approve: 作者确认 foundation 产物，section 置为 approved 且下游依赖解锁", async () => {
+    if (!postgresAvailable) return;
+
+    const projectId = `test-dr-approve-${randomUUID().slice(0, 8)}`;
+    await repository.ensureProject(projectId, "Plan Approve Test");
+
+    // foundation artifact + work item（bootstrap=true，taskKey=project-positioning）
+    const artifactId = `test-dr-approve-art-${randomUUID().slice(0, 8)}`;
+    await repository.pool.query(
+      `INSERT INTO artifacts(id, project_id, task_id, attempt_id, kind, content_hash, base_revision, fingerprint, payload)
+       VALUES($1, $2, $3, 'test', 'foundation', 'hash', 0, 'fp', $4)`,
+      [artifactId, projectId, `${artifactId}:foundation`, JSON.stringify({ structuredData: { taskKey: "project-positioning" } })],
+    );
+    const runId = `test-dr-approve-run-${randomUUID().slice(0, 8)}`;
+    const workItemId = `test-dr-approve-work-${randomUUID().slice(0, 8)}`;
+    await repository.pool.query(
+      `INSERT INTO creative_runs(id, project_id, mode, status, policy)
+       VALUES($1, $2, 'chapter', 'running', '{"reviewGate":"manual"}'::jsonb)`,
+      [runId, projectId],
+    );
+    await repository.pool.query(
+      `INSERT INTO creative_work_items(id, run_id, project_id, kind, task_key, status, instruction, parameters, artifact_refs)
+       VALUES($1, $2, $3, 'generation', 'project-positioning', 'running', 'test', '{"bootstrap":true}'::jsonb, ARRAY[$4])`,
+      [workItemId, runId, projectId, artifactId],
+    );
+    // project_plan_sections 初始记录（status=awaiting-confirmation）
+    await repository.pool.query(
+      `INSERT INTO project_plan_sections(project_id, task_key, work_item_id, source_artifact_id, status, payload, edit_revision)
+       VALUES($1, 'project-positioning', $2, $3, 'awaiting-confirmation', '{}'::jsonb, 0)`,
+      [projectId, workItemId, artifactId],
+    );
+
+    const result = await executeCreativeCommand(repository, {
+      type: "plan.approve",
+      runId,
+      workItemId,
+      idempotencyKey: `approve-${randomUUID()}`,
+    });
+
+    expect(result.commandType).toBe("plan.approve");
+    expect(result.summary).toContain("已批准");
+    const section = await repository.pool.query<{ status: string }>(
+      "SELECT status FROM project_plan_sections WHERE project_id=$1 AND task_key='project-positioning'",
+      [projectId],
+    );
+    expect(section.rows[0].status).toBe("approved");
+  });
+
+  it("plan.approve 错误路径: 非 foundation taskKey 被拒绝", async () => {
+    if (!postgresAvailable) return;
+
+    const projectId = `test-dr-approve-err-${randomUUID().slice(0, 8)}`;
+    await repository.ensureProject(projectId, "Plan Approve Error Test");
+    const runId = `test-dr-approve-err-run-${randomUUID().slice(0, 8)}`;
+    const workItemId = `test-dr-approve-err-work-${randomUUID().slice(0, 8)}`;
+    await repository.pool.query(
+      `INSERT INTO creative_runs(id, project_id, mode, status, policy)
+       VALUES($1, $2, 'chapter', 'running', '{"reviewGate":"manual"}'::jsonb)`,
+      [runId, projectId],
+    );
+    await repository.pool.query(
+      `INSERT INTO creative_work_items(id, run_id, project_id, kind, task_key, status, instruction, parameters, artifact_refs)
+       VALUES($1, $2, $3, 'generation', 'chapter-draft', 'running', 'test', '{}'::jsonb, ARRAY[]::text[])`,
+      [workItemId, runId, projectId],
+    );
+
+    await expect(executeCreativeCommand(repository, {
+      type: "plan.approve",
+      runId,
+      workItemId,
+      idempotencyKey: `approve-err-${randomUUID()}`,
+    })).rejects.toThrow(/仅适用于 Foundation 规划阶段/);
+  });
+
+  it("plan.approve 拒绝退役的 chapter-plan taskKey（isProjectPlanTaskKey 会误放行）", async () => {
+    if (!postgresAvailable) return;
+
+    const projectId = `test-dr-approve-plan-${randomUUID().slice(0, 8)}`;
+    await repository.ensureProject(projectId, "Plan Approve Chapter-Plan Test");
+    const runId = `test-dr-approve-plan-run-${randomUUID().slice(0, 8)}`;
+    const workItemId = `test-dr-approve-plan-work-${randomUUID().slice(0, 8)}`;
+    await repository.pool.query(
+      `INSERT INTO creative_runs(id, project_id, mode, status, policy)
+       VALUES($1, $2, 'chapter', 'running', '{"reviewGate":"manual"}'::jsonb)`,
+      [runId, projectId],
+    );
+    await repository.pool.query(
+      `INSERT INTO creative_work_items(id, run_id, project_id, kind, task_key, status, instruction, parameters, artifact_refs)
+       VALUES($1, $2, $3, 'generation', 'chapter-plan', 'running', 'test', '{}'::jsonb, ARRAY[]::text[])`,
+      [workItemId, runId, projectId],
+    );
+
+    await expect(executeCreativeCommand(repository, {
+      type: "plan.approve",
+      runId,
+      workItemId,
+      idempotencyKey: `approve-plan-err-${randomUUID()}`,
+    })).rejects.toThrow(/仅适用于 Foundation 规划阶段/);
+  });
 });

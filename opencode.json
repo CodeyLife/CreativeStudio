@@ -4,7 +4,9 @@
     "novel-v2": {
       "type": "local",
       "command": ["node", "--import", "tsx", "scripts/novel-v2-mcp-server.mjs"],
-      "enabled": true
+      "enabled": true,
+      "cwd": ".",
+      "timeout": 30000
     }
   }
 }

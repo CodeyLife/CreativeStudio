@@ -245,18 +245,7 @@ export interface ChapterBlueprint {
   unresolvedAtClose?: string[];
 }
 
-export {
-  ARC_PLAN_CHECK_DIMENSIONS,
-  CHAPTER_PLAN_CHECK_DIMENSIONS,
-  compileChapterPlanValidationReport,
-} from "./story-arc-review-policy";
-export type {
-  ArcPlanCheckDimension,
-  ArcPlanValidationCheck,
-  ChapterPlanCheckDimension,
-  ChapterPlanValidationCheck,
-  ChapterPlanValidationReport,
-} from "./story-arc-review-policy";
+export { storyArcAuthorityPaths } from "./story-arc-review-policy";
 
 export interface StoryArcBundle {
   arc: NarrativeArcPlan;

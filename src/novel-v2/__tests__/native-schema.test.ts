@@ -7,8 +7,7 @@ import { runtimeLearningAssessmentSchema } from "../learning-assessment";
 import { assertNativeJsonSchema, NativeSchemaCompatibilityError } from "../native-schema";
 import { characterEnrichmentSchema, chapterMemorySchema, factExtractionSchema, reviewerSchema } from "../prompts/schemas";
 import { authorRevisionAlignmentSchema, targetedRevisionBatchSchema } from "../prompts/chapter-revision";
-import { foundationReviewSchema } from "../prompts/foundation-review";
-import { storyArcBundleSchema, storyArcChaptersOutputSchema, storyArcPlanBatchSchema, storyArcReviewSchema } from "../prompts/story-arc";
+import { storyArcBundleSchema, storyArcChaptersOutputSchema, storyArcPlanBatchSchema } from "../prompts/story-arc";
 import { schemaForSkills, skillIterationSchema } from "../evaluation/skill-iteration";
 
 describe("native structured schema compatibility", () => {
@@ -21,7 +20,6 @@ describe("native structured schema compatibility", () => {
       ["story-arc-plan-batch", storyArcPlanBatchSchema],
       ["story-arc-chapters", storyArcChaptersOutputSchema],
       ["story-arc-bundle", storyArcBundleSchema],
-      ["story-arc-review", storyArcReviewSchema],
       ["learning", runtimeLearningAssessmentSchema],
       ["skill-iteration", skillIterationSchema],
       ["skill-iteration-dynamic", schemaForSkills(["skill-a", "skill-b"])],
@@ -30,7 +28,6 @@ describe("native structured schema compatibility", () => {
       ["chapter-title", CHAPTER_TITLE_SCHEMA],
       ["author-revision-alignment", authorRevisionAlignmentSchema],
       ["targeted-revision-batch", targetedRevisionBatchSchema],
-      ["foundation-review", foundationReviewSchema],
       ["foundation-evaluation", foundationEvaluationSchema],
     ];
     for (const [name, schema] of schemas) expect(() => assertNativeJsonSchema(schema, name)).not.toThrow();

@@ -1,8 +1,8 @@
-import { CHAPTER_NARRATIVE_FUNCTIONS, MAX_CHAPTER_HINTS, MAX_EXPECTED_CHAPTER_COUNT, type StoryArcBundle, type StoryArcContextReceipt, type StoryArcPlotOutline, type StoryArcRebaseTarget } from "../application/story-arc";
-import { ARC_PLAN_CHECK_DIMENSIONS, CHAPTER_PLAN_CHECK_DIMENSIONS, storyArcAuthorityPaths, type StoryArcReviewOutput } from "../application/story-arc-review-policy";
+import { CHAPTER_NARRATIVE_FUNCTIONS, MAX_CHAPTER_HINTS, MAX_EXPECTED_CHAPTER_COUNT, storyArcAuthorityPaths, type StoryArcBundle, type StoryArcContextReceipt, type StoryArcPlotOutline, type StoryArcRebaseTarget } from "../application/story-arc";
+import type { StoryArcReviewOutput } from "../application/story-arc-review-policy";
+import { TEXT_REVIEW_PASSED_MARKER } from "../text-review";
 import type { NarrativeStateSnapshot } from "../protocol";
 
-export { validateStoryArcReview } from "../application/story-arc-review-policy";
 export type { StoryArcReviewOutput } from "../application/story-arc-review-policy";
 
 const sceneSchema = {
@@ -69,17 +69,6 @@ export const storyArcChaptersOutputSchema = {
 export const storyArcBundleSchema = {
   type: "object", additionalProperties: false, required: ["arc", "batch", "chapters"],
   properties: { arc: storyArcPlanSchema, batch: storyArcBatchSchema, chapters: storyArcChaptersSchema },
-} as const;
-
-export const storyArcReviewSchema = {
-  type: "object", additionalProperties: false, required: ["verdict", "summary", "issues", "chapterChecks", "arcChecks", "authorityChecks"],
-  properties: {
-    verdict: { enum: ["passed", "revise", "blocked"] }, summary: { type: "string" },
-    issues: { type: "array", items: { type: "object", additionalProperties: false, required: ["severity", "title", "evidence", "suggestion"], properties: { severity: { enum: ["blocker", "major", "warning"] }, title: { type: "string" }, evidence: { type: "string" }, suggestion: { type: "string" } } } },
-    chapterChecks: { type: "array", items: { type: "object", additionalProperties: false, required: ["chapterIndex", "dimension", "verdict", "evidence", "reason"], properties: { chapterIndex: { type: "integer" }, dimension: { enum: CHAPTER_PLAN_CHECK_DIMENSIONS }, verdict: { enum: ["passed", "revise", "blocked"] }, evidence: { type: "string" }, reason: { type: "string" } } } },
-    arcChecks: { type: "array", items: { type: "object", additionalProperties: false, required: ["dimension", "verdict", "evidence", "reason"], properties: { dimension: { enum: ARC_PLAN_CHECK_DIMENSIONS }, verdict: { enum: ["passed", "revise", "blocked"] }, evidence: { type: "string" }, reason: { type: "string" } } } },
-    authorityChecks: { type: "array", minItems: 1, items: { type: "object", additionalProperties: false, required: ["chapterIndex", "verdict", "unresolvedAtClose", "checkedPaths", "candidateClaims", "frozenEvidence", "certaintyUpgrades", "reason"], properties: { chapterIndex: { type: "integer" }, verdict: { enum: ["passed", "revise", "blocked"] }, unresolvedAtClose: { type: "array", items: { type: "string" } }, checkedPaths: { type: "array", minItems: 1, items: { type: "string" } }, candidateClaims: { type: "array", minItems: 1, items: { type: "string" } }, frozenEvidence: { type: "array", minItems: 1, items: { type: "string" } }, certaintyUpgrades: { type: "array", items: { type: "object", additionalProperties: false, required: ["candidateClaim", "frozenBoundary", "reason"], properties: { candidateClaim: { type: "string" }, frozenBoundary: { type: "string" }, reason: { type: "string" } } } }, reason: { type: "string" } } } },
-  },
 } as const;
 
 export type StoryArcPromptInput = {
@@ -282,35 +271,37 @@ export function buildStoryArcBatchPrompt(input: StoryArcPromptInput & { arc: Sto
 
 export function buildStoryArcReviewPrompt(bundle: StoryArcBundle, contextText: string, rebaseTarget?: StoryArcRebaseTarget): string {
   return [
-    "审核故事弧的结构可靠性，不替正文规定审美。先按整弧检查承诺、入口/退出状态、阶段边界、线索责任和终局空间，再逐章检查状态连续、场景因果、人物选择、世界规则压力、知识边界和章节功能。",
-    "审核输出必须使用规范枚举值，不使用同义词或自定义标签：verdict 只能是 passed、revise、blocked；issues.severity 只能是 blocker、major、warning；chapterChecks.dimension 只能是 state-continuity、causal-fit、function-fit、authority-boundary；arcChecks.dimension 只能是 arc-boundary、window-rhythm、longform-hierarchy；所有检查 verdict 只能是 passed、revise、blocked。unresolvedAtClose、checkedPaths、candidateClaims、frozenEvidence 必须始终是数组；certaintyUpgrades 的字段必须是 candidateClaim、frozenBoundary、reason。",
-    `结构审核必须完整覆盖而不是抽样概括：chapterChecks 对每个章节分别输出四个 dimension，各组合恰好一次（当前为 ${bundle.chapters.length}×${CHAPTER_PLAN_CHECK_DIMENSIONS.length} 条）；arcChecks 对三个 arc dimension 各输出一次；authorityChecks 对每个章节恰好输出一次。authorityChecks 是机器可执行证据账本：请提供每章的 verdict、reason、frozenEvidence 和 certaintyUpgrades；checkedPaths、candidateClaims、unresolvedAtClose 必须存在并按当前蓝图填写，应用层会从候选蓝图确定性归一化这三个覆盖字段，避免动态路径因回显遗漏而丢失。不能用“已检查”或 dimension 摘要代替 authorityChecks，也不能省略任何章节。数量不足或重复都属于审核输出不完整，不等于要求正文增加事件。`,
+    "审核故事弧的结构可靠性，不替正文规定审美。先按整弧检查承诺、入口/退出状态、阶段边界、线索责任和终局空间，再逐章检查状态连续、场景因果、人物选择、世界规则压力、知识边界和章节功能。逐章逐项检查，不要抽样概括：当前批次共 " + bundle.chapters.length + " 章，每章都要覆盖状态连续、场景因果、章节功能与权威边界。",
     "把‘没有事件’与‘没有变化’区分开：安静章节可以通过关系温度、理解、信息分布、资源条件、心理方向或余波完成自身功能；只有在当前功能需要而正文/蓝图没有承载时才报告问题。",
     "检查节奏时看目标、阻力、期待、揭示、结果和余波的波形，以及重复冲突/反转造成的疲劳，不用固定章数、钩子密度、爽点数量或持续升级作为硬标准。同时按弧设计契约检查（契约是检查方向，不是必须全部成立的硬门）：development 各阶段是否呈承接的子问题链而非并列步骤，场景 outcome 是否成为下一场景 situation 的触发条件或承担独立体验/理解修正功能，安静章是否让读者获得可感知的新东西（关系温度/风险判断/物品易主/理解修正/情绪确认/余波承载），推进型弧的退出状态相对入口是否有身份、资源、知识、关系或威胁级别中的可感知变化。安静、关系、背景、铺垫和余波弧与行动弧同样合法，只要其功能有可感知证据；只有契约缺失且确实损害了本弧承诺功能的证据时才报告 major。",
     "以目标读者视角检查本弧的读者回报：entryState/objective 承诺了什么体验（解决问题、关系升温、世界揭秘、认知落差、情绪确认），exitState 与 development 是否真的交付了这种体验；若弧结束时读者只经历了过程而没有获得解决、成长、理解、情绪或新问题中的任何回报，报告为节奏问题。安静弧的回报可以是理解修正或关系温度，不要求每弧交付事件性高潮。",
-    "故事弧按批次滚动审核：当 batch.complete=false 或当前章节窗口少于 arc.expectedChapterCount 时，未到达 arc.exitState、后续阶段尚未交汇或长线尚未收束是预期的未决状态，不能仅因未来证据尚未出现而报告 blocker。arcChecks 应检查当前窗口是否与整弧边界、阶段责任和后续空间相容；只有当前窗口改写边界、提前消费答案、破坏责任传递或声称已完成却没有证据时才报告问题。",
-    "certaintyUpgrades 只记录证据不足却越过冻结边界的确定性升级，不记录当前章节由 stateTransition、observableActions 或 outcome 直接承载的正常状态推进，也不记录有明确范围和现场证据支持的局部结论。若候选主张被当前章节事实直接支持且没有扩大到人物未知、组织全貌、规则普遍性或未来答案，certaintyUpgrades 必须为空；只有无法由冻结证据和当前可观察材料蕴含的越界主张才填写 candidateClaim、frozenBoundary、reason，并将对应 authority verdict 标为 revise 或 blocked。",
-    "对未知物质、装置、痕迹或局部反应执行同一证据边界：湿度、颜色、气味、声音、光亮或接触变化只能支持当下可观察现象，不能单凭一次反应推出用途、成分、机制、追踪/筛选/警示功能或排除某种用途。若蓝图把局部现象写成角色尚未获得的功能结论，必须列为 authority revise，并在修订中保留未知状态。",
+    "故事弧按批次滚动审核：当 batch.complete=false 或当前章节窗口少于 arc.expectedChapterCount 时，未到达 arc.exitState、后续阶段尚未交汇或长线尚未收束是预期的未决状态，不能仅因未来证据尚未出现而报告问题。只有当前窗口改写边界、提前消费答案、破坏责任传递或声称已完成却没有证据时才报告。",
+    "对未知物质、装置、痕迹或局部反应执行同一证据边界：湿度、颜色、气味、声音、光亮或接触变化只能支持当下可观察现象，不能单凭一次反应推出用途、成分、机制、追踪/筛选/警示功能或排除某种用途。若蓝图把局部现象写成角色尚未获得的功能结论，必须列为问题并要求修订保留未知状态。",
     "逆向检查相邻章节的状态：任何跨章节持续的物件、伤势、资源、关系、知识或限制，都必须在前章结束、后章开始和中间转化之间保持同一身份；若后章出现‘没有/重新获得/已经知道’等状态跳变，却没有丢失、转移、消耗、恢复或新证据，按连续性重大问题报告。此规则只约束可验证的状态转化，不要求为每个普通名词建立清单。",
     "检查每个反转、回收和新答案是否有前置证据、行动代价和意义变化；检查每条重要线是否有交汇、退出、暂缓责任或转化原因，避免只在字段中挂名。",
+    "对每章按其权威路径逐一核对证据边界（路径清单见下），确认状态转化、场景处境/行动/结果和未解事项是否由蓝图字段直接承载；只有蓝图断言超出其字段可蕴含的范围时才报告越界。",
     contextText,
     `故事弧蓝图：${JSON.stringify(bundle)}`,
-    `权威路径示例：${bundle.chapters.map((chapter) => storyArcAuthorityPaths(chapter).join("、")).join("；")}`,
+    `权威路径清单：${bundle.chapters.map((chapter) => `第${chapter.index}章：${storyArcAuthorityPaths(chapter).join("、")}`).join("；")}`,
     rebaseTarget ? `重基线：${JSON.stringify(rebaseTarget)}` : "",
     rebaseTarget ? "重基线目标中的历史章节可能保留旧版可选场景字段（例如空的 situation 或 observableActions）；这些字段属于冻结兼容数据，不要把它们当作新的正文缺陷或要求虚构补写。对历史章节以 chapterMemory 和 authoritativeFacts 检查状态与事实边界；只有候选蓝图真正新增且没有证据支持的确定性，才报告为问题。" : "",
-    "每个问题必须引用实际蓝图字段、章节或场景证据，说明是事实/权威边界、因果承载、章节功能还是审美偏好；只输出 schema JSON。",
+    "每个问题必须引用实际蓝图字段、章节或场景证据，说明是事实/权威边界、因果承载、章节功能还是审美偏好；按严重度排序，并给出最小修复方向。不要输出 JSON、Markdown 代码块或 Schema。",
+    "跨阶段职责判定：你只对本故事弧可决定的范围负责（入口/退出状态、本弧章节、线索的本弧责任）。凡属于下游规划阶段才落地的细节——后续批次章节的未决状态、全书级长线在更晚窗口的收束、由其他弧承担的责任——只要本弧已登记为预期的未决状态或责任传递，即视为已尽责，不得作为判 revise 的依据。",
+    "判定纪律（收敛）：规划级审核的默认倾向是放行。每条意见判为 major 前先自问：此项缺失是否会让本弧无法推进，或让读者在本弧承诺的体验上直接受损？能在后续批次或正文中兑现的改进建议属于非阻断项，不得触发 revise。修订循环要收敛：上一轮主要问题已处理、本轮仅剩新增的非阻断建议时，应判 PASSED。",
+    "意见回流卫生：你的意见会作为指令回流到修订阶段，因此只针对本弧可修复的问题给出最小修复方向；不输出 Markdown 列表、代码围栏或 JSON 结构；示例值使用中文直角引号『』或描述性语言，禁止使用中文全角引号（“”）包裹示例，防止模型在 JSON 输出中回显污染。",
+    `## 输出约定\n若故事弧蓝图通过审核，只输出一行：${TEXT_REVIEW_PASSED_MARKER}\n若存在问题，输出审核意见（不输出 PASSED 标记）：逐章列出问题与整弧问题，每个问题说明现象、涉及章节与蓝图字段、影响机制和最小修复方向。`,
   ].filter(Boolean).join("\n\n");
 }
 
 export function buildStoryArcRevisionPrompt(bundle: StoryArcBundle, review: StoryArcReviewOutput, contextText: string, rebaseTarget?: StoryArcRebaseTarget): string {
   return [
-    "依据审核证据修订故事弧。先修复承载问题的最低层级：状态和事实边界优先于章节安排，因果与人物选择优先于抽象主题标签，线索责任优先于增加事件。",
+    "依据审核意见修订故事弧。先修复承载问题的最低层级：状态和事实边界优先于章节安排，因果与人物选择优先于抽象主题标签，线索责任优先于增加事件。",
     "保留已经成立的人物选择、关系积累、有效证据、未解问题和下层创作空间；不得为了补结构而提前兑现承诺、替人物宣布感情结论、抹平合理未知或覆盖已冻结事实。",
     "不为满足抽象质量标签添加无依据的人物、事件、主题或固定节奏；若问题源于规划缺失，补充可验证的边界、选择、代价、窗口或退出条件，而不是补写正文摘要。",
     "场景的 situation、observableActions、opposition、decision、outcome、cost 只保留写作者可转化为现场的材料；技术模型、分析步骤和推演理由放入 planningRationale，并确保正文执行投影不会消费该字段。",
     contextText,
     `当前蓝图：${JSON.stringify(bundle)}`,
-    `审核结果：${JSON.stringify(review)}`,
+    `审核意见：${review.opinion}`,
     rebaseTarget ? `重基线：${JSON.stringify(rebaseTarget)}` : "",
     "只输出完整 schema JSON。",
   ].filter(Boolean).join("\n\n");
