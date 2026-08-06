@@ -16,10 +16,11 @@ export const TOOL_GROUPS: ToolGroup[] = [
   { key: "catalog", title: "Catalog / Receipt", tools: ["novel_catalog_get", "novel_receipt_get", "novel_rule_target_get"] },
   { key: "craft-rule", title: "Craft Rule 候选演进", tools: ["novel_rule_candidate_create", "novel_rule_candidate_get", "novel_rule_evidence_submit", "novel_rule_foundation_evaluate", "novel_rule_review_submit", "novel_rule_promote", "novel_rule_rollback"] },
   { key: "project", title: "项目生命周期", tools: ["novel_project_create", "novel_project_list", "novel_project_delete"] },
-  { key: "bootstrap", title: "规划与创作", tools: ["novel_bootstrap_run", "novel_story_arc_start", "novel_story_arc_get", "novel_story_arc_review", "novel_story_arc_batch_start", "novel_chapter_review", "novel_chapter_review_issue_add", "novel_chapter_generate"] },
+  { key: "bootstrap", title: "规划与创作", tools: ["novel_bootstrap_run", "novel_story_arc_start", "novel_story_arc_get", "novel_story_arc_review", "novel_story_arc_batch_start", "novel_story_arc_orchestrate", "novel_chapter_review", "novel_chapter_review_issue_add", "novel_chapter_generate"] },
   { key: "closed-loop", title: "评估闭环", tools: ["novel_closed_loop_run"] },
   { key: "workflow", title: "Workflow 查询", tools: ["novel_workflow_get", "novel_workflow_list"] },
   { key: "workflow-decision", title: "Workflow 决策", tools: ["novel_chapter_review_decision"] },
+  { key: "context", title: "上下文与产物查询", tools: ["novel_context_get", "novel_artifact_list"] },
 ];
 
 const SHORT_LABELS: Partial<Record<ToolName, string>> = {
@@ -51,10 +52,13 @@ const SHORT_LABELS: Partial<Record<ToolName, string>> = {
   novel_story_arc_get: "查询故事弧",
   novel_story_arc_review: "审核故事弧",
   novel_story_arc_batch_start: "规划故事弧下一批次",
+  novel_story_arc_orchestrate: "故事弧外部编排",
   novel_closed_loop_run: "执行评估闭环",
   novel_workflow_get: "查询 Workflow 状态",
   novel_workflow_list: "列出 Workflow Runs",
   novel_chapter_review_decision: "提交章节审校决策",
+  novel_context_get: "获取创作上下文",
+  novel_artifact_list: "列出创作产物",
 };
 
 export const TOOL_DESCRIPTIONS: Record<string, ToolInfo> = Object.fromEntries(
@@ -78,8 +82,11 @@ export const DIRECT_EXEC_TOOLS = new Set<string>([
   "novel_story_arc_get",
   "novel_story_arc_review",
   "novel_story_arc_batch_start",
+  "novel_story_arc_orchestrate",
   "novel_closed_loop_run",
   "novel_chapter_review_decision",
+  "novel_context_get",
+  "novel_artifact_list",
 ]);
 
 export const TOOL_COUNT = TOOL_DEFINITIONS.length;

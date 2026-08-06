@@ -1,10 +1,10 @@
 /**
- * V2 MCP 工具处理函数（32 个工具的 handler 实现）。
+ * V2 MCP 工具处理函数（35 个工具的 handler 实现）。
  *
  * 设计依据：AGENTS.md 架构阶段 + Phase B-2 MCP 工具网关。
  *
  * 职责：
- * - 实现 32 个工具的具体调用逻辑
+ * - 实现 35 个工具的具体调用逻辑
  * - 路由到 creative/ + evaluation/ + postgres-repository 模块
  * - 返回标准 JSON-serializable 结果（executeTool 包装为 McpToolResponse）
  *
@@ -13,8 +13,11 @@
  * - Catalog / Receipt（3）
  * - Craft Rule 候选演进（7）—— 基于 craft-rule 模块（Postgres）
  * - 项目生命周期（3）
- * - 一键流程（2）—— foundation bootstrap 与章节审校 workflow
+ * - 规划与创作（9）—— foundation bootstrap、故事弧（含外部编排模式）与章节审校 workflow
  * - 评估闭环（1，v2 新增）
+ * - Workflow 查询（2）
+ * - Workflow 决策（1）
+ * - 上下文与产物查询（2，新增）
  *
  * 与 v1 的区别：v1 用 IndexedDB + CreativeToolEnvelope，v2 全部基于
  * NovelPostgresRepository + creative/evaluation 模块。
@@ -31,7 +34,9 @@ import type {
 } from "../protocol";
 import { startNovelBootstrap } from "../application/bootstrap";
 import { provisionalTitle } from "../application/provisional-title";
-import { startStoryArcBatchPlanning, startStoryArcPlanning, startStoryArcReview } from "../application/story-arc-workflow";
+import { parseStoryArcPlotOutline, validateStoryArcPlotOutline } from "../application/story-arc";
+import { DEFAULT_ARTIFACT_LIST_LIMIT, DEFAULT_WORKFLOW_LIST_LIMIT } from "./tool-definitions";
+import { startStoryArcBatchPlanning, startStoryArcOrchestratedPlanning, startStoryArcPlanning, startStoryArcReview } from "../application/story-arc-workflow";
 import { parseCreativeBrief } from "../application/creative-brief";
 import {
   createCreativeRun,
@@ -739,6 +744,39 @@ const novel_story_arc_batch_start: ToolHandler = async (args, ctx) => {
   });
 };
 
+/**
+ * 故事弧外部编排模式（模式 B）。
+ *
+ * 设计依据：mcp-orchestrator.md 阶段 1 模式 B——外部大模型或用户提供剧情
+ * 编排（plotOutline），系统负责完善为规范蓝图并走正式弧审核→修订闭环。
+ * 解析与校验在 handler 层执行（parse 拒绝结构错误、validate 拒绝空编排与
+ * 重复责任线），然后启动编排式规划工作流；工作流把编排持久化到
+ * workflow_runs.payload.plotOutline 并在规划/审核/修订 prompt 注入编排 section。
+ */
+const novel_story_arc_orchestrate: ToolHandler = async (args, ctx) => {
+  const projectId = asString(args.projectId);
+  if (!projectId) throw new Error("projectId 必填且非空");
+  if (!ctx.temporal) throw new Error("novel_story_arc_orchestrate 需要 Temporal");
+
+  const plotOutline = parseStoryArcPlotOutline(args.plotOutline);
+  validateStoryArcPlotOutline(plotOutline);
+
+  const reviewPolicy = asString(args.reviewPolicy);
+  if (reviewPolicy && reviewPolicy !== "manual" && reviewPolicy !== "auto") {
+    throw new Error("reviewPolicy 必须是 manual 或 auto");
+  }
+  const authorIntent = asString(args.authorIntent) || undefined;
+
+  return startStoryArcOrchestratedPlanning(ctx.repository, ctx.temporal, {
+    projectId,
+    plotOutline,
+    mode: "mcp",
+    reviewPolicy: reviewPolicy as "manual" | "auto" | undefined,
+    authorIntent,
+    taskQueue: ctx.taskQueue,
+  });
+};
+
 const novel_chapter_generate: ToolHandler = async (args, ctx) => {
   const projectId = asString(args.projectId);
   const idempotencyKey = asString(args.idempotencyKey);
@@ -959,7 +997,7 @@ const novel_workflow_get: ToolHandler = async (args, ctx) => {
 const novel_workflow_list: ToolHandler = async (args, ctx) => {
   const projectId = asString(args.projectId);
   if (!projectId) throw new Error("projectId 必填");
-  const limit = asNumber(args.limit) ?? 20;
+  const limit = asNumber(args.limit) ?? DEFAULT_WORKFLOW_LIST_LIMIT;
   const workflowType = asString(args.workflowType) || undefined;
 
   const runs = await ctx.repository.listProjectRuns(projectId, limit, workflowType);
@@ -1027,6 +1065,91 @@ const novel_chapter_review_decision: ToolHandler = async (args, ctx) => {
   }
 };
 
+// ===== 上下文与产物查询（2，新增）=====
+
+/**
+ * 获取项目当前创作上下文（事实梳理与编排依据）。
+ *
+ * 设计依据：mcp-orchestrator.md 阶段 3——外部模型在编排剧情、下达编辑指令前
+ * 用本工具读取叙事状态账本、定稿章节记忆、开放线索/伏笔/承诺与规划机制反馈，
+ * 避免编排与已定稿事实冲突。复用 getStoryArcPlanningInput 的上下文组装
+ * （同一投影，外部可见版本），按 sections 裁剪输出体积。
+ */
+const novel_context_get: ToolHandler = async (args, ctx) => {
+  const projectId = asString(args.projectId);
+  if (!projectId) throw new Error("projectId 必填且非空");
+
+  const sections = asStringArray(args.sections);
+
+  const planning = await ctx.repository.getStoryArcPlanningInput(projectId);
+
+  const all: Record<string, unknown> = {
+    projectTitle: planning.projectTitle,
+    narrativeCutoff: planning.contextReceipt.narrativeCutoff ?? null,
+    contextFingerprint: planning.contextReceipt.fingerprint,
+    foundation: planning.macro,
+    recentChapters: planning.recentChapters,
+    narrativeState: planning.narrativeState ?? null,
+    openThreads: planning.openThreads,
+    openForeshadowings: planning.openForeshadowings ?? [],
+    openPromises: planning.openPromises ?? [],
+    planningFeedback: planning.planningFeedback ?? [],
+    plotOutline: planning.plotOutline ?? null,
+  };
+  if (!sections?.length) return all;
+
+  const allowed = new Set(["foundation", "recent-chapters", "narrative-state", "open-elements", "planning-feedback"]);
+  const selected: Record<string, unknown> = { projectTitle: planning.projectTitle, narrativeCutoff: all.narrativeCutoff, contextFingerprint: all.contextFingerprint };
+  if (sections.includes("foundation")) selected.foundation = all.foundation;
+  if (sections.includes("recent-chapters")) selected.recentChapters = all.recentChapters;
+  if (sections.includes("narrative-state")) selected.narrativeState = all.narrativeState;
+  if (sections.includes("open-elements")) {
+    selected.openThreads = all.openThreads;
+    selected.openForeshadowings = all.openForeshadowings;
+    selected.openPromises = all.openPromises;
+  }
+  if (sections.includes("planning-feedback")) {
+    selected.planningFeedback = all.planningFeedback;
+    selected.plotOutline = all.plotOutline;
+  }
+  const unknown = sections.filter((item) => !allowed.has(item));
+  if (unknown.length) throw new Error(`sections 含未知项：${unknown.join("、")}`);
+  return selected;
+};
+
+/**
+ * 列出项目下的创作产物。
+ *
+ * 设计依据：mcp-orchestrator.md「外部大模型作为编排者」——外部模型需要先
+ * 定位 blueprint/draft/review 的 artifactId 才能阅读内容并做审核/决策。
+ * workflowId 定向复用 listRunArtifacts；其余走项目级列表（kind 可过滤）。
+ */
+const novel_artifact_list: ToolHandler = async (args, ctx) => {
+  const projectId = asString(args.projectId);
+  if (!projectId) throw new Error("projectId 必填且非空");
+
+  const workflowId = asString(args.workflowId) || undefined;
+  const kind = asString(args.kind) || undefined;
+  const limit = asNumber(args.limit) ?? DEFAULT_ARTIFACT_LIST_LIMIT;
+
+  const artifacts = workflowId
+    ? await ctx.repository.listRunArtifacts(workflowId)
+    : await ctx.repository.listProjectArtifacts({ projectId, kind, limit });
+
+  return {
+    artifacts: artifacts.map((artifact) => ({
+      id: artifact.id,
+      kind: artifact.kind,
+      taskId: artifact.taskId,
+      fingerprint: artifact.fingerprint,
+      createdAt: artifact.createdAt,
+      objectKey: artifact.objectKey,
+    })),
+    count: artifacts.length,
+    nextAction: "使用 novel_artifact_get({ artifactId }) 阅读产物内容",
+  };
+};
+
 // ===== Handler 注册表 =====
 
 export const TOOL_HANDLERS: Record<string, ToolHandler> = {
@@ -1058,7 +1181,7 @@ export const TOOL_HANDLERS: Record<string, ToolHandler> = {
   novel_project_list,
   novel_project_delete,
 
-  // 规划与创作（7）
+  // 规划与创作（9）
   novel_bootstrap_run,
   novel_chapter_review,
   novel_chapter_review_issue_add,
@@ -1067,6 +1190,7 @@ export const TOOL_HANDLERS: Record<string, ToolHandler> = {
   novel_story_arc_get,
   novel_story_arc_review,
   novel_story_arc_batch_start,
+  novel_story_arc_orchestrate,
 
   // 评估闭环（1）
   novel_closed_loop_run,
@@ -1077,4 +1201,8 @@ export const TOOL_HANDLERS: Record<string, ToolHandler> = {
 
   // Workflow 决策（1，新增）
   novel_chapter_review_decision,
+
+  // 上下文与产物查询（2，新增）
+  novel_context_get,
+  novel_artifact_list,
 };

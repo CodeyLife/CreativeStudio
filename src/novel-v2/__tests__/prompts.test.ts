@@ -75,6 +75,58 @@ describe("long-form prompt contracts", () => {
     expect(prompt).not.toContain("每章必须有新鲜贡献");
   });
 
+  it("guides arc-level design contracts: question ladder, causal scenes, quiet-chapter function and irreversible exit", () => {
+    const prompt = buildStoryArcPrompt({
+      projectTitle: "测试项目",
+      macro: [],
+      recentChapters: [],
+      openThreads: [],
+    });
+    expect(prompt).toContain("问题阶梯");
+    expect(prompt).toContain("可感知变化");
+    expect(prompt).toContain("确认规则的陈述若改变了角色后续选择或风险判断，即算功能");
+    expect(prompt).toContain("一个场景的 outcome 应成为下一场景 situation 的触发条件");
+    expect(prompt).not.toContain("每章必须有新事件");
+    expect(prompt).not.toContain("安静章必须承担");
+  });
+
+  it("keeps quiet-chapter function requirement in the split chapters contract", () => {
+    const prompt = buildStoryArcChaptersPrompt({
+      projectTitle: "测试项目",
+      macro: [],
+      recentChapters: [],
+      openThreads: [],
+      arc: { title: "当前弧" } as never,
+      batch: { batchIndex: 2, startChapterIndex: 11, complete: false },
+    });
+    expect(prompt).toContain("确认规则的陈述若改变了角色后续选择或风险判断，即算功能");
+    expect(prompt).toContain("状态保持稳定也是合法结果");
+  });
+
+  it("checks arc design contracts during arc review without requiring per-chapter events or blanket gates", () => {
+    const prompt = buildStoryArcReviewPrompt({
+      arc: { title: "当前弧" },
+      batch: { batchIndex: 2, startChapterIndex: 11, complete: false },
+      chapters: [{
+        index: 1,
+        title: "当前章",
+        narrativeFunction: "development",
+        povCharacterId: "char-1",
+        stateTransition: { before: "前", after: "后", evidence: "证据" },
+        scenes: [{ situation: "处境", observableActions: ["动作"], outcome: "结果" }],
+        continuityConstraints: [],
+        unresolvedAtClose: ["未知"],
+      }],
+    } as never, "");
+    expect(prompt).toContain("development 各阶段是否呈承接的子问题链而非并列步骤");
+    expect(prompt).toContain("推进型弧的退出状态相对入口是否有身份、资源、知识、关系或威胁级别中的可感知变化");
+    expect(prompt).toContain("安静、关系、背景、铺垫和余波弧与行动弧同样合法");
+    expect(prompt).toContain("本弧的读者回报");
+    expect(prompt).toContain("entryState/objective 承诺了什么体验");
+    expect(prompt).not.toContain("缺失任一契约按 major 报告");
+    expect(prompt).not.toContain("每章必须有事件");
+  });
+
   it("declares the complete chapter field contract for split arc planning", () => {
     const prompt = buildStoryArcChaptersPrompt({
       projectTitle: "测试项目",
@@ -162,6 +214,24 @@ describe("long-form prompt contracts", () => {
     expect(prompt).toContain("规划契约是否完整");
     expect(prompt).toContain("审查不确定性");
     expect(prompt).toContain("问题机制、影响范围和最小修复方向");
+  });
+
+  it("subjects foundation planning to a strict reader-view baseline audit", () => {
+    const prompt = buildFoundationReviewPrompt({
+      taskKey: "project-positioning",
+      artifact: { id: "artifact-1", fingerprint: "fingerprint-1", taskId: "project-positioning", structuredData: {} } as never,
+    });
+    expect(prompt).toContain("读者视角严苛检查");
+    expect(prompt).toContain("读者承诺可兑现");
+    expect(prompt).toContain("主题进入选择");
+    expect(prompt).toContain("欲望遇阻力产生选择");
+    expect(prompt).toContain("群像独立");
+    expect(prompt).toContain("世界观压力系统");
+    expect(prompt).toContain("感情线行动累积");
+    expect(prompt).toContain("疲劳管理");
+    expect(prompt).toContain("留白证据");
+    expect(prompt).toContain("不是必须全部成立的硬门");
+    expect(prompt).not.toContain("每章必须有新事件");
   });
 
   it("gives story arc planning, review and revision different responsibilities", () => {

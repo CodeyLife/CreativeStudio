@@ -1,64 +1,48 @@
-# Project Agent Constraints
+# 项目智能体约束
 
-## Iterative Improvement And Root-Cause Analysis
+## 创作支撑层基线
 
-- Treat tests, benchmark scores, generated samples, and user-reported cases as evidence of a problem, not as the specification of the fix.
-- Do not add rules that only recognize a particular title, genre, character name, paragraph, exact phrase, fixture shape, chapter index, or benchmark sample. Do not tune thresholds solely until one known sample passes.
-- Before changing code or prompts, identify the observed symptom, the failing workflow layer, the underlying mechanism, the affected class of inputs, and the boundaries of the proposed behavior. Distinguish root causes from downstream manifestations.
-- Fix the problem at the lowest shared layer that owns the faulty behavior. Prefer reusable contracts, algorithms, data modeling, validation, or execution hooks over accumulating case-specific prompt prohibitions and examples.
-- Prompt examples are illustrative, not normative. Express the general principle and decision rule first; vary examples across genres, roles, points of view, chapter functions, and prose styles so that one fixture cannot become an implicit product contract.
-- A valid improvement must explain why it addresses the broader failure class and what it deliberately does not cover. Record meaningful tradeoffs and regression risks when the solution changes behavior outside the original case.
-- Validate the original failing case and at least one materially different counterexample or cross-scenario case. For novel generation changes, inspect the actual generated artifacts and workflow transitions in addition to automated scores; a higher benchmark score alone is not proof of improvement.
-- If evidence disproves the proposed mechanism, revisit the root-cause analysis instead of adding another exception. If a narrow exception is genuinely required by the domain, state and test that domain boundary explicitly.
-- Keep changes scoped, but do not confuse a small diff with a general solution. The implementation should remain minimal while covering the identified class of failures.
+长篇创作质量依赖两层工程支撑：**创作上下文**（为模型供给规划、记忆、事实、剧情、角色材料）与**创作指引**（prompt 与 skill 按阶段提供创作方法）。本节是后续开发的共同方向，不新增行为约束。
 
-## LLM 输出净化与结构化约束
+- 上下文层：正文阶段获得上下文（全局规划投影、长记忆、冻结事实、剧情设计、角色关系）
+- 指引层：规划/剧情/正文/审核四阶段各有可执行指引，沉淀为 skill 执行点投影，以 novel-writing 技能为指导；学习闭环（learning → candidate → promote）是 skill 内容的增长通道。
+- 优化共识：任何优化先回答"增强哪一层、对哪些输入生效、边界在哪"，再回到基线检验，避免个案偏好固化为硬门。
+- 外部编排模式：外部大模型（或用户）作为任务编排、审核、推进、编辑与迭代优化者，通过 MCP 工具参与全流程（参考 `.agents/skills/novel-mcp-orchestration` 与 `docs/novel-v2/mcp-orchestrator.md`）。外部模型只给方向与意见（instruction / issue / plotOutline / review verdict），系统在正式工作流内完善与执行，不提供绕过质量门的直接改正文工具；故事弧外部编排（plotOutline）权威低于已定稿事实与作者边界，冲突时以事实为准。
 
-LLM 回显指令、注入元注释、包裹代码围栏等问题，必须在结构化输出层或通用启发式层解决，不允许堆叠精确短语黑名单或 case-specific 模式列表。
+## 根因分析与迭代改进
 
-- 禁止用精确短语数组（如 `["严格依据审核证据", "仅输出替换", ...]`）判断 LLM 输出是否含元注释。应基于行的结构特征（长度阈值、标点模式、冒号位置、Markdown 标题语法）判断。
-- 净化函数（如 `sanitizeRevisionOutput`）必须是可跨 prompt 版本、genre 和指令措辞复用的通用逻辑。新增净化规则时，说明它覆盖的结构形态类别，而非列举被匹配的特定短语。
-- 当 LLM 输出 schema 可约束输出格式时，优先在 schema 层强制结构化输出（如 `response_format: json_schema`），而非在输出后用正则修补。
-- 净化函数中的阈值（长度上限、扫描行数等）属魔法值，必须加 TODO 标注可配置意图。
+将测试、评分、生成样本和用户反馈视为问题证据，而非修复规格。所有改进遵循以下原则：
 
-## 语言
+- **泛化优先**：禁止添加只识别特定标题、题材、角色名、段落、固定短语、fixture 形状、章节索引或基准样本的规则；禁止为通过单个已知样本而调参。阈值、净化逻辑、prompt 示例均须跨题材复用；prompt 示例用通用叙事模式描述（如"叙述者直接总结他人心理"），不得嵌入特定角色名、场景或题材。
+- **定位根因**：改动前先识别症状、失败的工作流层、底层机制、受影响输入类别与行为边界，区分根因与下游表现。在拥有错误行为的最低共享层修复，优先使用可复用契约、算法、数据建模、校验或执行钩子，而非堆叠 case-specific 的 prompt 禁令。
+- **说明与验证**：改进须说明为何能覆盖更广的失败类别及刻意不覆盖的范围，记录权衡与回归风险。验证原失败用例及至少一个实质性不同的反例或跨场景用例；小说生成改动须检查实际生成产物与工作流转换，而非仅看自动化分数。若证据推翻既定机制，回到根因分析而非追加例外。
+- **最小且通用**：改动范围最小化，但勿将小 diff 等同于通用方案；实现应保持精简同时覆盖已识别的失败类别。
 
-所有对话回复必须用中文
+## LLM 输出净化与结构化
 
-## 质量阈值与守卫约束
+LLM 回显指令、注入元注释、包裹代码围栏等问题，须在结构化输出层或通用启发式层解决，禁止堆叠精确短语黑名单或 case-specific 模式列表。
 
-质量改善阈值、回退策略和评分守卫必须泛化设计，不允许为通过特定样本而调参，且必须配合局部退化守卫。
+- 优先在 schema 层强制结构化输出（如 `response_format: json_schema`），而非输出后正则修补。
+- 净化函数（如 `sanitizeRevisionOutput`）须基于行的结构特征（长度阈值、标点模式、冒号位置、Markdown 标题语法）判断，可跨 prompt 版本、genre 和指令措辞复用。
+- 净化函数中的阈值（长度上限、扫描行数等）属魔法值，须加 TODO 标注可配置意图。
 
-- 阈值常量（如 `PARTIAL_IMPROVEMENT_THRESHOLD`）的注释必须描述根因和决策依据，不允许引用特定章节/样本的具体分数变化。
-- 当"整体改善但局部退化"的接受逻辑引入阈值时，必须同时设置局部退化上限守卫（如 `MAX_REVIEWER_SCORE_DROP`），防止局部质量退化被整体改善掩盖。
-- 守卫约束必须对齐 spec 中定义的回退原则（如"同类最高分"优先），不允许与 spec 的回退规则产生矛盾。
-- 新增守卫必须有测试覆盖：验证守卫生效（退化超限被拒绝）和守卫未误杀（退化在限内被接受）两个方向。
+## 质量阈值与守卫
 
-## Prompt 示例与维度覆盖
+质量改善阈值、回退策略和评分守卫须泛化设计，配合局部退化守卫。
 
-Prompt 中的示例和审核维度必须覆盖 spec 定义的全部质量维度，且示例必须跨题材泛化。
-
-- 审核维度（`REVIEW_DIMENSIONS` / `REFLECTION_DIMENSIONS`）必须覆盖 `quality-standard.md` 定义的 5 大维度（D1 世界观 / D2 故事性 / D3 群像 / D4 感情线 / D5 幽默）。新增维度时同步更新 schema 枚举、维度锚点描述和测试断言。
-- Prompt 中的禁止/允许模式示例必须用通用叙事模式描述（如"叙述者直接总结他人心理"而非"少年不甘心地妥协了"），不允许嵌入特定角色名、场景或题材。
-- 当 spec 文档（如 `pipeline-audit.md`）记录了维度缺口和修复方向时，代码修复必须对齐 spec 建议的方向（如 F8 建议扩展 D1/D3/D4/D5，不得只扩展其他维度而忽略）。
+- 阈值常量（如 `PARTIAL_IMPROVEMENT_THRESHOLD`）注释须描述根因和决策依据，禁止引用特定章节/样本分数。
+- 引入"整体改善但局部退化"接受逻辑时，须同时设置局部退化上限守卫（如 `MAX_REVIEWER_SCORE_DROP`），防止局部退化被整体改善掩盖。
+- 守卫须对齐 spec 回退原则（如"同类最高分"优先），不得与之矛盾；新增守卫须有双向测试覆盖（退化超限被拒绝、限内被接受）。
 
 ## Spec 文档同步演进
 
-代码架构变更时，spec 文档必须同步更新，不允许代码与 spec 长期偏离。
+代码架构变更时，spec 文档须同步更新，禁止长期偏离。
 
-- 新增机制（如 thematicTreatment、NarrativeRhythmSnapshot、rebase 扩展、修订防退化机制等）必须在 `workflow-map.md` 或相关 spec 文档中记录其设计意图、数据流和约束。
-- spec 中记录的工具数、维度数、阶段数等量化指标必须与代码实际值一致。代码变更后立即同步 spec 中的数字。
-- 当 spec 文档间存在矛盾时（如 workflow-map.md 的 Load 步骤描述与 AGENTS.md 的章节审校契约不一致），以代码实际行为为准更新 spec，并在文档中标注矛盾已消除。
-- 范围蔓延（scope creep）的处理方式是更新 spec 使其成为正式契约，而非删除代码功能——前提是功能确实有价值且不与现有契约冲突。
+- 新增机制须在 `workflow-map.md` 或相关 spec 文档记录设计意图、数据流和约束。
+- spec 中的量化指标（工具数、维度数、阶段数等）须与代码实际值一致，代码变更后立即同步。
+- spec 文档间矛盾时，以代码实际行为为准更新 spec 并标注矛盾已消除。
+- 范围蔓延通过更新 spec 使其成为正式契约来处理，而非删除代码功能（前提：功能有价值且不与现有契约冲突）。
 
+## 语言
 
-## 经验沉淀与技能/提示词迭代
-
-MCP 工作流的核心是迭代优化。审核经验必须沉淀为可复用经验技巧，并通过 improvement propose/promote 流程迭代相关技能与提示词，不允许只在本次修复中起作用。
-
-- learning 闭环：`externalReview.learning.conclusion === "propose-improvement"` 时必须自动构造 `createCraftRuleCandidate`，不允许仅事件透传而不触发 proposeImprovement。
-- review-stage → learning 通路：review/commit 后必须汇总 issue 模式为 `RuntimeLearningAssessment`，不允许审核结果只写入 qualityReport 而不反馈到 learning。
-- skill-iteration 的 `buildIterationPrompt` 必须追加 learning 段落（`underlyingMechanism` 而非仅 issue 症状），不允许只把 issue 列表塞给 LLM 让它猜机制。
-- `learning.underlyingMechanism/affectedInputClass` 在 `conclusion=propose-improvement` 时必填，不允许只记录症状不记录机制。
-- promote 后必须做回归验证（用新版本重跑失败场景），不允许只看 A/B 分数提升就 promote。
-
+所有对话回复必须用中文。

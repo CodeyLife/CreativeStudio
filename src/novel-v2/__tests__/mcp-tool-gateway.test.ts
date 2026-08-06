@@ -37,12 +37,12 @@ const mockCtx = {
 // ===== A. 纯函数：validateToolArgs（无 Postgres 依赖）=====
 
 describe("validateToolArgs pure function", () => {
-  it("TOOL_NAMES has exactly 32 tools", () => {
-    expect(TOOL_NAMES).toHaveLength(32);
+  it("TOOL_NAMES has exactly 35 tools", () => {
+    expect(TOOL_NAMES).toHaveLength(35);
   });
 
-  it("TOOL_DEFINITIONS has 32 defs, each with name/description/inputSchema", () => {
-    expect(TOOL_DEFINITIONS).toHaveLength(32);
+  it("TOOL_DEFINITIONS has 35 defs, each with name/description/inputSchema", () => {
+    expect(TOOL_DEFINITIONS).toHaveLength(35);
     for (const def of TOOL_DEFINITIONS) {
       expect(typeof def.name).toBe("string");
       expect(def.name.length).toBeGreaterThan(0);
@@ -252,6 +252,82 @@ describe("validateToolArgs pure function", () => {
       expect(validateToolArgs("novel_review_submit", { ...base, review: { ...base.review, issues: [{ ...base.review.issues[0], readerReconstruction: { impact: "core", missingEvidence: ["unknown"], blockedQuestion: "问题" } }] } }).valid).toBe(false);
     });
   });
+
+  describe("novel_story_arc_orchestrate", () => {
+    it("valid args → valid=true", () => {
+      const result = validateToolArgs("novel_story_arc_orchestrate", {
+        projectId: "p-1",
+        plotOutline: {
+          objective: "主角必须混进暗渠上方的体系",
+          centralConflict: "体系要求交出秘密",
+          development: ["查明守门人", "通过审查"],
+          threadResponsibilities: [{ threadRef: "thread-1", responsibility: "推进探查", nextAdvance: "身份暴露后转移" }],
+          expectedChapterCount: 12,
+          chapterHints: ["开篇是驱逐现场"],
+          plotNotes: "伏笔：最后一封信在守门人手里",
+        },
+        reviewPolicy: "auto",
+      });
+      expect(result.valid).toBe(true);
+    });
+
+    it("missing plotOutline → valid=false", () => {
+      expect(validateToolArgs("novel_story_arc_orchestrate", { projectId: "p-1" }).valid).toBe(false);
+    });
+
+    it("empty objective → valid=false", () => {
+      expect(validateToolArgs("novel_story_arc_orchestrate", { projectId: "p-1", plotOutline: { objective: "" } }).valid).toBe(false);
+    });
+
+    it("malformed threadResponsibility entry → valid=false", () => {
+      expect(validateToolArgs("novel_story_arc_orchestrate", {
+        projectId: "p-1",
+        plotOutline: { objective: "目标", threadResponsibilities: [{ threadRef: "t-1", responsibility: "r" }] },
+      }).valid).toBe(false);
+    });
+
+    it("unknown field in plotOutline → valid=false", () => {
+      expect(validateToolArgs("novel_story_arc_orchestrate", {
+        projectId: "p-1",
+        plotOutline: { objective: "目标", sceneCount: 5 },
+      }).valid).toBe(false);
+    });
+
+    it("invalid reviewPolicy → valid=false", () => {
+      expect(validateToolArgs("novel_story_arc_orchestrate", {
+        projectId: "p-1",
+        plotOutline: { objective: "目标", plotNotes: "说明" },
+        reviewPolicy: "partial",
+      }).valid).toBe(false);
+    });
+  });
+
+  describe("novel_context_get", () => {
+    it("valid args → valid=true", () => {
+      expect(validateToolArgs("novel_context_get", { projectId: "p-1" }).valid).toBe(true);
+      expect(validateToolArgs("novel_context_get", { projectId: "p-1", sections: ["narrative-state", "open-elements"] }).valid).toBe(true);
+    });
+
+    it("unknown section → valid=false", () => {
+      expect(validateToolArgs("novel_context_get", { projectId: "p-1", sections: ["facts"] }).valid).toBe(false);
+    });
+
+    it("missing projectId → valid=false", () => {
+      expect(validateToolArgs("novel_context_get", {}).valid).toBe(false);
+    });
+  });
+
+  describe("novel_artifact_list", () => {
+    it("valid args → valid=true", () => {
+      expect(validateToolArgs("novel_artifact_list", { projectId: "p-1" }).valid).toBe(true);
+      expect(validateToolArgs("novel_artifact_list", { projectId: "p-1", kind: "review", limit: 10 }).valid).toBe(true);
+    });
+
+    it("out-of-range limit → valid=false", () => {
+      expect(validateToolArgs("novel_artifact_list", { projectId: "p-1", limit: 0 }).valid).toBe(false);
+      expect(validateToolArgs("novel_artifact_list", { projectId: "p-1", limit: 101 }).valid).toBe(false);
+    });
+  });
 });
 
 // ===== B. executeTool 路由（无 Postgres 依赖，测错误路径）=====
@@ -450,6 +526,97 @@ describe("executeTool error paths", () => {
     expect(start).toHaveBeenCalledWith("storyArcPlanningWorkflow", expect.objectContaining({
       args: [expect.objectContaining({ arcId: "arc-1", batchIndex: 2, startChapterIndex: 11 })],
     }));
+  });
+
+  it("novel_story_arc_orchestrate starts the orchestrated planning workflow with the outline", async () => {
+    const createNextStoryArc = vi.fn().mockResolvedValue({ id: "arc-orch-1" });
+    const putWorkflowRun = vi.fn().mockResolvedValue(undefined);
+    const start = vi.fn().mockResolvedValue({ firstExecutionRunId: "temporal-run-orch-1" });
+    const result = await executeTool(
+      "novel_story_arc_orchestrate",
+      {
+        projectId: "p1",
+        plotOutline: { objective: "查明暗渠上方的体系", development: ["找到守门人", "通过审查"], plotNotes: "伏笔在守门人手里" },
+        reviewPolicy: "auto",
+      },
+      {
+        repository: { createNextStoryArc, withStoryArcWorkflowLock: async (_projectId: string, _arcId: string, callback: () => Promise<unknown>) => callback(), putWorkflowRun } as never,
+        temporal: { workflow: { start } } as never,
+        taskQueue: "novel-v2",
+      },
+    );
+    expect(result.isError).toBeFalsy();
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload).toMatchObject({ status: "accepted", orchestrated: true, arcId: "arc-orch-1" });
+    expect(createNextStoryArc).toHaveBeenCalledWith(expect.objectContaining({
+      projectId: "p1",
+      plotOutline: expect.objectContaining({ objective: "查明暗渠上方的体系" }),
+    }));
+    expect(putWorkflowRun).toHaveBeenCalledWith(expect.objectContaining({
+      workflowType: "story-arc-planning",
+      payload: expect.objectContaining({ orchestrated: true, plotOutline: expect.objectContaining({ objective: "查明暗渠上方的体系" }) }),
+    }));
+    expect(start).toHaveBeenCalledWith("storyArcPlanningWorkflow", expect.objectContaining({
+      args: [expect.objectContaining({ arcId: "arc-orch-1", plotOutline: expect.objectContaining({ objective: "查明暗渠上方的体系" }) })],
+    }));
+  });
+
+  it("novel_story_arc_orchestrate rejects an empty-substance outline before starting Temporal", async () => {
+    const start = vi.fn();
+    const result = await executeTool(
+      "novel_story_arc_orchestrate",
+      { projectId: "p1", plotOutline: { objective: "写一个故事" } },
+      {
+        repository: { withStoryArcWorkflowLock: async (_projectId: string, _arcId: string, callback: () => Promise<unknown>) => callback() } as never,
+        temporal: { workflow: { start } } as never,
+        taskQueue: "novel-v2",
+      },
+    );
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("novel_story_arc_start");
+    expect(start).not.toHaveBeenCalled();
+  });
+
+  it("novel_context_get projects the planning context with section filtering", async () => {
+    const getStoryArcPlanningInput = vi.fn().mockResolvedValue({
+      projectTitle: "测试项目",
+      macro: [{ taskKey: "characters", title: "人物", summary: "甲" }],
+      recentChapters: [{ order: 3, summary: "第三章程", unresolvedThreads: ["t-1"] }],
+      openThreads: [{ id: "t-1", title: "线索一", payload: {} }],
+      openForeshadowings: [],
+      openPromises: [],
+      planningFeedback: [],
+      narrativeState: { narrativeOrder: 3, arcPhase: "development", openThreads: [], openForeshadowings: [], openPromises: [], fulfilledNodes: [], prohibitedEarlyConsumption: [], continuityConstraints: [], fingerprint: "fp" },
+      contextReceipt: { narrativeCutoff: 3, sourceArtifactIds: [], sourceRevisionIds: [], sectionFingerprints: {}, fingerprint: "ctx-fp", legacy: false },
+    });
+    const result = await executeTool(
+      "novel_context_get",
+      { projectId: "p1", sections: ["narrative-state", "recent-chapters"] },
+      { repository: { getStoryArcPlanningInput } as never },
+    );
+    expect(result.isError).toBeFalsy();
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.projectTitle).toBe("测试项目");
+    expect(payload.narrativeState.narrativeOrder).toBe(3);
+    expect(payload.recentChapters).toHaveLength(1);
+    expect(payload.openThreads).toBeUndefined();
+    expect(payload.foundation).toBeUndefined();
+  });
+
+  it("novel_artifact_list lists project artifacts through the repository", async () => {
+    const listProjectArtifacts = vi.fn().mockResolvedValue([
+      { id: "a-1", kind: "chapter-blueprint", taskId: "t-1", fingerprint: "f-1", createdAt: 1, objectKey: "o-1" },
+    ]);
+    const result = await executeTool(
+      "novel_artifact_list",
+      { projectId: "p1", kind: "chapter-blueprint" },
+      { repository: { listProjectArtifacts } as never },
+    );
+    expect(result.isError).toBeFalsy();
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.count).toBe(1);
+    expect(payload.artifacts[0].id).toBe("a-1");
+    expect(listProjectArtifacts).toHaveBeenCalledWith({ projectId: "p1", kind: "chapter-blueprint", limit: 50 });
   });
 });
 

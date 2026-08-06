@@ -76,6 +76,10 @@ Scene 的活动字段：
 
 已删除的活动编辑字段包括章节 summary、readerExperience、thematicTreatment、romanceTreatment、humorTreatment、narrativeScale、固定开场/章尾力量、setup/payoff 引用和旧 goal/turn。历史 JSONB 不重写。
 
+**外部编排模式（模式 B）**：`novel_story_arc_orchestrate` 接收外部大模型/用户提供的剧情编排（plotOutline：objective 必填，其余弧级设计意图可选），系统负责完善——编排作为 `arc-context-plot-outline` required section 注入 arc.plan / chapter.blueprint / arc.review / arc.revision，规划器对照冻结事实与叙事状态账本做事实梳理后补全场景因果、状态转换、连续性约束与章节蓝图，再走正式弧审核 → 修订闭环。编排权威低于已定稿事实与作者边界，冲突时以事实为准；空编排（只有 objective）拒绝。编排持久化在 `workflow_runs.payload.plotOutline` 与蓝图 artifact structuredData（provenance），按 arcId 精确读取，避免跨弧串扰；外部任务降级路径以 contextRefs.outlineJson 传递并在物化时写回。MCP 工具集由 32 扩至 35：新增 `novel_story_arc_orchestrate`、`novel_context_get`（外部编排者的事实梳理入口，投影宏观规划/叙事状态/章节记忆/开放线索/伏笔/承诺/规划反馈）、`novel_artifact_list`（按项目/kind 定位产物 artifactId）。外部编排者全流程工具映射见 [mcp-orchestrator.md](./mcp-orchestrator.md)。
+
+弧规划与审核由 `story-arc-design` Skill 注入五项设计契约（问题阶梯、压力类型轮换、场景因果链、安静章功能、不可逆出口）与弧级读者回报检查（入口期待在出口得到交付），作为弧级检查方向与证据类型而非硬性门禁；安静、关系、铺垫、余波弧与行动弧同样合法，安静章可通过关系温度、理解、信息分布、情绪或余波完成功能，不要求每章新事件，也不要求每个弧都满足全部契约。规划 prompt 与弧审核 prompt 承载同一契约的压缩表述。Foundation 审核由 `review-gate` Skill 与 foundation-review prompt 承载读者视角八项基线（承诺可兑现、主题进入选择、欲望-阻力-选择-代价闭环、配角独立欲望、世界观压力系统、感情线行动累积、疲劳管理、留白证据），同样按 taskKey 适用性选择、不适用项跳过，缺失且损害承诺功能才阻断。
+
 ### 2.3 Context
 
 ChapterPlanningContext 只投影当前执行合同、状态边界、场景执行信息、相邻章节边界和事实 provenance。它不把完整宏观规划重复塞入 draft/review/revision。

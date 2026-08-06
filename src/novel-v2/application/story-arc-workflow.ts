@@ -1,6 +1,53 @@
 import { randomUUID } from "node:crypto";
 import type { Client } from "@temporalio/client";
 import type { NovelPostgresRepository } from "../postgres-repository";
+import type { StoryArcPlotOutline } from "./story-arc";
+
+/**
+ * 故事弧外部编排模式（模式 B）：
+ *
+ * 外部大模型或用户提供剧情编排（plotOutline：objective 必填，其余为弧级
+ * 设计意图），系统负责完善——规划工作流内部把编排作为 required section
+ * 注入 arc.plan / chapter.blueprint / arc.review / arc.revision 执行点，
+ * 对照冻结事实与叙事状态账本做事实梳理，补全场景因果、章节状态转换、
+ * 连续性约束与责任承接，再走正式弧审核 → 修订闭环。编排输入持久化在
+ * workflow_runs.payload.plotOutline（arcs.payload 会被 bundle.arc 覆盖，
+ * 不能作为编排的持久化位置），并写入蓝图 artifact 的 structuredData 提供
+ * provenance。后续批次与审校通过 getStoryArcPlanningInput(projectId, arcId)
+ * 读取同一份编排作为参考。
+ */
+export async function startStoryArcOrchestratedPlanning(
+  repository: NovelPostgresRepository,
+  temporal: Client,
+  input: { projectId: string; plotOutline: StoryArcPlotOutline; mode: "web" | "mcp"; reviewPolicy?: "manual" | "auto"; authorIntent?: string; taskQueue?: string },
+) {
+  return repository.withStoryArcWorkflowLock(input.projectId, "next", async () => {
+    const workflowId = `story-arc-${randomUUID()}`;
+    const reviewPolicy = input.reviewPolicy ?? (input.mode === "mcp" ? "auto" : "manual");
+    let arc: Awaited<ReturnType<NovelPostgresRepository["getStoryArc"]>>;
+    try {
+      arc = await repository.createNextStoryArc({ projectId: input.projectId, workflowId, authorIntent: input.authorIntent ?? input.plotOutline.objective, plotOutline: input.plotOutline });
+      await repository.putWorkflowRun({
+        id: workflowId,
+        workflowType: "story-arc-planning",
+        projectId: input.projectId,
+        temporalWorkflowId: workflowId,
+        status: "accepted",
+        payload: { arcId: arc.id, mode: input.mode, reviewPolicy, authorIntent: input.authorIntent, rebase: false, plotOutline: input.plotOutline, orchestrated: true },
+      });
+      const handle = await temporal.workflow.start("storyArcPlanningWorkflow", {
+        args: [{ workflowId, projectId: input.projectId, arcId: arc.id, mode: input.mode, reviewPolicy, authorIntent: input.authorIntent, plotOutline: input.plotOutline }],
+        taskQueue: input.taskQueue ?? "novel-v2",
+        workflowId,
+      });
+      return { arcId: arc.id, workflowId, runId: handle.firstExecutionRunId, status: "accepted", orchestrated: true, plotOutline: input.plotOutline };
+    } catch (error) {
+      await repository.updateWorkflowRunStatus(workflowId, "failed", { error: error instanceof Error ? error.message : String(error), reasonCode: "workflow-start-failed" }).catch(() => undefined);
+      if (arc) await repository.recoverStoryArcAfterWorkflowCancellation(input.projectId, arc.id).catch(() => undefined);
+      throw error;
+    }
+  });
+}
 
 export async function startStoryArcPlanning(
   repository: NovelPostgresRepository,

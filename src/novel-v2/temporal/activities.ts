@@ -1579,7 +1579,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
     },
 
     generateStoryArcBundle: async (input: { workflowId: string; projectId: string; arcId: string; authorIntent?: string; routingSnapshot: ModelRoutingSnapshot; candidateStartIndex?: number; batchIndex?: number; startChapterIndex?: number; rebase?: boolean; arcPlan?: StoryArcPlanOutput }): Promise<GeneratedStoryArcResult> => {
-      const planning = await deps.repository.getStoryArcPlanningInput(input.projectId);
+      const planning = await deps.repository.getStoryArcPlanningInput(input.projectId, input.arcId);
       const skills = await resolveCurrentSkills({ projectId: input.projectId, executionPoint: "arc.plan", role: "planner" });
       const rebaseTarget = input.rebase ? await deps.repository.getStoryArcRebaseTarget(input.projectId, input.arcId) : undefined;
       const arc = input.batchIndex ? await deps.repository.getStoryArc(input.projectId, input.arcId) : undefined;
@@ -1611,11 +1611,11 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
           validateStoryArcRebaseBundle(bundle, rebaseTarget);
         }
         if (input.batchIndex && (bundle.batch.batchIndex !== input.batchIndex || bundle.batch.startChapterIndex !== input.startChapterIndex)) throw new Error("生成结果的故事弧批次位置与请求不一致");
-        const artifact = await makeArtifact({ projectId: input.projectId, taskId: `${input.arcId}:story-arc`, kind: "chapter-blueprint", baseRevision: 0, text: JSON.stringify(bundle, null, 2), structuredData: { ...bundle, workflowId: input.workflowId, arcId: input.arcId, modelProvenance: { plan: planProvenance, chapters: generatedChapters.provenance } } });
+        const artifact = await makeArtifact({ projectId: input.projectId, taskId: `${input.arcId}:story-arc`, kind: "chapter-blueprint", baseRevision: 0, text: JSON.stringify(bundle, null, 2), structuredData: { ...bundle, workflowId: input.workflowId, arcId: input.arcId, ...(planning.plotOutline ? { plotOutline: planning.plotOutline } : {}), modelProvenance: { plan: planProvenance, chapters: generatedChapters.provenance } } });
         return { kind: "completed", artifact, bundle };
       } catch (error) {
         if (!(error instanceof ExternalMcpRequiredError)) throw error;
-        return { kind: "external", task: await externalTask({ workflowId: input.workflowId, taskId: `${input.arcId}:story-arc:chapters`, purpose: "planning.arc", candidateIndex: error.candidateIndex, routingSnapshot: input.routingSnapshot, outputKind: "structured", system, instruction: chapterPromptPackage.instruction, schema: storyArcChaptersOutputSchema as unknown as Record<string, unknown>, schemaName: "story-arc-chapters", baseRevision: 0, contextRefs: { arcId: input.arcId, skillBundleId: skills.id, outputSegment: "chapters", segmentIndex: "2", segmentCount: "2", arcJson: JSON.stringify(plan.arc), batchJson: JSON.stringify(plan.batch) }, promptContext: chapterPromptPackage.manifest }) };
+        return { kind: "external", task: await externalTask({ workflowId: input.workflowId, taskId: `${input.arcId}:story-arc:chapters`, purpose: "planning.arc", candidateIndex: error.candidateIndex, routingSnapshot: input.routingSnapshot, outputKind: "structured", system, instruction: chapterPromptPackage.instruction, schema: storyArcChaptersOutputSchema as unknown as Record<string, unknown>, schemaName: "story-arc-chapters", baseRevision: 0, contextRefs: { arcId: input.arcId, skillBundleId: skills.id, outputSegment: "chapters", segmentIndex: "2", segmentCount: "2", arcJson: JSON.stringify(plan.arc), batchJson: JSON.stringify(plan.batch), outlineJson: JSON.stringify(planning.plotOutline ?? null) }, promptContext: chapterPromptPackage.manifest }) };
       }
     },
 
@@ -1632,6 +1632,19 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       const task = await deps.repository.getModelTask(input.modelTaskId);
       if (!task) throw new Error("外部故事弧任务不存在");
       const segment = task.workPackage.contextRefs.outputSegment;
+      // 外部编排（模式 B）的 provenance：chapters 分段携带 outlineJson，
+      // 物化时写回蓝图 artifact，保证编排输入可追溯。
+      const plotOutline = (() => {
+        if (segment !== "chapters") return undefined;
+        const raw = task.workPackage.contextRefs.outlineJson;
+        if (!raw || raw === "null") return undefined;
+        try {
+          const parsed = JSON.parse(raw) as unknown;
+          return parsed && typeof parsed === "object" ? parsed : undefined;
+        } catch {
+          return undefined;
+        }
+      })();
       let rawBundle: unknown = input.value;
       if (segment === "chapters") {
         assertStructuredSchema(input.value, storyArcChaptersOutputSchema as unknown as Record<string, unknown>, "外部故事弧 chapters 分段结果");
@@ -1648,14 +1661,14 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       else bundle = parseStoryArcBundle(bundle);
       validateStoryArcExecutionContracts(bundle);
       if (rebaseTarget) validateStoryArcRebaseBundle(bundle, rebaseTarget);
-      const artifact = await makeArtifact({ projectId: input.projectId, taskId: task.taskId, kind: "chapter-blueprint", baseRevision: 0, text: JSON.stringify(bundle, null, 2), structuredData: { ...bundle, workflowId: task.workflowRunId, arcId: input.arcId, externalModelTaskId: task.id } });
+      const artifact = await makeArtifact({ projectId: input.projectId, taskId: task.taskId, kind: "chapter-blueprint", baseRevision: 0, text: JSON.stringify(bundle, null, 2), structuredData: { ...bundle, workflowId: task.workflowRunId, arcId: input.arcId, externalModelTaskId: task.id, ...(plotOutline ? { plotOutline } : {}) } });
       return { artifact, bundle };
     },
 
     projectStoryArcBundle: async (input: { projectId: string; arcId: string; artifact: Artifact; bundle: StoryArcBundle; actor: string; edited?: boolean }) => deps.repository.projectStoryArcBundle(input),
 
     reviewStoryArcBundle: async (input: { workflowId: string; projectId: string; arcId: string; artifact: Artifact; bundle: StoryArcBundle; routingSnapshot: ModelRoutingSnapshot; candidateStartIndex?: number; rebase?: boolean }): Promise<GeneratedStoryArcReviewResult> => {
-      const planning = await deps.repository.getStoryArcPlanningInput(input.projectId);
+      const planning = await deps.repository.getStoryArcPlanningInput(input.projectId, input.arcId);
       const skills = await resolveCurrentSkills({ projectId: input.projectId, executionPoint: "arc.review", role: "structure-reviewer" });
       const rebaseTarget = input.rebase ? await deps.repository.getStoryArcRebaseTarget(input.projectId, input.arcId) : undefined;
       const prompt = buildStoryArcReviewPrompt(input.bundle, "", rebaseTarget);
@@ -1730,7 +1743,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
     },
 
     reviseStoryArcBundle: async (input: { workflowId: string; projectId: string; arcId: string; artifact: Artifact; bundle: StoryArcBundle; review: StoryArcReviewOutput; routingSnapshot: ModelRoutingSnapshot; candidateStartIndex?: number; rebase?: boolean }): Promise<GeneratedStoryArcResult> => {
-      const planning = await deps.repository.getStoryArcPlanningInput(input.projectId);
+      const planning = await deps.repository.getStoryArcPlanningInput(input.projectId, input.arcId);
       const skills = await resolveCurrentSkills({ projectId: input.projectId, executionPoint: "arc.revision", role: "reviser" });
       const rebaseTarget = input.rebase ? await deps.repository.getStoryArcRebaseTarget(input.projectId, input.arcId) : undefined;
       const prompt = buildStoryArcRevisionPrompt(input.bundle, input.review, "", rebaseTarget);

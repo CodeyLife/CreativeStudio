@@ -102,6 +102,19 @@ describe("Skill runtime resolution", () => {
     expect(arcPlanningText).not.toContain("固定顺序");
     expect(arcPlanningText).not.toContain("现场过程");
 
+    const arcReview = await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint: "arc.review", role: "structure-reviewer" });
+    const arcReviewText = renderSkillInstruction(arcReview, "arc.review");
+    expect(arcReviewText).toContain("问题阶梯");
+    expect(arcReviewText).toContain("不可逆出口");
+    expect(arcReviewText).toContain("读者回报");
+    expect(arcReviewText).toContain("安静、关系、背景、铺垫和余波弧与行动弧同样合法");
+    expect(arcReviewText).not.toContain("缺失任一契约按 major 报告");
+
+    const arcRevision = await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint: "arc.revision", role: "reviser" });
+    const arcRevisionText = renderSkillInstruction(arcRevision, "arc.revision");
+    expect(arcRevisionText).toContain("补问题阶梯");
+    expect(arcRevisionText).toContain("安静弧按其功能证据修订而不是改造成行动弧");
+
     const review = await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint: "chapter.review.prose", role: "prose-reviewer" });
     const reviewText = renderSkillInstruction(review, "chapter.review.prose");
     expect(reviewText).toContain("当前功能失效");
@@ -117,6 +130,8 @@ describe("Skill runtime resolution", () => {
     expect(review.skills.some((skill) => skill.skillId === "review-gate")).toBe(true);
     expect(review.skills.some((skill) => skill.roles?.includes("foundation-reviewer"))).toBe(true);
     expect(renderSkillInstruction(review, "foundation.book-plan")).toContain("项目级架构审核");
+    expect(renderSkillInstruction(review, "foundation.book-plan")).toContain("承诺可兑现");
+    expect(renderSkillInstruction(review, "foundation.book-plan")).toContain("不是必须全部成立的硬门");
   });
 
   it("reads workspace Skill content on every resolution without a process cache", async () => {

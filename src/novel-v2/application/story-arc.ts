@@ -9,6 +9,143 @@ export interface StoryArcThreadResponsibility {
   nextAdvance: string;
 }
 
+// TODO P2: 这两个上限应可配置——当前 80 覆盖单弧最大合理章数，
+// 16 与单批次章节窗口对齐。未来应由项目级配置或弧级预算决定，而非硬编码。
+export const MAX_EXPECTED_CHAPTER_COUNT = 80;
+export const MAX_CHAPTER_HINTS = 16;
+
+/**
+ * 外部剧情编排（由外部大模型或用户提供，系统完善）。
+ *
+ * 设计依据：mcp-orchestrator.md 阶段 1 模式 B——外部模型/作者给方向
+ * （objective 必填，其余为可选的弧级设计意图），系统负责把它完善为规范
+ * 蓝图：对照冻结事实与叙事状态账本做事实梳理，补全场景因果、章节状态转换、
+ * 连续性约束与章节蓝图，再走正式弧审核→修订闭环。编排是设计意图基线，
+ * 权威低于已定稿事实与作者边界；编排与事实冲突时以事实为准。
+ */
+export interface StoryArcPlotOutline {
+  /** 本弧创作目的 / 核心读者问题（必填） */
+  objective: string;
+  /** 弧标题建议 */
+  title?: string;
+  entryState?: string;
+  centralConflict?: string;
+  /** 发展阶梯：子问题链，每项承接前项并引出下一项 */
+  development?: string[];
+  resolution?: string;
+  exitState?: string;
+  threadResponsibilities?: StoryArcThreadResponsibility[];
+  expectedChapterCount?: number;
+  phases?: Array<{ title: string; objective: string }>;
+  /** 逐章提示（最多与单个批次窗口一致的 16 条，仅作为章节设计意图） */
+  chapterHints?: string[];
+  /** 自由剧情编排说明：人物安排、伏笔、关系进展、信息释放节奏等 */
+  plotNotes?: string;
+}
+
+/**
+ * 解析外部剧情编排。结构错误（非对象、objective 缺失、责任/阶段条目畸形、
+ * 章节数越界）直接抛错，不让调用方误以为编排已接受；字符串字段裁剪空白。
+ */
+export function parseStoryArcPlotOutline(value: unknown): StoryArcPlotOutline {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("plotOutline 必须是对象");
+  }
+  const source = value as Record<string, unknown>;
+  const objective = typeof source.objective === "string" ? source.objective.trim() : "";
+  if (!objective) throw new Error("plotOutline.objective 必填且非空：外部编排必须说明本弧讲什么、要解决什么读者问题");
+
+  const rawResponsibilities = source.threadResponsibilities;
+  let threadResponsibilities: StoryArcThreadResponsibility[] | undefined;
+  if (rawResponsibilities !== undefined) {
+    if (!Array.isArray(rawResponsibilities)) throw new Error("plotOutline.threadResponsibilities 必须是数组");
+    threadResponsibilities = rawResponsibilities.map((entry, index) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new Error(`plotOutline.threadResponsibilities 第 ${index + 1} 项必须是对象`);
+      const item = entry as Record<string, unknown>;
+      const threadRef = typeof item.threadRef === "string" ? item.threadRef.trim() : "";
+      const responsibility = typeof item.responsibility === "string" ? item.responsibility.trim() : "";
+      const nextAdvance = typeof item.nextAdvance === "string" ? item.nextAdvance.trim() : "";
+      if (!threadRef || !responsibility || !nextAdvance) {
+        throw new Error(`plotOutline.threadResponsibilities 第 ${index + 1} 项必须同时包含非空的 threadRef/responsibility/nextAdvance`);
+      }
+      return { threadRef, responsibility, nextAdvance };
+    });
+  }
+
+  const rawPhases = source.phases;
+  let phases: Array<{ title: string; objective: string }> | undefined;
+  if (rawPhases !== undefined) {
+    if (!Array.isArray(rawPhases)) throw new Error("plotOutline.phases 必须是数组");
+    phases = rawPhases.map((entry, index) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new Error(`plotOutline.phases 第 ${index + 1} 项必须是对象`);
+      const item = entry as Record<string, unknown>;
+      const title = typeof item.title === "string" ? item.title.trim() : "";
+      const phaseObjective = typeof item.objective === "string" ? item.objective.trim() : "";
+      if (!title || !phaseObjective) throw new Error(`plotOutline.phases 第 ${index + 1} 项必须同时包含非空的 title/objective`);
+      return { title, objective: phaseObjective };
+    });
+  }
+
+  const expectedChapterCount = source.expectedChapterCount;
+  if (expectedChapterCount !== undefined && (!Number.isInteger(expectedChapterCount) || Number(expectedChapterCount) < 1 || Number(expectedChapterCount) > MAX_EXPECTED_CHAPTER_COUNT)) {
+    throw new Error(`plotOutline.expectedChapterCount 必须是 1..${MAX_EXPECTED_CHAPTER_COUNT} 的整数`);
+  }
+
+  const rawChapterHints = source.chapterHints;
+  if (rawChapterHints !== undefined && (!Array.isArray(rawChapterHints) || rawChapterHints.length > MAX_CHAPTER_HINTS || rawChapterHints.some((item) => typeof item !== "string"))) {
+    throw new Error(`plotOutline.chapterHints 必须是字符串数组且不超过 ${MAX_CHAPTER_HINTS} 条`);
+  }
+
+  const title = typeof source.title === "string" ? source.title.trim() : undefined;
+  const entryState = typeof source.entryState === "string" ? source.entryState.trim() : undefined;
+  const centralConflict = typeof source.centralConflict === "string" ? source.centralConflict.trim() : undefined;
+  const resolution = typeof source.resolution === "string" ? source.resolution.trim() : undefined;
+  const exitState = typeof source.exitState === "string" ? source.exitState.trim() : undefined;
+  const plotNotes = typeof source.plotNotes === "string" ? source.plotNotes.trim() : undefined;
+  const development = strings(source.development);
+
+  return {
+    objective,
+    ...(title ? { title } : {}),
+    ...(entryState ? { entryState } : {}),
+    ...(centralConflict ? { centralConflict } : {}),
+    ...(development.length ? { development } : {}),
+    ...(resolution ? { resolution } : {}),
+    ...(exitState ? { exitState } : {}),
+    ...(threadResponsibilities?.length ? { threadResponsibilities } : {}),
+    ...(expectedChapterCount !== undefined ? { expectedChapterCount: Number(expectedChapterCount) } : {}),
+    ...(phases?.length ? { phases } : {}),
+    ...(rawChapterHints?.length ? { chapterHints: strings(rawChapterHints) } : {}),
+    ...(plotNotes ? { plotNotes } : {}),
+  };
+}
+
+/**
+ * 校验外部剧情编排有实质信息增量：只有 objective 的空编排不产生任何
+ * 设计意图（等价于普通模式），拒绝它让调用方明确失败边界。
+ */
+export function validateStoryArcPlotOutline(outline: StoryArcPlotOutline): void {
+  const hasSubstance = Boolean(
+    outline.entryState ||
+    outline.centralConflict ||
+    outline.development?.length ||
+    outline.resolution ||
+    outline.exitState ||
+    outline.threadResponsibilities?.length ||
+    outline.expectedChapterCount ||
+    outline.phases?.length ||
+    outline.chapterHints?.length ||
+    outline.plotNotes,
+  );
+  if (!hasSubstance) {
+    throw new Error("plotOutline 只有 objective 没有编排内容；请至少提供 entryState/centralConflict/development/resolution/exitState/threadResponsibilities/chapterHints/plotNotes 之一，否则请使用 novel_story_arc_start 普通模式");
+  }
+  if (outline.threadResponsibilities) {
+    const refs = new Set(outline.threadResponsibilities.map((item) => item.threadRef));
+    if (refs.size !== outline.threadResponsibilities.length) throw new Error("plotOutline.threadResponsibilities 的 threadRef 不能重复");
+  }
+}
+
 export const CHAPTER_NARRATIVE_FUNCTIONS = ["setup", "development", "relationship", "discovery", "confrontation", "payoff", "aftermath", "transition", "reflection"] as const;
 export type ChapterNarrativeFunction = (typeof CHAPTER_NARRATIVE_FUNCTIONS)[number];
 export const CHAPTER_EXECUTION_CONTRACT_VERSION = "reader-grounded-v1";

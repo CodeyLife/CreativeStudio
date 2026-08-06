@@ -1,5 +1,5 @@
 /**
- * V2 MCP 工具定义：32 个工具的 inputSchema（JSON Schema draft-07）。
+ * V2 MCP 工具定义：35 个工具的 inputSchema（JSON Schema draft-07）。
  *
  * 设计依据：AGENTS.md 架构阶段和 V2 MCP 工具契约。
  *
@@ -7,16 +7,26 @@
  * - v1 含 novel_foundation_export，v2 替换为 novel_closed_loop_run（评估闭环）
  * - v2 全部基于 Postgres，inputSchema 严格校验入参
  *
- * 工具分组（32 个）：
+ * 工具分组（35 个）：
  * - Run / Action 主体（7）
  * - Catalog / Receipt（3）
  * - Craft Rule 候选演进（7）
  * - 项目生命周期（3）
- * - 一键流程（6）
+ * - 规划与创作（9，含外部编排模式 novel_story_arc_orchestrate）
  * - 评估闭环（1，v2 新增）
+ * - Workflow 查询（2）
+ * - Workflow 决策（1）
+ * - 上下文与产物查询（2，新增：novel_context_get / novel_artifact_list）
  */
 import type { ToolDefinition } from "./types";
 import { readerReconstructionSchema } from "../reader-reconstruction-schema";
+import { MAX_CHAPTER_HINTS, MAX_EXPECTED_CHAPTER_COUNT } from "../application/story-arc";
+
+// TODO P2: 分页默认值与上限应可配置——当前默认 20/50、上限 100 适配 MCP 单次响应。
+// 未来应由 API 网关或项目级配置决定，而非硬编码。
+export const DEFAULT_WORKFLOW_LIST_LIMIT = 20;
+export const DEFAULT_ARTIFACT_LIST_LIMIT = 50;
+export const MAX_LIST_LIMIT = 100;
 
 // ===== 共享 Schema 片段 =====
 
@@ -107,6 +117,47 @@ const creativeBriefSchema: Record<string, unknown> = {
   },
 };
 
+/**
+ * 外部剧情编排（故事弧模式 B）schema。
+ *
+ * 设计依据：mcp-orchestrator.md 阶段 1 模式 B——外部大模型/用户提供剧情编排
+ * （objective 必填，其余为弧级设计意图），系统负责完善为规范蓝图并走正式
+ * 审核闭环。threadResponsibilities 沿用 threadRef/responsibility/nextAdvance
+ * 三段契约，与 story arc 规范一致；chapterHints 上限与单批次窗口（16 章）对齐。
+ */
+const plotOutlineSchema: Record<string, unknown> = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    objective: { type: "string", minLength: 1, description: "本弧创作目的 / 核心读者问题（必填）" },
+    title: { type: "string", description: "弧标题建议" },
+    entryState: { type: "string", description: "入口状态" },
+    centralConflict: { type: "string", description: "核心冲突" },
+    development: { type: "array", items: { type: "string" }, description: "发展阶梯：子问题链，每项承接前项并引出下一项" },
+    resolution: { type: "string", description: "解决" },
+    exitState: { type: "string", description: "退出状态" },
+    threadResponsibilities: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["threadRef", "responsibility", "nextAdvance"],
+        properties: {
+          threadRef: { type: "string", minLength: 1 },
+          responsibility: { type: "string", minLength: 1 },
+          nextAdvance: { type: "string", minLength: 1 },
+        },
+      },
+      description: "本弧责任线（threadRef 必须能解析到当前项目剧情线，未解析引用会阻止批准）",
+    },
+    expectedChapterCount: { type: "integer", minimum: 1, maximum: MAX_EXPECTED_CHAPTER_COUNT, description: "期望章节数" },
+    phases: { type: "array", items: { type: "object", additionalProperties: false, required: ["title", "objective"], properties: { title: { type: "string", minLength: 1 }, objective: { type: "string", minLength: 1 } } }, description: "阶段划分" },
+    chapterHints: { type: "array", maxItems: MAX_CHAPTER_HINTS, items: { type: "string" }, description: `逐章提示（作为章节设计意图，最多 ${MAX_CHAPTER_HINTS} 条）` },
+    plotNotes: { type: "string", description: "自由剧情编排说明：人物安排、伏笔、关系进展、信息释放节奏等" },
+  },
+  required: ["objective"],
+};
+
 // ===== 工具名常量 =====
 
 export const TOOL_NAMES = [
@@ -143,6 +194,7 @@ export const TOOL_NAMES = [
   "novel_story_arc_get",
   "novel_story_arc_review",
   "novel_story_arc_batch_start",
+  "novel_story_arc_orchestrate",
   // 评估闭环（1，v2 新增）
   "novel_closed_loop_run",
   // Workflow 查询（2，新增）
@@ -150,6 +202,9 @@ export const TOOL_NAMES = [
   "novel_workflow_list",
   // Workflow 决策（1，新增）
   "novel_chapter_review_decision",
+  // 上下文与产物查询（2，新增）
+  "novel_context_get",
+  "novel_artifact_list",
 ] as const;
 
 export type ToolName = (typeof TOOL_NAMES)[number];
@@ -633,6 +688,22 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     },
   },
 
+  {
+    name: "novel_story_arc_orchestrate",
+    description: "故事弧外部编排模式：由外部大模型或用户提供剧情编排（plotOutline），系统负责完善——对照冻结事实与叙事状态账本做事实梳理，补全场景因果、章节状态转换、连续性约束与章节蓝图，再走正式弧审核→修订闭环。编排是设计意图基线，权威低于已定稿事实与作者边界；编排与事实冲突时以事实为准。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectId: { type: "string", minLength: 1 },
+        plotOutline: { ...plotOutlineSchema, description: "外部剧情编排：objective 必填；其余为弧级设计意图。只有 objective 的编排会被拒绝，请用 novel_story_arc_start 普通模式" },
+        reviewPolicy: { type: "string", enum: ["manual", "auto"], default: "auto", description: "manual=弧审核通过后等待人工/外部审批；auto=自动批准（默认，适合外部模型作为编排者驱动）" },
+        authorIntent: { type: "string", description: "可选，作者整体意图说明（并入规划上下文，权威低于已定稿事实）" },
+      },
+      required: ["projectId", "plotOutline"],
+      additionalProperties: false,
+    },
+  },
+
   // ===== 评估闭环（1，v2 新增）=====
 
   {
@@ -673,7 +744,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
       type: "object",
       properties: {
         projectId: { type: "string", minLength: 1 },
-        limit: { type: "integer", minimum: 1, maximum: 100, default: 20 },
+        limit: { type: "integer", minimum: 1, maximum: MAX_LIST_LIMIT, default: DEFAULT_WORKFLOW_LIST_LIMIT },
         workflowType: { type: "string", description: "可选。常见值: novel-intent(章节生成)、chapter-review(章节审校)、story-arc-planning(故事弧规划)" },
       },
       required: ["projectId"],
@@ -696,6 +767,42 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
         revisionBase: { type: "string", enum: ["current", "previous"], description: "revise 时选择修订基础：current=从当前候选稿修订、previous=从修订前原稿修订" },
       },
       required: ["workflowId", "artifactId", "decision"],
+      additionalProperties: false,
+    },
+  },
+
+  // ===== 上下文与产物查询（2，新增）=====
+
+  {
+    name: "novel_context_get",
+    description: "获取项目当前创作上下文（事实梳理与编排依据）：宏观规划摘要、叙事状态账本、最近定稿章节记忆、开放剧情线/伏笔/承诺、规划机制反馈。外部模型在编排剧情或下达编辑指令前调用，避免与已定稿事实冲突。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectId: { type: "string", minLength: 1 },
+        sections: {
+          type: "array",
+          items: { type: "string", enum: ["foundation", "recent-chapters", "narrative-state", "open-elements", "planning-feedback"] },
+          description: "可选，只返回指定 section；缺省返回全部",
+        },
+      },
+      required: ["projectId"],
+      additionalProperties: false,
+    },
+  },
+
+  {
+    name: "novel_artifact_list",
+    description: "列出项目下的创作产物（foundation/蓝图/draft/review 等，按时间倒序），返回 artifactId 供 novel_artifact_get 阅读内容。支持 kind 过滤与 workflowId 定向（复用工作流级产物列表）。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectId: { type: "string", minLength: 1 },
+        workflowId: { type: "string", description: "可选，只返回该 workflow run 的产物" },
+        kind: { type: "string", description: "可选，产物类型过滤（foundation/chapter-blueprint/draft/review 等）" },
+        limit: { type: "integer", minimum: 1, maximum: MAX_LIST_LIMIT, default: DEFAULT_ARTIFACT_LIST_LIMIT },
+      },
+      required: ["projectId"],
       additionalProperties: false,
     },
   },

@@ -1,5 +1,5 @@
 skillId: fact-memory
-version: 1.0.0
+version: 1.0.1
 executionPoints:
   - chapter.fact-extraction
   - character.enrichment
@@ -17,6 +17,6 @@ qualityGates:
 priority: required
 promptSections:
   chapter.fact-extraction: |
-    只沉淀会影响后续因果、人物知识、持续状态、关系、伏笔或承诺的内容。每条事实都要有正文逐字证据、来源段落和 novelty 判断。
+    只沉淀会影响后续因果、人物知识、持续状态、关系、伏笔或承诺的内容。每条事实都要有正文逐字证据、来源段落和 novelty 判断。时间相关事实要标注发生时点与失效条件，区分事实何时成立与何时被正文揭示；一次性描写不泛化为永久规则。
   character.enrichment: |
     只提取本章实际呈现的角色增量；区分观察、听闻、推测和客观事实，避免把叙述者总结或读者推断写入角色知识。

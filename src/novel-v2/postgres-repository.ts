@@ -62,7 +62,7 @@ import type { ObjectStoreIdentity } from "./object-store";
 import { normalizeManuscriptStructuralReview } from "./application/manuscript-structure";
 import { auditNamedReferences, auditStoryArcBatchRanges, canonicalReferenceId, normalizeThreadResponsibilityReferences, resolveNamedReference, type NamedReferenceCandidate, type StoryArcIntegrityIssue } from "./application/story-arc-integrity";
 import { auditFullBookArchitecture } from "./application/full-book-architecture";
-import { CHAPTER_NARRATIVE_FUNCTIONS, canGenerateNextStoryArcBatch, compileChapterPlanValidationReport, normalizeChapterPlanningContext, parseStoryArcBundle, parseStoryArcPlan, planningContextFingerprint, validateStoryArcPlanContracts, type ArcPlanningStatus, type ChapterBlueprint, type ChapterBlueprintRecord, type ChapterPlanningContext, type ChapterSceneBlueprint, type NarrativeArcPlan, type StoryArcBatchRecord, type StoryArcBundle, type StoryArcContextReceipt, type StoryArcRebaseTarget, type StoryArcRecord } from "./application/story-arc";
+import { CHAPTER_NARRATIVE_FUNCTIONS, canGenerateNextStoryArcBatch, compileChapterPlanValidationReport, normalizeChapterPlanningContext, parseStoryArcBundle, parseStoryArcPlan, planningContextFingerprint, validateStoryArcPlanContracts, type ArcPlanningStatus, type ChapterBlueprint, type ChapterBlueprintRecord, type ChapterPlanningContext, type ChapterSceneBlueprint, type NarrativeArcPlan, type StoryArcBatchRecord, type StoryArcBundle, type StoryArcContextReceipt, type StoryArcPlotOutline, type StoryArcRebaseTarget, type StoryArcRecord } from "./application/story-arc";
 import type { StoryArcReviewOutput } from "./prompts/story-arc";
 import { aggregateChapterReviews, markEvidenceUnverified, reviewIssueFingerprint, type ChapterReviewIssueStatus } from "./chapter-review-snapshot";
 import {
@@ -2739,7 +2739,7 @@ export class NovelPostgresRepository {
     return volumeId;
   }
 
-  async createNextStoryArc(input: { projectId: string; workflowId: string; authorIntent?: string }): Promise<StoryArcRecord> {
+  async createNextStoryArc(input: { projectId: string; workflowId: string; authorIntent?: string; plotOutline?: StoryArcPlotOutline }): Promise<StoryArcRecord> {
     await this.assertRequiredPlanApproved(input.projectId);
     const client = await this.pool.connect();
     let arcId = "";
@@ -2754,7 +2754,7 @@ export class NovelPostgresRepository {
       const ordinalResult = await client.query<{ ordinal: number }>("SELECT COALESCE(MAX(ordinal),0)+1 AS ordinal FROM arcs WHERE project_id=$1", [input.projectId]);
       const ordinal = Number(ordinalResult.rows[0]?.ordinal ?? 1);
       arcId = randomUUID();
-      const payload = { title: `故事弧 ${ordinal}`, objective: input.authorIntent || "依据当前宏观规划和已定稿故事状态，形成一个完整的小故事", entryState: "", centralConflict: "", development: [], resolution: "", exitState: "", threadResponsibilities: [], foreshadowingRefs: [], expectedChapterCount: 0, phases: [], workflowId: input.workflowId };
+      const payload = { title: input.plotOutline?.title || `故事弧 ${ordinal}`, objective: input.plotOutline?.objective || input.authorIntent || "依据当前宏观规划和已定稿故事状态，形成一个完整的小故事", entryState: input.plotOutline?.entryState ?? "", centralConflict: input.plotOutline?.centralConflict ?? "", development: input.plotOutline?.development ?? [], resolution: input.plotOutline?.resolution ?? "", exitState: input.plotOutline?.exitState ?? "", threadResponsibilities: input.plotOutline?.threadResponsibilities ?? [], foreshadowingRefs: [], expectedChapterCount: input.plotOutline?.expectedChapterCount ?? 0, phases: input.plotOutline?.phases ?? [], workflowId: input.workflowId };
       await client.query(
         `INSERT INTO arcs(id,volume_id,project_id,title,ordinal,planning_status,execution_status,payload)
          VALUES($1,$2,$3,$4,$5,'generating','planned',$6)`,
@@ -2762,7 +2762,7 @@ export class NovelPostgresRepository {
       );
       await client.query(
         "INSERT INTO audit_records(project_id,actor,action,aggregate_type,aggregate_id,payload) VALUES($1,'runtime','story-arc.created','story-arc',$2,$3)",
-        [input.projectId, arcId, { workflowId: input.workflowId, authorIntent: input.authorIntent }],
+        [input.projectId, arcId, { workflowId: input.workflowId, authorIntent: input.authorIntent, ...(input.plotOutline ? { plotOutline: input.plotOutline } : {}) }],
       );
       await client.query("COMMIT");
     } catch (error) {
@@ -3629,7 +3629,7 @@ export class NovelPostgresRepository {
     return this.getStoryArc(projectId, arcId);
   }
 
-  async getStoryArcPlanningInput(projectId: string) {
+  async getStoryArcPlanningInput(projectId: string, arcId?: string) {
     const [project, macro, memories, threads, narrativeState, openElements, learning] = await Promise.all([
       this.pool.query<{ title: string }>("SELECT title FROM novel_projects WHERE id=$1", [projectId]),
       this.listCurrentFoundationArtifacts(projectId),
@@ -3656,7 +3656,17 @@ export class NovelPostgresRepository {
         boundaries: view.assessment.boundaries,
         sourceArtifactId: view.assessment.source.artifactId,
       }));
-    const contextData = {
+    const contextData: {
+      projectTitle: string;
+      macro: Array<{ taskKey: string; title: string; summary: string }>;
+      recentChapters: Array<{ order: number; summary: string; unresolvedThreads: string[]; emotionalArc?: string }>;
+      openThreads: Array<{ id: string; title: string; payload: Record<string, unknown> }>;
+      openForeshadowings: Array<{ id: string; description: string; triggerKeywords: string[]; expectedPayoffWindow: string; readerQuestion?: string; possiblePayoffs?: string[]; meaningDelta?: string; cost?: string; plantedRevisionId: string }>;
+      openPromises: Array<{ id: string; promiser: string; promisee: string; statement: string; sourceRevisionId: string }>;
+      planningFeedback: Array<{ sourceChapterOrder?: number; targetId: string; underlyingMechanism: string; affectedInputClass: string; boundaries?: string; sourceArtifactId?: string }>;
+      narrativeState: NarrativeStateSnapshot | undefined;
+      plotOutline?: StoryArcPlotOutline;
+    } = {
       projectTitle: project.rows[0].title,
       macro: macro.map((artifact) => ({ taskKey: foundationTaskKey(artifact) ?? "unknown", title: typeof artifact.structuredData?.title === "string" ? artifact.structuredData.title : "", summary: typeof artifact.structuredData?.summary === "string" ? artifact.structuredData.summary : "" })),
       recentChapters: memories.slice().reverse().map((memory) => ({ order: memory.narrativeRange.end, summary: memory.summary, unresolvedThreads: memory.unresolvedThreads, emotionalArc: memory.emotionalArc })),
@@ -3666,6 +3676,32 @@ export class NovelPostgresRepository {
       planningFeedback,
       narrativeState,
     };
+    // 外部剧情编排（模式 B）从对应故事弧的规划 workflow run 读取：arcs.payload
+    // 在项目蓝图投影时会被 bundle.arc 覆盖，不能作为编排输入的持久化位置；
+    // workflow_runs.payload 是审计性持久层，经 startStoryArcOrchestratedPlanning
+    // 写入 plotOutline，按 arcId 精确匹配避免被其他弧的编排串扰；未提供
+    // arcId（如 novel_context_get 项目级视图）时回退到项目最近一次编排。
+    let plotOutline: StoryArcPlotOutline | undefined;
+    if (arcId) {
+      const outlineResult = await this.pool.query<{ plot_outline: StoryArcPlotOutline | null }>(
+        `SELECT payload->'plotOutline' AS plot_outline
+         FROM workflow_runs
+         WHERE project_id=$1 AND workflow_type='story-arc-planning' AND payload->>'arcId'=$2 AND payload ? 'plotOutline'
+         ORDER BY updated_at DESC LIMIT 1`,
+        [projectId, arcId],
+      );
+      plotOutline = outlineResult.rows[0]?.plot_outline ?? undefined;
+    } else {
+      const outlineResult = await this.pool.query<{ plot_outline: StoryArcPlotOutline | null }>(
+        `SELECT payload->'plotOutline' AS plot_outline
+         FROM workflow_runs
+         WHERE project_id=$1 AND workflow_type='story-arc-planning' AND payload ? 'plotOutline'
+         ORDER BY updated_at DESC LIMIT 1`,
+        [projectId],
+      );
+      plotOutline = outlineResult.rows[0]?.plot_outline ?? undefined;
+    }
+    if (plotOutline) contextData.plotOutline = plotOutline;
     const narrativeCutoff = (narrativeState?.narrativeOrder ?? memories.reduce((max, memory) => Math.max(max, memory.narrativeRange.end), 0)) || undefined;
     const sourceArtifactIds = [...new Set([
       ...macro.map((artifact) => artifact.id),
@@ -4428,6 +4464,34 @@ export class NovelPostgresRepository {
       [projectId, artifactId],
     );
     return result.rows[0] ? artifactFromRow(result.rows[0]) : undefined;
+  }
+
+  /**
+   * 列出项目下的创作产物（按时间倒序），供外部编排者定位审核/决策对象。
+   *
+   * 设计依据：mcp-orchestrator.md「外部大模型作为编排者」——外部模型需要
+   * 找到 blueprint/draft/review artifactId 才能调用 novel_artifact_get 阅读
+   * 内容并做审核或决策。kind 可选过滤（foundation/chapter-blueprint/draft/
+   * review 等），workflow 级列表仍使用 listRunArtifacts(temporalWorkflowId)。
+   */
+  async listProjectArtifacts(input: { projectId: string; kind?: string; limit?: number }): Promise<Artifact[]> {
+    const limit = Math.min(Math.max(input.limit ?? 50, 1), 100);
+    const params: unknown[] = [input.projectId];
+    let filterSql = "";
+    if (input.kind) {
+      params.push(input.kind);
+      filterSql = " AND kind=$2";
+    }
+    params.push(limit);
+    const result = await this.pool.query<ArtifactRow>(
+      `SELECT id,project_id,task_id,attempt_id,kind,content_hash,object_key,base_revision,fingerprint,payload,created_at
+       FROM artifacts
+       WHERE project_id=$1${filterSql}
+       ORDER BY created_at DESC,id DESC
+       LIMIT $${params.length}`,
+      params,
+    );
+    return result.rows.map(artifactFromRow);
   }
 
   async getArtifact(artifactId: string): Promise<Artifact | undefined> {

@@ -1,4 +1,4 @@
-import { CHAPTER_NARRATIVE_FUNCTIONS, type StoryArcBundle, type StoryArcContextReceipt, type StoryArcRebaseTarget } from "../application/story-arc";
+import { CHAPTER_NARRATIVE_FUNCTIONS, MAX_CHAPTER_HINTS, MAX_EXPECTED_CHAPTER_COUNT, type StoryArcBundle, type StoryArcContextReceipt, type StoryArcPlotOutline, type StoryArcRebaseTarget } from "../application/story-arc";
 import { ARC_PLAN_CHECK_DIMENSIONS, CHAPTER_PLAN_CHECK_DIMENSIONS, storyArcAuthorityPaths, type StoryArcReviewOutput } from "../application/story-arc-review-policy";
 import type { NarrativeStateSnapshot } from "../protocol";
 
@@ -31,7 +31,7 @@ const storyArcPlanSchema = {
     development: { type: "array", items: { type: "string" } }, resolution: { type: "string" }, exitState: { type: "string" },
     threadResponsibilities: { type: "array", items: { type: "object", additionalProperties: false, required: ["threadRef", "responsibility", "nextAdvance"], properties: { threadRef: { type: "string", minLength: 1 }, responsibility: { type: "string", minLength: 1 }, nextAdvance: { type: "string", minLength: 1 } } } },
     foreshadowingRefs: { type: "array", items: { type: "string" } },
-    expectedChapterCount: { type: "integer", minimum: 1, maximum: 80 },
+    expectedChapterCount: { type: "integer", minimum: 1, maximum: MAX_EXPECTED_CHAPTER_COUNT },
     phases: { type: "array", items: { type: "object", additionalProperties: false, required: ["title", "objective"], properties: { title: { type: "string" }, objective: { type: "string" } } } },
   },
 } as const;
@@ -42,7 +42,7 @@ const storyArcBatchSchema = {
 } as const;
 
 const storyArcChaptersSchema = {
-  type: "array", minItems: 1, maxItems: 16,
+  type: "array", minItems: 1, maxItems: MAX_CHAPTER_HINTS,
   items: {
     type: "object", additionalProperties: false,
     required: ["index", "title", "narrativeFunction", "povCharacterId", "stateTransition", "scenes", "continuityConstraints", "unresolvedAtClose"],
@@ -93,7 +93,33 @@ export type StoryArcPromptInput = {
   planningFeedback?: Array<{ sourceChapterOrder?: number; targetId: string; underlyingMechanism: string; affectedInputClass: string; boundaries?: string; sourceArtifactId?: string }>;
   narrativeState?: NarrativeStateSnapshot;
   contextReceipt?: StoryArcContextReceipt;
+  /** 外部剧情编排（模式 B）：由外部大模型/作者提供，规划器负责完善为规范蓝图 */
+  plotOutline?: StoryArcPlotOutline;
 };
+
+/**
+ * 渲染外部剧情编排为可注入的上下文文本。
+ *
+ * 设计依据：编排是设计意图基线，权威低于已定稿事实与叙事状态账本；
+ * 渲染内容只陈述"外部想讲什么"，不把编排字段当作必须逐字兑现的清单。
+ */
+export function renderStoryArcPlotOutline(outline: StoryArcPlotOutline): string {
+  const lines = [
+    `objective：${outline.objective}`,
+    outline.title ? `标题建议：${outline.title}` : "",
+    outline.entryState ? `入口状态：${outline.entryState}` : "",
+    outline.centralConflict ? `核心冲突：${outline.centralConflict}` : "",
+    outline.development?.length ? `发展阶梯：${outline.development.map((item, index) => `${index + 1}. ${item}`).join("；")}` : "",
+    outline.resolution ? `解决：${outline.resolution}` : "",
+    outline.exitState ? `退出状态：${outline.exitState}` : "",
+    outline.threadResponsibilities?.length ? `编排责任线：${outline.threadResponsibilities.map((item) => `${item.threadRef}：${item.responsibility}；下一次推进=${item.nextAdvance}`).join("\n")}` : "",
+    outline.expectedChapterCount ? `期望章节数：${outline.expectedChapterCount}` : "",
+    outline.phases?.length ? `阶段：${outline.phases.map((item) => `${item.title}（${item.objective}）`).join("；")}` : "",
+    outline.chapterHints?.length ? `逐章提示：${outline.chapterHints.map((item, index) => `第${index + 1}章：${item}`).join("\n")}` : "",
+    outline.plotNotes ? `编排说明：${outline.plotNotes}` : "",
+  ];
+  return lines.filter(Boolean).join("\n");
+}
 
 function sourceRefs(receipt: StoryArcContextReceipt | undefined, section: string, fallback: string[] = []): string[] {
   const fingerprint = receipt?.sectionFingerprints[section];
@@ -125,13 +151,24 @@ export function buildStoryArcPlanningContextSections(input: StoryArcPromptInput)
   const receiptText = receipt
     ? `上下文收据：fingerprint=${receipt.fingerprint}；cutoff=${receipt.narrativeCutoff ?? "legacy"}；来源 artifacts=${receipt.sourceArtifactIds.join("、") || "无"}；来源 revisions=${receipt.sourceRevisionIds.join("、") || "无"}`
     : "上下文收据：legacy context，未提供独立来源收据";
-  return [
+  const outlineSection = input.plotOutline
+    ? {
+      id: "arc-context-plot-outline" as const,
+      kind: "planning" as const,
+      title: "外部剧情编排（由作者/外部模型提供，规划器负责完善）",
+      text: renderStoryArcPlotOutline(input.plotOutline),
+      priority: "required" as const,
+      provenanceRefs: ["orchestrated-plot-outline"],
+    }
+    : undefined;
+  const base = [
     { id: "arc-context-macro", kind: "planning" as const, title: "故事弧宏观规划", text: macro, priority: "required" as const, provenanceRefs: sourceRefs(receipt, "macro", receipt?.sourceArtifactIds ?? []) },
     { id: "arc-context-recent", kind: "fact" as const, title: "已定稿章节与叙事截止点", text: recent, priority: "required" as const, provenanceRefs: sourceRefs(receipt, "recent", receipt?.sourceRevisionIds ?? []) },
     { id: "arc-context-open-elements", kind: "planning" as const, title: "开放线索、伏笔与承诺候选", text: open, priority: "normal" as const, provenanceRefs: sourceRefs(receipt, "open-elements") },
     { id: "arc-context-feedback-state", kind: "review" as const, title: "机制反馈与叙事状态", text: feedback, priority: "normal" as const, provenanceRefs: sourceRefs(receipt, "feedback-state", receipt?.sourceRevisionIds ?? []) },
     { id: "arc-context-receipt", kind: "background" as const, title: "上下文来源收据", text: receiptText, priority: "normal" as const, provenanceRefs: receipt ? [receipt.fingerprint] : ["legacy-context"] },
   ];
+  return outlineSection ? [outlineSection, ...base] : base;
 }
 
 function renderNarrativeState(state: NarrativeStateSnapshot): string {
@@ -179,6 +216,7 @@ function context(input: StoryArcPromptInput): string {
       ? `近期可迁移的规划反馈（只作为风险信号，不是新增剧情要求）：${input.planningFeedback.map((item) => `${item.targetId}${item.sourceChapterOrder ? `/第${item.sourceChapterOrder}章` : ""}：机制=${item.underlyingMechanism}；影响输入类=${item.affectedInputClass}${item.boundaries ? `；边界=${item.boundaries}` : ""}`).join("\n")}`
       : "近期可迁移的规划反馈：无",
     input.narrativeState ? `最新叙事状态账本：\n${renderNarrativeState(input.narrativeState)}` : "最新叙事状态账本：无",
+    input.plotOutline ? `外部剧情编排（由作者/外部模型提供，规划器负责完善）：\n${renderStoryArcPlotOutline(input.plotOutline)}` : "",
   ].filter(Boolean).join("\n\n");
 }
 
@@ -189,9 +227,11 @@ export function buildStoryArcPrompt(input: StoryArcPromptInput): string {
     "先写清故事弧入口状态、主要欲望/压力、关键选择、代价、退出状态和新问题；每个阶段都要说明它改变了什么人物选择、关系状态、信息分布、资源条件或读者期待。",
     "主线、支线、人物线、关系线和世界压力线要直接在 threadResponsibilities 中标明本弧责任、交汇/退出条件和未回收承诺，并写清下一推进条件。若某条线本弧暂缓，写清可验证的保持/观察责任和触发条件；没有剧情线时数组为空。不为了填满结构而制造无依据事件，也不提前消费后续答案。",
     "上下文优先级：已定稿事实、叙事状态账本和明确作者边界高于当前故事弧草案；开放线索是待判断的责任与素材，不是本批次必须兑现的事件；规划反馈只用于修复共享机制，不把某一章的表面问题复制成剧情规则。",
+    "外部剧情编排（如有）是设计意图基线，不是逐字清单：规划器负责把它完善为规范蓝图——对照冻结事实与叙事状态账本做事实梳理，补全场景因果、章节状态转换、连续性约束与责任承接。编排与已定稿事实冲突时以已定稿事实为准；编排未覆盖的部分按本提示词其余规则生成；不得为了贴合编排而虚构事实、提前消费后续答案或改写人物知识边界。",
     "章节可以推进、停顿、相处、等待、恢复、内省或处理余波，不要求每章新增事件、压力、爽点、主题表达或固定结尾。未指定的表达层由作者自然发挥。",
-    "每章填写起始状态、结束状态和可观察证据；状态保持稳定也是合法结果，但必须说明本章承担的体验、关系、理解、条件或余波功能。每个场景填写处境、可观察行动和结果；阻力、选择、代价在自然承担时写清，不用标签代替过程。若需要保留作者侧分析，使用 planningRationale；正文执行上下文不会读取它。没有真实连续性约束时使用空数组，不要为了满足格式虚构内容。",
-    "场景设计至少能回答：谁此刻想要什么、什么在阻拦、人物知道什么/不知道什么、有哪些选择与代价、结果如何改变后续；安静场景也要有可感知的注意力、关系温度、理解或处境证据。",
+    "弧应先按问题阶梯设计再展开章节：主线推进弧的核心读者问题在 development 中逐级被回答并升级，各阶段（phase）之间有承接关系；关系、铺垫和余波弧以关系温度或理解变化为推进方式，同样成立。推进型弧结束时相对入口应有身份、资源、知识、关系或威胁级别中的可感知变化；铺垫/过渡弧的出口可保持稳定，但必须说明本弧承担的静态功能。本弧在 objective 中承诺的读者体验（解决问题、关系升温、世界揭秘、认知落差、情绪确认）应在 exitState 中得到交付，弧的读者回报与入口期待匹配。",
+    "每章填写起始状态、结束状态和可观察证据；状态保持稳定也是合法结果，但必须说明本章让读者获得了什么可感知的新东西——体验、关系、理解、条件、余波或情绪确认；确认规则的陈述若改变了角色后续选择或风险判断，即算功能；若只是认知登记且无后续影响，则并入相邻章节。每个场景填写处境、可观察行动和结果；阻力、选择、代价在自然承担时写清，不用标签代替过程。若需要保留作者侧分析，使用 planningRationale；正文执行上下文不会读取它。没有真实连续性约束时使用空数组，不要为了满足格式虚构内容。",
+    "场景设计至少能回答：谁此刻想要什么、什么在阻拦、人物知道什么/不知道什么、有哪些选择与代价、结果如何改变后续；安静场景也要有可感知的注意力、关系温度、理解或处境证据。一个场景的 outcome 应成为下一场景 situation 的触发条件；不推动外部因果的场景必须承担关系温度、理解修正、余波承载或独立体验功能，而不是只作为过程流水。",
     context(input),
     "只输出 schema 所需 JSON，不输出 Markdown 或解释文字。",
   ].join("\n\n");
@@ -204,6 +244,7 @@ export function buildStoryArcPlanPrompt(input: StoryArcPromptInput, target?: Sto
     "先写清故事弧入口状态、主要欲望/压力、关键选择、代价、退出状态和新问题；每个阶段都要说明它改变了什么人物选择、关系状态、信息分布、资源条件或读者期待。",
     "主线、支线、人物线、关系线和世界压力线要直接在 threadResponsibilities 中标明当前责任、交汇/退出条件和未回收承诺。没有剧情线时数组为空，不为了填满结构制造无依据事件，也不提前消费后续答案。",
     "上下文优先级：已定稿事实、叙事状态账本和明确作者边界高于当前故事弧草案；开放线索是待判断的责任与素材，不是本批次必须兑现的事件；规划反馈只用于修复共享机制。",
+    "外部剧情编排（如有）是设计意图基线，不是逐字清单：规划器负责把它完善为规范蓝图——对照冻结事实与叙事状态账本做事实梳理，补全场景因果、章节状态转换、连续性约束与责任承接。编排与已定稿事实冲突时以已定稿事实为准；编排未覆盖的部分按本提示词其余规则生成；不得为了贴合编排而虚构事实、提前消费后续答案或改写人物知识边界。",
     `批次位置必须是 batch.batchIndex=${target?.batchIndex ?? 1}、batch.startChapterIndex=${target?.startChapterIndex ?? 1}；${target ? "这是重基线，不能改写目标批次窗口。" : "这是新规划，批次从当前输入上下文确定。"}`,
     context(input),
     target ? `重基线目标（只读）：${JSON.stringify(target)}` : "",
@@ -214,7 +255,7 @@ export function buildStoryArcPlanPrompt(input: StoryArcPromptInput, target?: Sto
 export function buildStoryArcChaptersPrompt(input: StoryArcPromptInput & { arc: StoryArcBundle["arc"]; batch: StoryArcBundle["batch"] }, target?: StoryArcRebaseTarget): string {
   return [
     `依据故事弧“${input.arc.title}”生成第 ${input.batch.batchIndex} 批章节，叙事序号从 ${input.batch.startChapterIndex} 开始。输出根对象只包含 chapters。`,
-    "只展开当前窗口，不把整卷或整本书压缩成章节任务清单；保留后续发展的空间。每章填写起始状态、结束状态和可观察证据；状态保持稳定也是合法结果，但必须说明本章承担的体验、关系、理解、条件或余波功能。",
+    "只展开当前窗口，不把整卷或整本书压缩成章节任务清单；保留后续发展的空间。每章填写起始状态、结束状态和可观察证据；状态保持稳定也是合法结果，但必须说明本章让读者获得了什么可感知的新东西——体验、关系、理解、条件、余波或情绪确认；确认规则的陈述若改变了角色后续选择或风险判断，即算功能；若只是认知登记且无后续影响，则并入相邻章节。",
     "每章都必须完整返回 schema 声明的 index、title、narrativeFunction、povCharacterId、stateTransition、scenes、continuityConstraints、unresolvedAtClose；stateTransition 必须是包含 before、after、evidence 三个非空字符串的对象，不能省略、改名或用摘要替代。narrativeFunction 必须使用 schema 枚举值，不得自造同义标签。",
     "每个场景填写处境、可观察行动和结果；阻力、选择、代价在自然承担时写清，不用标签代替过程。需要保留但不应进入正文的分析方法放入 planningRationale，不要写进 observableActions 或 outcome。没有真实连续性约束时使用空数组，不为了满足格式虚构内容。",
     `当前故事弧：${JSON.stringify(input.arc)}`,
@@ -245,7 +286,8 @@ export function buildStoryArcReviewPrompt(bundle: StoryArcBundle, contextText: s
     "审核输出必须使用规范枚举值，不使用同义词或自定义标签：verdict 只能是 passed、revise、blocked；issues.severity 只能是 blocker、major、warning；chapterChecks.dimension 只能是 state-continuity、causal-fit、function-fit、authority-boundary；arcChecks.dimension 只能是 arc-boundary、window-rhythm、longform-hierarchy；所有检查 verdict 只能是 passed、revise、blocked。unresolvedAtClose、checkedPaths、candidateClaims、frozenEvidence 必须始终是数组；certaintyUpgrades 的字段必须是 candidateClaim、frozenBoundary、reason。",
     `结构审核必须完整覆盖而不是抽样概括：chapterChecks 对每个章节分别输出四个 dimension，各组合恰好一次（当前为 ${bundle.chapters.length}×${CHAPTER_PLAN_CHECK_DIMENSIONS.length} 条）；arcChecks 对三个 arc dimension 各输出一次；authorityChecks 对每个章节恰好输出一次。authorityChecks 是机器可执行证据账本：请提供每章的 verdict、reason、frozenEvidence 和 certaintyUpgrades；checkedPaths、candidateClaims、unresolvedAtClose 必须存在并按当前蓝图填写，应用层会从候选蓝图确定性归一化这三个覆盖字段，避免动态路径因回显遗漏而丢失。不能用“已检查”或 dimension 摘要代替 authorityChecks，也不能省略任何章节。数量不足或重复都属于审核输出不完整，不等于要求正文增加事件。`,
     "把‘没有事件’与‘没有变化’区分开：安静章节可以通过关系温度、理解、信息分布、资源条件、心理方向或余波完成自身功能；只有在当前功能需要而正文/蓝图没有承载时才报告问题。",
-    "检查节奏时看目标、阻力、期待、揭示、结果和余波的波形，以及重复冲突/反转造成的疲劳，不用固定章数、钩子密度、爽点数量或持续升级作为硬标准。",
+    "检查节奏时看目标、阻力、期待、揭示、结果和余波的波形，以及重复冲突/反转造成的疲劳，不用固定章数、钩子密度、爽点数量或持续升级作为硬标准。同时按弧设计契约检查（契约是检查方向，不是必须全部成立的硬门）：development 各阶段是否呈承接的子问题链而非并列步骤，场景 outcome 是否成为下一场景 situation 的触发条件或承担独立体验/理解修正功能，安静章是否让读者获得可感知的新东西（关系温度/风险判断/物品易主/理解修正/情绪确认/余波承载），推进型弧的退出状态相对入口是否有身份、资源、知识、关系或威胁级别中的可感知变化。安静、关系、背景、铺垫和余波弧与行动弧同样合法，只要其功能有可感知证据；只有契约缺失且确实损害了本弧承诺功能的证据时才报告 major。",
+    "以目标读者视角检查本弧的读者回报：entryState/objective 承诺了什么体验（解决问题、关系升温、世界揭秘、认知落差、情绪确认），exitState 与 development 是否真的交付了这种体验；若弧结束时读者只经历了过程而没有获得解决、成长、理解、情绪或新问题中的任何回报，报告为节奏问题。安静弧的回报可以是理解修正或关系温度，不要求每弧交付事件性高潮。",
     "故事弧按批次滚动审核：当 batch.complete=false 或当前章节窗口少于 arc.expectedChapterCount 时，未到达 arc.exitState、后续阶段尚未交汇或长线尚未收束是预期的未决状态，不能仅因未来证据尚未出现而报告 blocker。arcChecks 应检查当前窗口是否与整弧边界、阶段责任和后续空间相容；只有当前窗口改写边界、提前消费答案、破坏责任传递或声称已完成却没有证据时才报告问题。",
     "certaintyUpgrades 只记录证据不足却越过冻结边界的确定性升级，不记录当前章节由 stateTransition、observableActions 或 outcome 直接承载的正常状态推进，也不记录有明确范围和现场证据支持的局部结论。若候选主张被当前章节事实直接支持且没有扩大到人物未知、组织全貌、规则普遍性或未来答案，certaintyUpgrades 必须为空；只有无法由冻结证据和当前可观察材料蕴含的越界主张才填写 candidateClaim、frozenBoundary、reason，并将对应 authority verdict 标为 revise 或 blocked。",
     "对未知物质、装置、痕迹或局部反应执行同一证据边界：湿度、颜色、气味、声音、光亮或接触变化只能支持当下可观察现象，不能单凭一次反应推出用途、成分、机制、追踪/筛选/警示功能或排除某种用途。若蓝图把局部现象写成角色尚未获得的功能结论，必须列为 authority revise，并在修订中保留未知状态。",

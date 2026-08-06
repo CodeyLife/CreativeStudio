@@ -1,6 +1,6 @@
 import { CancellationScope, condition, defineSignal, isCancellation, patched, proxyActivities, setHandler } from "@temporalio/workflow";
 import type { ApprovalEvidence, Artifact, CommitResult, ContextManifest, CreativeReview, CreativeRun, CreativeReviewGate, CreativeWorkItem, ExecutionBlueprint, FactApprovalSummary, MemoryBundle, MemoryClaim, NovelIntent, PreflightPlan, PreflightProjectSnapshot, Review, ReviewIssue, RuntimeLearningAssessmentV2, SkillBundle, TaskAttemptRecord } from "../protocol";
-import type { ChapterPlanningContext, StoryArcBundle } from "../application/story-arc";
+import type { ChapterPlanningContext, StoryArcBundle, StoryArcPlotOutline } from "../application/story-arc";
 import type { ManuscriptStructuralReport } from "../application/manuscript-structure";
 import { storyArcReviewStrategy, validateStoryArcReview, type StoryArcReviewOutput } from "../application/story-arc-review-policy";
 import type { ReviewerRole } from "../prompts/chapter-review";
@@ -610,6 +610,12 @@ export interface StoryArcPlanningWorkflowInput {
   startChapterIndex?: number;
   existingArtifactId?: string;
   rebase?: boolean;
+  /**
+   * 外部剧情编排（模式 B）：仅作为 workflow 启动参数记录在
+   * workflow_runs.payload；规划 activity 从仓储层按 arcId 读取同一份编排
+   * 作为 planning section，系统负责完善为规范蓝图。
+   */
+  plotOutline?: StoryArcPlotOutline;
 }
 
 export interface BookSynopsisWorkflowInput {
@@ -851,7 +857,7 @@ export async function storyArcPlanningWorkflow(params: StoryArcPlanningWorkflowI
   const reviewPolicy = params.reviewPolicy ?? (params.mode === "mcp" ? "auto" : "manual");
   const reviewStrategy = storyArcReviewStrategy(reviewPolicy);
   const routingSnapshot = await activities.getStoryArcRoutingSnapshot();
-  await activities.updateWorkflowStatus({ workflowId: params.workflowId, status: "running", payload: { arcId: params.arcId, mode: params.mode, reviewPolicy, routingSnapshotId: routingSnapshot.id } });
+  await activities.updateWorkflowStatus({ workflowId: params.workflowId, status: "running", payload: { arcId: params.arcId, mode: params.mode, reviewPolicy, routingSnapshotId: routingSnapshot.id, orchestrated: Boolean(params.plotOutline) } });
   const runStoryArcLearning = async (current: { artifact: Artifact }, reviewed: { artifact: Artifact; review: StoryArcReviewOutput }, candidateStartIndex?: number): Promise<void> => {
     if (!reviewed.review.issues.length) return;
     const generated = await storyArcModelActivities.assessStoryArcLearning({ projectId: params.projectId, workflowId: params.workflowId, artifact: current.artifact, reviewArtifact: reviewed.artifact, review: reviewed.review, routingSnapshot, candidateStartIndex });

@@ -1,5 +1,5 @@
 skillId: narrative-continuity
-version: 1.0.0
+version: 1.0.1
 executionPoints:
   - foundation.book-plan
   - arc.plan
@@ -30,7 +30,7 @@ promptSections:
   arc.revision: |
     修订只能统一已建立的事实和状态边界，不得把审核意见中的猜测提升为新的世界事实。
   chapter.drafting: |
-    写作时遵守叙事截止、视角人物知识边界、既有世界规则和人物当前状态；连续性约束应通过可感知行动、判断、信息差和后果体现，而不是机械复述设定。
+    写作时遵守叙事截止、视角人物知识边界、既有世界规则和人物当前状态；连续性约束应通过可感知行动、判断、信息差和后果体现，而不是机械复述设定。章节记忆、序列证据等派生记忆只提供承接方向与统计信号，不能替代正文现场，也不把其中任何措辞变成逐章必填项。
   chapter.review.structure: |
     只依据冻结事实、章节规划和正文证据检查时间线、世界规则、人物知识、关系状态和伏笔账本；不把安静章节或未承担相关内容的章节强行判为失败。
   chapter.revision: |

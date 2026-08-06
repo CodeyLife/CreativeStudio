@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { startStoryArcBatchPlanning, startStoryArcPlanning, startStoryArcReview } from "../application/story-arc-workflow";
+import { startStoryArcBatchPlanning, startStoryArcOrchestratedPlanning, startStoryArcPlanning, startStoryArcReview } from "../application/story-arc-workflow";
 import type { NovelPostgresRepository } from "../postgres-repository";
 
 const withStoryArcWorkflowLock = async <T>(_projectId: string, _arcId: string, callback: () => Promise<T>): Promise<T> => callback();
@@ -241,5 +241,55 @@ describe("story arc review authority boundary", () => {
     expect(retry).toHaveBeenCalledWith("project-1", "arc-1");
     expect(putWorkflowRun).toHaveBeenCalledWith(expect.objectContaining({ payload: expect.objectContaining({ retryFailed: true, batchIndex: 2, startChapterIndex: 11 }) }));
     expect(start).toHaveBeenCalledWith("storyArcPlanningWorkflow", expect.objectContaining({ args: [expect.objectContaining({ batchIndex: 2, startChapterIndex: 11 })] }));
+  });
+
+  it("starts orchestrated planning with the plot outline persisted in the run payload", async () => {
+    const createNextStoryArc = vi.fn(async () => ({ id: "arc-orch-1" }));
+    const putWorkflowRun = vi.fn(async () => undefined);
+    const start = vi.fn(async () => ({ firstExecutionRunId: "run-orch" }));
+    const repository = {
+      createNextStoryArc,
+      putWorkflowRun,
+      updateWorkflowRunStatus: vi.fn(async () => undefined),
+      recoverStoryArcAfterWorkflowCancellation: vi.fn(async () => undefined),
+      withStoryArcWorkflowLock,
+    } as unknown as NovelPostgresRepository;
+    const temporal = { workflow: { start } } as never;
+    const outline = { objective: "查明暗渠上方的体系", development: ["找到守门人", "通过审查"], plotNotes: "伏笔在守门人手里" };
+
+    const result = await startStoryArcOrchestratedPlanning(repository, temporal, { projectId: "project-1", plotOutline: outline, mode: "mcp", reviewPolicy: "auto", taskQueue: "novel-v2" });
+
+    expect(result).toMatchObject({ arcId: "arc-orch-1", status: "accepted", orchestrated: true });
+    expect(createNextStoryArc).toHaveBeenCalledWith(expect.objectContaining({ projectId: "project-1", plotOutline: outline, authorIntent: outline.objective }));
+    expect(putWorkflowRun).toHaveBeenCalledWith(expect.objectContaining({
+      workflowType: "story-arc-planning",
+      payload: expect.objectContaining({ orchestrated: true, plotOutline: outline, arcId: "arc-orch-1" }),
+    }));
+    expect(start).toHaveBeenCalledWith("storyArcPlanningWorkflow", expect.objectContaining({
+      args: [expect.objectContaining({ arcId: "arc-orch-1", plotOutline: outline })],
+    }));
+  });
+
+  it("records a failed run and recovers the arc when orchestrated workflow start fails", async () => {
+    const updateWorkflowRunStatus = vi.fn(async () => undefined);
+    const recover = vi.fn(async () => undefined);
+    const repository = {
+      createNextStoryArc: vi.fn(async () => ({ id: "arc-orch-fail" })),
+      putWorkflowRun: vi.fn(async () => undefined),
+      updateWorkflowRunStatus,
+      recoverStoryArcAfterWorkflowCancellation: recover,
+      withStoryArcWorkflowLock,
+    } as unknown as NovelPostgresRepository;
+    const temporal = { workflow: { start: vi.fn(async () => { throw new Error("Temporal unavailable"); }) } } as never;
+
+    await expect(startStoryArcOrchestratedPlanning(repository, temporal, {
+      projectId: "project-1",
+      plotOutline: { objective: "查明暗渠上方的体系", plotNotes: "伏笔在守门人手里" },
+      mode: "mcp",
+      taskQueue: "novel-v2",
+    })).rejects.toThrow("Temporal unavailable");
+
+    expect(updateWorkflowRunStatus).toHaveBeenCalledWith(expect.any(String), "failed", expect.objectContaining({ reasonCode: "workflow-start-failed" }));
+    expect(recover).toHaveBeenCalledWith("project-1", "arc-orch-fail");
   });
 });
