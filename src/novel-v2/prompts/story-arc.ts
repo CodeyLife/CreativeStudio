@@ -84,6 +84,13 @@ export type StoryArcPromptInput = {
   contextReceipt?: StoryArcContextReceipt;
   /** 外部剧情编排（模式 B）：由外部大模型/作者提供，规划器负责完善为规范蓝图 */
   plotOutline?: StoryArcPlotOutline;
+  /**
+   * 近 N 章连续同类功能游程（连续 ≥3 章同 narrativeFunction）。
+   * 设计依据：AGENTS.md「问题要在机制层解决」——连续低行动/观察型章节密度的根因
+   * 在规划批准了被动功能序列；把信号前移到 arc.plan 让规划器在分配 narrativeFunction
+   * 时就能看到疲劳风险，主动轮换压力类型。只作描述性统计，不是短语黑名单。
+   */
+  serialFunctionRuns?: Array<{ narrativeFunction: string; narrativeOrders: number[] }>;
 };
 
 /**
@@ -137,6 +144,9 @@ export function buildStoryArcPlanningContextSections(input: StoryArcPromptInput)
       : "近期可迁移的规划反馈：无",
     input.narrativeState ? `最新叙事状态账本：\n${renderNarrativeState(input.narrativeState)}` : "最新叙事状态账本：无",
   ].join("\n\n");
+  const serialSignals = input.serialFunctionRuns?.length
+    ? `连续同类功能游程（近 N 章连续 ≥3 章同 narrativeFunction）：${input.serialFunctionRuns.map((run) => `${run.narrativeFunction}×${run.narrativeOrders.length}（第${run.narrativeOrders.join("、")}章）`).join("；")}；连续同类功能不等于问题，但如果本批次再分配相同功能会延续疲劳——检查是否需要轮换压力类型或在该功能内提供可感知的新回报。`
+    : "连续同类功能游程：近 N 章无连续同类功能游程。";
   const receiptText = receipt
     ? `上下文收据：fingerprint=${receipt.fingerprint}；cutoff=${receipt.narrativeCutoff ?? "legacy"}；来源 artifacts=${receipt.sourceArtifactIds.join("、") || "无"}；来源 revisions=${receipt.sourceRevisionIds.join("、") || "无"}`
     : "上下文收据：legacy context，未提供独立来源收据";
@@ -155,6 +165,7 @@ export function buildStoryArcPlanningContextSections(input: StoryArcPromptInput)
     { id: "arc-context-recent", kind: "fact" as const, title: "已定稿章节与叙事截止点", text: recent, priority: "required" as const, provenanceRefs: sourceRefs(receipt, "recent", receipt?.sourceRevisionIds ?? []) },
     { id: "arc-context-open-elements", kind: "planning" as const, title: "开放线索、伏笔与承诺候选", text: open, priority: "normal" as const, provenanceRefs: sourceRefs(receipt, "open-elements") },
     { id: "arc-context-feedback-state", kind: "review" as const, title: "机制反馈与叙事状态", text: feedback, priority: "normal" as const, provenanceRefs: sourceRefs(receipt, "feedback-state", receipt?.sourceRevisionIds ?? []) },
+    { id: "arc-context-serial-signals", kind: "review" as const, title: "跨章序列信号（连续同类功能游程）", text: serialSignals, priority: "normal" as const, provenanceRefs: sourceRefs(receipt, "serial-signals") },
     { id: "arc-context-receipt", kind: "background" as const, title: "上下文来源收据", text: receiptText, priority: "normal" as const, provenanceRefs: receipt ? [receipt.fingerprint] : ["legacy-context"] },
   ];
   return outlineSection ? [outlineSection, ...base] : base;
@@ -205,6 +216,9 @@ function context(input: StoryArcPromptInput): string {
       ? `近期可迁移的规划反馈（只作为风险信号，不是新增剧情要求）：${input.planningFeedback.map((item) => `${item.targetId}${item.sourceChapterOrder ? `/第${item.sourceChapterOrder}章` : ""}：机制=${item.underlyingMechanism}；影响输入类=${item.affectedInputClass}${item.boundaries ? `；边界=${item.boundaries}` : ""}`).join("\n")}`
       : "近期可迁移的规划反馈：无",
     input.narrativeState ? `最新叙事状态账本：\n${renderNarrativeState(input.narrativeState)}` : "最新叙事状态账本：无",
+    input.serialFunctionRuns?.length
+      ? `连续同类功能游程（近 N 章连续 ≥3 章同 narrativeFunction）：${input.serialFunctionRuns.map((run) => `${run.narrativeFunction}×${run.narrativeOrders.length}（第${run.narrativeOrders.join("、")}章）`).join("；")}；连续同类功能不等于问题，但如果本批次再分配相同功能会延续疲劳——检查是否需要轮换压力类型或在该功能内提供可感知的新回报。`
+      : "连续同类功能游程：近 N 章无连续同类功能游程。",
     input.plotOutline ? `外部剧情编排（由作者/外部模型提供，规划器负责完善）：\n${renderStoryArcPlotOutline(input.plotOutline)}` : "",
   ].filter(Boolean).join("\n\n");
 }
@@ -218,6 +232,7 @@ export function buildStoryArcPrompt(input: StoryArcPromptInput): string {
     "上下文优先级：已定稿事实、叙事状态账本和明确作者边界高于当前故事弧草案；开放线索是待判断的责任与素材，不是本批次必须兑现的事件；规划反馈只用于修复共享机制，不把某一章的表面问题复制成剧情规则。",
     "外部剧情编排（如有）是设计意图基线，不是逐字清单：规划器负责把它完善为规范蓝图——对照冻结事实与叙事状态账本做事实梳理，补全场景因果、章节状态转换、连续性约束与责任承接。编排与已定稿事实冲突时以已定稿事实为准；编排未覆盖的部分按本提示词其余规则生成；不得为了贴合编排而虚构事实、提前消费后续答案或改写人物知识边界。",
     "章节可以推进、停顿、相处、等待、恢复、内省或处理余波，不要求每章新增事件、压力、爽点、主题表达或固定结尾。未指定的表达层由作者自然发挥。",
+    "近 N 章连续同类功能游程（见上下文序列信号）是疲劳风险提示，不是硬门：连续同类功能本身合法，但如果本批次再分配相同功能会延续疲劳，应检查是否可以轮换压力类型，或在该功能内提供可感知的新回报（关系温度、理解修正、余波承载、独立体验）。不要为了打破连续而强行安排无依据事件。",
     "弧应先按问题阶梯设计再展开章节：主线推进弧的核心读者问题在 development 中逐级被回答并升级，各阶段（phase）之间有承接关系；关系、铺垫和余波弧以关系温度或理解变化为推进方式，同样成立。推进型弧结束时相对入口应有身份、资源、知识、关系或威胁级别中的可感知变化；铺垫/过渡弧的出口可保持稳定，但必须说明本弧承担的静态功能。本弧在 objective 中承诺的读者体验（解决问题、关系升温、世界揭秘、认知落差、情绪确认）应在 exitState 中得到交付，弧的读者回报与入口期待匹配。",
     "每章填写起始状态、结束状态和可观察证据；状态保持稳定也是合法结果，但必须说明本章让读者获得了什么可感知的新东西——体验、关系、理解、条件、余波或情绪确认；确认规则的陈述若改变了角色后续选择或风险判断，即算功能；若只是认知登记且无后续影响，则并入相邻章节。每个场景填写处境、可观察行动和结果；阻力、选择、代价在自然承担时写清，不用标签代替过程。若需要保留作者侧分析，使用 planningRationale；正文执行上下文不会读取它。没有真实连续性约束时使用空数组，不要为了满足格式虚构内容。",
     "场景设计至少能回答：谁此刻想要什么、什么在阻拦、人物知道什么/不知道什么、有哪些选择与代价、结果如何改变后续；安静场景也要有可感知的注意力、关系温度、理解或处境证据。一个场景的 outcome 应成为下一场景 situation 的触发条件；不推动外部因果的场景必须承担关系温度、理解修正、余波承载或独立体验功能，而不是只作为过程流水。",
