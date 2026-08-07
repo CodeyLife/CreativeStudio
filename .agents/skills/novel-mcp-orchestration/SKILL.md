@@ -103,6 +103,22 @@ manual reviewGate 下，bootstrap 的 5 个 foundation 阶段每阶段都要走"
 - **learning 记录**：review 落库后按 AGENTS.md 汇总 issue 模式；可复用机制
   沉淀走 novel_rule_candidate_create（scope 四件套）。
 
+### 治理者纪律（2026-08-06 起，实战沉淀）
+
+- **契约核对前置**：下达修订指令 / 编排 / 审批前，先核对目标产物的 schema 契约、
+  人物 ID 规范（characters 阶段使用 `char_` 前缀 ID，如 `char_chu_heng`）与下游
+  消费方（foundation-contract 校验、full-book-architecture 审计）对字段格式的要求。
+  给错误 ID 或错误格式的指令会让模型产出再次违约，拖长返工链。
+- **优先 review.submit 驱动修订**：需要修订 foundation / 弧时，首选
+  `review.submit(verdict=revise, issues=[意见])`（意见自动作为 instruction 回流）；
+  `work.revise` 仅用于携带自定义指令，落库后不要再手动 `work.start`（修复后的
+  workflow 会自动拾取 pending）。
+- **修复后做端到端验证**：修改系统代码（超时、解析、校验、prompt）后，用真实数据
+  验证整条链（如用真实审核文本验证 `parseTextReview`、用 `auditFullBookArchitecture`
+  验证审计通过），再继续流程；不要等下一次流程暴露。
+- **工具调用纪律**：工具参数必须是严格的 JSON 键值；一个消息只发格式正确的
+  工具调用，不要把分析文本混入参数，不要输出畸形的调用块。
+
 ### 阶段 1 故事弧规划（两种模式）
 
 **模式 A 系统自规划**：`novel_story_arc_start(projectId, authorIntent?)`

@@ -441,6 +441,22 @@ export function validateFoundationTaskContract(value: FoundationOutput, taskKey:
   validateRepeatedEntries(taskKey, structuredData, errors);
   if (taskKey === "worldview") validateWorldviewRules(structuredData, errors);
   if (taskKey === "architecture") validateArchitectureVolumes(structuredData, errors);
+  if (taskKey === "plot-design") {
+    // 根因修复（2026-08-06）：模型多次输出对象形式的 characterDestinations
+    //（{ ChuHeng: {...} }），而契约与 full-book-architecture 审计都要求数组
+    //（每项含 characterRef）。provider 的 strict json_schema 可能被第三方中转站忽略，
+    // 因此在此处做本地强校验，确保生成时对象形式即被拦截。
+    const destinations = valueAt(structuredData, "plotStrategy.characterDestinations") ?? structuredData.characterDestinations;
+    if (destinations !== undefined && !Array.isArray(destinations)) {
+      errors.push("plotStrategy.characterDestinations 必须是数组（每项含 characterRef 规范人物 ID 与 endingRange）");
+    } else if (Array.isArray(destinations)) {
+      for (const [index, entry] of destinations.entries()) {
+        if (!entry || typeof entry !== "object" || Array.isArray(entry) || !meaningful((entry as Record<string, unknown>).characterRef)) {
+          errors.push(`plotStrategy.characterDestinations[${index}].characterRef 不能为空`);
+        }
+      }
+    }
+  }
   return errors;
 }
 

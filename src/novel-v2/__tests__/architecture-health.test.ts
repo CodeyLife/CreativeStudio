@@ -77,6 +77,8 @@ describe("story arc approval architecture gate", () => {
       previewStoryArcApproval: async () => ({ creates: [], updates: [], conflicts: [], artifactId: blueprint.id }),
       getArtifact: async (id: string) => id === blueprint.id ? blueprint : id === review.id ? review : undefined,
       getArchitectureHealth: async () => health,
+      // approveStoryArc 在引用门禁前会先物化弧引用；测试中不物化，保持 health 的 blocking issues 可见
+      normalizeStoryArcReferences: async () => ({ arc: null, mappings: [], created: [] }),
     } as unknown as NovelPostgresRepository;
     await expect(NovelPostgresRepository.prototype.approveStoryArc.call(fakeRepository, "project-1", "arc-1", blueprint.id, review.id, "test"))
       .rejects.toThrow(/故事弧审批前置门禁未通过|故事弧存在未解决的结构引用/);

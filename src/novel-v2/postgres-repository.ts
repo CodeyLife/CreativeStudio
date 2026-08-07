@@ -3061,6 +3061,14 @@ export class NovelPostgresRepository {
       if (Object.prototype.hasOwnProperty.call(rawPayload, "plotThreadRefs")) {
         throw new Error("故事弧仍包含已删除的 plotThreadRefs；请按当前契约重新生成并审核故事弧");
       }
+      // 根因修复（2026-08-07）：此前 threadResponsibilities 只走 normalizeThreadResponsibilityReferences
+      //（unresolved 保持原值、不创建项目对象），导致 plot_threads 表中没有对应剧情线时，弧审批的
+      // 引用完整性门禁永远判 blocking。此处先用 normalize("thread", ...) 物化缺失的剧情线对象
+      //（创建逻辑已存在，与 foreshadowing 一致），再解析 responsibilities 得到 canonicalId。
+      const threadRefsToNormalize = originalResponsibilities
+        .map((responsibility) => (responsibility && typeof responsibility === "object" && typeof (responsibility as unknown as Record<string, unknown>).threadRef === "string" ? (responsibility as unknown as Record<string, unknown>).threadRef as string : undefined))
+        .filter((ref): ref is string => Boolean(ref && ref.trim()));
+      await normalize("thread", threadRefsToNormalize, threadCandidates);
       const threadResponsibilities = normalizeThreadResponsibilityReferences(
         originalResponsibilities,
         threadCandidates,
@@ -3494,7 +3502,15 @@ export class NovelPostgresRepository {
       const architectureMessage = blockingArchitectureIssues.length ? `全书架构审计：${blockingArchitectureIssues.map((issue) => `${issue.path} ${issue.message}`).join("；")}` : "";
       throw new Error(`故事弧审批前置门禁未通过：${[foundationMessage, architectureMessage].filter(Boolean).join("；")}`);
     }
-    const references = architectureHealth.references.find((item) => item.arcId === arcId);
+    // 根因修复（2026-08-07）：normalizeStoryArcReferences 此前从未被调用，弧的
+    // threadResponsibilities.threadRef 与 foreshadowingRefs 无法解析到项目级对象
+    //（plot_threads / foreshadowing 表），approveStoryArc 的引用完整性门禁被判
+    // blocking（"故事弧存在未解决的结构引用"）。在引用门禁前先物化弧引用为项目对象，
+    // 幂等（ON CONFLICT DO UPDATE）；物化会改写 arc payload 的 threadRef 为 canonicalId，
+    // 因此需要重新获取架构健康以刷新引用检查。
+    await this.normalizeStoryArcReferences(projectId, arcId, actor);
+    const refreshedHealth = await this.getArchitectureHealth(projectId);
+    const references = refreshedHealth.references.find((item) => item.arcId === arcId);
     const blockingReferenceIssues = [
       ...(references?.plotThreads.issues ?? []),
       ...(references?.foreshadowing.issues ?? []),

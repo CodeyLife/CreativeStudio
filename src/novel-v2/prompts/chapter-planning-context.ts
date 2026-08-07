@@ -97,6 +97,10 @@ export function memoryClaimPriority(memory: MemoryBundle, claim: MemoryHit): Sta
  * Single execution projection shared by draft, review and revision.
  * Editorial labels are intentionally absent; only causal state and observable scene material remains.
  */
+
+/** 单章建议性目标篇幅（字符数）；蓝图可经 targetWordCount 覆盖，正文产出时作为创作指引而非硬性上限。 */
+export const DEFAULT_TARGET_WORD_COUNT = 3500;
+
 export function renderChapterExecutionContract(context: ChapterPlanningContext): string {
   const chapter = context.chapter;
   const projection = projectChapterForExecution(chapter);
@@ -119,6 +123,7 @@ export function renderChapterExecutionContract(context: ChapterPlanningContext):
     `目标章：第 ${chapter.globalOrder} 章《${chapter.title}》`,
     `叙事功能：${projection.narrativeFunction ?? "由正文自然形成"}`,
     `POV：${projection.povCharacterId || "未限定"}`,
+    `目标篇幅：约 ${chapter.targetWordCount ?? DEFAULT_TARGET_WORD_COUNT} 字（建议性目标：以情节完整为优先，不因凑字或压字牺牲内容，也不设硬性上限）`,
     `起始状态：${projection.stateTransition.before}`,
     `结束状态：${projection.stateTransition.after}`,
     `状态证据：${projection.stateTransition.evidence}`,

@@ -918,7 +918,12 @@ export async function storyArcPlanningWorkflow(params: StoryArcPlanningWorkflowI
       }
       if (iteration >= maxRetries) {
         await activities.failStoryArc({ projectId: params.projectId, arcId: params.arcId, reason: "故事弧蓝图在最大修订次数内未通过审核" });
-        await activities.updateWorkflowStatus({ workflowId: params.workflowId, status: "manual-review-required", payload: { arcId: params.arcId, artifactId: current.artifact.id, reviewArtifactId: reviewed.artifact.id, reason: "故事弧蓝图在最大修订次数内未通过审核", reviewSummary: reviewed.review.opinion } });
+        // 根因修复（2026-08-06）：此前此处把 workflow 状态置为 manual-review-required 后直接
+        // return，导致 workflow_runs.status 永久停留在 manual-review-required（listActiveStoryArcWorkflowIds
+        // 视为活动状态），后续 novel_story_arc_review 被"已有活动工作流"永久阻塞。
+        // 本分支不等待 approved 信号（无外部审批入口），因此置为 completed 终态（释放活动锁）；
+        // 弧已被 failStoryArc 标记为 failed，人工可通过 novel_story_arc_review 重审（failed+蓝图 → retry）。
+        await activities.updateWorkflowStatus({ workflowId: params.workflowId, status: "completed", payload: { arcId: params.arcId, artifactId: current.artifact.id, reviewArtifactId: reviewed.artifact.id, reason: "故事弧蓝图在最大修订次数内未通过审核", reviewSummary: reviewed.review.opinion } });
         return;
       }
       current = await reviseBundle(current, reviewed.review);

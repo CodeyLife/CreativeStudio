@@ -54,6 +54,9 @@ function stripPassedPrefix(content: string): string {
  * 判定规则（结构特征，非内容匹配）：
  * - 提取代码围栏内容（若存在）作为正文
  * - 正文（去空白）等于 PASSED → passed
+ * - 正文最后一行/最后一段为 PASSED 标记（模型输出逐项分析后以 PASSED 收尾，
+ *   未严格遵循"通过只输出单行 PASSED"契约时的兜底判定；通过意图以显式标记
+ *   结尾为证据）→ passed
  * - 其余任何内容（含空输出）→ revise，意见为正文全文（剥离 PASSED 标记回显与
  *   指令回显前缀）；仅当正文为空时使用兜底文案，保证意见非空
  */
@@ -62,6 +65,23 @@ export function parseTextReview(raw: string): TextReviewOutput {
   // 通过标记允许尾部标点（模型在单行 PASSED 后追加句号是常见行为），
   // 与 stripPassedPrefix 的标点容忍集合保持一致，避免带标点的通过被误判为 revise。
   if (/^PASSED[：:\s.,。]*$/i.test(content)) return { verdict: "passed", opinion: "" };
+  // 长文本 PASSED 收尾（两种形态）：
+  // 1) 最后一行是独立的 PASSED 标记行（逐项分析后单行输出通过标记）；
+  // 2) 末尾以 PASSED 标记收尾且前有分隔符（模型在段落末尾写"……。PASSED"）。
+  // 均以显式标记结尾为通过意图的证据，不识别任何具体内容，可跨 prompt 版本与题材复用。
+  const lines = content.split(/\r?\n/);
+  const lastLine = lines.at(-1)?.trim() ?? "";
+  if (/^PASSED[：:\s.,。]*$/i.test(lastLine) && content.length > lastLine.length) {
+    return { verdict: "passed", opinion: "" };
+  }
+  const trimmed = content.replace(/\s+$/, "");
+  const tailMatch = trimmed.match(/PASSED[：:\s.,。]*$/i);
+  if (tailMatch && tailMatch[0].length > 0) {
+    const prefix = trimmed.slice(0, trimmed.length - tailMatch[0].length);
+    // 前缀须以分隔符结尾（换行/句号/冒号/空白），避免把"问题已PASSED"这类
+    // 观点句中夹带的标记误判为通过结论。
+    if (/[\n。.！!？?:：\s]$/.test(prefix)) return { verdict: "passed", opinion: "" };
+  }
   const opinion = stripPassedPrefix(stripInstructionEcho(content)) || TEXT_REVIEW_EMPTY_OPINION_FALLBACK;
   return { verdict: "revise", opinion };
 }

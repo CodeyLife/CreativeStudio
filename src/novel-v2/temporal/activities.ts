@@ -94,9 +94,14 @@ type TargetedRevisionBatchOutput = { replacements: TargetedRevisionReplacement[]
 // default bounds one independent lens while leaving enough time for a large
 // structured architecture review; a slow lens is evidence to retain, not a
 // reason to block a complete independent review.
+// 根因修复（2026-08-06）：弧审核 prompt 包含整弧章节蓝图 + 规划上下文，模型生成
+// 审核意见通常需 2-5 分钟；120s 默认预算在模型服务响应偏慢时导致所有 lens 同时
+// 超时（generated.length===0 → 整轮审核失败），连续多次复现。观察审核模型输出超长
+// 逐章分析（>1.7 万字符）单次生成可超 5 分钟，故默认预算放宽为 10 分钟，属通用
+// 超时配置，非针对特定弧/章节的个案调整；仍可经 env 覆盖。
 const ARC_REVIEW_PASS_TIMEOUT_MS = (() => {
   const configured = Number(process.env.NOVEL_ARC_REVIEW_PASS_TIMEOUT_MS);
-  return Number.isFinite(configured) && configured > 0 ? configured : 120_000;
+  return Number.isFinite(configured) && configured > 0 ? configured : 600_000;
 })();
 
 export function buildCraftRuleCandidateInput(assessment: RuntimeLearningAssessmentV2): Parameters<typeof createCraftRuleCandidate>[1] | undefined {

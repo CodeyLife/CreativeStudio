@@ -1,6 +1,6 @@
 import type { Artifact, ExecutionBlueprint, MemoryBundle, NovelIntent, SkillBundle, StagePromptPackage } from "../protocol";
 import type { ChapterPlanningContext } from "../application/story-arc";
-import { dedupeNarrativeRhythmMemory, memoryClaimPriority, renderChapterExecutionContract, renderExecutionMemoryClaim, renderNarrativeRhythm, renderSerialContext } from "./chapter-planning-context";
+import { dedupeNarrativeRhythmMemory, DEFAULT_TARGET_WORD_COUNT, memoryClaimPriority, renderChapterExecutionContract, renderExecutionMemoryClaim, renderNarrativeRhythm, renderSerialContext } from "./chapter-planning-context";
 import { buildBlueprintSummary } from "./chapter-review";
 import { compileStageContext } from "../stage-context";
 import { buildSkillContextSections } from "../skill-runtime";
@@ -73,13 +73,14 @@ function renderIntent(intent: NovelIntent): string {
   ].filter(Boolean).join("\n");
 }
 
-function buildWritingContract(): string {
+function buildWritingContract(targetWordCount?: number): string {
   return [
     "只输出连续的小说正文，不输出标题、Markdown、作者说明、审核意见、指令回显或元注释。",
     "遵守冻结事实、当前 POV、人物知识边界和已确定的因果状态；未知信息只能通过正文中真实发生的告知、观察或推断获得。",
     "完成当前章节执行合同，但把它转化为自然的场景、行动、对白和体验，不逐条复述规划，也不添加合同外的事实。",
     READER_RECONSTRUCTION_CONTRACT,
     "状态可以保持稳定；关系、理解、情绪、资源、知识或处境的细微变化同样可以构成章节完成感。",
+    `本章目标篇幅约 ${targetWordCount ?? DEFAULT_TARGET_WORD_COUNT} 字（建议性目标：按情节完整自然展开，不因凑字或压字牺牲内容，也不设硬性上限）。`,
     "在体验自然完成的位置收束，保留必要的铺陈、内省和余波，不按固定字数、段落数量、钩子类型或节奏公式停笔。",
   ].join("\n");
 }
@@ -94,7 +95,7 @@ export function dedupeDraftMemory(input: DraftPromptInput): MemoryBundle {
 
 export function buildChapterDraftPromptPackage(input: DraftPromptInput & { workflowId: string; system: string }): StagePromptPackage {
   const memory = dedupeDraftMemory(input);
-  const instruction = buildWritingContract();
+  const instruction = buildWritingContract(input.planningContext?.chapter?.targetWordCount);
   const sections = [
     { id: "draft-contract", kind: "goal" as const, title: "正文写作契约", text: instruction, priority: "critical" as const, provenanceRefs: [input.intent.id] },
     { id: "author-intent", kind: "goal" as const, title: "作者目标", text: renderIntent(input.intent), priority: "required" as const, provenanceRefs: [input.intent.id] },

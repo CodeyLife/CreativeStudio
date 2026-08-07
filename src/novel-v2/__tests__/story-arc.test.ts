@@ -36,6 +36,16 @@ describe("story arc blueprint subtraction contract", () => {
     expect(parsed.chapters[0]).not.toHaveProperty("narrativeScale");
   });
 
+  it("preserves the optional targetWordCount suggestion for the drafting stage", () => {
+    const withTarget = { ...bundle, chapters: [{ ...bundle.chapters[0], targetWordCount: 3500 }] };
+    expect(parseStoryArcBundle(withTarget).chapters[0].targetWordCount).toBe(3500);
+    // 缺省时不注入，正文产出阶段回退默认建议值
+    expect(parseStoryArcBundle(bundle).chapters[0].targetWordCount).toBeUndefined();
+    // 非法值（非正数）不保留
+    const invalid = { ...bundle, chapters: [{ ...bundle.chapters[0], targetWordCount: 0 }] };
+    expect(parseStoryArcBundle(invalid).chapters[0].targetWordCount).toBeUndefined();
+  });
+
   it("validates quiet chapters through state boundaries and observable actions", () => {
     expect(() => validateStoryArcExecutionContracts(bundle)).not.toThrow();
     const projection = projectChapterForExecution(bundle.chapters[0]);

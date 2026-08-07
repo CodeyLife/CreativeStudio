@@ -43,7 +43,7 @@ const TASK_KEY_GUIDANCE: Record<string, FoundationGuidance> = {
   "plot-design": {
     dimension: "形成可长期校准的主线、支线、信息释放和终局战略。",
     focus: ["叙事承诺的长期回应：读者问题、建立证据、回收窗口、意义变化和代价", "主线、支线、关系线与世界压力的因果方向、耦合机制、交汇/退出/转化条件", "每条长线的耦合机制：它改变人物选择、资源、认知、关系或世界规则中的至少一项；无法说明耦合的支线应当合并、缩短或删除", "人物终点区间、独立欲望和不可接受的捷径", "区分隐藏信息、尚未设计的信息和开放问题；记录不可提前消费的边界", "必须解决、允许开放和可多路径抵达的终局条件", "每项战略决策如何改变人物选择或读者理解"],
-    structuredDataHint: "{narrativePromises, longHorizonThreads: [{threadRef, direction, closureCondition, doNotConsumeBefore, responsibleVolumeOrdinals, nextResponsibility, coupling?, mergePoint?, exitPoint?, transformPoint?}], characterDestinations, informationBoundaries, endingEnvelope, nonNegotiables}",
+    structuredDataHint: "{narrativePromises, longHorizonThreads: [{threadRef, direction, closureCondition, doNotConsumeBefore, responsibleVolumeOrdinals, nextResponsibility, coupling?, mergePoint?, exitPoint?, transformPoint?}], characterDestinations: [{characterRef, endingRange, costBoundary?}], informationBoundaries, endingEnvelope, nonNegotiables}。characterDestinations 必须是【数组】，每项用 characterRef 引用 characters 阶段已冻结的人物 ID（规范 ID 形如 char_chu_heng，带 char_ 前缀），并给出终点区间与代价锚定；不得输出对象映射（{ 人名: 终点 }）形式。",
   },
 };
 
@@ -63,6 +63,7 @@ export function buildFoundationPrompt(input: {
     "你是长篇小说全书规划师。",
     "当前规划阶段只负责全书层面的方向和可验证边界，不把未来章节压缩成固定任务清单。",
     "只输出符合 foundationSchema 的 JSON，不输出 Markdown、解释文字或指令回显。",
+    "冻结事实保护：已定稿的其他规划阶段（人物身份与关系、世界规则、既定卷级结构、终局边界）是权威事实。除非当前修订指令明确要求改动某项，否则必须保持这些已定稿事实不变——聚焦重生成只修指令要求的问题，不得擅自改写、合并或新增未要求的设定。",
     "",
     "## 当前阶段：" + (guidance ? input.taskKey : "通用规划"),
     guidance ? "职责：" + guidance.dimension : "依据项目上下文形成可审计的规划产出。",

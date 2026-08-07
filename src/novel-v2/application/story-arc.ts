@@ -240,6 +240,8 @@ export interface ChapterBlueprint {
   stateTransition: { before: string; after: string; evidence: string };
   narrativeFunction?: ChapterNarrativeFunction;
   povCharacterId?: string;
+  /** 建议性目标篇幅（正文产出时的创作指引，非硬性上限；缺省回退默认值）。 */
+  targetWordCount?: number;
   scenes: ChapterSceneBlueprint[];
   continuityConstraints: string[];
   unresolvedAtClose?: string[];
@@ -513,6 +515,7 @@ export function parseStoryArcBundle(value: unknown): StoryArcBundle {
       stateTransition: stateTransition ?? { before: "", after: "", evidence: "" },
       narrativeFunction: enumValue(chapter.narrativeFunction, CHAPTER_NARRATIVE_FUNCTIONS),
       povCharacterId: typeof chapter.povCharacterId === "string" && chapter.povCharacterId.trim() ? chapter.povCharacterId : undefined,
+      targetWordCount: typeof chapter.targetWordCount === "number" && Number.isFinite(chapter.targetWordCount) && chapter.targetWordCount > 0 ? Math.round(chapter.targetWordCount) : undefined,
       scenes: rawScenes.map((scene, sceneIndex) => {
         const item = scene && typeof scene === "object" && !Array.isArray(scene) ? scene as Record<string, unknown> : {};
         return {

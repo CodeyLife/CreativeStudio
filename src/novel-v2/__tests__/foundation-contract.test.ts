@@ -22,7 +22,7 @@ describe("foundation task semantic contracts", () => {
       foreshadowing: { foreshadowings: [{ id: "f1", description: "旧照片缺角", expectedPayoffWindow: "第二卷末" }] },
       timeline: { storyEvents: ["归乡", "发现照片"] },
       "story-control": { paceCurve: ["缓", "紧"], payoffDistribution: ["关系回报", "真相回报"] },
-      "plot-design": { narrativePromises: ["真相改变关系"], characterDestinations: ["甲承担后果"], longHorizonThreads: [{ threadRef: "main", direction: "查明真相", closureCondition: "公开真相", doNotConsumeBefore: "后期", responsibleVolumeOrdinals: [1, 2], nextResponsibility: "在第二阶段公开证据" }], informationBoundaries: { hidden: [], notDesigned: [], open: [] }, endingEnvelope: "开放但不否定代价", nonNegotiables: ["不抹除已付出的代价"] },
+      "plot-design": { narrativePromises: ["真相改变关系"], characterDestinations: [{ characterRef: "p1", endingRange: "承担后果" }], longHorizonThreads: [{ threadRef: "main", direction: "查明真相", closureCondition: "公开真相", doNotConsumeBefore: "后期", responsibleVolumeOrdinals: [1, 2], nextResponsibility: "在第二阶段公开证据" }], informationBoundaries: { hidden: [], notDesigned: [], open: [] }, endingEnvelope: "开放但不否定代价", nonNegotiables: ["不抹除已付出的代价"] },
     };
     for (const [taskKey, structuredData] of Object.entries(fixtures)) {
       expect(validateFoundationTaskContract(output(structuredData), taskKey), taskKey).toEqual([]);
@@ -61,12 +61,12 @@ describe("foundation task semantic contracts", () => {
     };
     expect(validateFoundationTaskContract(output(structuredData), "architecture")).toEqual([]);
 
-    const plotData = output({ narrativePromises: ["真相改变关系"], characterDestinations: ["甲承担后果"], longHorizonThreads: [{ threadRef: "side", direction: "调查失踪者", closureCondition: "查明去向", doNotConsumeBefore: "中期", responsibleVolumeOrdinals: [2], nextResponsibility: "与主线交汇前确认线索", coupling: "改变人物认知", mergePoint: "第二卷中段", exitPoint: "第二卷末", transformPoint: "真相公开后并入责任线" }], informationBoundaries: { hidden: [], notDesigned: [], open: [] }, endingEnvelope: "开放但不否定代价", nonNegotiables: ["不抹除已付出的代价"] });
+    const plotData = output({ narrativePromises: ["真相改变关系"], characterDestinations: [{ characterRef: "p1", endingRange: "承担后果" }], longHorizonThreads: [{ threadRef: "side", direction: "调查失踪者", closureCondition: "查明去向", doNotConsumeBefore: "中期", responsibleVolumeOrdinals: [2], nextResponsibility: "与主线交汇前确认线索", coupling: "改变人物认知", mergePoint: "第二卷中段", exitPoint: "第二卷末", transformPoint: "真相公开后并入责任线" }], informationBoundaries: { hidden: [], notDesigned: [], open: [] }, endingEnvelope: "开放但不否定代价", nonNegotiables: ["不抹除已付出的代价"] });
     expect(validateFoundationTaskContract(plotData, "plot-design")).toEqual([]);
   });
 
   it("keeps legacy threads without coupling fields valid", () => {
-    const value = output({ narrativePromises: ["真相"], characterDestinations: ["甲"], longHorizonThreads: [{ threadRef: "main", direction: "查明", closureCondition: "完成", doNotConsumeBefore: "后期", responsibleVolumeOrdinals: [1], nextResponsibility: "下一阶段推进" }], informationBoundaries: { hidden: [], notDesigned: [], open: [] }, endingEnvelope: "开放", nonNegotiables: ["保留代价"] });
+    const value = output({ narrativePromises: ["真相"], characterDestinations: [{ characterRef: "p1", endingRange: "承担后果" }], longHorizonThreads: [{ threadRef: "main", direction: "查明", closureCondition: "完成", doNotConsumeBefore: "后期", responsibleVolumeOrdinals: [1], nextResponsibility: "下一阶段推进" }], informationBoundaries: { hidden: [], notDesigned: [], open: [] }, endingEnvelope: "开放", nonNegotiables: ["保留代价"] });
     expect(validateFoundationTaskContract(value, "plot-design")).toEqual([]);
   });
 

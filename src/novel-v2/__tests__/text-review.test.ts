@@ -20,6 +20,39 @@ describe("parseTextReview", () => {
     expect(result.opinion).toContain("但第二卷");
   });
 
+  it("treats a long analysis ending with a PASSED marker line as passed", () => {
+    // 审核模型未严格遵循"通过只输出单行 PASSED"契约，输出逐项分析后以 PASSED 收尾；
+    // 通过意图以显式标记结尾为证据，应判 passed（不把长分析误判为 revise）。
+    const result = parseTextReview(
+      "逐章检查：\n第1章：状态转换证据确凿，无问题。\n第7章：伏笔合理。\nPASSED",
+    );
+    expect(result.verdict).toBe("passed");
+    expect(result.opinion).toBe("");
+  });
+
+  it("treats a paragraph ending with a PASSED marker as passed", () => {
+    // 模型把 PASSED 写在最后一段末尾（"……。PASSED"），而非独立一行，也应判 passed。
+    const result = parseTextReview(
+      "我的判断是有几个非阻断建议但无 major，应该 PASSED。输出 PASSED。PASSED",
+    );
+    expect(result.verdict).toBe("passed");
+    expect(result.opinion).toBe("");
+  });
+
+  it("keeps revise when PASSED is embedded mid-sentence, not a closing verdict", () => {
+    // 观点句中夹带的 PASSED（前缀非分隔符结尾）不得误判为通过结论。
+    const result = parseTextReview("这个修改已 PASSED，可以继续。");
+    expect(result.verdict).toBe("revise");
+    expect(result.opinion).toContain("PASSED");
+  });
+
+  it("keeps a revise verdict when the trailing line is an opinion, not a PASSED marker", () => {
+    // 最后一行不是 PASSED 标记（即使前文提到"通过"），仍须判 revise 并保留意见。
+    const result = parseTextReview("第5章存在因果缺环，需补充动机。\n其余各章可以接受。");
+    expect(result.verdict).toBe("revise");
+    expect(result.opinion).toContain("因果缺环");
+  });
+
   it("strips a PASSED marker prefix echoed before the opinion", () => {
     const result = parseTextReview("PASSED：第一处问题：契约与架构脱节。");
     expect(result.verdict).toBe("revise");
