@@ -498,6 +498,14 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
         includeDirectedReviewEvidence: Boolean(input.directedIssues?.length),
       });
       const hasAuthorInstruction = Boolean(input.authorInstruction?.trim());
+      // 根因修复（2026-08-07）：修订阶段需要同时加载正文、记忆、规划上下文与审核意见，
+      // 旧 blueprint 的 maxInputTokens（早期章节 32K）不足，实测必要上下文约 35K 触发
+      // context-budget-exceeded（chapter-review 复用已固化 blueprint，computeTokenBudget
+      // 的新值不会追溯生效）。此处统一提升到至少 96K（模型上下文支持 128K），
+      // 新 blueprint 的预算若更大则取其值。
+      // TODO: 96K 下限是魔法值，应迁入 model-routing profile 的 revisionMinInputTokens 配置；
+      //   该下限使 computeTokenBudget 对 revision 的分级在 <96K 区间失效（只对 drafting 生效）。
+      const revisionMaxInputTokens = Math.max(input.blueprint.budget.maxInputTokens, 96_000);
       if (shouldBlockRevisionForConflicts(revisionBrief.conflicts, hasAuthorInstruction)) {
         throw new Error(`revision-brief-conflict: ${revisionBrief.conflicts.map((conflict) => conflict.mechanism).join("、")}`);
       }
@@ -525,7 +533,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
         system,
         goal: stageGoal,
         sourceArtifactId: input.artifact.id,
-        maxInputTokens: input.blueprint.budget.maxInputTokens,
+        maxInputTokens: revisionMaxInputTokens,
         maxOutputTokens: input.blueprint.budget.maxOutputTokens,
         text: input.text,
         issues: actionableIssues,
@@ -557,7 +565,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
               workflowId: input.workflowId,
               system,
               goal: stageGoal,
-              maxInputTokens: input.blueprint.budget.maxInputTokens,
+              maxInputTokens: revisionMaxInputTokens,
               maxOutputTokens: batchMaxTokens,
               text: input.text,
               windows: revisionWindows,
@@ -609,7 +617,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
         }
         for (const window of revisionWindows) {
           const source = paragraphs.slice(window.start, window.end + 1).join("\n\n");
-          const windowPackage = buildRevisionWindowPromptPackage({ projectId: input.intent.projectId, workflowId: input.workflowId, system, goal: stageGoal, maxInputTokens: input.blueprint.budget.maxInputTokens, maxOutputTokens: Math.min(4096, Math.max(1024, source.length * 2)), text: input.text, window, memory: input.memory, skills: input.skills, planningContext: input.planningContext, authorInstruction: input.authorInstruction, revisionHistory: input.revisionHistory });
+          const windowPackage = buildRevisionWindowPromptPackage({ projectId: input.intent.projectId, workflowId: input.workflowId, system, goal: stageGoal, maxInputTokens: revisionMaxInputTokens, maxOutputTokens: Math.min(4096, Math.max(1024, source.length * 2)), text: input.text, window, memory: input.memory, skills: input.skills, planningContext: input.planningContext, authorInstruction: input.authorInstruction, revisionHistory: input.revisionHistory });
           const generated = await model.generateText({
             purpose: "writing.revision",
             system,
@@ -650,7 +658,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
               system: alignmentSystem,
               goal: stageGoal,
               schema: authorRevisionAlignmentSchema as unknown as Record<string, unknown>,
-              maxInputTokens: input.blueprint.budget.maxInputTokens,
+              maxInputTokens: revisionMaxInputTokens,
               reservedOutputTokens: 2_048,
               skillManifest: input.skills.resolution,
               sections: [
@@ -685,7 +693,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
                 system,
                 goal: stageGoal,
                 sourceArtifactId: input.artifact.id,
-                maxInputTokens: input.blueprint.budget.maxInputTokens,
+                maxInputTokens: revisionMaxInputTokens,
                 maxOutputTokens: input.blueprint.budget.maxOutputTokens,
                 original: input.text,
                 candidate: revisedText,
@@ -742,7 +750,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
               system,
               goal: stageGoal,
               sourceArtifactId: input.artifact.id,
-              maxInputTokens: input.blueprint.budget.maxInputTokens,
+              maxInputTokens: revisionMaxInputTokens,
               maxOutputTokens: input.blueprint.budget.maxOutputTokens,
               original: input.text,
               candidate: revisedText,
@@ -781,7 +789,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
           workflowId: input.workflowId,
           system,
           goal: stageGoal,
-          maxInputTokens: input.blueprint.budget.maxInputTokens,
+          maxInputTokens: revisionMaxInputTokens,
           maxOutputTokens: input.blueprint.budget.maxOutputTokens,
           text: input.text,
           windows,

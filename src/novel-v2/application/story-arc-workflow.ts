@@ -97,7 +97,16 @@ export async function startStoryArcReview(
     if (activeWorkflowIds.length) throw new Error(`故事弧已有活动工作流：${activeWorkflowIds.join("、")}`);
     let arc = await repository.getStoryArc(input.projectId, input.arcId);
     if (arc?.planningStatus === "failed" && arc.blueprintArtifactId) {
-      arc = await repository.prepareStoryArcReviewRetry(input.projectId, input.arcId, input.mode === "web" ? "web-author" : "mcp");
+      // failed 弧的恢复路径按批次状态分流，避免 retry 与 rebase 前置条件互斥造成死锁：
+      // - 存在引用当前蓝图的 awaiting-review 批次：审核中断重审，走 retry（保留原蓝图，不重生成）
+      // - 无引用当前蓝图的 awaiting-review 批次（批次已 approved 或引用旧蓝图，当前蓝图过时）：
+      //   恢复 awaiting-review 走 rebase；"匹配当前蓝图"语义与 prepareStoryArcReviewRetry 精确互补
+      const blueprintArtifactId = arc.blueprintArtifactId;
+      const hasMatchingPendingBatchReview = arc.batches?.some((batch) => batch.status === "awaiting-review" && batch.sourceArtifactId === blueprintArtifactId) ?? false;
+      const actor = input.mode === "web" ? "web-author" : "mcp";
+      arc = hasMatchingPendingBatchReview
+        ? await repository.prepareStoryArcReviewRetry(input.projectId, input.arcId, actor)
+        : await repository.prepareStoryArcRebase(input.projectId, input.arcId, actor);
     }
     if (!arc?.blueprintArtifactId || arc.planningStatus !== "awaiting-review") throw new Error("故事弧当前没有可审核的蓝图");
     const workflowId = `story-arc-review-${randomUUID()}`;
@@ -109,7 +118,7 @@ export async function startStoryArcReview(
     // it must stay on the ordinary batch path even when earlier chapters are
     // already committed; frozen-history rebase is for an artifact whose target
     // is the committed chapter set.
-    const hasPendingBatchReview = arc.batches?.some((batch) => batch.status === "awaiting-review") ?? false;
+    const hasPendingBatchReview = arc.batches?.some((batch) => batch.status === "awaiting-review" && batch.sourceArtifactId === arc.blueprintArtifactId) ?? false;
     const rebase = !hasPendingBatchReview && (arc.executionStatus === "completed" || arc.chapters.some((chapter) => Boolean(chapter.documentId)));
     try {
       await repository.putWorkflowRun({

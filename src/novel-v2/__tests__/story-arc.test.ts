@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { normalizeStoryArcRebaseBundle, parseStoryArcBundle, projectChapterForExecution, validateStoryArcExecutionContracts, validateStoryArcPlanContracts, validateStoryArcRebaseBundle, type StoryArcBundle, type StoryArcRebaseTarget } from "../application/story-arc";
+import { normalizeStoryArcRebaseBundle, parseStoryArcBundle, projectChapterForExecution, validateStoryArcExecutionContracts, validateStoryArcPlanContracts, validateStoryArcRebaseBundle, type ChapterBlueprint, type StoryArcBundle, type StoryArcRebaseTarget } from "../application/story-arc";
 
 const bundle: StoryArcBundle = {
   arc: {
@@ -107,6 +107,60 @@ describe("story arc blueprint subtraction contract", () => {
     };
     const rebased = normalizeStoryArcRebaseBundle(bundle, target);
     expect(rebased.chapters[0].index).toBe(1);
+    expect(() => validateStoryArcRebaseBundle(rebased, target)).not.toThrow();
+  });
+
+  it("lets a rebase candidate update a planned chapter while preserving its unresolved boundary", () => {
+    const plannedOld: ChapterBlueprint = {
+      index: 1,
+      title: "旧标题",
+      narrativeFunction: "development",
+      povCharacterId: "protagonist",
+      stateTransition: {
+        before: "旧前状态",
+        after: "旧后状态",
+        evidence: "旧证据（含职业黑话）",
+      },
+      scenes: [{ title: "旧场景", participants: ["protagonist"], situation: "旧处境", observableActions: ["记录旧规则"], outcome: "旧结果", planningRationale: "", opposition: "", decision: "", cost: "" }],
+      continuityConstraints: [],
+      unresolvedAtClose: ["某异常现象是否具有特定含义"],
+    };
+    const candidateNew: ChapterBlueprint = {
+      index: 1,
+      title: "新标题",
+      narrativeFunction: "development",
+      povCharacterId: "protagonist",
+      stateTransition: {
+        before: "新前状态",
+        after: "新后状态",
+        evidence: "新证据（题材通用表述）",
+      },
+      scenes: [{ title: "新场景", participants: ["protagonist"], situation: "新处境", observableActions: ["暗中观察新规矩"], outcome: "新结果", planningRationale: "", opposition: "", decision: "", cost: "" }],
+      continuityConstraints: [],
+      unresolvedAtClose: ["其他未解边界"],
+    };
+    const target: StoryArcRebaseTarget = {
+      arcId: "arc-1",
+      executionStatus: "active",
+      approvedArc: bundle.arc,
+      batchIndex: 1,
+      startChapterIndex: 1,
+      chapters: [{
+        chapterId: "chapter-1",
+        documentId: "document-1",
+        globalOrder: 1,
+        title: "旧标题",
+        revisionId: undefined,
+        plannedBlueprint: plannedOld,
+        authoritativeFacts: [],
+      }],
+    };
+    const rebased = normalizeStoryArcRebaseBundle({ ...bundle, chapters: [candidateNew] }, target);
+    // 修订后的标题/证据以候选蓝图为准，不被旧 plannedBlueprint 覆盖
+    expect(rebased.chapters[0].title).toBe("新标题");
+    expect(rebased.chapters[0].stateTransition.evidence).toBe("新证据（题材通用表述）");
+    // 已批准的未解边界保留
+    expect(rebased.chapters[0].unresolvedAtClose).toEqual(["某异常现象是否具有特定含义"]);
     expect(() => validateStoryArcRebaseBundle(rebased, target)).not.toThrow();
   });
 });

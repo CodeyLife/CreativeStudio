@@ -782,7 +782,11 @@ export async function storyArcPlanningWorkflow(params: StoryArcPlanningWorkflowI
   // 会重复消耗所有候选并把可见的路由失败拖成长时间运行。外部任务仍由
   // generate/review/revise 自己管理，失败批次通过 MCP retryFailed 显式恢复。
   const storyArcModelActivities = proxyActivities<NovelWorkflowActivities>({
-    startToCloseTimeout: "10 minutes",
+    // 整套重生成（generateBundle）在同一 activity 内串行执行 arc plan + chapters 两次
+    // 模型调用，10 分钟对长弧重基线不够（曾触发 activity StartToClose timeout 使弧卡
+    // 在 failed）。重任务是生成/审核/修订整弧蓝图，超时预算放宽到 30 分钟；
+    // 外部任务等待仍由 waitForExternal 的 15 分钟独立约束，不在此预算内。
+    startToCloseTimeout: "30 minutes",
     retry: { maximumAttempts: 1, nonRetryableErrorTypes: ["NonRetryableModelTransportError", "ModelTransportError"] },
   });
   const externalResults = new Map<string, Record<string, unknown>>();

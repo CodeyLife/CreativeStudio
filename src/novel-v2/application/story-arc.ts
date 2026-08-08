@@ -325,16 +325,16 @@ export function normalizeStoryArcRebaseBundle(bundle: StoryArcBundle, target: St
     ...bundle,
     chapters: bundle.chapters.map((chapter, index) => {
       const targetChapter = target.chapters[index];
-      const plannedBlueprint = !targetChapter?.revisionId && !targetChapter?.chapterMemory
-        ? targetChapter.plannedBlueprint
-        : undefined;
       const isHistoricalTarget = Boolean(targetChapter?.revisionId || targetChapter?.chapterMemory);
+      // committed 章节（已有定稿正文或记忆账本）：正文已冻结，蓝图严格对齐已提交版本，只修正 index。
       const committedBlueprint = isHistoricalTarget ? targetChapter.committedBlueprint : undefined;
-      const candidate = plannedBlueprint
-        ? { ...plannedBlueprint, index: chapter.index }
-        : committedBlueprint
-          ? { ...committedBlueprint, index: chapter.index }
-          : chapter;
+      // planned 章节（只有已批准的未来蓝图、尚无正文）：蓝图读者可见字段允许随模型新生成内容
+      // 更新（标题/场景/证据以新内容为准，供叙事语言等审核修订传导），但未解边界必须保留自已批准
+      // 蓝图，防止修订悄悄改变跨章承诺；validateStoryArcRebaseBundle 仍要求该章节有 plannedBlueprint。
+      const plannedBlueprint = !isHistoricalTarget ? targetChapter?.plannedBlueprint : undefined;
+      const candidate = committedBlueprint
+        ? { ...committedBlueprint, index: chapter.index }
+        : chapter;
       return {
         ...candidate,
         unresolvedAtClose: targetChapter?.chapterMemory

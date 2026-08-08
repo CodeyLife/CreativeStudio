@@ -192,14 +192,15 @@ describe("story arc review authority boundary", () => {
     expect(block).toContain('if (isCancellation(error))');
   });
 
-  it("reopens a failed arc review without regenerating its blueprint", async () => {
+  it("recovers a failed arc without a pending batch onto the rebase path", async () => {
     const putWorkflowRun = vi.fn(async () => undefined);
-    const retry = vi.fn(async () => ({
+    const rebase = vi.fn(async () => ({
       id: "arc-1",
       planningStatus: "awaiting-review",
       executionStatus: "active",
       blueprintArtifactId: "artifact-1",
       chapters: [{ documentId: "document-1" }],
+      batches: [],
     }));
     const repository = {
       getStoryArc: vi.fn(async () => ({
@@ -208,6 +209,40 @@ describe("story arc review authority boundary", () => {
         executionStatus: "active",
         blueprintArtifactId: "artifact-1",
         chapters: [{ documentId: "document-1" }],
+        batches: [],
+      })),
+      prepareStoryArcRebase: rebase,
+      putWorkflowRun,
+      listActiveStoryArcWorkflowIds: vi.fn(async () => []),
+      updateWorkflowRunStatus: vi.fn(async () => undefined),
+      withStoryArcWorkflowLock,
+    } as unknown as NovelPostgresRepository;
+    const temporal = { workflow: { start: vi.fn(async () => ({ firstExecutionRunId: "run-1" })) } } as never;
+
+    await startStoryArcReview(repository, temporal, { projectId: "project-1", arcId: "arc-1", mode: "web", reviewPolicy: "manual", taskQueue: "creative-studio-v2" });
+
+    expect(rebase).toHaveBeenCalledWith("project-1", "arc-1", "web-author");
+    expect(putWorkflowRun).toHaveBeenCalledWith(expect.objectContaining({ payload: expect.objectContaining({ existingArtifactId: "artifact-1", rebase: true }) }));
+  });
+
+  it("keeps a failed arc with a pending batch on the ordinary retry path", async () => {
+    const putWorkflowRun = vi.fn(async () => undefined);
+    const retry = vi.fn(async () => ({
+      id: "arc-1",
+      planningStatus: "awaiting-review",
+      executionStatus: "active",
+      blueprintArtifactId: "artifact-1",
+      chapters: [{ documentId: "document-1" }],
+      batches: [{ batchIndex: 1, status: "awaiting-review", sourceArtifactId: "artifact-1" }],
+    }));
+    const repository = {
+      getStoryArc: vi.fn(async () => ({
+        id: "arc-1",
+        planningStatus: "failed",
+        executionStatus: "active",
+        blueprintArtifactId: "artifact-1",
+        chapters: [{ documentId: "document-1" }],
+        batches: [{ batchIndex: 1, status: "awaiting-review", sourceArtifactId: "artifact-1" }],
       })),
       prepareStoryArcReviewRetry: retry,
       putWorkflowRun,
@@ -220,6 +255,44 @@ describe("story arc review authority boundary", () => {
     await startStoryArcReview(repository, temporal, { projectId: "project-1", arcId: "arc-1", mode: "web", reviewPolicy: "manual", taskQueue: "creative-studio-v2" });
 
     expect(retry).toHaveBeenCalledWith("project-1", "arc-1", "web-author");
+    expect(putWorkflowRun).toHaveBeenCalledWith(expect.objectContaining({ payload: expect.objectContaining({ existingArtifactId: "artifact-1", rebase: false }) }));
+  });
+
+  it("routes a failed arc with a stale awaiting-review batch onto the rebase path", async () => {
+    const putWorkflowRun = vi.fn(async () => undefined);
+    const rebase = vi.fn(async () => ({
+      id: "arc-1",
+      planningStatus: "awaiting-review",
+      executionStatus: "active",
+      blueprintArtifactId: "artifact-1",
+      chapters: [{ documentId: "document-1" }],
+      batches: [{ batchIndex: 1, status: "awaiting-review", sourceArtifactId: "stale-artifact" }],
+    }));
+    const retry = vi.fn(async () => undefined);
+    const repository = {
+      getStoryArc: vi.fn(async () => ({
+        id: "arc-1",
+        planningStatus: "failed",
+        executionStatus: "active",
+        blueprintArtifactId: "artifact-1",
+        chapters: [{ documentId: "document-1" }],
+        batches: [{ batchIndex: 1, status: "awaiting-review", sourceArtifactId: "stale-artifact" }],
+      })),
+      prepareStoryArcRebase: rebase,
+      prepareStoryArcReviewRetry: retry,
+      putWorkflowRun,
+      listActiveStoryArcWorkflowIds: vi.fn(async () => []),
+      updateWorkflowRunStatus: vi.fn(async () => undefined),
+      withStoryArcWorkflowLock,
+    } as unknown as NovelPostgresRepository;
+    const temporal = { workflow: { start: vi.fn(async () => ({ firstExecutionRunId: "run-1" })) } } as never;
+
+    await startStoryArcReview(repository, temporal, { projectId: "project-1", arcId: "arc-1", mode: "web", reviewPolicy: "manual", taskQueue: "creative-studio-v2" });
+
+    // 批次引用旧蓝图（source != blueprint）时 retry 前置条件不满足，恢复走 rebase，
+    // 避免 retry/rebase 双双拒绝把弧卡死在 failed。
+    expect(rebase).toHaveBeenCalledWith("project-1", "arc-1", "web-author");
+    expect(retry).not.toHaveBeenCalled();
     expect(putWorkflowRun).toHaveBeenCalledWith(expect.objectContaining({ payload: expect.objectContaining({ existingArtifactId: "artifact-1", rebase: true }) }));
   });
 

@@ -92,6 +92,7 @@ function reviewInstruction(input: ReviewPromptInput, memory: MemoryBundle): stri
     "若问题涉及普通读者无法复原现场，readerReconstruction 必须填写 impact、missingEvidence 和 blockedQuestion；impact 只能原样使用 core/local，missingEvidence 只能原样使用 body/space/object/action/consequence/relationship，不要创造近义标签。blockedQuestion 要说明读者无法判断的具体动作、空间、因果、情绪或关系问题，不能只写‘不通俗’。不涉及该机制时 impact 必须填 none，missingEvidence 留空数组，blockedQuestion 留空字符串（输出 null 会被 schema 拒绝）。core 表示已经影响当前场景的关键行动、选择或结果，severity 至少使用 major；local 才可以使用 warning。",
     "对 prose-reviewer，readerReconstruction 与正文质量问题是两个独立判断：技术标签即使没有阻断动作复原，也可以因为删除后不损失事实、选择、因果或世界观功能而报告局部 warning；不要为了填写 readerReconstruction 把所有文风问题夸大成读者理解阻断。",
     "技术认知不能成为当前动作的唯一主语、唯一动因或唯一后果。同一局部节拍中连续用多个技术模型重新命名同一身体感觉、动作或意志时，保留必要的角色判断，删除不改变行动的重复标签；不要把它们互换成另一组抽象词。",
+    "叙事语言降噪检查（prose-reviewer 主责，其他角色可补充）：主角的独特认知（职业思维、专业训练、天赋等）是设定来源——解释他为何能看出常人看不到的规律——不是叙事语言。若正文把机制层概念以职业黑话原词作为叙事主导，连续用专业术语解说身体感觉、动作或意志（叙述者以专业系统比喻重新命名现象、把身体或情绪状态描述为专业故障），属于叙事语言污染，判为 major 并要求转译为题材通用表达或普通读者可读的类比；只有当单个术语承担不可替代的世界观揭示或角色独有认知时才保留，且不能是当前动作的唯一载体。开篇一次性交代主角出身背景是允许的，但不得以此授权全篇技术解说。",
     "结构角色优先寻找状态/因果/功能/世界规则/知识边界证据；人物角色优先寻找欲望、能动性、声部、关系行为和情感变化证据；文风角色优先寻找 POV、具体细节、场景承载、节奏疲劳和幽默后果证据。不要把同一偏好复制成三个 issue。",
     "不要把篇幅、章节必须有新事件、固定钩子、反转、主题、感情线或幽默的出现与否单独当作问题。",
     "",
@@ -115,6 +116,9 @@ export function buildChapterReviewPromptPackage(input: ReviewPromptInput & { wor
     ...buildSkillContextSections(skills ?? { skills: [] }, skills?.executionPoint ?? reviewExecutionPoint(input.role), "审校 Skill"),
   ];
   const purpose = ({ "structure-reviewer": "review.structure", "character-reviewer": "review.character", "prose-reviewer": "review.prose" } as const)[input.role];
+  // review 复用已固化 blueprint 的 maxInputTokens（不追溯 computeTokenBudget 新值）。
+  // 修订阶段才需要更高预算（正文+记忆+规划+审核意见，见 activities.ts revise 的 96K 下限）；
+  // review 实测上下文低于旧 32K 档，复用旧 blueprint 值不会触发 context-budget-exceeded。
   return compileStageContext({ projectId: input.artifact.projectId, workflowId: input.workflowId, purpose, stage: "review", system: input.system, schema: reviewerSchema, maxInputTokens: input.blueprint.budget.maxInputTokens, reservedOutputTokens: input.blueprint.budget.maxOutputTokens, goal: input.stageGoal, skillManifest: skills?.resolution, sections });
 }
 

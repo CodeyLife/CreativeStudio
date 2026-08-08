@@ -166,23 +166,32 @@ export function createPreflightPlan(intent: NovelIntent, snapshot: PreflightProj
  *
  * 决策规则（覆盖更广的失败类，非针对单一章节调参）：
  * - foundation/planning：24K（默认，规划任务不需要太多上下文）
- * - drafting/revision 且 totalChapters < 50：32K（短篇，正常预算）
- * - drafting/revision 且 totalChapters >= 50：48K（中篇，需要更多前章记忆）
- * - drafting/revision 且 totalChapters >= 200：64K（长篇后期，需 chapter memory + 伏笔 + 角色状态全量）
+ * - drafting/revision 且 totalChapters < 50：64K（短篇，正常预算）
+ * - drafting/revision 且 totalChapters >= 50：96K（中篇，需要更多前章记忆）
+ * - drafting/revision 且 totalChapters >= 200：128K（长篇后期，需 chapter memory + 伏笔 + 角色状态全量）
  *
  * 该值是记忆检索预算，不是模型最终输入上限；draft/revision 编译时还会
  * 预留输出、system/schema 和固定写作指令，并可按优先级裁剪 ranked-fill。
- * 硬上限：不超过 64K（避免超出模型上下文窗口 60% 的安全边界）。
+ * 硬上限：不超过 128K。2026-08-07 根因修复将 64K 上限放宽到 128K：修订阶段
+ * 与记忆检索同源（buildMemoryBundle 的 tokenBudget → blueprint.budget.maxInputTokens），
+ * 旧 64K 档对早期章节的 32K 不足（实测必要上下文约 35K 触发 context-budget-exceeded），
+ * 而 fact-extraction / learning 等阶段已使用 128K；"不超过上下文窗口 60%"的旧安全边界
+ * 因此不再作为硬约束，溢出防护改由 model-gateway 的 contextWindow 守卫兜底。
  * 调用方可在 model-routing profile 的 contextLimit 中配置更小的上限。
  */
 export function computeTokenBudget(taskClass: PreflightPlan["taskClass"], totalChapters?: number): number {
+  // 根因修复（2026-08-07）：章节任务的 maxInputTokens 与记忆检索预算同源（buildMemoryBundle
+  // 的 tokenBudget → blueprint.budget.maxInputTokens）。修订阶段要同时加载正文、记忆、规划
+  // 上下文与审核意见，<50 章节时的 32K 预算不足以容纳（实测必要上下文约 35K 触发
+  // context-budget-exceeded）。fact-extraction / learning 等阶段已使用 128K，说明模型上下文
+  // 支持更大；此处按章节数分级放宽，保持"早期紧凑、长篇放宽"的预算哲学。
   const DEFAULT_BUDGET = 24_000;
-  const HARD_LIMIT = 64_000;
+  const HARD_LIMIT = 128_000;
   if (taskClass !== "drafting" && taskClass !== "revision") return DEFAULT_BUDGET;
   if (totalChapters === undefined) return DEFAULT_BUDGET;
   if (totalChapters >= 200) return HARD_LIMIT;
-  if (totalChapters >= 50) return 48_000;
-  return 32_000;
+  if (totalChapters >= 50) return 96_000;
+  return 64_000;
 }
 
 export async function buildMemoryBundle(plan: PreflightPlan, input: { projectId: string; provider: MemoryProvider; tokenBudget?: number; pinnedClaims?: MemoryHit[]; additionalClaims?: MemoryHit[] }, now = Date.now()): Promise<MemoryBundle> {

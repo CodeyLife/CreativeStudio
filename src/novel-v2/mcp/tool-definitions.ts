@@ -671,7 +671,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: "novel_story_arc_review",
-    description: "对已有故事弧蓝图启动正式审核；失败但保留蓝图的故事弧会先通过 retry 状态转换恢复为 awaiting-review，不重新生成蓝图。",
+    description: "对已有故事弧蓝图启动正式审核；失败但保留蓝图的故事弧按批次状态自动恢复：存在引用当前蓝图的 awaiting-review 批次时走 retry（重审原蓝图，不重生成），无引用当前蓝图的 awaiting-review 批次（含批次已批准或引用旧蓝图的过期批次）时走 rebase 恢复（对齐当前宏观规划重新审核修订蓝图）。",
     inputSchema: {
       type: "object",
       properties: {

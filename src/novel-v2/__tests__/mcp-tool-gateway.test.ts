@@ -480,7 +480,7 @@ describe("executeTool error paths", () => {
             chapters: [],
           }),
           listActiveStoryArcWorkflowIds: vi.fn().mockResolvedValue([]),
-          prepareStoryArcReviewRetry: vi.fn().mockResolvedValue({
+          prepareStoryArcRebase: vi.fn().mockResolvedValue({
             id: "arc-1",
             planningStatus: "awaiting-review",
             executionStatus: "planned",

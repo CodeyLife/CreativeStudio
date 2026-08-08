@@ -3607,6 +3607,62 @@ export class NovelPostgresRepository {
     return this.getStoryArc(projectId, arcId);
   }
 
+  /**
+   * Rebase recovery for a failed arc that has no awaiting-review batch for the
+   * current blueprint.
+   *
+   * prepareStoryArcReviewRetry only handles the "review interrupted mid-flight"
+   * case, where the pending batch still references the current blueprint.
+   * A failed arc whose batch was already approved (e.g. the macro plan changed
+   * after the arc was approved, so the blueprint went stale) can never satisfy
+   * that precondition, while the rebase decision in startStoryArcReview requires
+   * the absence of an awaiting-review batch. That precondition pair deadlocks the
+   * arc in failed status. This method recovers that second case by returning the
+   * arc to awaiting-review with its blueprint preserved, so the caller's rebase
+   * decision (no pending batch for the current blueprint + committed chapters)
+   * can take the rebase path.
+   *
+   * Precondition aligns with prepareStoryArcReviewRetry's source_artifact_id
+   * semantics (negated): "pending batch" means an awaiting-review batch whose
+   * source_artifact_id equals the current blueprint. A batch awaiting-review
+   * that references an older artifact is stale and does not block rebase; this
+   * makes the two recovery paths exact complements with no deadlock gap.
+   *
+   * 审计语义注意：本方法只把 failed 弧恢复为 awaiting-review（audit
+   * story-arc.review-recovered，recovery=rebase-prepare）。调用方
+   * startStoryArcReview 随后按是否有 committed 章节决定走 frozen-history rebase
+   * 还是普通复审：无 committed 章节时 rebase 判定为 false，工作流实际对旧蓝图做
+   * 普通复审（修订只在审核失败时触发，蓝图本身保留）；真正 rebase 决策记录在
+   * workflow run payload 的 rebase 字段，而非本恢复审计。
+   */
+  async prepareStoryArcRebase(projectId: string, arcId: string, actor: string) {
+    const result = await this.pool.query(`
+      UPDATE arcs a SET
+        planning_status='awaiting-review',
+        updated_at=now(),
+        payload=payload - 'failureReason'
+      WHERE a.id=$1
+        AND a.project_id=$2
+        AND a.planning_status='failed'
+        AND a.blueprint_artifact_id IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1
+          FROM story_arc_batches b
+          WHERE b.arc_id=a.id
+            AND b.project_id=a.project_id
+            AND b.status='awaiting-review'
+            AND b.source_artifact_id=a.blueprint_artifact_id
+        )
+      RETURNING a.id
+    `, [arcId, projectId]);
+    if (!result.rowCount) throw new Error("故事弧没有可重基线的失败蓝图");
+    await this.pool.query(
+      "INSERT INTO audit_records(project_id,actor,action,aggregate_type,aggregate_id,payload) VALUES($1,$2,'story-arc.review-recovered','story-arc',$3,$4)",
+      [projectId, actor, arcId, { recovery: "rebase-prepare", blueprintArtifactId: (await this.getStoryArc(projectId, arcId))?.blueprintArtifactId }],
+    );
+    return this.getStoryArc(projectId, arcId);
+  }
+
   async failStoryArc(projectId: string, arcId: string, reason: string) {
     await this.pool.query(`
       UPDATE arcs SET
