@@ -411,6 +411,8 @@ export type SkillExecutionPoint =
   | "chapter.review.character"
   | "chapter.review.prose"
   | "chapter.revision"
+  | "chapter.script"
+  | "short.script"
   | "chapter.fact-extraction"
   | "character.enrichment"
   | "learning.assessment"
@@ -601,7 +603,7 @@ export interface Artifact {
   projectId: string;
   taskId: string;
   attemptId: string;
-  kind: "draft" | "review" | "revision" | "fact-extraction" | "foundation" | "chapter-blueprint";
+  kind: "draft" | "review" | "revision" | "fact-extraction" | "foundation" | "chapter-blueprint" | "chapter-script" | "short-script";
   contentHash: string;
   objectKey?: string;
   structuredData?: Record<string, unknown>;

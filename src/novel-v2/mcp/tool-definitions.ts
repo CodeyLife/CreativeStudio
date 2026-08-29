@@ -1,5 +1,5 @@
 /**
- * V2 MCP 工具定义：35 个工具的 inputSchema（JSON Schema draft-07）。
+ * V2 MCP 工具定义：37 个工具的 inputSchema（JSON Schema draft-07）。
  *
  * 设计依据：AGENTS.md 架构阶段和 V2 MCP 工具契约。
  *
@@ -7,12 +7,13 @@
  * - v1 含 novel_foundation_export，v2 替换为 novel_closed_loop_run（评估闭环）
  * - v2 全部基于 Postgres，inputSchema 严格校验入参
  *
- * 工具分组（35 个）：
+ * 工具分组（37 个）：
  * - Run / Action 主体（7）
  * - Catalog / Receipt（3）
  * - Craft Rule 候选演进（7）
  * - 项目生命周期（3）
- * - 规划与创作（9，含外部编排模式 novel_story_arc_orchestrate）
+ * - 规划与创作（11，含外部编排模式 novel_story_arc_orchestrate、短剧剧本派生
+ *   novel_chapter_script_h3 与创意短剧脚本 novel_short_script_h3）
  * - 评估闭环（1，v2 新增）
  * - Workflow 查询（2）
  * - Workflow 决策（1）
@@ -185,11 +186,13 @@ export const TOOL_NAMES = [
   "novel_project_create",
   "novel_project_list",
   "novel_project_delete",
-  // 规划与创作（6）
+  // 规划与创作（11）
   "novel_bootstrap_run",
   "novel_chapter_review",
   "novel_chapter_review_issue_add",
   "novel_chapter_generate",
+  "novel_chapter_script_h3",
+  "novel_short_script_h3",
   "novel_story_arc_start",
   "novel_story_arc_get",
   "novel_story_arc_review",
@@ -655,6 +658,37 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
         idempotencyKey: { type: "string", minLength: 1 },
       },
       required: ["projectId", "idempotencyKey"],
+      additionalProperties: false,
+    },
+  },
+
+  {
+    name: "novel_chapter_script_h3",
+    description: "为已定稿章节生成短剧分镜剧本提示词（MiniMax H3 Ref2VA 全参考模式六段结构：subject_definitions / summary / retention_analysis / detailed_description / overall_soundscape / non_diegetic_music）。按场景节拍拆分为多个 5-10 秒片段，每片段一条完整提示词、可含多镜头；人物外观基线跨片段一致。只读定稿正文派生辅助产物（kind=chapter-script），不改正文、不进质量门；同一定稿内容幂等复用既有产物。需要 ToolContext.model。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectId: { type: "string", minLength: 1 },
+        documentId: { type: "string", minLength: 1, description: "目标章节 document（须已有正式 revision 的定稿）" },
+        instruction: { type: "string", description: "可选，剧本改编指令/特殊要求" },
+      },
+      required: ["projectId", "documentId"],
+      additionalProperties: false,
+    },
+  },
+
+  {
+    name: "novel_short_script_h3",
+    description: "从一个核心创意生成简短短剧脚本提示词（MiniMax H3 Ref2VA 全参考模式六段结构），供单支竖屏短视频生成使用。完全独立于小说项目：无需任何定稿正文，剧情节拍从创意穷举自拟，目标时长 10-180 秒（默认 30，clamp 收敛），按 5-10 秒片段拆分，总时长落在目标 ±10 秒容差内；含剧集剧作契约（开场即冲突、情绪节点节奏、出口即钩子、台词密度、伏笔链、人物经济）。产物落 short_scripts 独立表（scriptId 主键），同一创意输入幂等复用；填 projectId 时产物关联该作品（衍生短剧）。需要 ToolContext.model。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectId: { type: "string", minLength: 1, description: "可选：关联小说作品（为某部小说世界观创作衍生短剧时填写；缺省为独立短剧）" },
+        idea: { type: "string", minLength: 10, description: "核心创意：写清谁、何处、什么冲突（至少 10 字符）" },
+        instruction: { type: "string", description: "可选，短剧创作指令/特殊要求" },
+        targetDurationSeconds: { type: "integer", minimum: 10, maximum: 180, description: "目标总时长（秒），默认 30，超界收敛到边界" },
+      },
+      required: ["idea"],
       additionalProperties: false,
     },
   },

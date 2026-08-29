@@ -134,6 +134,32 @@ describe("Skill runtime resolution", () => {
     expect(renderSkillInstruction(review, "foundation.book-plan")).toContain("不是必须全部成立的硬门");
   });
 
+  it("binds chapter.script and short.script exclusively to the H3 script skill and keeps drafting skills out", async () => {
+    const provider = createWorkspaceSkillProvider(path.resolve(process.cwd(), "skills", "novel-v2"));
+    const descriptors = await provider.list("test-project");
+    expect(descriptors.some((skill) => skill.skillId === "h3-video-prompt")).toBe(true);
+    for (const descriptor of descriptors) {
+      if (descriptor.skillId !== "h3-video-prompt") {
+        expect(descriptor.executionPoints ?? []).not.toContain("chapter.script");
+        expect(descriptor.executionPoints ?? []).not.toContain("short.script");
+      }
+    }
+
+    for (const executionPoint of ["chapter.script", "short.script"] as const) {
+      const bundle = await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint });
+      expect(bundle.skills.map((skill) => skill.skillId)).toEqual(["h3-video-prompt"]);
+      const instruction = renderSkillInstruction(bundle, executionPoint);
+      for (const section of ["subjectDefinitions", "summary", "retentionAnalysis", "detailedDescription", "overallSoundscape", "nonDiegeticMusic"]) {
+        expect(instruction).toContain(section);
+      }
+      expect(instruction).toContain("[Shot N]");
+      expect(instruction).toContain("Ref2VA");
+    }
+    // 创意入口专属指引：无定稿正文，从核心创意自拟节拍
+    const shortBundle = await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint: "short.script" });
+    expect(renderSkillInstruction(shortBundle, "short.script")).toContain("核心创意");
+  });
+
   it("reads workspace Skill content on every resolution without a process cache", async () => {
     const root = await temporarySkillRoot();
     const file = path.join(root, "draft.yaml");

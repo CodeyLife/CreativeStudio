@@ -93,7 +93,25 @@ novel_chapter_review_decision(workflowId, artifactId, decision=approve|revise|re
 - 阅读候选稿与三份审核（`novel_workflow_get` + `novel_artifact_get`）；
 - `novel_chapter_review_issue_add(projectId, documentId, severity, title, evidenceQuote, revisionRanges)` 追加作者意见 → `novel_chapter_review(mode=targeted, targetIssueIds)` 走正式定向修订；
 - `novel_chapter_review_decision(revise, feedback, revisionBase)` 带指令继续修订；
-- 已定稿章节重审：`novel_chapter_review(projectId, documentId)`（full 模式）。
+- 已定稿章节重审：`novel_chapter_review(projectId, documentId)`（full 模式）；
+- 短剧剧本派生：`novel_chapter_script_h3(projectId, documentId, instruction?)` 为已定稿章节生成 MiniMax H3 Ref2VA 提示词（见阶段 2.5）。
+- 创意短剧脚本：`novel_short_script_h3(idea, instruction?, targetDurationSeconds?, projectId?)` 从一个核心创意生成短剧脚本提示词，`projectId` 可选（缺省为独立短剧，填则关联该作品作衍生短剧；见阶段 2.5）。
+
+### 阶段 2.5 短剧剧本提示词（章节派生与核心创意两条路径）
+
+```
+novel_chapter_script_h3(projectId, documentId, instruction?)   # 定稿正文 → Ref2VA 分镜提示词
+novel_short_script_h3(idea, instruction?, targetDurationSeconds?, projectId?)   # 核心创意 → 短剧脚本提示词（projectId 缺省=独立短剧，不依赖任何小说项目）
+novel_artifact_list(projectId, kind="chapter-script")           # 历史章节剧本产物
+novel_artifact_list(projectId, kind="short-script")             # 仅迁移前历史产物（v2 起新产物落 short_scripts 表，经 REST /v2/short-script-h3 读取）
+novel_artifact_get(artifactId)                                  # 完整章节剧本
+```
+
+对已 commit 的 final 章节，外部编排者可调用该工具产出短剧剧本提示词：按场景节拍拆分为多个 5-10 秒片段，每片段一条自包含的 MiniMax H3 全参考模式（Ref2VA）六段提示词（subject_definitions / summary / retention_analysis / detailed_description / overall_soundscape / non_diegetic_music），片段内可含多镜头；顶层 characters 提供英文外观基线，各片段 subjectDefinitions 复用同一外形描述，对白保留中文原文。生成时系统自动注入 workspace 运行时 skill `h3-video-prompt@1.3.0(chapter.script)` 指引（影视镜头语言四要素 + 节奏范式 + signature shot 范式 + 剧集剧作层契约，方法论沉淀于 `.agents/skills/short-drama-writing/`，输出语法规范见 h3-prompt-writing）；返回携带 `cinematicHints`（缺少运镜/景别描述的镜头清单，提示级）；同一定稿内容幂等复用既有产物（键含 定稿哈希+共享定义哈希+契约版本），改稿或契约升级后重新生成。该产物是正文的只读派生（kind=chapter-script），不改正文、不进质量门；编排者可直接把各片段 promptText 送入 H3 视频生成。改编方法论详见 `.agents/skills/short-drama-writing/`。
+
+也可脱离章节与小说项目，直接用 `novel_short_script_h3` 从一个核心创意生成短剧脚本（如抖音短视频）：`idea` 须写清谁、何处、什么冲突（≥10 字符），`targetDurationSeconds` 可选（10-180s，默认 30s，超界收敛到边界；上限对应片段数上限 36），`projectId` 可选（契约 v2 起完全独立：缺省为独立短剧，不依赖任何小说项目；填写时产物关联该作品作衍生短剧，填错仍报 404）。片段数下限按时长推导（全部按最长单段 10s 承载仍需的段数），总时长须落在目标 ±10s 容差内（`SHORT_SCRIPT_TOTAL_DURATION_TOLERANCE_SECONDS`，窗口须大于单段跨度）。生成走 `short.script` 执行点的 `h3-video-prompt@1.3.0` 指引（与 chapter.script 共享导演层与剧作层规则，另含创意模式专属指引：节拍为设计而非穷举、开场即冲突、末段切在钩子上）。产物落独立表 `short_scripts`（迁移 050，`project_id` 可空；artifacts 中 kind=short-script 历史行保留审计），payload 记录 idea 与 instruction 来源；幂等键绑定作用域（projectId 缺省为 `independent` 占位）+idea+instruction+目标时长+契约版本，同一作用域同一创意输入复用既有产物；REST 对应项目无关端点 `GET/POST /v2/short-script-h3`、`GET /v2/short-script-h3/:scriptId`、`GET /v2/short-script-h3/list?projectId=`（可选按作品过滤），项目级旧端点 `/v2/projects/:id/short-script-h3` 保留兼容（改读新表并校验项目归属）；Web 前端在左侧主导航「剧本创作」独立板块（路由 `/script-studio`，与小说创作平级）提供创意短剧创作与历史回看入口，顶部「关联作品」选择器可选——未选即独立模式（章节派生入口在章节工作台弹窗）。
+
+作者可经前端（或 `GET/PUT /v2/projects/:id/script-h3/subject-preset`）预设**项目级共享 subject_definitions**（`<Subject N>` 行格式）：生成时片段直接复用共享主体（不重写），片段内只写新增主体（编号从共享最大编号 +1 续接），无新增时片段省略 subject_definitions 区块；共享库以独立块随产物导出供 H3 前置拼接。该预设管理不经 MCP（前端/REST 专属），但编排触发的生成会读取同一份项目级预设；修改预设后需对章节点重新生成。
 
 ### 阶段 3 事实梳理与记忆
 
@@ -127,7 +145,7 @@ novel_receipt_get(receiptId)
 7. **串行约束**：同项目章节审校互斥（`projectActiveReviewWorkflowId`），外部模型必须等当前审校完成后启动下一个。
 8. **编排权威顺序**：已定稿事实 / 叙事状态账本 / 作者边界 > 外部剧情编排 > 模型自行发挥；编排只给方向，不给假事实。
 
-## 4. 工具清单（35 个）
+## 4. 工具清单（37 个）
 
 | 组 | 工具 |
 | --- | --- |
@@ -135,7 +153,7 @@ novel_receipt_get(receiptId)
 | Catalog / Receipt（3） | novel_catalog_get、novel_receipt_get、novel_rule_target_get |
 | Craft Rule 演进（7） | novel_rule_candidate_create、novel_rule_candidate_get、novel_rule_evidence_submit、novel_rule_foundation_evaluate、novel_rule_review_submit、novel_rule_promote、novel_rule_rollback |
 | 项目生命周期（3） | novel_project_create、novel_project_list、novel_project_delete |
-| 规划与创作（9） | novel_bootstrap_run、novel_story_arc_start、novel_story_arc_get、novel_story_arc_review、novel_story_arc_batch_start、novel_story_arc_orchestrate、novel_chapter_review、novel_chapter_review_issue_add、novel_chapter_generate |
+| 规划与创作（11） | novel_bootstrap_run、novel_story_arc_start、novel_story_arc_get、novel_story_arc_review、novel_story_arc_batch_start、novel_story_arc_orchestrate、novel_chapter_review、novel_chapter_review_issue_add、novel_chapter_generate、novel_chapter_script_h3、novel_short_script_h3 |
 | 评估闭环（1） | novel_closed_loop_run |
 | Workflow 查询（2） | novel_workflow_get、novel_workflow_list |
 | Workflow 决策（1） | novel_chapter_review_decision |

@@ -4,6 +4,7 @@ import {
   AppstoreOutlined,
   PictureOutlined,
   VideoCameraOutlined,
+  PlaySquareOutlined,
   ToolOutlined,
   ScissorOutlined,
   BorderOuterOutlined,
@@ -41,7 +42,8 @@ const groups: NavGroup[] = [
       { key: "", label: "工作台", icon: <AppstoreOutlined /> },
       { key: "image-gen", label: "AI 生图", icon: <PictureOutlined /> },
       { key: "novels", label: "小说创作", icon: <ReadOutlined /> },
-      { key: "video-gen", label: "视频生成", icon: <VideoCameraOutlined />, badge: "预留" },
+      { key: "script-studio", label: "剧本创作", icon: <VideoCameraOutlined /> },
+      { key: "video-gen", label: "视频生成", icon: <PlaySquareOutlined />, badge: "预留" },
     ],
   },
   {

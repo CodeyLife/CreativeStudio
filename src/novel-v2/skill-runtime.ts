@@ -33,6 +33,11 @@ export const SKILL_EXECUTION_POLICIES: Record<SkillExecutionPoint, SkillStagePol
   "chapter.review.character": { taskClasses: ["review"], requiredCapabilities: ["review"] },
   "chapter.review.prose": { taskClasses: ["review"], requiredCapabilities: ["review"] },
   "chapter.revision": { taskClasses: ["revision"], requiredCapabilities: ["revision"] },
+  // 章节短剧剧本改写与创意短剧脚本（辅助产物，不进正文质量门）：
+  // 只允许显式声明 chapter.script / short.script 执行点的 skill（如 h3-video-prompt）
+  // 进入，不加入 TASK_CLASS_POINTS，避免其他 drafting 技能因 applicableTasks 推导被误挂载。
+  "chapter.script": { taskClasses: ["drafting"], requiredCapabilities: ["script"] },
+  "short.script": { taskClasses: ["drafting"], requiredCapabilities: ["script"] },
   "chapter.fact-extraction": { taskClasses: ["memory-maintenance"], requiredCapabilities: ["memory"] },
   "character.enrichment": { taskClasses: ["memory-maintenance"], requiredCapabilities: ["memory"] },
   "learning.assessment": { taskClasses: ["review"], requiredCapabilities: ["learning"] },
@@ -59,6 +64,8 @@ const COARSE_STAGE: Record<SkillExecutionPoint, NovelStage> = {
   "chapter.review.character": "review",
   "chapter.review.prose": "review",
   "chapter.revision": "revision",
+  "chapter.script": "drafting",
+  "short.script": "drafting",
   "chapter.fact-extraction": "fact-extraction",
   "character.enrichment": "fact-extraction",
   "learning.assessment": "review",

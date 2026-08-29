@@ -2,7 +2,7 @@ import { createServer } from "node:http";
 import { Client, Connection } from "@temporalio/client";
 import { QdrantClient } from "@qdrant/js-client-rest";
 import { createHash, randomUUID } from "node:crypto";
-import { NovelPostgresRepository, type KnowledgeRecordKind, type MutableKnowledgeRecordKind } from "../src/novel-v2/postgres-repository";
+import { NovelPostgresRepository, type KnowledgeRecordKind, type MutableKnowledgeRecordKind, type StoredShortScript } from "../src/novel-v2/postgres-repository";
 import { NOVEL_V2_PROTOCOL_VERSION, type Artifact, type AuthorDecision, type NovelIntent } from "../src/novel-v2/protocol";
 import { CommitService } from "../src/novel-v2/commit-service";
 import { createRuntimeModelGateway } from "../src/novel-v2/model-runtime";
@@ -48,6 +48,8 @@ import {
 } from "../src/novel-v2/application/book-synopsis";
 import { startBookSynopsisGeneration, startBookTitleCandidateGeneration } from "../src/novel-v2/application/book-synopsis-workflow";
 import { startChapterTitleGeneration } from "../src/novel-v2/application/chapter-title-workflow";
+import { CHAPTER_SCRIPT_ARTIFACT_KIND, ChapterScriptSourceError, computeCinematicHints, generateChapterScriptH3, parseSharedSubjectPreset } from "../src/novel-v2/application/chapter-script-h3";
+import { generateShortScriptH3, ShortScriptInputError } from "../src/novel-v2/application/short-script-h3";
 import { parseStoryArcBundle } from "../src/novel-v2/application/story-arc";
 import { startStoryArcBatchPlanning, startStoryArcPlanning, startStoryArcReview } from "../src/novel-v2/application/story-arc-workflow";
 import { QdrantMemoryProvider } from "../src/novel-v2/qdrant-memory";
@@ -62,6 +64,10 @@ import { publicRuntimeIdentity, resolveNovelRuntimeConfig } from "../src/novel-v
 
 Object.assign(process.env, loadRuntimeEnv(process.cwd()));
 const runtime = resolveNovelRuntimeConfig(process.env);
+
+/** 剧本类历史产物读取上限（章节剧本 / 创意短剧列表共用）。
+ *  TODO P2：与 repository.listShortScripts 的钳制上限（100）独立；后续统一为可配置分页。 */
+const SCRIPT_LIST_LIMIT = 50;
 
 // 通过 Extract 从 CreativeCommand 联合类型中派生 review.submit 的 review 字段类型，
 // 避免新增 CreativeReviewInput / ReviewIssue 的直接导入。
@@ -89,6 +95,42 @@ const temporal = new Client({ connection, namespace: runtime.temporalNamespace }
 const port = runtime.apiPort;
 const taskQueue = runtime.taskQueue;
 const ACTIVE_CHAPTER_INTENT_STATUSES = new Set(["accepted", "pending", "running", "waiting-external", "manual-review-required"]);
+
+/** 创意短剧列表项（语义化摘要，不暴露原始 JSON；projectId 缺省=独立短剧）。 */
+function shortScriptSummary(stored: StoredShortScript) {
+  const segments = Array.isArray(stored.payload?.segments) ? stored.payload.segments as unknown[] : [];
+  return {
+    scriptId: stored.id,
+    projectId: stored.projectId,
+    idea: stored.idea,
+    instruction: stored.instruction,
+    targetDurationSeconds: stored.targetDurationSeconds,
+    segmentCount: segments.length,
+    cinematicHintCount: computeCinematicHints(segments as never).length,
+    createdAt: stored.createdAt,
+  };
+}
+
+/** 创意短剧详情（v2 契约：scriptId 主键；cinematicHints 现算，随读取实时反映）。 */
+function shortScriptDetail(stored: StoredShortScript) {
+  const data = stored.payload ?? {};
+  const segments = Array.isArray(data.segments) ? data.segments as unknown[] : [];
+  return {
+    exists: true,
+    scriptId: stored.id,
+    projectId: stored.projectId,
+    createdAt: stored.createdAt,
+    sourceFingerprint: stored.sourceFingerprint,
+    mode: typeof data.mode === "string" ? data.mode : "ref2va",
+    idea: stored.idea,
+    instruction: stored.instruction,
+    targetDurationSeconds: stored.targetDurationSeconds,
+    plotBeats: Array.isArray(data.plotBeats) ? data.plotBeats : [],
+    cinematicHints: computeCinematicHints(segments as never),
+    characters: Array.isArray(data.characters) ? data.characters : [],
+    segments,
+  };
+}
 
 function chapterTargetId(target: unknown): string | undefined {
   const record = asRecord(target);
@@ -612,6 +654,174 @@ const server = createServer(async (request, response) => {
       const documentId = decodeURIComponent(chapterTitleGenerationMatch[2]);
       const result = await startChapterTitleGeneration(repository, temporal, { projectId, documentId, taskQueue });
       return send(response, result.reused ? 200 : 202, result);
+    }
+    // 章节短剧剧本：项目级共享 subject_definitions 预设（作者手动编辑，生成前预设）
+    const scriptSubjectPresetMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/script-h3\/subject-preset$/);
+    if (scriptSubjectPresetMatch && (request.method === "GET" || request.method === "PUT")) {
+      const projectId = decodeURIComponent(scriptSubjectPresetMatch[1]);
+      if (request.method === "GET") {
+        return send(response, 200, { definitionText: await repository.getChapterScriptSubjectPreset(projectId) });
+      }
+      const body = await readJson(request).catch(() => ({}) as Record<string, unknown>);
+      // 空文本合法（= 清空共享定义）；非字符串入参按空处理。
+      const definitionText = typeof body.definitionText === "string" ? body.definitionText : "";
+      try {
+        parseSharedSubjectPreset(definitionText);
+      } catch (error) {
+        return send(response, 400, { error: error instanceof Error ? error.message : String(error) });
+      }
+      await repository.putChapterScriptSubjectPreset(projectId, definitionText);
+      return send(response, 200, { definitionText });
+    }
+    // 短剧剧本提示词（MiniMax H3 Ref2VA）：定稿章节的只读派生产物
+    const chapterScriptMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/documents\/([^/?]+)\/script-h3$/);
+    if (chapterScriptMatch && (request.method === "GET" || request.method === "POST")) {
+      const projectId = decodeURIComponent(chapterScriptMatch[1]);
+      const documentId = decodeURIComponent(chapterScriptMatch[2]);
+      if (request.method === "GET") {
+        const artifacts = await repository.listProjectArtifacts({ projectId, kind: CHAPTER_SCRIPT_ARTIFACT_KIND, limit: SCRIPT_LIST_LIMIT });
+        const latest = [...artifacts].sort((left, right) => right.createdAt - left.createdAt).find((artifact) => artifact.structuredData?.documentId === documentId);
+        const sharedDefinitionText = await repository.getChapterScriptSubjectPreset(projectId);
+        let sharedMaxLabel = 0;
+        try { sharedMaxLabel = parseSharedSubjectPreset(sharedDefinitionText).maxLabel; } catch { sharedMaxLabel = 0; }
+        if (!latest) return send(response, 200, {
+          exists: false,
+          sharedSubjects: { definitionText: sharedDefinitionText, maxLabel: sharedMaxLabel },
+        });
+        const data = latest.structuredData ?? {};
+        // 影视镜头语言提示（提示级）：直接从 segments 现算，随产物读取实时反映。
+        let cinematicHints: string[] = [];
+        if (Array.isArray(data.segments)) {
+          cinematicHints = computeCinematicHints(data.segments as never);
+        }
+        return send(response, 200, {
+          exists: true,
+          artifactId: latest.id,
+          createdAt: latest.createdAt,
+          sourceFingerprint: typeof data.sourceFingerprint === "string" ? data.sourceFingerprint : null,
+          mode: typeof data.mode === "string" ? data.mode : "ref2va",
+          minSegments: typeof data.minSegments === "number" ? data.minSegments : undefined,
+          plotBeats: Array.isArray(data.plotBeats) ? data.plotBeats : [],
+          cinematicHints,
+          sharedSubjects: typeof data.sharedSubjectsText === "string" && data.sharedSubjectsText
+            ? { definitionText: data.sharedSubjectsText, maxLabel: (() => { try { return parseSharedSubjectPreset(data.sharedSubjectsText).maxLabel; } catch { return 0; } })() }
+            : { definitionText: sharedDefinitionText, maxLabel: sharedMaxLabel },
+          characters: Array.isArray(data.characters) ? data.characters : [],
+          segments: Array.isArray(data.segments) ? data.segments : [],
+        });
+      }
+      const body = await readJson(request).catch(() => ({}) as Record<string, unknown>);
+      try {
+        const sharedSubjectsText = await repository.getChapterScriptSubjectPreset(projectId);
+        const record = await generateChapterScriptH3(
+          { projectId, documentId, instruction: asString(body.instruction) || undefined },
+          { repository, objects: objectStore, model, skillProvider, sharedSubjectsText },
+        );
+        return send(response, 200, { record });
+      } catch (error) {
+        // 来源类错误携带建议状态码（跨层契约）；其余错误交由外层 500 通道。
+        if (error instanceof ChapterScriptSourceError) return send(response, error.statusCode, { error: error.message });
+        throw error;
+      }
+    }
+    // 创意短剧脚本（项目无关端点，契约 v2）：核心创意 → 简短分镜提示词。
+    // 独立于小说创作板块：不依赖任何小说项目；projectId 可选（关联作品=衍生短剧）。
+    const independentShortScriptListMatch = request.url?.match(/^\/v2\/short-script-h3\/list(?:\?(.+))?$/);
+    if (request.method === "GET" && independentShortScriptListMatch) {
+      const projectId = new URL(request.url ?? "/", "http://localhost").searchParams.get("projectId")?.trim() || undefined;
+      const scripts = (await repository.listShortScripts({ projectId, limit: SCRIPT_LIST_LIMIT })).map(shortScriptSummary);
+      return send(response, 200, { scripts });
+    }
+    const independentShortScriptDetailMatch = request.url?.match(/^\/v2\/short-script-h3\/([^/?]+)$/);
+    if (request.method === "GET" && independentShortScriptDetailMatch) {
+      const stored = await repository.getShortScript(decodeURIComponent(independentShortScriptDetailMatch[1]));
+      if (!stored) return send(response, 404, { error: "指定的创意短剧产物不存在" });
+      return send(response, 200, shortScriptDetail(stored));
+    }
+    const independentShortScriptMatch = request.url?.match(/^\/v2\/short-script-h3(?:\?(.+))?$/);
+    if (independentShortScriptMatch && (request.method === "GET" || request.method === "POST")) {
+      if (request.method === "GET") {
+        // ?scriptId= 读指定产物（与 workflow-map 8.2 契约一致）；无参读最新一条。
+        const scriptId = new URL(request.url ?? "/", "http://localhost").searchParams.get("scriptId")?.trim() || undefined;
+        const stored = scriptId
+          ? await repository.getShortScript(scriptId)
+          : (await repository.listShortScripts({ limit: 1 }))[0];
+        if (scriptId && !stored) return send(response, 404, { error: "指定的创意短剧产物不存在" });
+        return stored ? send(response, 200, shortScriptDetail(stored)) : send(response, 200, { exists: false });
+      }
+      const body = await readJson(request).catch(() => ({}) as Record<string, unknown>);
+      const idea = asString(body.idea);
+      if (!idea) return send(response, 400, { error: "idea 必填：核心创意须写清谁、何处、什么冲突" });
+      const targetDurationRaw = body.targetDurationSeconds;
+      const targetDurationSeconds = typeof targetDurationRaw === "number" && Number.isFinite(targetDurationRaw)
+        ? Math.round(targetDurationRaw)
+        : undefined;
+      try {
+        const record = await generateShortScriptH3(
+          {
+            projectId: asString(body.projectId) || undefined,
+            idea,
+            instruction: asString(body.instruction) || undefined,
+            ...(targetDurationSeconds !== undefined ? { targetDurationSeconds } : {}),
+          },
+          { repository, objects: objectStore, model, skillProvider },
+        );
+        return send(response, record.reused ? 200 : 202, { record });
+      } catch (error) {
+        if (error instanceof ShortScriptInputError) return send(response, error.statusCode, { error: error.message });
+        throw error;
+      }
+    }
+    // 创意短剧脚本历史列表（项目级兼容端点：按关联作品过滤，读 short_scripts 表）
+    const shortScriptListMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/short-script-h3\/list$/);
+    if (request.method === "GET" && shortScriptListMatch) {
+      const projectId = decodeURIComponent(shortScriptListMatch[1]);
+      const scripts = (await repository.listShortScripts({ projectId, limit: SCRIPT_LIST_LIMIT })).map(shortScriptSummary);
+      return send(response, 200, { scripts });
+    }
+    // 创意短剧脚本（项目级兼容端点：POST 透传 projectId 关联，GET 按项目读最新/指定产物）
+    const shortScriptMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/short-script-h3(?:\?(.+))?$/);
+    if (shortScriptMatch && (request.method === "GET" || request.method === "POST")) {
+      const projectId = decodeURIComponent(shortScriptMatch[1]);
+      if (request.method === "GET") {
+        // 兼容参数 artifactId（v2 契约为 scriptId）：按产物加载详情并校验项目归属。
+        const scriptId = new URL(request.url ?? "/", "http://localhost").searchParams.get("scriptId")?.trim()
+          ?? (new URL(request.url ?? "/", "http://localhost").searchParams.get("artifactId")?.trim() || undefined);
+        let stored;
+        if (scriptId) {
+          const found = await repository.getShortScript(scriptId);
+          if (!found || found.projectId !== projectId) {
+            return send(response, 404, { error: "指定的创意短剧产物不存在" });
+          }
+          stored = found;
+        } else {
+          stored = (await repository.listShortScripts({ projectId, limit: 1 }))[0];
+        }
+        if (!stored) return send(response, 200, { exists: false });
+        return send(response, 200, shortScriptDetail(stored));
+      }
+      const body = await readJson(request).catch(() => ({}) as Record<string, unknown>);
+      const idea = asString(body.idea);
+      if (!idea) return send(response, 400, { error: "idea 必填：核心创意须写清谁、何处、什么冲突" });
+      const targetDurationRaw = body.targetDurationSeconds;
+      const targetDurationSeconds = typeof targetDurationRaw === "number" && Number.isFinite(targetDurationRaw)
+        ? Math.round(targetDurationRaw)
+        : undefined;
+      try {
+        const record = await generateShortScriptH3(
+          {
+            projectId,
+            idea,
+            instruction: asString(body.instruction) || undefined,
+            ...(targetDurationSeconds !== undefined ? { targetDurationSeconds } : {}),
+          },
+          { repository, objects: objectStore, model, skillProvider },
+        );
+        return send(response, record.reused ? 200 : 202, { record });
+      } catch (error) {
+        if (error instanceof ShortScriptInputError) return send(response, error.statusCode, { error: error.message });
+        throw error;
+      }
     }
     const documentContentMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/documents\/([^/?]+)\/content$/);
     if (request.method === "GET" && documentContentMatch) {

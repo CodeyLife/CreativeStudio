@@ -218,6 +218,56 @@ function taskAttemptFromRow(row: TaskAttemptRow): TaskAttemptRecord {
 function artifactFromRow(row: ArtifactRow): Artifact {
   return { id: row.id, projectId: row.project_id, taskId: row.task_id, attemptId: row.attempt_id, kind: row.kind, contentHash: row.content_hash, objectKey: row.object_key ?? undefined, baseRevision: Number(row.base_revision), fingerprint: row.fingerprint, structuredData: row.payload ?? {}, createdAt: new Date(row.created_at).getTime() };
 }
+
+/** 创意短剧独立存储行（short_scripts 表，迁移 050）：project_id 可空=独立短剧。 */
+export interface StoredShortScript {
+  id: string;
+  projectId?: string;
+  idea: string;
+  instruction?: string;
+  targetDurationSeconds: number;
+  sourceFingerprint: string;
+  contractVersion: string;
+  objectKey?: string;
+  contentHash: string;
+  workflowId: string;
+  payload: Record<string, unknown>;
+  createdAt: number;
+}
+
+interface ShortScriptRow {
+  id: string;
+  project_id: string | null;
+  idea: string;
+  instruction: string | null;
+  target_duration_seconds: number;
+  source_fingerprint: string;
+  contract_version: string;
+  object_key: string | null;
+  content_hash: string;
+  workflow_id: string;
+  payload: Record<string, unknown> | null;
+  created_at: Date | string;
+}
+
+const SHORT_SCRIPT_SELECT_SQL = "SELECT id,project_id,idea,instruction,target_duration_seconds,source_fingerprint,contract_version,object_key,content_hash,workflow_id,payload,created_at FROM short_scripts";
+
+function shortScriptFromRow(row: ShortScriptRow): StoredShortScript {
+  return {
+    id: row.id,
+    projectId: row.project_id ?? undefined,
+    idea: row.idea,
+    instruction: row.instruction ?? undefined,
+    targetDurationSeconds: Number(row.target_duration_seconds),
+    sourceFingerprint: row.source_fingerprint,
+    contractVersion: row.contract_version,
+    objectKey: row.object_key ?? undefined,
+    contentHash: row.content_hash,
+    workflowId: row.workflow_id,
+    payload: row.payload ?? {},
+    createdAt: new Date(row.created_at).getTime(),
+  };
+}
 function memoryClaimFromRow(row: any): MemoryClaim {
   return {
     id: row.id,
@@ -1864,6 +1914,23 @@ export class NovelPostgresRepository {
       `, [marked.id, snapshotId, marked.fingerprint, marked.dimension ?? null, marked.severity, marked.title, marked.description ?? null, marked.evidenceQuote, marked.paragraph ?? null, JSON.stringify(marked.revisionRanges), marked.rule ?? null, marked.suggestion ?? null, marked.readerReconstruction ?? null, marked.sourceRoles, marked.status]);
     }
     return true;
+  }
+
+  /** 章节短剧剧本：项目级共享 subject_definitions 预设（用户手动编辑，生成前预设）。 */
+  async getChapterScriptSubjectPreset(projectId: string): Promise<string> {
+    const result = await this.pool.query<{ definition_text: string }>(
+      "SELECT definition_text FROM chapter_script_subject_presets WHERE project_id=$1",
+      [projectId],
+    );
+    return result.rows[0]?.definition_text ?? "";
+  }
+
+  async putChapterScriptSubjectPreset(projectId: string, definitionText: string): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO chapter_script_subject_presets(project_id, definition_text, updated_at) VALUES($1,$2,now())
+       ON CONFLICT (project_id) DO UPDATE SET definition_text=EXCLUDED.definition_text, updated_at=now()`,
+      [projectId, definitionText],
+    );
   }
 
   async listSkills(_projectId: string): Promise<SkillDescriptor[]> {
@@ -4571,6 +4638,44 @@ export class NovelPostgresRepository {
       [artifactId],
     );
     return result.rows[0] ? artifactFromRow(result.rows[0]) : undefined;
+  }
+
+  async recordShortScript(script: StoredShortScript): Promise<void> {
+    // 冲突目标指向 source_fingerprint 唯一索引（ux_short_scripts_fingerprint）而非 id：
+    // id 为 randomUUID 永不冲突；并发同创意提交时第二个插入在指纹索引上冲突，
+    // 静默跳过后调用方经 findShortScriptByFingerprint 读到既有产物（幂等语义）。
+    await this.pool.query(
+      `INSERT INTO short_scripts(id,project_id,idea,instruction,target_duration_seconds,source_fingerprint,contract_version,object_key,content_hash,workflow_id,payload,created_at)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+       ON CONFLICT(source_fingerprint) DO NOTHING`,
+      [script.id, script.projectId ?? null, script.idea, script.instruction ?? null, script.targetDurationSeconds, script.sourceFingerprint, script.contractVersion, script.objectKey ?? null, script.contentHash, script.workflowId, script.payload ?? {}, new Date(script.createdAt)],
+    );
+  }
+
+  async getShortScript(id: string): Promise<StoredShortScript | undefined> {
+    const result = await this.pool.query<ShortScriptRow>(SHORT_SCRIPT_SELECT_SQL + " WHERE id=$1", [id]);
+    return result.rows[0] ? shortScriptFromRow(result.rows[0]) : undefined;
+  }
+
+  async findShortScriptByFingerprint(fingerprint: string): Promise<StoredShortScript | undefined> {
+    const result = await this.pool.query<ShortScriptRow>(SHORT_SCRIPT_SELECT_SQL + " WHERE source_fingerprint=$1 ORDER BY created_at DESC LIMIT 1", [fingerprint]);
+    return result.rows[0] ? shortScriptFromRow(result.rows[0]) : undefined;
+  }
+
+  async listShortScripts(options: { projectId?: string; limit?: number } = {}): Promise<StoredShortScript[]> {
+    const limit = Math.min(Math.max(options.limit ?? 50, 1), 100);
+    const params: unknown[] = [];
+    let filterSql = "";
+    if (options.projectId !== undefined) {
+      params.push(options.projectId);
+      filterSql = ` WHERE project_id=$${params.length}`;
+    }
+    params.push(limit);
+    const result = await this.pool.query<ShortScriptRow>(
+      SHORT_SCRIPT_SELECT_SQL + filterSql + ` ORDER BY created_at DESC,id DESC LIMIT $${params.length}`,
+      params,
+    );
+    return result.rows.map(shortScriptFromRow);
   }
 
   async createNextDocument(projectId: string, title?: string): Promise<ManuscriptDocumentSummary> {

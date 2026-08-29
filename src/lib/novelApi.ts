@@ -270,6 +270,91 @@ export interface NovelFactCandidate {
   authority: string;
 }
 
+export interface NovelChapterScriptCharacterView {
+  name: string;
+  appearanceEn: string;
+}
+
+export interface NovelPlotBeatView {
+  id: string;
+  kind: "event" | "dialogue" | "memory" | "setup" | "hook" | "decision";
+  summary: string;
+}
+
+/** 项目级共享 subject_definitions 预设（用户手动编辑，生成前预设；空文本=无共享） */
+export interface NovelChapterScriptSharedSubjectsView {
+  definitionText: string;
+  maxLabel: number;
+}
+
+export interface NovelChapterScriptSegmentView {
+  index: number;
+  title: string;
+  synopsis: string;
+  durationSeconds: number;
+  promptText: string;
+}
+
+/** GET /v2/projects/:id/documents/:docId/script-h3 响应；exists=false 表示本章尚未生成 */
+export interface NovelChapterScriptView {
+  exists: boolean;
+  artifactId?: string;
+  createdAt?: number;
+  sourceFingerprint?: string | null;
+  mode?: string;
+  minSegments?: number;
+  plotBeats?: NovelPlotBeatView[];
+  /** 影视镜头语言提示（提示级，不阻断）：缺少运镜/景别描述的镜头清单 */
+  cinematicHints?: string[];
+  /** 本次产物使用的共享定义快照（片段 subjectDefinitions 只含新增主体） */
+  sharedSubjects?: NovelChapterScriptSharedSubjectsView;
+  characters?: NovelChapterScriptCharacterView[];
+  segments?: NovelChapterScriptSegmentView[];
+}
+
+/** GET /v2/short-script-h3/:id 响应；exists=false 表示尚未生成创意短剧（契约 v2：scriptId 主键，projectId 缺省=独立短剧） */
+export interface NovelShortScriptView {
+  exists: boolean;
+  scriptId?: string;
+  /** 关联作品（衍生短剧）；缺省=独立短剧，不依赖任何小说项目 */
+  projectId?: string;
+  createdAt?: number;
+  sourceFingerprint?: string | null;
+  mode?: string;
+  /** 本次产物的创意来源（历史列表语义展示依据） */
+  idea?: string;
+  instruction?: string;
+  targetDurationSeconds?: number;
+  plotBeats?: NovelPlotBeatView[];
+  cinematicHints?: string[];
+  characters?: NovelChapterScriptCharacterView[];
+  segments?: NovelChapterScriptSegmentView[];
+}
+
+/** GET /v2/short-script-h3/list 响应项：创意短剧历史摘要（语义化，不暴露原始 JSON/UUID） */
+export interface NovelShortScriptSummaryView {
+  scriptId: string;
+  projectId?: string;
+  idea: string;
+  instruction?: string;
+  targetDurationSeconds?: number;
+  segmentCount: number;
+  cinematicHintCount: number;
+  createdAt: number;
+}
+
+export function fetchNovelChapterScriptSubjectPreset(projectId: string): Promise<{ definitionText: string }> {
+  return novelFetch(`/v2/projects/${enc(projectId)}/script-h3/subject-preset`);
+}
+
+export function saveNovelChapterScriptSubjectPreset(projectId: string, definitionText: string): Promise<{ definitionText: string }> {
+  return novelFetch(`/v2/projects/${enc(projectId)}/script-h3/subject-preset`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ definitionText }),
+  });
+}
+
 export interface NovelLearningAssessmentView {
   assessment: {
     id: string;
@@ -724,6 +809,45 @@ export function useNovelChapterWorkspace(projectId: string, documentId: string |
     queryKey: novelKeys.chapterWorkspace(projectId, documentId ?? "none"),
     queryFn: async () => (await novelFetch<{ workspace: NovelChapterWorkspace }>(`/v2/projects/${enc(projectId)}/documents/${enc(documentId!)}/workspace`)).workspace,
     enabled: Boolean(projectId && documentId),
+  });
+}
+
+export function fetchNovelChapterScript(projectId: string, documentId: string): Promise<NovelChapterScriptView> {
+  return novelFetch(`/v2/projects/${enc(projectId)}/documents/${enc(documentId)}/script-h3`);
+}
+
+export function generateNovelChapterScript(projectId: string, documentId: string, instruction?: string): Promise<{ record: NovelChapterScriptView & { reused?: boolean } }> {
+  return novelFetch(`/v2/projects/${enc(projectId)}/documents/${enc(documentId)}/script-h3`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ instruction: instruction?.trim() || undefined }),
+  });
+}
+
+/** 创意短剧（契约 v2，项目无关端点）：按 scriptId 读详情；scriptId 缺省返回全部中最新一条 */
+export function fetchShortScript(scriptId?: string): Promise<NovelShortScriptView> {
+  return scriptId ? novelFetch(`/v2/short-script-h3/${enc(scriptId)}`) : novelFetch("/v2/short-script-h3");
+}
+
+/** 历史短剧列表：projectId 提供时按关联作品过滤，缺省返回全部（独立的 + 关联的） */
+export function fetchShortScriptList(projectId?: string): Promise<{ scripts: NovelShortScriptSummaryView[] }> {
+  const query = projectId ? `?projectId=${enc(projectId)}` : "";
+  return novelFetch(`/v2/short-script-h3/list${query}`);
+}
+
+/** 生成创意短剧：projectId 可选（关联作品=衍生短剧），缺省为独立短剧 */
+export function generateShortScript(
+  input: { idea: string; instruction?: string; targetDurationSeconds?: number; projectId?: string },
+): Promise<{ record: NovelShortScriptView & { reused?: boolean; scriptId: string } }> {
+  return novelFetch("/v2/short-script-h3", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      idea: input.idea,
+      instruction: input.instruction?.trim() || undefined,
+      targetDurationSeconds: input.targetDurationSeconds,
+      projectId: input.projectId?.trim() || undefined,
+    }),
   });
 }
 

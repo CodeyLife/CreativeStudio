@@ -33,12 +33,14 @@ import {
   RocketOutlined,
   SaveOutlined,
   ThunderboltOutlined,
+  VideoCameraOutlined,
 } from "@ant-design/icons";
 
 import { STAGE_META, type StageMeta } from "./workflow-showcase/stage-meta";
 import type { WorkflowStage } from "@/novel-v2/protocol";
 import { describeEvent, documentStatusMeta, relativeTime, statusMeta, type EventCategory } from "./presentation";
 import ArtifactContentModal, { ArtifactCard, type ArtifactSummary } from "./ArtifactContentModal";
+import ChapterScriptModal from "./ChapterScriptModal";
 import ManuscriptEditor from "./ManuscriptEditor";
 import TextDiff from "./TextDiff";
 import LearningPanel from "./LearningPanel";
@@ -518,6 +520,7 @@ function RunStatusPanel({ run, document, superseded }: { run?: NovelRunState; do
 function ManuscriptWorkbench({ projectId, documentId, workspace, loading, error, onRefresh, activeParagraph, onDirtyChange, onReviewFromBlueprint }: { projectId: string; documentId?: string; workspace?: NovelChapterWorkspace; loading?: boolean; error?: boolean; onRefresh?: () => void; activeParagraph?: number; onDirtyChange?: (dirty: boolean) => void; onReviewFromBlueprint?: () => void }) {
   const [mode, setMode] = useState<"read" | "edit" | "diff">("read");
   const [edited, setEdited] = useState("");
+  const [scriptOpen, setScriptOpen] = useState(false);
   const save = useSaveNovelDocumentContent(projectId, documentId);
   const submit = useSubmitChapterReview(projectId, documentId);
   const paragraphRefs = useRef<Array<HTMLParagraphElement | null>>([]);
@@ -579,6 +582,7 @@ function ManuscriptWorkbench({ projectId, documentId, workspace, loading, error,
             />
           )}
           {mode === "edit" && dirty && <Button size="small" icon={<SaveOutlined />} loading={save.isPending} onClick={() => void handleSave()}>保存</Button>}
+          {content && <Tooltip title="为定稿正文生成短剧分镜剧本提示词（MiniMax H3 · Ref2VA），只读派生、不改正文"><Button size="small" icon={<VideoCameraOutlined />} onClick={() => setScriptOpen(true)}>剧本提示词</Button></Tooltip>}
           {content && <Button size="small" type="primary" loading={submit.isPending || save.isPending} onClick={() => void handleSubmit()}>{dirty ? "保存并重新审校" : "重新审校"}</Button>}
           {content && onReviewFromBlueprint && (
             <Popconfirm
@@ -602,6 +606,7 @@ function ManuscriptWorkbench({ projectId, documentId, workspace, loading, error,
       {content && mode === "read" && <div className="pb-manuscript pb-manuscript-reading">{original ? original.split(/\n\s*\n/gu).map((paragraph, index) => <p key={index} ref={(node) => { paragraphRefs.current[index] = node; }} className={activeParagraph === index + 1 ? "is-highlighted" : ""}>{paragraph}</p>) : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="正文为空" />}</div>}
       {content && mode === "edit" && <ManuscriptEditor key={content.contentHash} value={edited} onChange={setEdited} minHeight={620} activeParagraph={activeParagraph === undefined ? undefined : activeParagraph - 1} />}
       {content && mode === "diff" && <TextDiff baseText={original} newText={edited} baseLabel="当前定稿" newLabel="我的修改" emptyText="尚未做任何修改" />}
+      <ChapterScriptModal open={scriptOpen} onClose={() => setScriptOpen(false)} projectId={projectId} documentId={documentId} />
     </section>
   );
 }

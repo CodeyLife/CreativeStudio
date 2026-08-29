@@ -699,3 +699,46 @@
   .pb-fact-review-list article > div:last-child { display: grid; grid-template-columns: 1fr 1fr; }
   .pb-review-actions > div { grid-template-columns: 1fr; }
 }
+
+/* ===== 章节短剧剧本提示词（ChapterScriptModal） ===== */
+.pb-script-empty { display: grid; gap: 14px; padding: 8px 0 4px; }
+.pb-script-generated { display: grid; gap: 12px; }
+.pb-script-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.pb-script-toolbar-info { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.pb-script-time { color: var(--pb-muted, #94a3b8); font-size: 12px; }
+.pb-script-fingerprint { margin-bottom: 0 !important; font-size: 12px; }
+.pb-script-segment { border: 1px solid var(--pb-border, #e2e8f0); border-radius: 10px; padding: 12px 14px; display: grid; gap: 8px; background: var(--pb-surface-alt, rgba(148, 163, 184, 0.06)); }
+.pb-script-segment-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.pb-script-segment-head strong { font-size: 14px; }
+.pb-script-segment-meta { display: inline-flex; align-items: center; gap: 6px; }
+.pb-script-synopsis { margin: 0; color: var(--pb-muted, #64748b); font-size: 12.5px; line-height: 1.7; }
+.pb-script-prompt { margin: 0; max-height: 320px; overflow: auto; white-space: pre-wrap; word-break: break-word; font-size: 12.5px; line-height: 1.75; padding: 10px 12px; border-radius: 8px; background: var(--pb-code-bg, rgba(15, 23, 42, 0.05)); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+
+
+/* 片段横向 Tabs：压缩 tab 条留白，面板内仍用卡片样式 */
+.pb-script-tabs .ant-tabs-nav { margin-bottom: 10px; }
+.pb-script-tabs .ant-tabs-tab { padding: 6px 4px; font-size: 13px; }
+
+/* 共享定义库编辑区 */
+.pb-script-shared { border: 1px solid var(--pb-border, #e2e8f0); border-radius: 10px; padding: 10px 12px; display: grid; gap: 8px; background: var(--pb-surface-alt, rgba(20, 184, 166, 0.05)); margin-bottom: 12px; }
+.pb-script-shared-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.pb-script-shared-title { display: inline-flex; align-items: center; gap: 6px; font-weight: 600; font-size: 13px; }
+.pb-script-shared-actions { display: inline-flex; align-items: center; gap: 6px; }
+
+.pb-script-hints { margin: 6px 0 0; padding-left: 18px; font-size: 12.5px; line-height: 1.7; }
+
+/* ---------- 剧本创作板块（ScriptStudioPanel） ---------- */
+.pb-script-studio { display: grid; gap: 16px; }
+.pb-script-create { display: grid; gap: 12px; padding: 4px 0; }
+.pb-script-duration { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 12px; }
+.pb-script-duration-label { font-size: 13px; font-weight: 600; white-space: nowrap; }
+.pb-script-duration-hint { color: var(--pb-muted, #64748b); font-size: 12px; white-space: nowrap; }
+.pb-script-history-list { display: grid; gap: 8px; padding: 4px 0; }
+.pb-script-history-card { display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; text-align: left; padding: 10px 14px; border: 1px solid var(--pb-border, #e2e8f0); border-radius: 10px; background: var(--pb-surface-alt, rgba(148, 163, 184, 0.05)); cursor: pointer; transition: border-color 0.15s ease, background 0.15s ease; }
+.pb-script-history-card:hover { border-color: var(--pb-accent, #14b8a6); }
+.pb-script-history-card.is-active { border-color: var(--pb-accent, #14b8a6); background: rgba(20, 184, 166, 0.08); }
+.pb-script-history-copy { display: grid; gap: 2px; min-width: 0; }
+.pb-script-history-copy strong { font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pb-script-history-copy small { color: var(--pb-muted, #64748b); font-size: 12px; }
+.pb-script-history-action { color: var(--pb-accent, #14b8a6); font-size: 12.5px; white-space: nowrap; }
+.pb-script-studio-detail { margin-top: 14px; border-top: 1px dashed var(--pb-border, #e2e8f0); padding-top: 14px; }

@@ -34,6 +34,7 @@ metadata:
 | 推进 | novel_action_execute(work.accept/retry/recover/run.pause/resume/cancel)、novel_chapter_review_decision(approve)、novel_story_arc_batch_start |
 | 编辑 | novel_chapter_review_issue_add、novel_chapter_review(mode=targeted)、novel_chapter_review_decision(revise+feedback)、novel_action_execute(work.revise)、novel_story_arc_orchestrate |
 | 迭代优化 | novel_closed_loop_run、novel_rule_candidate_create/get、novel_rule_evidence_submit、novel_rule_foundation_evaluate、novel_rule_review_submit、novel_rule_promote、novel_rule_rollback |
+| 派生产物 | novel_chapter_script_h3（定稿章节 → MiniMax H3 Ref2VA 短剧剧本提示词）、novel_short_script_h3（核心创意 → 短剧脚本提示词，projectId 可选、可完全独立于小说项目） |
 | 查询 | novel_catalog_get、novel_context_get、novel_artifact_list、novel_story_arc_get、novel_workflow_get/list |
 
 ## 全流程各阶段
@@ -176,6 +177,34 @@ novel_chapter_review_decision(workflowId, artifactId, decision, feedback?, revis
 4. 或者在工作流等待处 `novel_chapter_review_decision(revise, feedback, revisionBase=current|previous)`。
 5. approve 前检查：有 blocker/major 而你要 approve，必须给 feedback 理由。
 
+### 阶段 2.5 短剧剧本提示词（章节派生与核心创意两条路径，只读派生）
+
+```
+novel_chapter_script_h3(projectId, documentId, instruction?)
+  → artifacts(kind=chapter-script)，返回各片段 promptText
+novel_short_script_h3(idea, instruction?, targetDurationSeconds?, projectId?)
+  → short_scripts 独立表（projectId 缺省=独立短剧，不依赖任何小说项目）
+```
+
+**路径 A（章节派生）**：
+- 仅适用于已有正式 revision 的 final 章节；是正文的只读派生，不走工作流、
+  不进质量门，也不影响后续编排。
+- 输出为 MiniMax H3 全参考模式（Ref2VA）提示词：一章拆多个 5-10 秒片段，
+  每片段一条自包含六段提示词（含 subject_definitions），片段内可含多镜头；
+  人物外观基线由顶层 characters 统一，对白保留中文原文。
+- 同一定稿内容幂等复用既有产物；要重新生成先让正文重新修订产生新 revision。
+
+**路径 B（核心创意，独立于小说项目）**：
+- `idea` 写清谁/何处/什么冲突（≥10 字符）；`targetDurationSeconds` 10-180s
+  （默认 30s）；`projectId` 可选——缺省为独立短剧（完全不需要小说项目），
+  填写时产物关联该作品作衍生短剧。
+- 产物存 `short_scripts` 独立表（契约 v2），经 REST `GET /v2/short-script-h3/:scriptId`
+  读取；同作用域同创意输入幂等复用。
+- 两条路径共享六段式结构与结构特征校验；创意模式专属指引：节拍为设计而非
+  穷举、开场即冲突、末段切在钩子上。
+- 写作方法论见 h3-prompt-writing skill（SKILL.md + references/base-en.txt +
+  references/ref-en.txt）；系统生成时已自动注入对应运行时 Skill 指引。
+
 ### 阶段 3 事实梳理与记忆（编排/编辑前必做）
 
 ```
@@ -238,6 +267,8 @@ novel_rule_promote(candidateId) / novel_rule_rollback(candidateId)
 | 有剧情想法想交给系统完善 | novel_story_arc_orchestrate |
 | 常规推进故事弧 | novel_story_arc_start → novel_story_arc_get → novel_story_arc_batch_start |
 | 生成下一章 | novel_chapter_generate |
+| 定稿章节转短剧剧本（H3 视频提示词） | novel_chapter_script_h3 → 产物 kind=chapter-script；方法论见 h3-prompt-writing skill |
+| 从核心创意直接写短剧（无需小说项目） | novel_short_script_h3 → short_scripts 独立表（projectId 可选关联作品）；REST /v2/short-script-h3 读取 |
 | 追进度 | novel_workflow_get(workflowId) |
 | 人工定稿/修订 | novel_chapter_review_decision(approve/revise/feedback) |
 | 追加编辑意见 | novel_chapter_review_issue_add → novel_chapter_review(mode=targeted) |

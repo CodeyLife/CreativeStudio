@@ -37,12 +37,12 @@ const mockCtx = {
 // ===== A. 纯函数：validateToolArgs（无 Postgres 依赖）=====
 
 describe("validateToolArgs pure function", () => {
-  it("TOOL_NAMES has exactly 35 tools", () => {
-    expect(TOOL_NAMES).toHaveLength(35);
+  it("TOOL_NAMES has exactly 37 tools", () => {
+    expect(TOOL_NAMES).toHaveLength(37);
   });
 
-  it("TOOL_DEFINITIONS has 35 defs, each with name/description/inputSchema", () => {
-    expect(TOOL_DEFINITIONS).toHaveLength(35);
+  it("TOOL_DEFINITIONS has 37 defs, each with name/description/inputSchema", () => {
+    expect(TOOL_DEFINITIONS).toHaveLength(37);
     for (const def of TOOL_DEFINITIONS) {
       expect(typeof def.name).toBe("string");
       expect(def.name.length).toBeGreaterThan(0);

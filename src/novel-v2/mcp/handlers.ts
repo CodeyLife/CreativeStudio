@@ -1,10 +1,10 @@
 /**
- * V2 MCP 工具处理函数（35 个工具的 handler 实现）。
+ * V2 MCP 工具处理函数（37 个工具的 handler 实现）。
  *
  * 设计依据：AGENTS.md 架构阶段 + Phase B-2 MCP 工具网关。
  *
  * 职责：
- * - 实现 35 个工具的具体调用逻辑
+ * - 实现 37 个工具的具体调用逻辑
  * - 路由到 creative/ + evaluation/ + postgres-repository 模块
  * - 返回标准 JSON-serializable 结果（executeTool 包装为 McpToolResponse）
  *
@@ -13,7 +13,7 @@
  * - Catalog / Receipt（3）
  * - Craft Rule 候选演进（7）—— 基于 craft-rule 模块（Postgres）
  * - 项目生命周期（3）
- * - 规划与创作（9）—— foundation bootstrap、故事弧（含外部编排模式）与章节审校 workflow
+ * - 规划与创作（11）—— foundation bootstrap、故事弧（含外部编排模式）、章节审校 workflow、章节剧本派生与创意短剧脚本
  * - 评估闭环（1，v2 新增）
  * - Workflow 查询（2）
  * - Workflow 决策（1）
@@ -38,6 +38,10 @@ import { parseStoryArcPlotOutline, validateStoryArcPlotOutline } from "../applic
 import { DEFAULT_ARTIFACT_LIST_LIMIT, DEFAULT_WORKFLOW_LIST_LIMIT } from "./tool-definitions";
 import { startStoryArcBatchPlanning, startStoryArcOrchestratedPlanning, startStoryArcPlanning, startStoryArcReview } from "../application/story-arc-workflow";
 import { parseCreativeBrief } from "../application/creative-brief";
+import { generateChapterScriptH3 } from "../application/chapter-script-h3";
+import { generateShortScriptH3 } from "../application/short-script-h3";
+import { ContentObjectStore } from "../object-store";
+import { createConfiguredSkillProvider } from "../skill-runtime";
 import {
   createCreativeRun,
   executeCreativeCommand,
@@ -1171,6 +1175,104 @@ const novel_artifact_list: ToolHandler = async (args, ctx) => {
   };
 };
 
+/**
+ * 为已定稿章节生成短剧分镜剧本提示词（MiniMax H3 Ref2VA）。
+ *
+ * 设计依据：创作支撑层基线 —— 定稿正文的只读辅助派生，不走 Temporal 工作流，
+ * 也不进正文质量门；skill 指引经 chapter.script 执行点解析后注入系统提示。
+ */
+const novel_chapter_script_h3: ToolHandler = async (args, ctx) => {
+  const projectId = asString(args.projectId);
+  const documentId = asString(args.documentId);
+  if (!projectId || !documentId) throw new Error("projectId/documentId 必填且非空");
+  if (!ctx.model) throw new Error("novel_chapter_script_h3 需要 ToolContext.model（LLM 网关）");
+
+  // 项目级共享定义由作者在前端预设（REST/前端管理），MCP 生成时读取同一份。
+  const sharedSubjectsText = await ctx.repository.getChapterScriptSubjectPreset(projectId);
+  const record = await generateChapterScriptH3({ projectId, documentId, instruction: asString(args.instruction) || undefined }, {
+    repository: ctx.repository,
+    objects: new ContentObjectStore(),
+    model: ctx.model,
+    skillProvider: createConfiguredSkillProvider({ databaseList: (pid) => ctx.repository.listSkills(pid) }),
+    sharedSubjectsText,
+  });
+
+  return {
+    projectId: record.projectId,
+    documentId: record.documentId,
+    artifactId: record.artifactId,
+    revisionId: record.revisionId,
+    sourceFingerprint: record.sourceFingerprint,
+    mode: "ref2va",
+    minSegments: record.minSegments,
+    plotBeats: record.plotBeats,
+    cinematicHints: record.cinematicHints,
+    sharedSubjects: record.sharedSubjects,
+    characterBaselines: record.characters,
+    segments: record.segments.map((segment) => ({
+      index: segment.index,
+      title: segment.title,
+      synopsis: segment.synopsis,
+      durationSeconds: segment.durationSeconds,
+      promptText: segment.promptText,
+    })),
+    nextAction: "把各片段 promptText 直接送入 MiniMax H3；完整产物可用 novel_artifact_get 阅读，历史剧本可用 novel_artifact_list(kind=chapter-script) 查询",
+  };
+};
+
+/**
+ * 从核心创意生成简短短剧脚本提示词（MiniMax H3 Ref2VA）。
+ *
+ * 设计依据：创作支撑层基线 —— 无定稿正文依赖的独立创作派生物，不走 Temporal
+ * 工作流，也不进正文质量门；skill 指引经 short.script 执行点解析后注入系统提示；
+ * 与章节剧本共用六段式片段契约与结构特征校验。
+ */
+const novel_short_script_h3: ToolHandler = async (args, ctx) => {
+  const idea = asString(args.idea);
+  if (!idea) throw new Error("idea 必填且非空");
+  if (!ctx.model) throw new Error("novel_short_script_h3 需要 ToolContext.model（LLM 网关）");
+  const projectId = asString(args.projectId) || undefined;
+
+  const targetDurationSecondsRaw = args.targetDurationSeconds;
+  const targetDurationSeconds = typeof targetDurationSecondsRaw === "number" && Number.isFinite(targetDurationSecondsRaw)
+    ? Math.round(targetDurationSecondsRaw)
+    : undefined;
+  const record = await generateShortScriptH3(
+    {
+      projectId,
+      idea,
+      instruction: asString(args.instruction) || undefined,
+      ...(targetDurationSeconds !== undefined ? { targetDurationSeconds } : {}),
+    },
+    {
+      repository: ctx.repository,
+      objects: new ContentObjectStore(),
+      model: ctx.model,
+      skillProvider: createConfiguredSkillProvider({ databaseList: (pid) => ctx.repository.listSkills(pid) }),
+    },
+  );
+
+  return {
+    projectId: record.projectId,
+    scriptId: record.scriptId,
+    sourceFingerprint: record.sourceFingerprint,
+    reused: record.reused ?? false,
+    mode: "ref2va",
+    targetDurationSeconds: record.targetDurationSeconds,
+    plotBeats: record.plotBeats,
+    cinematicHints: record.cinematicHints,
+    characterBaselines: record.characters,
+    segments: record.segments.map((segment) => ({
+      index: segment.index,
+      title: segment.title,
+      synopsis: segment.synopsis,
+      durationSeconds: segment.durationSeconds,
+      promptText: segment.promptText,
+    })),
+    nextAction: "把各片段 promptText 直接送入 MiniMax H3；短剧产物存储于 short_scripts 独立表（不依赖小说项目），可通过 REST GET /v2/short-script-h3/:scriptId 读取",
+  };
+};
+
 // ===== Handler 注册表 =====
 
 export const TOOL_HANDLERS: Record<string, ToolHandler> = {
@@ -1202,11 +1304,13 @@ export const TOOL_HANDLERS: Record<string, ToolHandler> = {
   novel_project_list,
   novel_project_delete,
 
-  // 规划与创作（9）
+  // 规划与创作（11）
   novel_bootstrap_run,
   novel_chapter_review,
   novel_chapter_review_issue_add,
   novel_chapter_generate,
+  novel_chapter_script_h3,
+  novel_short_script_h3,
   novel_story_arc_start,
   novel_story_arc_get,
   novel_story_arc_review,
