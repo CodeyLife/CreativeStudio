@@ -6,22 +6,26 @@ import { requestJson } from "../lib/json-response";
 
 const { Text, Title } = Typography;
 
-const PURPOSES = [
-  "planning.foundation", "planning.blueprint", "writing.draft", "writing.revision",
-  "review.structure", "review.character", "review.prose", "review.foundation",
-  "facts.extract", "learning.assess", "skill.iterate", "memory.embed", "memory.rerank",
-] as const;
-type Purpose = (typeof PURPOSES)[number];
+// purpose 与能力要求单一真源：src/novel-v2/model-purposes.ts（后端 model-routing 同源导入，
+// 此前两端各自硬编码已发生漂移——新增 purpose 必须只改 model-purposes.ts 与下方标签表）。
+import { MODEL_PURPOSES, PURPOSE_CAPABILITY, type ModelCapability, type ModelPurpose } from "@/novel-v2/model-purposes";
+
+type Purpose = ModelPurpose;
+type Capability = ModelCapability;
 
 const PURPOSE_LABELS: Record<Purpose, string> = {
   "planning.foundation": "规划·基础设定",
   "planning.blueprint": "规划·章节蓝图",
+  "planning.arc": "规划·故事弧",
+  "planning.arc-revision": "规划·故事弧修订",
   "writing.draft": "写作·初稿生成",
   "writing.revision": "写作·润色修订",
+  "writing.script": "写作·短剧剧本提示词",
   "review.structure": "审校·结构与事实",
   "review.character": "审校·人物",
   "review.prose": "审校·正文体验与语言",
   "review.foundation": "审校·全书架构",
+  "review.arc": "审校·故事弧",
   "facts.extract": "事实·抽取",
   "learning.assess": "学习·评估",
   "skill.iterate": "技能·迭代",
@@ -29,23 +33,6 @@ const PURPOSE_LABELS: Record<Purpose, string> = {
   "memory.rerank": "记忆·重排",
 };
 
-// 与后端 model-routing.ts 的 PURPOSE_CAPABILITY 保持一致：每个 purpose 要求的最低能力
-const PURPOSE_CAPABILITY: Record<Purpose, Capability> = {
-  "planning.foundation": "structured",
-  "planning.blueprint": "structured",
-  "writing.draft": "text",
-  "writing.revision": "text",
-  "review.structure": "structured",
-  "review.character": "structured",
-  "review.prose": "structured",
-  "review.foundation": "structured",
-  "facts.extract": "structured",
-  "learning.assess": "structured",
-  "skill.iterate": "structured",
-  "memory.embed": "embedding",
-  "memory.rerank": "rerank",
-};
-type Capability = "text" | "structured" | "stream" | "responses-continuation" | "embedding" | "rerank";
 type Candidate = { executor: "api"; profileId: string; model?: string } | { executor: "external-mcp" };
 type Route = { candidates: Candidate[]; conversationPolicy?: "stateless" | "task-chain"; maxInputTokens?: number; maxOutputTokens?: number };
 type Profile = {
@@ -230,7 +217,7 @@ export function NovelModelRoutingSettings() {
         </Space>
         <div className="settings-table-scroll">
           <Table<Purpose>
-          rowKey={(purpose) => purpose} pagination={false} size="small" dataSource={[...PURPOSES]}
+          rowKey={(purpose) => purpose} pagination={false} size="small" dataSource={[...MODEL_PURPOSES]}
           scroll={{ x: 880 }}
           className="settings-table"
           columns={[

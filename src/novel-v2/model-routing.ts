@@ -1,28 +1,14 @@
 import { createHash } from "node:crypto";
 import type { PromptContextManifest } from "./protocol";
 
-export const MODEL_PURPOSES = [
-  "planning.foundation",
-  "planning.blueprint",
-  "planning.arc",
-  "planning.arc-revision",
-  "writing.draft",
-  "writing.revision",
-  "review.structure",
-  "review.character",
-  "review.prose",
-  "review.foundation",
-  "review.arc",
-  "facts.extract",
-  "learning.assess",
-  "skill.iterate",
-  "memory.embed",
-  "memory.rerank",
-] as const;
+// purpose / capability 单一真源见 model-purposes.ts（无 node 依赖，前端设置界面共用）；
+// 这里 re-export 保持既有导入路径兼容。
+import { MODEL_PURPOSES, PURPOSE_CAPABILITY, type ModelCapability, type ModelPurpose } from "./model-purposes";
 
-export type ModelPurpose = (typeof MODEL_PURPOSES)[number];
+export { MODEL_PURPOSES };
+export type { ModelCapability, ModelPurpose };
+export { PURPOSE_CAPABILITY };
 export type ModelProtocol = "chat-completions" | "responses";
-export type ModelCapability = "text" | "structured" | "stream" | "responses-continuation" | "embedding" | "rerank";
 export type ConversationPolicy = "stateless" | "task-chain";
 
 export type ModelSecret =
@@ -136,25 +122,6 @@ export class ExternalMcpRequiredError extends Error {
     this.name = "ExternalMcpRequiredError";
   }
 }
-
-const PURPOSE_CAPABILITY: Record<ModelPurpose, ModelCapability> = {
-  "planning.foundation": "structured",
-  "planning.blueprint": "structured",
-  "planning.arc": "structured",
-  "planning.arc-revision": "structured",
-  "writing.draft": "text",
-  "writing.revision": "text",
-  "review.structure": "structured",
-  "review.character": "structured",
-  "review.prose": "structured",
-  "review.foundation": "structured",
-  "review.arc": "structured",
-  "facts.extract": "structured",
-  "learning.assess": "structured",
-  "skill.iterate": "structured",
-  "memory.embed": "embedding",
-  "memory.rerank": "rerank",
-};
 
 export function requiredCapability(purpose: ModelPurpose): ModelCapability {
   return PURPOSE_CAPABILITY[purpose];
