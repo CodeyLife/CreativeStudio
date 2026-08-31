@@ -3777,6 +3777,43 @@ export class NovelPostgresRepository {
       this.listLearningAssessments(projectId, 24),
     ]);
     if (!project.rowCount) throw new Error("项目不存在");
+    // 跨章序列信号前移到规划：查询最近 N 章的 narrativeFunction，计算连续同类功能游程。
+    // 设计依据：AGENTS.md「问题要在机制层解决」——连续低行动/观察型章节密度类问题的
+    // 根因在规划批准了被动功能序列；把 functionRuns 前移到 arc.plan 让规划器在分配
+    // narrativeFunction 时就能看到疲劳风险，主动轮换压力类型，而不是等到正文生成后
+    // 再由 learning 事后补救。只输出描述性统计，不输出短语黑名单或题材特定规则。
+    // TODO P3: SERIAL_WINDOW 为魔法值，未来应可配置（序列证据预算的一部分）。
+    const SERIAL_WINDOW = 6;
+    const SERIAL_FUNCTION_RUN_MIN = 3;
+    const narrativeCutoffForSerial = (narrativeState?.narrativeOrder ?? memories.reduce((max, memory) => Math.max(max, memory.narrativeRange.end), 0)) || 0;
+    const serialRows = narrativeCutoffForSerial > 0
+      ? await this.pool.query<{ narrative_order: string | number; narrative_function: string | null }>(
+        `SELECT d.narrative_order, c.payload->>'narrativeFunction' AS narrative_function
+         FROM chapters c
+         JOIN manuscript_documents d ON d.id=c.document_id AND d.project_id=c.project_id
+         WHERE c.project_id=$1 AND d.status='final' AND d.current_revision_id IS NOT NULL
+           AND d.narrative_order <= $2
+         ORDER BY d.narrative_order DESC
+         LIMIT $3`,
+        [projectId, narrativeCutoffForSerial, SERIAL_WINDOW],
+      )
+      : { rows: [] };
+    const serialChapters = serialRows.rows
+      .map((row) => ({ narrativeOrder: Number(row.narrative_order), narrativeFunction: row.narrative_function ?? undefined }))
+      .filter((chapter): chapter is { narrativeOrder: number; narrativeFunction: string } => typeof chapter.narrativeFunction === "string" && chapter.narrativeFunction.length > 0)
+      .sort((a, b) => a.narrativeOrder - b.narrativeOrder);
+    const serialFunctionRuns: Array<{ narrativeFunction: string; narrativeOrders: number[] }> = [];
+    let runStart = 0;
+    for (let index = 1; index <= serialChapters.length; index += 1) {
+      const previous = serialChapters[index - 1].narrativeFunction;
+      const current = index < serialChapters.length ? serialChapters[index].narrativeFunction : undefined;
+      if (previous === current) continue;
+      const run = serialChapters.slice(runStart, index);
+      if (run.length >= SERIAL_FUNCTION_RUN_MIN) {
+        serialFunctionRuns.push({ narrativeFunction: run[0].narrativeFunction, narrativeOrders: run.map((chapter) => chapter.narrativeOrder) });
+      }
+      runStart = index;
+    }
     const planningFeedback = learning
       .filter((view) => view.assessment.conclusion === "propose-improvement" && view.assessment.underlyingMechanism && view.assessment.affectedInputClass)
       .filter((view) => {
@@ -3803,6 +3840,7 @@ export class NovelPostgresRepository {
       planningFeedback: Array<{ sourceChapterOrder?: number; targetId: string; underlyingMechanism: string; affectedInputClass: string; boundaries?: string; sourceArtifactId?: string }>;
       narrativeState: NarrativeStateSnapshot | undefined;
       plotOutline?: StoryArcPlotOutline;
+      serialFunctionRuns?: Array<{ narrativeFunction: string; narrativeOrders: number[] }>;
     } = {
       projectTitle: project.rows[0].title,
       macro: macro.map((artifact) => ({ taskKey: foundationTaskKey(artifact) ?? "unknown", title: typeof artifact.structuredData?.title === "string" ? artifact.structuredData.title : "", summary: typeof artifact.structuredData?.summary === "string" ? artifact.structuredData.summary : "" })),
@@ -3812,6 +3850,7 @@ export class NovelPostgresRepository {
       openPromises: openElements.promises,
       planningFeedback,
       narrativeState,
+      ...(serialFunctionRuns.length ? { serialFunctionRuns } : {}),
     };
     // 外部剧情编排（模式 B）从对应故事弧的规划 workflow run 读取：arcs.payload
     // 在项目蓝图投影时会被 bundle.arc 覆盖，不能作为编排输入的持久化位置；
@@ -3855,6 +3894,7 @@ export class NovelPostgresRepository {
       recent: canonicalSha256(contextData.recentChapters),
       "open-elements": canonicalSha256({ openThreads: contextData.openThreads, openForeshadowings: contextData.openForeshadowings, openPromises: contextData.openPromises }),
       "feedback-state": canonicalSha256({ planningFeedback: contextData.planningFeedback, narrativeState: contextData.narrativeState }),
+      ...(contextData.serialFunctionRuns ? { "serial-signals": canonicalSha256(contextData.serialFunctionRuns) } : {}),
     };
     const receiptBase: Omit<StoryArcContextReceipt, "fingerprint"> = { narrativeCutoff, sourceArtifactIds, sourceRevisionIds, sectionFingerprints, legacy: false };
     const contextReceipt: StoryArcContextReceipt = { ...receiptBase, fingerprint: canonicalSha256(receiptBase) };
@@ -4278,6 +4318,10 @@ export class NovelPostgresRepository {
    */
   async getRecentReviewIssueClusters(projectId: string, narrativeCutoff: number, window = 6): Promise<RecentIssueCluster[]> {
     const minOrder = Math.max(1, narrativeCutoff - window + 1);
+    // evidence-unverified issue 的 evidence 在正文零命中，可能是审校模型对指令示例词的回显误报。
+    // 聚类时排除这些 issue，避免误报形成"持续模式"污染 learning propose-improvement。
+    // 设计依据：AGENTS.md「根因分析与迭代改进」——基于"证据是否在正文出现"这一结构特征过滤，
+    // 跨题材复用，不识别特定审校模型或指令示例词。
     const result = await this.pool.query<{ key: string; chapter_count: string; orders: string[]; titles: string[]; severities: string[] }>(
       `WITH windowed AS (
          SELECT d.id AS document_id, d.narrative_order, d.title, i.rule, i.title AS issue_title, i.severity
@@ -4285,6 +4329,7 @@ export class NovelPostgresRepository {
          JOIN manuscript_documents d ON d.id=s.document_id AND d.project_id=s.project_id
          JOIN chapter_review_snapshot_issues i ON i.snapshot_id=s.id
          WHERE s.project_id=$1 AND d.narrative_order BETWEEN $2 AND $3
+           AND (i.dimension IS NULL OR i.dimension != 'evidence-unverified')
        )
        SELECT COALESCE(NULLIF(trim(rule),''), trim(issue_title)) AS key,
               count(DISTINCT document_id) AS chapter_count,

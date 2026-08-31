@@ -4,6 +4,7 @@ import type { ModelGateway, ModelUsage } from "./model-gateway";
 import { ExternalMcpRequiredError, type ModelRoutingSnapshot } from "./model-routing";
 import { compileStageContext } from "./stage-context";
 import { buildSkillContextSections } from "./skill-runtime";
+import { isEvidencePresentInText } from "./chapter-review-snapshot";
 
 type LearningSource = RuntimeLearningAssessmentV2["source"];
 
@@ -38,9 +39,17 @@ function requiredTextList(value: unknown, field: string): string[] {
  * 保留 severity 标记让 LLM 区分严重度，但不做硬过滤。
  * LLM 仍应优先关注 blocker/major，warning 只有在形成持续模式时才 propose-improvement。
  */
-export function reviewIssuesForLearning(reviews: Review[]) {
+export function reviewIssuesForLearning(reviews: Review[], plainText?: string) {
   return reviews.flatMap((review) => review.issues
-    .map((issue) => ({ ...issue, reviewId: review.id, reviewer: review.identity, verdict: review.verdict })));
+    .map((issue) => {
+      // evidence-unverified 标注：复用 chapter-review-snapshot 的正文包含性校验，
+      // 对 evidence 在正文零命中的 issue 标记 evidenceUnverified=true。
+      // 设计依据：AGENTS.md「根因分析与迭代改进」——审校模型可能对指令示例词回显
+      // 产生误报 issue，其 evidence 在正文中不存在；基于"证据是否在正文出现"这一
+      // 结构特征标注，跨题材复用，不识别特定审校模型或指令示例词。
+      const evidenceUnverified = plainText ? isEvidencePresentInText(issue.evidence, plainText) === false : undefined;
+      return { ...issue, reviewId: review.id, reviewer: review.identity, verdict: review.verdict, ...(evidenceUnverified ? { evidenceUnverified } : {}) };
+    }));
 }
 
 /**
@@ -178,10 +187,17 @@ export function buildRuntimeLearningPrompt(input: {
    * 即使当前章无 blocker/major 也应 propose-improvement。
    */
   recentIssueClusters?: RecentIssueCluster[];
+  /**
+   * 当前章正文（用于标注 issue evidence 是否在正文出现）。
+   * 设计依据：AGENTS.md「根因分析与迭代改进」——审校模型可能对指令示例词回显
+   * 产生误报 issue；对 evidence 在正文零命中的 issue 在 prompt 里标注 evidence-unverified，
+   * 让 LLM 降权（只有与已验证 issue 形成同 rule 类持续模式时才纳入证据）。
+   */
+  plainText?: string;
 }): string {
   // P0-B3: 汇总所有 issue（含 warning），让 LLM 判断是否形成可迁移的共享缺陷模式
-  const issues = reviewIssuesForLearning(input.reviews)
-    .map((issue, index) => `${index + 1}. [${issue.reviewer}/${issue.reviewId}] severity=${issue.severity} verdict=${issue.verdict}
+  const issues = reviewIssuesForLearning(input.reviews, input.plainText)
+    .map((issue, index) => `${index + 1}. [${issue.reviewer}/${issue.reviewId}] severity=${issue.severity} verdict=${issue.verdict}${issue.evidenceUnverified ? " [evidence-unverified]" : ""}
 标题：${issue.title}
 证据：${issue.evidence}`)
     .join("\n\n");
@@ -212,7 +228,11 @@ targetKind=system-prompt 时，targetId 格式为 "<projectId>:<templateId>"，�
 - 跨章模式是持续模式的最强证据：同 rule 类在近 N 章出现 ≥2 次，或序列信号显示
   同一状态/物件跨章等幅重述、连续同类功能章节缺少压力推进时，即使当前章无 blocker/major
   也应 propose-improvement（问题已跨章重复，单章修正无法根治）。单章偶发、序列信号无持续
-  证据的，返回 no-shared-learning。
+  证据的，返回 no-shared-learning。近章 issue 聚类已排除 evidence-unverified 的 issue，
+  只统计 evidence 在正文中实际出现的已验证 issue。
+- 标注了 [evidence-unverified] 的当前章 issue，其 evidence 在正文中未找到，可能是审校模型
+  对指令示例词的回显误报；只有当它与已验证 issue 形成同 rule 类持续模式时才纳入证据，
+  单独的 evidence-unverified issue 不触发 propose-improvement。
 - 连续低行动/观察型章节密度类问题，failingLayer 优先定位到 story-arc planning 层：
   candidate 应指向规划类 skill 的 planning 执行点（或规划相关 system-prompt），
   而不是只修 drafting——根因在规划批准了被动功能序列，正文修订只能事后补救。
@@ -300,6 +320,8 @@ export async function assessRuntimeLearningWithModel(input: {
   serialContext?: SerialContextSnapshot;
   /** 近 N 章审核 issue 按 rule 聚类（持续模式证据）。 */
   recentIssueClusters?: RecentIssueCluster[];
+  /** 当前章正文（用于标注 issue evidence 是否在正文出现，降权回显误报）。 */
+  plainText?: string;
   /** 当前 learning Skill bundle；由 compileStageContext 负责实际注入和 manifest 对账。 */
   skillBundle?: SkillBundle;
   skillManifest?: SkillResolutionManifest;
@@ -336,7 +358,7 @@ export async function assessRuntimeLearningWithModel(input: {
     if (!input.model) throw new Error("模型网关未配置");
     const system = "你是长篇小说 Runtime 的学习闭环审计员，只在能说明底层机制和影响输入类时提出可复用规则改进。";
     const skillSections = input.skillBundle ? buildSkillContextSections(input.skillBundle, "learning.assessment", "学习评估 Skill") : [];
-    const promptPackage = compileStageContext({ projectId: input.projectId, workflowId: input.workflowId, purpose: "learning.assess", stage: "review", system, schema: runtimeLearningAssessmentSchema, maxInputTokens: 128_000, reservedOutputTokens: 4_096, skillManifest: input.skillBundle?.resolution ?? input.skillManifest, sections: [{ id: "learning-evidence", kind: "review", title: "学习评估证据与规则", text: buildRuntimeLearningPrompt({ artifact: input.artifact, reviews: input.reviews, availableSkills: input.availableSkills, serialContext: input.serialContext, recentIssueClusters: input.recentIssueClusters }), priority: "required", provenanceRefs: [input.artifact.id, ...input.reviews.map((review) => review.id)] }, ...skillSections] });
+    const promptPackage = compileStageContext({ projectId: input.projectId, workflowId: input.workflowId, purpose: "learning.assess", stage: "review", system, schema: runtimeLearningAssessmentSchema, maxInputTokens: 128_000, reservedOutputTokens: 4_096, skillManifest: input.skillBundle?.resolution ?? input.skillManifest, sections: [{ id: "learning-evidence", kind: "review", title: "学习评估证据与规则", text: buildRuntimeLearningPrompt({ artifact: input.artifact, reviews: input.reviews, availableSkills: input.availableSkills, serialContext: input.serialContext, recentIssueClusters: input.recentIssueClusters, plainText: input.plainText }), priority: "required", provenanceRefs: [input.artifact.id, ...input.reviews.map((review) => review.id)] }, ...skillSections] });
     const result = await input.model.generateStructured<Record<string, unknown>>({
       purpose: "learning.assess",
       system,

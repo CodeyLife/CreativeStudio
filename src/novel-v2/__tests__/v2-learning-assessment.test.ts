@@ -288,7 +288,7 @@ function learningActivities(repository: Partial<NovelPostgresRepository>, genera
       }],
     },
     modelGateway: { generateStructured } as unknown as ModelGateway,
-    objectStore: {} as ContentObjectStore,
+    objectStore: { getText: async () => undefined } as unknown as ContentObjectStore,
     commitService: {} as CommitService,
     enableChapterMemory: false,
   });

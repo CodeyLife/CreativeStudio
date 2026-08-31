@@ -890,14 +890,20 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       const recentIssueClusters = typeof input.narrativeOrder === "number"
         ? await deps.repository.getRecentReviewIssueClusters(input.projectId, input.narrativeOrder - 1)
         : undefined;
-      const learningEvidence = { serialContext, recentIssueClusters };
+      // 获取当前章正文用于标注 issue evidence 是否在正文出现（降权审校模型回显误报）。
+      // artifact.objectKey 存储了 commit 后的正文对象键；未配置 objectStore 或无 objectKey
+      // 时跳过标注（learning 通路仍正常工作，只是不做 evidence-unverified 降权）。
+      const plainText = input.artifact.objectKey
+        ? await objects.getText(input.artifact.objectKey).catch(() => undefined)
+        : undefined;
+      const learningEvidence = { serialContext, recentIssueClusters, plainText };
       try {
         const { assessment, validationError } = await assessRuntimeLearningWithModel({ ...input, ...learningEvidence, model, routingSnapshot: input.routingSnapshot, candidateStartIndex: input.candidateStartIndex, availableSkills, skillBundle: learningSkills });
         const recorded = validationError ? { ...assessment, validationError } : assessment;
         return { kind: "completed", assessment: await recordLearning(recorded) };
       } catch (error) {
         if (!(error instanceof ExternalMcpRequiredError)) throw error;
-        const learningIssues = reviewIssuesForLearning(input.reviews);
+        const learningIssues = reviewIssuesForLearning(input.reviews, plainText);
         if (!learningIssues.length) throw error;
         const system = "你是长篇小说 Runtime 的学习闭环审计员，只在能说明底层机制和影响输入类时提出可复用规则改进。";
         const promptPackage = compileSinglePrompt({ projectId: input.projectId, workflowId: input.workflowId, purpose: "learning.assess", stage: "review", system, prompt: buildRuntimeLearningPrompt({ artifact: input.artifact, reviews: input.reviews, availableSkills, ...learningEvidence }), schema: runtimeLearningAssessmentSchema, reservedOutputTokens: 4_096, provenanceRefs: [input.artifact.id, ...input.reviews.map((review) => review.id)], skillBundle: learningSkills, skillExecutionPoint: "learning.assessment" });
