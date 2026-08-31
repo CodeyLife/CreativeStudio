@@ -1,8 +1,9 @@
 /**
- * 核心创意短剧脚本（short-script-h3）单元测试（契约 v2：独立存储）。
+ * 核心创意短剧脚本（short-script-h3）单元测试（契约 v2：独立存储 + 零阻断契约）。
  *
- * 契约：与章节剧本共用六段式片段结构与结构特征校验（节拍覆盖、呈现手段、
- * 标签、时序、对白标记）；额外约束目标时长预算（分段数上下限 + 总时长容差窗口）。
+ * 契约：与章节剧本共用六段式片段结构与零阻断组装（结构观察全部只进 hints，
+ * 不回灌 repair、不阻止落库）；目标时长预算（分段数上下限 + 总时长容差窗口）
+ * 仅作为 prompt 预算约束与人工复核观察存在，不再抛错。
  * v2 起完全独立于小说项目：projectId 可选（缺省=独立短剧），产物落 short_scripts 表。
  * 夹具说明：使用虚构人物与通用都市题材的示例性内容作结构校验样本；被测的
  * 结构规则、校验逻辑与断言全部题材无关（泛化优先约束针对规则文本，
@@ -18,7 +19,6 @@ import {
   deriveShortScriptMaxSegments,
   deriveShortScriptMinSegments,
   generateShortScriptH3,
-  MAX_SHORT_SCRIPT_SEGMENTS,
   MAX_SHORT_SCRIPT_TARGET_SECONDS,
   MIN_IDEA_LENGTH,
   MIN_SHORT_SCRIPT_TARGET_SECONDS,
@@ -26,7 +26,7 @@ import {
   ShortScriptInputError,
   SHORT_SCRIPT_KIND,
   SHORT_SCRIPT_TOTAL_DURATION_TOLERANCE_SECONDS,
-  verifyShortScriptTotalDuration,
+  observeShortScriptTotalDuration,
 } from "../application/short-script-h3";
 
 const IDEA = "深夜便利店店员发现连续三晚同一时刻进店的顾客们买走的商品首字拼成同一句警告，而第四晚进店的是他自己。";
@@ -100,7 +100,8 @@ function shortScriptOutput(targetDurationSeconds: number) {
   const segments: Array<ReturnType<typeof clerkSegment>> = [];
   let remaining = targetDurationSeconds;
   while (remaining > 0) {
-    const duration = Math.min(10, Math.max(5, remaining));
+    // 区间 10-15s（契约 v6）：余量不足 10s 时并入前一段由容差窗口吸收。
+    const duration = Math.min(15, Math.max(10, remaining));
     segments.push(clerkSegment(duration));
     remaining -= duration;
   }
@@ -121,30 +122,31 @@ describe("目标时长与分段预算", () => {
   });
 
   it("derives segment floors and caps from the target duration", () => {
-    expect(deriveShortScriptMinSegments(30)).toBe(3);
-    expect(deriveShortScriptMaxSegments(30)).toBe(6);
-    expect(deriveShortScriptMinSegments(60)).toBe(6);
-    expect(deriveShortScriptMaxSegments(60)).toBe(12);
-    expect(deriveShortScriptMinSegments(12)).toBe(2);
-    expect(deriveShortScriptMaxSegments(12)).toBe(3);
-    // 180s（3 分钟上限）：下限 18（全按最长单段 10s），上限收在段数 cap 36。
-    expect(deriveShortScriptMinSegments(MAX_SHORT_SCRIPT_TARGET_SECONDS)).toBe(18);
-    expect(deriveShortScriptMaxSegments(MAX_SHORT_SCRIPT_TARGET_SECONDS)).toBe(MAX_SHORT_SCRIPT_SEGMENTS);
-    expect(deriveShortScriptMaxSegments(MAX_SHORT_SCRIPT_TARGET_SECONDS)).toBe(36);
+    // v6 起区间 10-15s：下限按最长单段 15s、上限按最短单段 10s 推导。
+    expect(deriveShortScriptMinSegments(30)).toBe(2);
+    expect(deriveShortScriptMaxSegments(30)).toBe(3);
+    expect(deriveShortScriptMinSegments(60)).toBe(4);
+    expect(deriveShortScriptMaxSegments(60)).toBe(6);
+    expect(deriveShortScriptMinSegments(12)).toBe(1);
+    expect(deriveShortScriptMaxSegments(12)).toBe(2);
+    // 180s（3 分钟上限）：下限 12（全按 15s），上限 18（全按 10s），未触及段数 cap 36。
+    expect(deriveShortScriptMinSegments(MAX_SHORT_SCRIPT_TARGET_SECONDS)).toBe(12);
+    expect(deriveShortScriptMaxSegments(MAX_SHORT_SCRIPT_TARGET_SECONDS)).toBe(18);
   });
 
   it("narrows the schema segment bounds around the budget", () => {
     const schema = buildShortScriptSchema(30) as { properties: { segments: { minItems: number; maxItems: number } } };
-    expect(schema.properties.segments.minItems).toBe(3);
-    expect(schema.properties.segments.maxItems).toBe(6);
+    expect(schema.properties.segments.minItems).toBe(2);
+    expect(schema.properties.segments.maxItems).toBe(3);
   });
 
-  it("accepts totals inside the tolerance window and rejects drift beyond it", () => {
-    expect(verifyShortScriptTotalDuration([clerkSegment(8), clerkSegment(8), clerkSegment(8)], 24)).toBeNull();
-    expect(verifyShortScriptTotalDuration([clerkSegment(8), clerkSegment(8), clerkSegment(8)], 24 + SHORT_SCRIPT_TOTAL_DURATION_TOLERANCE_SECONDS)).toBeNull();
-    const drift = verifyShortScriptTotalDuration([clerkSegment(5), clerkSegment(5)], 30);
+  it("observes totals inside the tolerance window and reports drift beyond it (no blocking)", () => {
+    expect(observeShortScriptTotalDuration([clerkSegment(12), clerkSegment(12)], 24)).toBeNull();
+    expect(observeShortScriptTotalDuration([clerkSegment(12), clerkSegment(12)], 24 + SHORT_SCRIPT_TOTAL_DURATION_TOLERANCE_SECONDS)).toBeNull();
+    const drift = observeShortScriptTotalDuration([clerkSegment(10), clerkSegment(10)], 40);
     expect(drift).toContain("偏离目标");
     expect(drift).toContain("容差");
+    expect(drift).toContain("供人工复核");
   });
 });
 
@@ -161,8 +163,10 @@ describe("buildShortScriptPrompt", () => {
     expect(prompt).toContain(IDEA);
     expect(prompt).toContain("共 30 秒左右");
     expect(prompt).toContain("剧情覆盖契约");
-    expect(prompt).toContain("信息呈现手段（硬性规则）");
+    expect(prompt).toContain("信息呈现手段（硬性规则，剧情型创意适用");
     expect(prompt).toContain("片段数须落在 3-6 个之间");
+    expect(prompt).toContain("创意意图忠实性");
+    expect(prompt).toContain("展示型创意禁止自行注入对抗事件");
     expect(prompt).toContain("剧集剧作契约");
     expect(prompt).toContain("开场即冲突");
     expect(prompt).toContain("出口即钩子");
@@ -210,7 +214,7 @@ describe("generateShortScriptH3（结构复用与幂等）", () => {
     )).rejects.toThrow(new RegExp(`至少 ${MIN_IDEA_LENGTH} 个字符`));
   });
 
-  it("generates, validates the duration window, and persists a short_scripts row", async () => {
+  it("generates and persists a short_scripts row", async () => {
     const { repository, recordShortScript, projectQuery } = mockRepository();
     const record = await generateShortScriptH3(
       { projectId: "project-1", idea: IDEA, instruction: "结尾停在第四晚开门瞬间" },
@@ -220,7 +224,7 @@ describe("generateShortScriptH3（结构复用与幂等）", () => {
     expect(record.projectId).toBe("project-1");
     expect(record.scriptId).toEqual(expect.any(String));
     expect(record.targetDurationSeconds).toBe(30);
-    expect(record.segments).toHaveLength(3);
+    expect(record.segments).toHaveLength(2);
     expect(record.segments[0].promptText).toContain("subject_definitions:");
     expect(record.plotBeats[0].id).toBe("beat-pattern");
     expect(recordShortScript).toHaveBeenCalledTimes(1);
@@ -245,7 +249,7 @@ describe("generateShortScriptH3（结构复用与幂等）", () => {
       { repository, objects: objects as never, model: mockModel(shortScriptOutput(30)) as never, skillProvider: skillProvider as never },
     );
     expect(record.projectId).toBeUndefined();
-    expect(record.segments).toHaveLength(3);
+    expect(record.segments).toHaveLength(2);
     // 独立模式不查询 novel_projects（无项目依赖）
     expect(projectQuery).not.toHaveBeenCalled();
     const stored = recordShortScript.mock.calls[0][0] as StoredShortScript;
@@ -260,13 +264,18 @@ describe("generateShortScriptH3（结构复用与幂等）", () => {
     )).rejects.toThrow(/项目不存在/);
   });
 
-  it("rejects output whose total duration drifts beyond the tolerance window", async () => {
-    const { repository } = mockRepository();
-    const drift = [clerkSegment(5), clerkSegment(5), clerkSegment(5)];
-    await expect(generateShortScriptH3(
+  it("persists drift output beyond the tolerance window without blocking (zero-blocking display)", async () => {
+    const { repository, recordShortScript } = mockRepository();
+    const drift = [clerkSegment(15), clerkSegment(15), clerkSegment(15)];
+    const record = await generateShortScriptH3(
       { projectId: "project-1", idea: IDEA, targetDurationSeconds: 30 },
       { repository, objects: objects as never, model: mockModel({ ...shortScriptOutput(30), segments: drift }) as never, skillProvider: skillProvider as never },
-    )).rejects.toThrow(/时长校验失败.*偏离目标/s);
+    );
+    expect(record.reused).toBeUndefined();
+    expect(record.segments).toHaveLength(3);
+    // 总时长 45s 偏离目标 30s 超容差：零阻断契约下只作为人工复核提示，不阻止落库展示。
+    expect(record.cinematicHints.some((hint) => hint.includes("偏离目标"))).toBe(true);
+    expect(recordShortScript).toHaveBeenCalledTimes(1);
   });
 
   it("reuses the stored script for identical creative input within the same scope", async () => {
@@ -285,7 +294,7 @@ describe("generateShortScriptH3（结构复用与幂等）", () => {
     );
     expect(second.reused).toBe(true);
     expect(second.scriptId).toBe("script-stored");
-    expect(second.segments).toHaveLength(3);
+    expect(second.segments).toHaveLength(2);
     expect(second.cinematicHints).toEqual([]);
     expect(generateStructured).toHaveBeenCalledTimes(1);
   });

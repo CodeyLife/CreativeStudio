@@ -189,19 +189,22 @@ novel_short_script_h3(idea, instruction?, targetDurationSeconds?, projectId?)
 **路径 A（章节派生）**：
 - 仅适用于已有正式 revision 的 final 章节；是正文的只读派生，不走工作流、
   不进质量门，也不影响后续编排。
-- 输出为 MiniMax H3 全参考模式（Ref2VA）提示词：一章拆多个 5-10 秒片段，
+- 输出为 MiniMax H3 全参考模式（Ref2VA）提示词：一章拆多个 10-15 秒片段，
   每片段一条自包含六段提示词（含 subject_definitions），片段内可含多镜头；
   人物外观基线由顶层 characters 统一，对白保留中文原文。
 - 同一定稿内容幂等复用既有产物；要重新生成先让正文重新修订产生新 revision。
 
 **路径 B（核心创意，独立于小说项目）**：
-- `idea` 写清谁/何处/什么冲突（≥10 字符）；`targetDurationSeconds` 10-180s
-  （默认 30s）；`projectId` 可选——缺省为独立短剧（完全不需要小说项目），
-  填写时产物关联该作品作衍生短剧。
+- `idea` 写清谁/何处/什么（人物冲突或场景奇观均可，≥10 字符——创意意图
+  忠实性契约按创意文本判定类型：剧情型走冲突导向剧作模式；展示型（只描述
+  场景/世界观/氛围/视觉奇观）走视觉展示模式——空间巡游/规模递进/光影氛围
+  为节拍，禁止自行注入追击、战斗等对抗事件）；`targetDurationSeconds`
+  10-180s（默认 30s，各片段 10-15s）；`projectId` 可选——缺省为独立短剧
+  （完全不需要小说项目），填写时产物关联该作品作衍生短剧。
 - 产物存 `short_scripts` 独立表（契约 v2），经 REST `GET /v2/short-script-h3/:scriptId`
   读取；同作用域同创意输入幂等复用。
 - 两条路径共享六段式结构与结构特征校验；创意模式专属指引：节拍为设计而非
-  穷举、开场即冲突、末段切在钩子上。
+  穷举、末段切在钩子上（开场即冲突等冲突导向规则仅对剧情型创意生效）。
 - 写作方法论见 h3-prompt-writing skill（SKILL.md + references/base-en.txt +
   references/ref-en.txt）；系统生成时已自动注入对应运行时 Skill 指引。
 

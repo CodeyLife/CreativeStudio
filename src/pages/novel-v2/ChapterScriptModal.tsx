@@ -291,7 +291,7 @@ export function ChapterScriptBody({ documentId, view, loading, error, instructio
             type="info"
             showIcon
             message="本章尚未生成短剧剧本"
-            description="将按场景节拍把定稿正文拆分为多个 5-10 秒片段，每片段产出一条 MiniMax H3 全参考模式（Ref2VA）提示词；上方共享定义库中的主体在片段内直接复用（不重复定义），片段内只写新增主体；对白保留中文原文。该产物为只读派生，不会修改正文。"
+            description="将按场景节拍把定稿正文拆分为多个 10-15 秒片段，每片段产出一条 MiniMax H3 全参考模式（Ref2VA）提示词；上方共享定义库中的主体在片段内直接复用（不重复定义），片段内只写新增主体；对白保留中文原文。该产物为只读派生，不会修改正文。"
           />
           <Input.TextArea
             value={instruction}

@@ -1,11 +1,12 @@
 /**
- * 章节短剧剧本提示词（chapter-script-h3）单元测试（契约 v5）。
+ * 章节短剧剧本提示词（chapter-script-h3）单元测试（契约 v5 + 零阻断契约）。
  *
  * 契约：每条片段提示词自包含六段（subject_definitions → non_diegetic_music）；
  * 顶层 plotBeats 穷举剧情节拍，segments 用 beatIds 引用；
- * memory/setup/hook 类节拍必须以 [Flashback] 闪回、台词 <d> 或屏幕文字承载信息内容，
- * 仅靠反应动作视为呈现缺失；
- * v5 增剧集剧作层提示契约（开场即冲突/情绪节点节奏/出口即钩子/台词密度/伏笔链/人物经济）。
+ * v5 增剧集剧作层提示契约（开场即冲突/情绪节点节奏/出口即钩子/台词密度/伏笔链/人物经济）；
+ * 零阻断契约（2026-08-31，用户指令：产物不做任何校验，直接显示）：结构观察
+ * （标签/时序/标记/时长/节拍覆盖/呈现手段）全部只进 hints，normalize 仅在
+ * 完全无可展示片段时失败；时长非法回退中点、越界夹回界内。
  * 夹具说明：使用虚构人物与仙侠题材的示例性内容作结构校验样本；被测的结构规则、
  * 校验逻辑与断言全部题材无关，不构成 case-specific 产品契约（泛化优先约束针对
  * 规则与规则文本，不禁止测试样本携带题材）。
@@ -23,6 +24,7 @@ import {
   MIN_SEGMENT_SECONDS,
   MAX_SEGMENT_SECONDS,
   normalizeChapterScriptOutput,
+  collectSegmentHintIssues,
   parseSharedSubjectPreset,
   SCRIPT_CONTRACT_VERSION,
   validateChapterScriptSegment,
@@ -57,7 +59,7 @@ function courierSectionFields(overrides: Partial<Record<string, string>> = {}) {
   };
 }
 
-function courierSegment(durationSeconds = 8) {
+function courierSegment(durationSeconds = 12) {
   return {
     title: "雨巷发现空袋",
     synopsis: "快递员进巷查看，发现包裹丢失并上报。",
@@ -125,29 +127,34 @@ describe("章节共享定义预设（用户手动编辑）", () => {
     expect(assembleSegmentPromptText(fields).startsWith("subject_definitions:\n<Subject 3>")).toBe(true);
   });
 
-  it("rejects redefinition of shared subjects and broken continuation numbering", () => {
+  it("downgrades shared-subject redefinition and broken numbering to hints (weak validator)", () => {
     const redefine = { ...courierSegment(), subjectDefinitions: `<Subject 1> ${COURIER_BASELINE}` };
-    expect(validateChapterScriptSegment(redefine, SHARED)).toContainEqual(expect.stringContaining("与共享定义重复"));
+    expect(collectSegmentHintIssues(redefine, SHARED)).toContainEqual(expect.stringContaining("与共享定义重复"));
     const restart = { ...courierSegment(), subjectDefinitions: "<Subject 1> is a new prop restarting numbering instead of continuing." };
-    expect(validateChapterScriptSegment(restart, SHARED)).toContainEqual(expect.stringContaining("与共享定义重复"));
+    expect(collectSegmentHintIssues(restart, SHARED)).toContainEqual(expect.stringContaining("与共享定义重复"));
     const gap = { ...courierSegment(), subjectDefinitions: "<Subject 5> is a prop skipping the continuation order." };
-    expect(validateChapterScriptSegment(gap, SHARED)).toContainEqual(expect.stringContaining("从 <Subject 3> 起连续递增"));
+    expect(collectSegmentHintIssues(gap, SHARED)).toContainEqual(expect.stringContaining("从 <Subject 3> 起连续递增"));
     const duplicate = { ...courierSegment(), subjectDefinitions: "<Subject 3> is a prop.\n<Subject 3> is the same prop again." };
-    expect(validateChapterScriptSegment(duplicate, SHARED)).toContainEqual(expect.stringContaining("定义重复"));
+    expect(collectSegmentHintIssues(duplicate, SHARED)).toContainEqual(expect.stringContaining("定义重复"));
   });
 
-  it("allows an empty subjectDefinitions when shared subjects exist, and falls back without sharing", () => {
+  it("allows an empty subjectDefinitions when shared subjects exist, and observes without sharing", () => {
     const reuseOnly = { ...courierSegment(), subjectDefinitions: "" };
     expect(validateChapterScriptSegment(reuseOnly, SHARED)).toEqual([]);
     expect(assembleSegmentPromptText(reuseOnly)).not.toContain("subject_definitions:");
-    expect(() => normalizeChapterScriptOutput(
+    // 零阻断契约：未承载节拍、空 subjectDefinitions 与悬空引用标签均只进 hints，不抛错。
+    const withShared = normalizeChapterScriptOutput(
       { plotBeats: PLOT_BEATS, characters: [], segments: [{ ...courierSegment(), subjectDefinitions: "" }] },
       { minSegments: 2, shared: SHARED },
-    )).toThrow(/beat-memory|beat-deadline/s);
-    expect(() => normalizeChapterScriptOutput(
+    );
+    expect(withShared.hints.some((hint) => /beat-memory|beat-deadline/.test(hint))).toBe(true);
+    // 无共享且空定义时正文引用悬空标签——H3 语义必需项观察，零阻断契约下仅提示。
+    const withoutShared = normalizeChapterScriptOutput(
       { plotBeats: PLOT_BEATS, characters: [], segments: [{ ...courierSegment(), subjectDefinitions: "" }] },
       { minSegments: 6, shared: { lines: [], maxLabel: 0 } },
-    )).toThrow(/subjectDefinitions（无共享定义时必须在本段定义主体）/);
+    );
+    expect(withoutShared.segments).toHaveLength(1);
+    expect(withoutShared.hints.some((hint) => hint.includes("未在 subject_definitions 定义的引用标签"))).toBe(true);
   });
 });
 
@@ -178,8 +185,8 @@ describe("normalizeChapterScriptOutput", () => {
     expect(result.characters[0]).toEqual({ name: "陈默", appearanceEn: COURIER_BASELINE });
   });
 
-  describe("剧情节拍与呈现手段校验", () => {
-    it("rejects a memory beat carried only by reaction actions without dialogue/flashback/on-screen text", () => {
+  describe("剧情节拍与呈现手段观察（提示级）", () => {
+    it("downgrades a reaction-only memory beat to a hint (no dialogue/flashback/on-screen text)", () => {
       const reactionOnly = {
         ...memoryCarrierSegment(),
         detailedDescription: [
@@ -188,28 +195,54 @@ describe("normalizeChapterScriptOutput", () => {
           "[Shot 2] At 00:03.000, the shot cuts to <Subject 1> trembling, sweat dripping down his temple as he stares at his calloused palms.",
         ].join("\n"),
       };
-      expect(() => normalizeChapterScriptOutput({ ...validScript(), segments: [courierSegment(), reactionOnly] })).toThrow(/没有呈现手段|反应动作/);
+      const normalized = normalizeChapterScriptOutput({ ...validScript(), segments: [courierSegment(), reactionOnly] });
+      expect(normalized.hints.some((hint) => hint.includes("没有台词/闪回/屏幕文字呈现手段"))).toBe(true);
     });
 
-    it("rejects beats that no segment carries", () => {
+    it("downgrades uncovered beats to hints", () => {
       const orphan = { ...validScript(), segments: [courierSegment()] };
-      expect(() => normalizeChapterScriptOutput(orphan)).toThrow(/剧情节拍未被任何片段承载.*beat-memory|剧情节拍未被任何片段承载.*beat-deadline/s);
+      const normalized = normalizeChapterScriptOutput(orphan);
+      expect(normalized.hints.some((hint) => /剧情节拍未被任何片段承载.*beat-memory|剧情节拍未被任何片段承载.*beat-deadline/s.test(hint))).toBe(true);
     });
 
-    it("rejects beatIds referencing unknown beats and empty beat lists", () => {
-      expect(() => normalizeChapterScriptOutput({ ...validScript(), segments: [{ ...courierSegment(), beatIds: ["beat-ghost"] }, memoryCarrierSegment()] })).toThrow(/不存在的节拍 beat-ghost/);
-      expect(() => normalizeChapterScriptOutput({ ...validScript(), segments: [{ ...courierSegment(), beatIds: [] }, memoryCarrierSegment()] })).toThrow(/beatIds 为空/);
+    it("downgrades unknown beatId references and empty beat lists to hints", () => {
+      const ghost = normalizeChapterScriptOutput({ ...validScript(), segments: [{ ...courierSegment(), beatIds: ["beat-ghost"] }, memoryCarrierSegment()] });
+      expect(ghost.hints.some((hint) => hint.includes("不存在的节拍 beat-ghost"))).toBe(true);
+      const empty = normalizeChapterScriptOutput({ ...validScript(), segments: [{ ...courierSegment(), beatIds: [] }, memoryCarrierSegment()] });
+      expect(empty.hints.some((hint) => hint.includes("beatIds 为空"))).toBe(true);
     });
 
-    it("rejects missing or invalid plotBeats", () => {
-      expect(() => normalizeChapterScriptOutput({ characters: [], segments: [courierSegment()] })).toThrow(/plotBeats/);
-      expect(() => normalizeChapterScriptOutput({ plotBeats: [{ id: "b1", kind: "telepathy", summary: "未知类型节拍" }], characters: [], segments: [courierSegment()] })).toThrow(/没有有效的剧情节拍/);
+    it("tolerates missing or invalid plotBeats with an observation hint (zero-blocking)", () => {
+      const missing = normalizeChapterScriptOutput({ characters: [], segments: [courierSegment()] });
+      expect(missing.segments).toHaveLength(1);
+      expect(missing.plotBeats).toEqual([]);
+      expect(missing.hints.some((hint) => hint.includes("plotBeats 缺失"))).toBe(true);
+      const invalid = normalizeChapterScriptOutput({ plotBeats: [{ id: "b1", kind: "telepathy", summary: "未知类型节拍" }], characters: [], segments: [courierSegment()] });
+      expect(invalid.plotBeats).toEqual([]);
+      expect(invalid.hints.some((hint) => hint.includes("没有有效的剧情节拍"))).toBe(true);
     });
   });
 
   describe("时序与标记校验", () => {
     it.each([
-      ["cut beyond duration", { durationSeconds: MIN_SEGMENT_SECONDS, detailedDescription: courierSectionFields().detailedDescription.replace("At 00:04.000", "At 00:06.500") }],
+      ["non-sequential shot numbers", {
+        detailedDescription: [
+          "Live-action cinematic look.",
+          "[Shot 1] A medium-wide shot frames the rain-glossed alley lamp as <Subject 1>, the courier in his faded grey uniform, steps into view beside <Subject 2>.",
+          "[Shot 3] At 00:04.000, the shot cuts to a close-up of <Subject 1> (S1), who radios the station in Chinese, <d>[中文] 包裹不见了，先别回站。</d>",
+        ].join("\n"),
+      }],
+      ["missing shot marker", { detailedDescription: "Live-action cinematic look. The camera follows the courier in his faded grey uniform as he crosses the lamp-lit alley and opens the empty satchel; nothing else happens." }],
+    ])("downgrades marker failure to a hint: %s", (_label, overrides) => {
+      const normalized = normalizeChapterScriptOutput({ ...validScript(), segments: [{ ...courierSegment(), ...overrides }] });
+      expect(normalized.segments).toHaveLength(1);
+      expect(normalized.hints.some((hint) => /镜头编号|镜头标记/.test(hint))).toBe(true);
+    });
+
+    // 风格类时序问题（开场镜头带时间戳 / 末镜头缺切点 / 切点超时长或非递增）为提示级：
+    // H3 生成器对切点风格差异兼容性好，不再阻断生成，仅进 cinematicHints 供人工复核。
+    it.each([
+      ["cut beyond duration", { durationSeconds: MIN_SEGMENT_SECONDS, detailedDescription: courierSectionFields().detailedDescription.replace("At 00:04.000", "At 00:12.500") }],
       ["non-increasing cut times", {
         detailedDescription: [
           "Live-action cinematic look.",
@@ -219,58 +252,104 @@ describe("normalizeChapterScriptOutput", () => {
         ].join("\n"),
       }],
       ["opening shot carries a timestamp", { detailedDescription: courierSectionFields().detailedDescription.replace("[Shot 1] A medium-wide shot", "[Shot 1] At 00:00.500, a medium-wide shot") }],
-      ["missing shot marker", { detailedDescription: "Live-action cinematic look. The camera follows the courier in his faded grey uniform as he crosses the lamp-lit alley and opens the empty satchel; nothing else happens." }],
-    ])("rejects timing failure: %s", (_label, overrides) => {
-      expect(() => normalizeChapterScriptOutput({ ...validScript(), segments: [{ ...courierSegment(), ...overrides }] })).toThrow(/切点|镜头编号|时间戳|镜头标记|超出片段时长/);
+    ])("downgrades stylistic timing issue to hint: %s", (_label, overrides) => {
+      const normalized = normalizeChapterScriptOutput({ ...validScript(), segments: [{ ...courierSegment(), ...overrides }, memoryCarrierSegment()] });
+      expect(computeCinematicHints(normalized.segments).length).toBeGreaterThan(0);
     });
 
-    it("rejects an unresolved reference label used outside definitions", () => {
+    it("accepts the prefix cut style (At MM:SS.mmm cut to [Shot N]) as a valid timeline", () => {
+      // 前缀式与后缀式均为行业惯例（真实生成验证发现 provider 稳定采用前缀式），
+      // 解析层按最近邻配对双写法兼容；规范写法仍由 skill v1.4.1 指定为后缀式。
+      const prefixStyle = [
+        "Live-action cinematic look, handheld energy.",
+        "[Shot 1] A medium-wide shot frames <Subject 2>, the rain-glossed alley lit by one flickering wall lamp. <Subject 1>, the courier in his faded grey uniform with a scuffed satchel, steps in from the left and frowns at his empty satchel.",
+        "At 00:04.000 cut to [Shot 2] a close-up of <Subject 1> (S1). Speaking into a worn radio in Chinese with clipped urgency, <d>[中文] 包裹不见了，先别回站。</d> Static answers him; water drips off the lamp housing beside his shoulder.",
+      ].join("\n");
+      const normalized = normalizeChapterScriptOutput({ ...validScript(), segments: [{ ...courierSegment(), detailedDescription: prefixStyle }, memoryCarrierSegment()] });
+      expect(normalized.segments[0].detailedDescription).toContain("cut to [Shot 2]");
+    });
+
+    it("prefix-style timestamp on the opening shot downgrades to hint (not rejected)", () => {
+      // Shot 1 前的 At 归属 Shot 1：作为提示级观察进 cinematicHints，不再阻断生成。
+      const badOpening = [
+        "Live-action cinematic look.",
+        "At 00:00.500 cut to [Shot 1] a medium-wide shot of the rain-glossed alley as <Subject 1> steps in with his empty satchel.",
+        "At 00:04.000 cut to [Shot 2] a close-up of <Subject 1> (S1) radioing the station in Chinese, <d>[中文] 包裹不见了，先别回站。</d>",
+      ].join("\n");
+      const normalized = normalizeChapterScriptOutput({ ...validScript(), segments: [{ ...courierSegment(), detailedDescription: badOpening }, memoryCarrierSegment()] });
+      expect(computeCinematicHints(normalized.segments).some((hint) => hint.includes("[Shot 1] 携带"))).toBe(true);
+    });
+
+    it("downgrades an unresolved reference label used outside definitions to a hint", () => {
       const fields = courierSectionFields();
       const broken = {
         ...fields,
         summary: `[reference generation] The target video follows <Subject 9> through the alley lamp light.`,
       };
-      expect(() => normalizeChapterScriptOutput({ ...validScript(), segments: [{ ...courierSegment(), ...broken }] })).toThrow(/<Subject 9>/);
+      const normalized = normalizeChapterScriptOutput({ ...validScript(), segments: [{ ...courierSegment(), ...broken }] });
+      expect(normalized.segments).toHaveLength(1);
+      expect(normalized.hints.some((hint) => hint.includes("<Subject 9>"))).toBe(true);
     });
 
-    it("rejects a defined label that is never used", () => {
+    it("downgrades an unused defined label to a hint", () => {
       const fields = courierSectionFields();
-      expect(() => normalizeChapterScriptOutput({
+      const normalized = normalizeChapterScriptOutput({
         ...validScript(),
         segments: [{ ...courierSegment(), subjectDefinitions: `${fields.subjectDefinitions}\n<Subject 3> is an unused radio prop.` }],
-      })).toThrow(/未被.*使用|未被 summary/);
+      });
+      expect(normalized.hints.some((hint) => /未被.*使用|未被 summary/.test(hint))).toBe(true);
     });
 
-    it("rejects unpaired dialogue tags and missing language markers", () => {
+    it("downgrades unpaired dialogue tags and missing language markers to hints", () => {
       const unclosed = courierSectionFields().detailedDescription.replace("</d>", "");
-      expect(() => normalizeChapterScriptOutput({ ...validScript(), segments: [{ ...courierSegment(), detailedDescription: unclosed }] })).toThrow(/标签不配对/);
+      const unpaired = normalizeChapterScriptOutput({ ...validScript(), segments: [{ ...courierSegment(), detailedDescription: unclosed }] });
+      expect(unpaired.segments).toHaveLength(1);
+      expect(unpaired.hints.some((hint) => hint.includes("标签不配对"))).toBe(true);
       const unlabeled = courierSectionFields().detailedDescription.replace("[中文] ", "");
-      expect(() => normalizeChapterScriptOutput({ ...validScript(), segments: [{ ...courierSegment(), detailedDescription: unlabeled }] })).toThrow(/语言标注/);
+      const normalized = normalizeChapterScriptOutput({ ...validScript(), segments: [{ ...courierSegment(), detailedDescription: unlabeled }] });
+      expect(normalized.hints.some((hint) => hint.includes("语言标注"))).toBe(true);
     });
 
-    it("rejects a summary without the bracketed task-type prefix", () => {
+    it("downgrades a summary without the bracketed task-type prefix to a hint", () => {
       const noPrefix = courierSectionFields().summary.replace(/^\[reference generation\]\s*/u, "");
-      expect(() => normalizeChapterScriptOutput({ ...validScript(), segments: [{ ...courierSegment(), summary: noPrefix }] })).toThrow(/任务类型前缀/);
+      const normalized = normalizeChapterScriptOutput({ ...validScript(), segments: [{ ...courierSegment(), summary: noPrefix }] });
+      expect(normalized.hints.some((hint) => hint.includes("任务类型前缀"))).toBe(true);
     });
 
-    it("rejects invented audio assets and empty section fields", () => {
+    it("downgrades invented audio assets and empty section fields to hints", () => {
       const fields = courierSectionFields();
-      expect(() => normalizeChapterScriptOutput({
+      const withAudio = normalizeChapterScriptOutput({
         ...validScript(),
         segments: [{ ...courierSegment(), subjectDefinitions: `${fields.subjectDefinitions}\n<Audio 1> is the reused source audio track.` }],
-      })).toThrow(/Audio N/);
-      expect(() => normalizeChapterScriptOutput({ ...validScript(), segments: [{ ...courierSegment(), overallSoundscape: "" }] })).toThrow(/字段为空：overallSoundscape/);
+      });
+      expect(withAudio.segments).toHaveLength(1);
+      expect(withAudio.hints.some((hint) => hint.includes("Audio N"))).toBe(true);
+      const normalized = normalizeChapterScriptOutput({ ...validScript(), segments: [{ ...courierSegment(), overallSoundscape: "" }] });
+      expect(normalized.hints.some((hint) => hint.includes("字段为空：overallSoundscape"))).toBe(true);
     });
 
-    it("rejects out-of-range durations aligned with the schema bounds", () => {
-      expect(() => normalizeChapterScriptOutput({ ...validScript(), segments: [{ ...courierSegment(4) }] })).toThrow(/durationSeconds/);
+    it("clamps out-of-range durations to the schema bounds instead of rejecting", () => {
+      const normalized = normalizeChapterScriptOutput({ ...validScript(), segments: [{ ...courierSegment(4) }] });
+      expect(normalized.segments).toHaveLength(1);
+      expect(normalized.segments[0].durationSeconds).toBe(MIN_SEGMENT_SECONDS);
+      expect(normalized.hints.some((hint) => /durationSeconds 4s 超出.*已收敛/.test(hint))).toBe(true);
       expect(CHAPTER_SCRIPT_H3_SCHEMA.properties.segments.maxItems).toBe(MAX_SEGMENTS_PER_CHAPTER);
       expect(CHAPTER_SCRIPT_H3_SCHEMA.properties.segments.items.properties.durationSeconds.maximum).toBe(MAX_SEGMENT_SECONDS);
     });
 
-    it("fails closed when no valid object is returned", () => {
+    it("falls back to the midpoint duration when durationSeconds is invalid", () => {
+      const normalized = normalizeChapterScriptOutput({
+        ...validScript(),
+        segments: [{ ...courierSegment(), durationSeconds: "12s" as unknown as number }],
+      });
+      expect(normalized.segments[0].durationSeconds).toBe(12);
+      expect(normalized.hints.some((hint) => hint.includes("已回退为 12s"))).toBe(true);
+    });
+
+    it("fails closed only when nothing displayable is returned", () => {
       expect(() => normalizeChapterScriptOutput(null)).toThrow();
       expect(() => normalizeChapterScriptOutput({ plotBeats: PLOT_BEATS, characters: [], segments: [] })).toThrow();
+      expect(() => normalizeChapterScriptOutput({ plotBeats: PLOT_BEATS, characters: [], segments: ["not-an-object"] })).toThrow(/可展示/);
     });
   });
 
@@ -281,8 +360,9 @@ describe("normalizeChapterScriptOutput", () => {
       expect(deriveMinSegments("字".repeat(999_999))).toBe(MAX_SEGMENTS_PER_CHAPTER);
     });
 
-    it("rejects segment sets below the floor with a repairable message", () => {
-      expect(() => normalizeChapterScriptOutput(validScript(), { minSegments: 6 })).toThrow(/覆盖不足.*下限 6|剧情节拍未被任何片段承载/s);
+    it("downgrades below-floor segment sets to a hint (no longer blocks output)", () => {
+      const normalized = normalizeChapterScriptOutput(validScript(), { minSegments: 6 });
+      expect(normalized.hints.some((hint) => /覆盖不足.*下限 6/.test(hint))).toBe(true);
     });
 
     it("accepts segment sets at or above the floor", () => {
@@ -371,7 +451,8 @@ describe("buildChapterScriptCharacterDigests / buildChapterScriptPrompt", () => 
     expect(prompt).toContain("台词密度");
     expect(prompt).toContain("反转须有伏笔");
     expect(prompt).toContain("人物经济");
-    expect(SCRIPT_CONTRACT_VERSION).toBe("5");
+    // v6=描述体量契约；本用例锚定剧集剧作层引入后契约不再回退（v5 起 >= 5）
+    expect(Number(SCRIPT_CONTRACT_VERSION)).toBeGreaterThanOrEqual(5);
   });
 
   it("injects the user-preset shared definitions with reuse rules when present", () => {

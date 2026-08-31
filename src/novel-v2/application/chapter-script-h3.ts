@@ -13,7 +13,9 @@
  * 1. getFinalDocumentContentRef 加载已定稿章节正文
  * 2. 从角色规划与实体注册表构建人物事实输入
  * 3. resolveStageSkillBundle(chapter.script) 注入 skill 指引 → generateStructured 调模型
- * 4. 结构特征校验（标签解析、切点时序、对话标记、任务前缀），失败进入 repair 循环
+ * 4. 零阻断组装（2026-08-31 起，用户指令：产物不做任何校验，直接显示）——
+ *    结构观察（标签解析、切点时序、对话标记、任务前缀）全部降级为 hints
+ *    供人工复核，不回灌 repair、不阻止组装落库
  * 5. 六段按固定顺序组装成最终提示词，落 artifacts(kind=chapter-script)
  */
 import { createHash, randomUUID } from "node:crypto";
@@ -26,8 +28,18 @@ import { buildSkillContextSections, resolveStageSkillBundle } from "../skill-run
 import { compileStageContext } from "../stage-context";
 
 /** TODO P2: 分段时长上下限与数量上限是运营参数，应来自项目级配置而非硬编码。 */
-export const MIN_SEGMENT_SECONDS = 5;
-export const MAX_SEGMENT_SECONDS = 10;
+// 下限 10s（2026-08-31 起由 5s 抬升）：用户要求片段统一落在 10-15s 区间，
+// 避免模型取区间中下沿产出碎片化短片段；片段数下限推导与总时长容差随之适配。
+export const MIN_SEGMENT_SECONDS = 10;
+// 上限 15s（2026-08-31 起由 10s 放宽）：H3 单片段可承载更长镜头叙事，
+// 用户要求片段最长可到 15s（含）。
+export const MAX_SEGMENT_SECONDS = 15;
+/**
+ * 零阻断契约下的时长回退值（区间中点）：模型返回非法 durationSeconds 时
+ * 收敛到此值而非拒绝片段，保证产物可展示、总时长统计可用。
+ * TODO P2: 回退值是魔法值，宜与分段时长上下限一同并入项目级配置。
+ */
+export const FALLBACK_SEGMENT_SECONDS = 12;
 export const MAX_SEGMENTS_PER_CHAPTER = 20;
 export const MAX_SCRIPT_CHARACTERS = 12;
 export const MIN_SEGMENTS_PER_CHAPTER = 6;
@@ -71,8 +83,24 @@ export class ChapterScriptSourceError extends Error {
  *    片段出口即钩子（末段冲击瞬间切卡）、台词密度三功能、反转须有已呈现伏笔、
  *    人物经济（核心三角）；属提示层契约，不新增结构校验（节奏类问题无跨题材
  *    可靠结构特征，堆 heuristic 违反泛化优先）；运行时 skill v1.3.0 同步。
+ * v6：描述体量契约——schema 描述字段下限抬升（summary 20→40、detailedDescription
+ *    80→600、retentionAnalysis/overallSoundscape 1→20 字符）+ 运行时 skill v1.4.0
+ *    字段级体量要求（detailed_description 350-500 英文词、四要素写全、宁详勿简）。
+ *    根因：旧下限过低且无体量目标，模型贴下限交付概要化产物，无法支撑视频生成。
+ * v7：时长与语言契约——片段时长上限 10s→15s（H3 单片段可承载更长镜头叙事，
+ *    用户需求）；描述字段语言放开中文（H3 对中文提示词兼容，用户需求）；
+ *    运行时 skill v1.4.2 同步（另补冲击场面细节指引：宏大场景与战斗反馈
+ *    需写规模参照与物理反馈，避免生成平淡）。
+ * v8：片段时长分布契约——时长按信息密度取值，宏大/战斗片段取上沿 12-15s，
+ *    禁止整体贴下限（根因：v7 实测模型把 5-15s 区间理解为均匀中值，
+ *    冲击场面画面无法充分展开；skill v1.4.3 同步）。
+ * v9：片段时长区间收紧 10-15s（MIN 5→10，用户要求统一区间）；
+ *    创意意图忠实性契约（short.script 专属，skill v1.4.4）——展示型创意
+ *    （场景/世界观/氛围展示，无人物对抗）按视觉展示模式组织节拍，
+ *    不强行注入追击/战斗等对抗事件；冲突导向剧作契约仅对剧情型创意生效
+ *    （根因：实测展示型创意被套进冲突模板，产出追兵/迎敌剧情）。
  */
-export const SCRIPT_CONTRACT_VERSION = "5";
+export const SCRIPT_CONTRACT_VERSION = "9";
 
 /** 剧情节拍种类：memory/setup/hook 属"信息承载必需"类，需要显式呈现手段。 */
 export const PLOT_BEAT_KINDS = ["event", "dialogue", "memory", "setup", "hook", "decision"] as const;
@@ -213,11 +241,13 @@ const DIALOGUE_PAIR_RE = /<d>([\s\S]*?)<\/d>/gu;
 const CODE_FENCE_RE = /^```[^\n]*\n([\s\S]*?)\n?```$/u;
 
 // TODO P2: 以下结构契约阈值（plotBeats maxItems=40、beatIds maxItems=12、id 长度 2-24、
-// summary 6-120、appearanceEn 10-600、title 1-24、synopsis≥4、summary≥20、
-// detailedDescription≥80、retention/soundscape/music≥1、segments 数组上下限除外——
-// 后两者已具名常量）均为魔法值，宜随剧本契约版本化一并改为可配置；
-// 当前取值依据 Ref2VA 指南的描述体量（detailed_description 350-500 英文词）
-// 与 MCP/REST 单响应约束设定。
+// summary 6-120、appearanceEn 10-600、title 1-24、synopsis≥4、
+// summary≥40、detailedDescription≥600、retention/soundscape≥20、segments 数组上下限除外——
+// 后两者已具名常量）均为魔法值，宜随剧本契约版本化一并改为可配置。
+// 描述体量下限依据：视频生成器仅凭文字复原画面，贴着旧下限（summary 20 /
+// detailedDescription 80 字符）交付的概要化产物无法生成可看视频；新下限仍远低于
+// Ref2VA 指南体量（detailed_description 350-500 英文词 ≈ 2000+ 字符），作为
+// 硬门兜底，体量目标由运行时 skill（h3-video-prompt v1.4.0 描述体量契约）驱动。
 export const CHAPTER_SCRIPT_H3_SCHEMA = {
   type: "object",
   additionalProperties: false,
@@ -278,10 +308,10 @@ export const CHAPTER_SCRIPT_H3_SCHEMA = {
           // subjectDefinitions 允许为空串：存在共享预设且本段无新增主体时合法
           //（共享行不进片段文本）；非空性由 normalize 按共享状态条件校验。
           subjectDefinitions: { type: "string" },
-          summary: { type: "string", minLength: 20 },
-          retentionAnalysis: { type: "string", minLength: 1 },
-          detailedDescription: { type: "string", minLength: 80 },
-          overallSoundscape: { type: "string", minLength: 1 },
+          summary: { type: "string", minLength: 40 },
+          retentionAnalysis: { type: "string", minLength: 20 },
+          detailedDescription: { type: "string", minLength: 600 },
+          overallSoundscape: { type: "string", minLength: 20 },
           nonDiegeticMusic: { type: "string", minLength: 1 },
         },
       },
@@ -304,16 +334,38 @@ interface ShotTimelineEntry {
 }
 
 function collectShotTimeline(description: string): ShotTimelineEntry[] {
-  const markers = [...description.matchAll(/\[Shot\s+(\d+)\]/gu)];
-  return markers.map((marker, position) => {
-    const segmentStart = marker.index! + marker[0].length;
-    const segmentEnd = position + 1 < markers.length ? markers[position + 1].index! : description.length;
-    const cutMatch = /\bAt\s+(\d{1,2}):(\d{2})\.(\d{3})\b/u.exec(description.slice(segmentStart, segmentEnd));
-    return {
-      shotNumber: Number(marker[1]),
-      cutMs: cutMatch ? (Number(cutMatch[1]) * 60 + Number(cutMatch[2])) * 1000 + Number(cutMatch[3]) : null,
-    };
+  // 切点配对采用最近邻规则：`At MM:SS.mmm` 与它前后最近的 [Shot N] 标记配对。
+  // 同时覆盖两种行业惯例写法（泛化要求：不针对特定 provider 的措辞）：
+  //   后缀式 `[Shot 2] At 00:02.000, ...`（时间戳属于其后镜头，本契约的规范写法）
+  //   前缀式 `At 00:02.000 cut to [Shot 2] ...`（切换时刻写在被切镜头标记之前）
+  // 旧实现只认后缀式，前缀式会被错配给前一个镜头，产生「开场镜头携带时间戳 +
+  // 末镜头缺切点」的伪错误并连锁污染节拍覆盖校验。
+  const markers = [...description.matchAll(/\[Shot\s+(\d+)\]/gu)].map((marker) => ({
+    shotNumber: Number(marker[1]),
+    start: marker.index!,
+    end: marker.index! + marker[0].length,
+  }));
+  const cuts = [...description.matchAll(/\bAt\s+(\d{1,2}):(\d{2})\.(\d{3})\b/gu)].map((cut) => ({
+    ms: (Number(cut[1]) * 60 + Number(cut[2])) * 1000 + Number(cut[3]),
+    pos: cut.index!,
+  }));
+  // 切点视角配对：每个 At 只归属距离最近的一个镜头标记（后缀式自然贴近其后镜头，
+  // 前缀式贴近其前镜头）；多个切点落到同一镜头时保留最近的一个。按镜头顺序贪心
+  // 会让早期镜头抢走全局最近的切点（或一个切点被多个镜头重复认领），必须以切点
+  // 为分配主体且一一归属。
+  const assignment = new Map<number, { ms: number; distance: number }>();
+  cuts.forEach((cut) => {
+    let bestIndex = -1;
+    let bestDistance = Number.POSITIVE_INFINITY;
+    markers.forEach((marker, markerIndex) => {
+      const distance = cut.pos < marker.start ? marker.start - cut.pos : cut.pos - marker.end;
+      if (distance < bestDistance) { bestDistance = distance; bestIndex = markerIndex; }
+    });
+    if (bestIndex < 0) return;
+    const current = assignment.get(bestIndex);
+    if (!current || bestDistance < current.distance) assignment.set(bestIndex, { ms: cut.ms, distance: bestDistance });
   });
+  return markers.map((marker, markerIndex) => ({ shotNumber: marker.shotNumber, cutMs: assignment.get(markerIndex)?.ms ?? null }));
 }
 
 function definedSubjectLabel(line: string): string | undefined {
@@ -321,8 +373,25 @@ function definedSubjectLabel(line: string): string | undefined {
   return match ? `<${match[1]} ${match[2]}>` : undefined;
 }
 
-function verifyReferenceLabels(fields: ChapterScriptSegmentFields, shared: SharedSubjectPreset): string[] {
-  const issues: string[] = [];
+/**
+ * 片段级结构观察分级（2026-08-31 零阻断改造，用户指令：产物不做任何校验，直接显示）：
+ * - blocking/hints 两级结果均只进 cinematicHints 供人工复核，不再回灌 repair、
+ *   不阻止组装落库；分级保留是为了在 hints 面板中区分「H3 语义必需项观察」
+ *   （原阻断级：悬空标签、<Video/Audio> 条目、[Shot N] 标记、<d> 配对、时长区间）
+ *   与「风格与剧作层观察」（定义行格式、共享重复、summary 前缀、语言标注等）。
+ * 根因：实测展示型创意被「setup 必须台词/闪回」硬校验阻塞，模型在
+ * 指引（展示型禁台词）与校验（必须有台词）的矛盾中反复 repair 至失败；
+ * 弱化（仅降级）后仍有语义必需项阻断把可展示产物整批拒掉，遂按用户指令
+ * 收敛为零阻断——质量由 prompt/skill 指引层保证，结构问题交人工复核。
+ */
+interface SegmentValidation {
+  blocking: string[];
+  hints: string[];
+}
+
+function verifyReferenceLabels(fields: ChapterScriptSegmentFields, shared: SharedSubjectPreset): SegmentValidation {
+  const blocking: string[] = [];
+  const hints: string[] = [];
   // 合法定义集 = 共享预设（<Subject 1>..maxLabel）∪ 本段新增行（编号必须从 maxLabel+1 起连续递增）。
   const defined = new Set<string>();
   for (let label = 1; label <= shared.maxLabel; label += 1) defined.add(`<Subject ${label}>`);
@@ -332,68 +401,61 @@ function verifyReferenceLabels(fields: ChapterScriptSegmentFields, shared: Share
     if (!trimmed) continue;
     const label = definedSubjectLabel(trimmed);
     if (!label) {
-      issues.push(`subject_definitions 中存在非 <Subject N> 开头的行：${trimmed.slice(0, 40)}`);
+      hints.push(`subject_definitions 中存在非 <Subject N> 开头的行：${trimmed.slice(0, 40)}`);
       continue;
     }
     const number = Number(label.replace(/\D+/gu, ""));
     if (number <= shared.maxLabel) {
-      issues.push(`${label} 与共享定义重复：共享主体不得在片段中重复定义，请直接引用同编号或删除该行`);
+      hints.push(`${label} 与共享定义重复：共享主体不得在片段中重复定义，请直接引用同编号或删除该行`);
       continue;
     }
-    if (defined.has(label)) issues.push(`subject_definitions 中 ${label} 定义重复`);
+    if (defined.has(label)) hints.push(`subject_definitions 中 ${label} 定义重复`);
     defined.add(label);
     localLabels.push(number);
   }
   const sortedLocal = [...localLabels].sort((left, right) => left - right);
   sortedLocal.forEach((number, position) => {
     const expected = shared.maxLabel + 1 + position;
-    if (number !== expected) issues.push(`新增主体编号必须从 <Subject ${shared.maxLabel + 1}> 起连续递增：出现 <Subject ${number}>`);
+    if (number !== expected) hints.push(`新增主体编号必须从 <Subject ${shared.maxLabel + 1}> 起连续递增：出现 <Subject ${number}>`);
   });
   const bodyLabels = new Set([...`${fields.summary}\n${fields.retentionAnalysis}\n${fields.detailedDescription}`.matchAll(REFERENCE_LABEL_RE)].map((item) => item[0]));
   for (const label of bodyLabels) {
-    if (!defined.has(label)) issues.push(`未在 subject_definitions 定义的引用标签出现在正文中：${label}（共享库或本段新增定义均可）`);
+    if (!defined.has(label)) blocking.push(`未在 subject_definitions 定义的引用标签出现在正文中：${label}（共享库或本段新增定义均可）`);
   }
   for (const number of localLabels) {
     const label = `<Subject ${number}>`;
-    if (!bodyLabels.has(label)) issues.push(`subject_definitions 中新增定义的标签未被 summary / retention_analysis / detailed_description 使用：${label}`);
+    if (!bodyLabels.has(label)) hints.push(`subject_definitions 中新增定义的标签未被 summary / retention_analysis / detailed_description 使用：${label}`);
   }
   if ([...fields.subjectDefinitions.split("\n")].some((line) => /^<(Video|Audio)\s+\d+>/u.test(line.trim()))) {
-    issues.push("未提供源视频或音频参考资产，不得创建 <Video N> / <Audio N> 独立条目");
+    blocking.push("未提供源视频或音频参考资产，不得创建 <Video N> / <Audio N> 独立条目");
   }
-  return issues;
+  return { blocking, hints };
 }
 
-function verifySegmentTiming(fields: ChapterScriptSegmentFields): string[] {
-  const issues: string[] = [];
+function verifySegmentTiming(fields: ChapterScriptSegmentFields): SegmentValidation {
+  const blocking: string[] = [];
+  const hints: string[] = [];
   if (!SUMMARY_TASK_PREFIX_RE.test(fields.summary.trim())) {
-    issues.push(`summary 必须以方括号任务类型前缀开头（如 [reference generation]）：${fields.summary.slice(0, 40)}`);
+    hints.push(`summary 必须以方括号任务类型前缀开头（如 [reference generation]）：${fields.summary.slice(0, 40)}`);
   }
   const timeline = collectShotTimeline(fields.detailedDescription);
-  if (!timeline.length) return [...issues, "detailed_description 缺少 [Shot N] 镜头标记"];
+  if (!timeline.length) return { blocking: [...blocking, "detailed_description 缺少 [Shot N] 镜头标记"], hints };
   timeline.forEach((entry, position) => {
-    if (entry.shotNumber !== position + 1) issues.push(`镜头编号必须从 1 连续递增，第 ${position + 1} 个标记实际是 [Shot ${entry.shotNumber}]`);
-    const isOpeningShot = position === 0;
-    if (isOpeningShot && entry.cutMs !== null) issues.push("[Shot 1] 是开场镜头，不得携带 At MM:SS.mmm 时间戳");
-    if (!isOpeningShot && entry.cutMs === null) issues.push(`[Shot ${entry.shotNumber}] 缺少 At MM:SS.mmm 切点`);
-    if (entry.cutMs === null) return;
-    if (entry.cutMs > fields.durationSeconds * 1000) issues.push(`[Shot ${entry.shotNumber}] 的切点 ${entry.cutMs}ms 超出片段时长 ${fields.durationSeconds}s`);
-    const previous = timeline[position - 1];
-    if (!isOpeningShot && previous && previous.cutMs !== null && previous.cutMs >= entry.cutMs) {
-      issues.push(`切点必须严格递增：[Shot ${previous.shotNumber}] ${previous.cutMs}ms ≥ [Shot ${entry.shotNumber}] ${entry.cutMs}ms`);
-    }
+    if (entry.shotNumber !== position + 1) blocking.push(`镜头编号必须从 1 连续递增，第 ${position + 1} 个标记实际是 [Shot ${entry.shotNumber}]`);
   });
-  return issues;
+  return { blocking, hints };
 }
 
-function verifyDialogueMarkup(detailedDescription: string): string[] {
-  const issues: string[] = [];
+function verifyDialogueMarkup(detailedDescription: string): SegmentValidation {
+  const blocking: string[] = [];
+  const hints: string[] = [];
   const openTags = detailedDescription.split("<d>").length - 1;
   const closeTags = detailedDescription.split("</d>").length - 1;
-  if (openTags !== closeTags) issues.push(`<d> 标签不配对：开标签 ${openTags} 个、闭标签 ${closeTags} 个`);
+  if (openTags !== closeTags) blocking.push(`<d> 标签不配对：开标签 ${openTags} 个、闭标签 ${closeTags} 个`);
   for (const match of detailedDescription.matchAll(DIALOGUE_PAIR_RE)) {
-    if (!/^\s*\[[^\]]+\]/u.test(match[1])) issues.push(`对白必须保留原语言并带语言标注，如 <d>[中文] ……</d>：${match[1].slice(0, 30)}`);
+    if (!/^\s*\[[^\]]+\]/u.test(match[1])) hints.push(`对白必须保留原语言并带语言标注，如 <d>[中文] ……</d>：${match[1].slice(0, 30)}`);
   }
-  return issues;
+  return { blocking, hints };
 }
 
 export function assembleSegmentPromptText(fields: ChapterScriptSegmentFields): string {
@@ -409,11 +471,21 @@ export function assembleSegmentPromptText(fields: ChapterScriptSegmentFields): s
   return blocks.join("\n\n");
 }
 
+/** 语义必需项观察（原阻断级；零阻断契约下仅进 hints 供人工复核，不回灌 repair）。 */
 export function validateChapterScriptSegment(fields: ChapterScriptSegmentFields, shared: SharedSubjectPreset): string[] {
   return [
-    ...verifyReferenceLabels(fields, shared),
-    ...verifySegmentTiming(fields),
-    ...verifyDialogueMarkup(fields.detailedDescription),
+    ...verifyReferenceLabels(fields, shared).blocking,
+    ...verifySegmentTiming(fields).blocking,
+    ...verifyDialogueMarkup(fields.detailedDescription).blocking,
+  ];
+}
+
+/** 提示级校验（不阻断产出，进 cinematicHints 供人工复核）。 */
+export function collectSegmentHintIssues(fields: ChapterScriptSegmentFields, shared: SharedSubjectPreset): string[] {
+  return [
+    ...verifyReferenceLabels(fields, shared).hints,
+    ...verifySegmentTiming(fields).hints,
+    ...verifyDialogueMarkup(fields.detailedDescription).hints,
   ];
 }
 
@@ -437,26 +509,43 @@ export function computeCinematicHints(segments: ReadonlyArray<AssembledChapterSc
         hints.push(`片段 ${segment.index} [Shot ${marker[1]}] 缺少运镜或景别描述——建议补写镜头四要素（景别/角度/运镜/光线氛围），参见 short-drama-writing 技能`);
       }
     });
+    // 提示级时序观察（不阻断）：H3 生成器对切点风格差异兼容性好，
+    // 开场镜头时间戳、缺切点、超时长、非递增只在 hints 中提示，不再回灌 repair。
+    const timeline = collectShotTimeline(description);
+    timeline.forEach((entry, position) => {
+      if (position === 0 && entry.cutMs !== null) hints.push(`片段 ${segment.index} [Shot 1] 携带 At 时间戳（开场镜头惯例上不带；H3 可容忍，供人工复核）`);
+      if (position > 0 && entry.cutMs === null) hints.push(`片段 ${segment.index} [Shot ${entry.shotNumber}] 缺少 At MM:SS.mmm 切点（H3 可容忍，建议补写以精确控制切镜时刻）`);
+      if (entry.cutMs === null) return;
+      if (entry.cutMs > segment.durationSeconds * 1000) hints.push(`片段 ${segment.index} [Shot ${entry.shotNumber}] 切点 ${entry.cutMs}ms 超出片段时长 ${segment.durationSeconds}s（H3 会收敛到时长内，供人工复核）`);
+      const previous = timeline[position - 1];
+      if (position > 0 && previous && previous.cutMs !== null && previous.cutMs >= entry.cutMs) {
+        hints.push(`片段 ${segment.index} 切点未严格递增：[Shot ${previous.shotNumber}] ≥ [Shot ${entry.shotNumber}]（供人工复核）`);
+      }
+    });
   }
   return hints;
 }
 
 /**
- * 解析并校验模型输出为可落库的片段集合。
- * 全部拒绝原因一次性收集返回给调用方（repair 循环 / 最终错误信息共用）。
- * minSegments 是按正文字数推导的剧情覆盖下限；不足视为剧情省略并回灌 repair。
+ * 解析模型输出为可落库的片段集合（零阻断契约：产物不做任何校验，直接组装显示）。
+ *
+ * 用户指令（2026-08-31）：任何结构问题都不再阻止组装与落库——原阻断级
+ * （H3 语义必需项）与提示级观察全部降级为 hints 供人工复核，不回灌 repair。
+ * 仅当模型完全没有返回可展示的片段（segments 缺失/为空/全部非对象）时才失败，
+ * 因为此时没有产物可显示。时长做容错收敛而非拒绝：非法值回退区间中点、
+ * 越界值夹回界内，保证 UI 时长展示与总时长统计可用。
+ * minSegments 是按正文字数推导的剧情覆盖下限；不足为提示级观察。
  */
-export function normalizeChapterScriptOutput(raw: unknown, options: { minSegments?: number; shared?: SharedSubjectPreset } = {}): { plotBeats: PlotBeat[]; characters: ChapterScriptCharacterSheet[]; segments: AssembledChapterScriptSegment[] } {
+export function normalizeChapterScriptOutput(raw: unknown, options: { minSegments?: number; shared?: SharedSubjectPreset } = {}): { plotBeats: PlotBeat[]; characters: ChapterScriptCharacterSheet[]; segments: AssembledChapterScriptSegment[]; hints: string[] } {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("模型没有返回有效的剧本对象");
   const value = raw as Partial<ChapterScriptModelOutput>;
   const rawSegments: unknown[] = Array.isArray(value.segments) ? [...value.segments] : [];
   if (!rawSegments.length) throw new Error("模型没有返回任何剧本片段");
   const { minSegments, shared = { lines: [], maxLabel: 0 } } = options;
 
-  const parsed = new Array<{ suffix: string; segment?: AssembledChapterScriptSegment }>(rawSegments.length);
-  const issueLines: string[] = [];
+  const hintLines: string[] = [];
+  // plotBeats 容错解析：缺失或全无效时为空数组并提示，不阻止展示。
   const rawBeats: unknown[] = Array.isArray(value.plotBeats) ? [...value.plotBeats] : [];
-  if (!rawBeats.length) throw new Error("模型没有返回剧情节拍清单（plotBeats）");
   const beats = new Map<string, PlotBeat>();
   for (const entry of rawBeats) {
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
@@ -468,22 +557,32 @@ export function normalizeChapterScriptOutput(raw: unknown, options: { minSegment
     if (!PLOT_BEAT_KINDS.includes(kind)) continue;
     beats.set(id, { id, kind, summary });
   }
-  if (!beats.size) throw new Error("plotBeats 中没有有效的剧情节拍（需要 id/kind/summary）");
+  if (!rawBeats.length) hintLines.push("- plotBeats 缺失（零阻断契约：不阻止展示，供人工复核）");
+  else if (!beats.size) hintLines.push("- plotBeats 中没有有效的剧情节拍（需要 id/kind/summary；零阻断契约：不阻止展示，供人工复核）");
 
+  const segments: AssembledChapterScriptSegment[] = [];
   rawSegments.forEach((segment, index) => {
     const suffix = `片段 ${index + 1}`;
-    parsed[index] = { suffix };
     if (!segment || typeof segment !== "object" || Array.isArray(segment)) {
-      issueLines.push(`- ${suffix}: 结构不是对象`);
+      hintLines.push(`- ${suffix}: 结构不是对象，已跳过该片段（零阻断契约）`);
       return;
     }
     const candidate = segment as Record<string, unknown>;
     const durationSecondsRaw = typeof candidate.durationSeconds === "number" ? Math.round(candidate.durationSeconds) : NaN;
+    // 时长容错收敛（非校验）：非法回退中点、越界夹回界内，原始值问题进 hints。
+    let durationSeconds = durationSecondsRaw;
+    if (!Number.isFinite(durationSecondsRaw)) {
+      durationSeconds = FALLBACK_SEGMENT_SECONDS;
+      hintLines.push(`- ${suffix}: durationSeconds 非法（${String(candidate.durationSeconds)}），已回退为 ${FALLBACK_SEGMENT_SECONDS}s`);
+    } else if (durationSecondsRaw < MIN_SEGMENT_SECONDS || durationSecondsRaw > MAX_SEGMENT_SECONDS) {
+      durationSeconds = Math.min(MAX_SEGMENT_SECONDS, Math.max(MIN_SEGMENT_SECONDS, durationSecondsRaw));
+      hintLines.push(`- ${suffix}: durationSeconds ${durationSecondsRaw}s 超出 ${MIN_SEGMENT_SECONDS}-${MAX_SEGMENT_SECONDS}s 区间，已收敛为 ${durationSeconds}s`);
+    }
     const beatIds = Array.isArray(candidate.beatIds) ? candidate.beatIds.filter((item): item is string => typeof item === "string" && item.trim().length > 0).map((item) => item.trim()) : [];
     const fields: ChapterScriptSegmentFields = {
       title: typeof candidate.title === "string" ? candidate.title.trim() : "",
       synopsis: normalizeMultilineText(candidate.synopsis),
-      durationSeconds: durationSecondsRaw,
+      durationSeconds,
       beatIds,
       subjectDefinitions: normalizeMultilineText(candidate.subjectDefinitions),
       summary: normalizeMultilineText(candidate.summary),
@@ -492,33 +591,23 @@ export function normalizeChapterScriptOutput(raw: unknown, options: { minSegment
       overallSoundscape: normalizeMultilineText(candidate.overallSoundscape),
       nonDiegeticMusic: normalizeMultilineText(candidate.nonDiegeticMusic),
     };
-    if (!fields.title || fields.title.length > 24) issueLines.push(`- ${suffix}: title 无效或超过 24 字`);
-    // subjectDefinitions 允许为空的条件：存在共享预设（本段只复用共享主体）；
-    // 无共享时仍须至少定义一个本段主体（否则引用标签全部悬空）。
+    // 结构观察（零阻断契约：以下全部只进 hints，不再回灌 repair、不阻止组装）。
+    if (!fields.title || fields.title.length > 24) hintLines.push(`- ${suffix}: title 无效或超过 24 字`);
     const requiredTextFields: ReadonlyArray<keyof ChapterScriptSectionFields | "synopsis"> = [
       "synopsis", "summary", "retentionAnalysis", "detailedDescription", "overallSoundscape", "nonDiegeticMusic",
     ];
-    const localIssues = requiredTextFields.filter((key) => !String(fields[key]).trim()).map((key) => `- ${suffix}: 字段为空：${key}`);
+    hintLines.push(...requiredTextFields.filter((key) => !String(fields[key]).trim()).map((key) => `- ${suffix}: 字段为空：${key}`));
     if (!fields.subjectDefinitions.trim() && shared.maxLabel === 0) {
-      localIssues.push(`- ${suffix}: 字段为空：subjectDefinitions（无共享定义时必须在本段定义主体）`);
+      hintLines.push(`- ${suffix}: 字段为空：subjectDefinitions（无共享定义时主体定义缺失）`);
     }
-    if (!fields.beatIds.length) localIssues.push(`- ${suffix}: beatIds 为空，请声明本段承载的剧情节拍`);
+    if (!fields.beatIds.length) hintLines.push(`- ${suffix}: beatIds 为空，请声明本段承载的剧情节拍`);
     for (const beatId of new Set(fields.beatIds)) {
-      if (!beats.has(beatId)) localIssues.push(`- ${suffix}: beatIds 引用了不存在的节拍 ${beatId}`);
+      if (!beats.has(beatId)) hintLines.push(`- ${suffix}: beatIds 引用了不存在的节拍 ${beatId}`);
     }
-    if (new Set(fields.beatIds).size !== fields.beatIds.length) localIssues.push(`- ${suffix}: beatIds 存在重复引用`);
-    if (!Number.isFinite(durationSecondsRaw) || durationSecondsRaw < MIN_SEGMENT_SECONDS || durationSecondsRaw > MAX_SEGMENT_SECONDS) {
-      localIssues.push(`- ${suffix}: durationSeconds 必须落在 ${MIN_SEGMENT_SECONDS}-${MAX_SEGMENT_SECONDS}s（实际 ${String(candidate.durationSeconds)}）`);
-    }
-    localIssues.push(...(Number.isFinite(durationSecondsRaw)
-      ? validateChapterScriptSegment(fields, shared)
-      : ["durationSeconds 非法，跳过结构校验"]
-    ).map((issue) => `- ${suffix}: ${issue}`));
-    issueLines.push(...localIssues);
-    // 仅在校验通过的片段上执行确定性组装：避免未受控异常掩盖结构问题清单。
-    if (!localIssues.length) {
-      parsed[index].segment = { ...fields, index: index + 1, promptText: assembleSegmentPromptText(fields) };
-    }
+    if (new Set(fields.beatIds).size !== fields.beatIds.length) hintLines.push(`- ${suffix}: beatIds 存在重复引用`);
+    hintLines.push(...validateChapterScriptSegment(fields, shared).map((issue) => `- ${suffix}: ${issue}`));
+    hintLines.push(...collectSegmentHintIssues(fields, shared).map((issue) => `- ${suffix}: ${issue}`));
+    segments.push({ ...fields, index: index + 1, promptText: assembleSegmentPromptText(fields) });
   });
 
   const characters = Array.isArray(value.characters)
@@ -531,19 +620,18 @@ export function normalizeChapterScriptOutput(raw: unknown, options: { minSegment
     : [];
 
   if (typeof minSegments === "number" && Number.isFinite(minSegments) && rawSegments.length < minSegments) {
-    issueLines.push(`- 覆盖不足：片段数 ${rawSegments.length} 少于本章剧情覆盖所需下限 ${minSegments}（按正文字数推导）。请重新穷举剧情节拍，把被省略的叙事信息块（背景记忆、关键设定、期限任务、信念转折）映射进片段。`);
+    hintLines.push(`- 覆盖不足：片段数 ${rawSegments.length} 少于剧情覆盖所需下限 ${minSegments}，可能有叙事信息块被省略，建议复核。`);
   }
 
-  // 剧情节拍覆盖 + 信息呈现手段校验（结构特征，可回灌 repair）：
-  // 每个节拍至少被一段承载；memory/setup/hook 节拍的承载段必须用
-  // 闪回画面 [Flashback]、台词 <d>（含画外音）或屏幕可读文字承载信息内容，
-  // 仅抱头/颤抖等反应动作不构成呈现，否则观众无法理解剧情。
-  const segmentsAssembled = parsed.map((item) => item.segment!).filter(Boolean);
-  const coveredBeats = new Set(segmentsAssembled.flatMap((segment) => segment.beatIds));
+  // 剧情节拍覆盖 + 信息呈现手段观察（提示级，零阻断契约：不阻塞、不回灌 repair）：
+  // 展示型创意的 setup 节拍以画面本身呈现（奇观即信息），无台词/闪回是合法形态，
+  // 硬性阻断会与指引层的展示型契约自相矛盾（见 contractVersion 9 段）。
+  if (!segments.length) throw new Error("模型没有返回任何可展示的剧本片段");
+  const coveredBeats = new Set(segments.flatMap((segment) => segment.beatIds));
   for (const beat of beats.values()) {
-    if (!coveredBeats.has(beat.id)) issueLines.push(`- 剧情节拍未被任何片段承载：[${beat.kind}] ${beat.summary}（id=${beat.id}）`);
+    if (!coveredBeats.has(beat.id)) hintLines.push(`- 剧情节拍未被任何片段承载：[${beat.kind}] ${beat.summary}（id=${beat.id}）`);
   }
-  for (const segment of segmentsAssembled) {
+  for (const segment of segments) {
     const carriedRequired = segment.beatIds.map((id) => beats.get(id)).filter((beat): beat is PlotBeat => Boolean(beat) && PRESENTATION_REQUIRED_BEAT_KINDS.includes(beat!.kind));
     if (!carriedRequired.length) continue;
     const hasDialogue = segment.detailedDescription.includes("<d>");
@@ -551,12 +639,11 @@ export function normalizeChapterScriptOutput(raw: unknown, options: { minSegment
     const hasOnScreenText = /<\/?text>|屏幕字|字幕|on-screen text/iu.test(segment.detailedDescription);
     if (!hasDialogue && !hasFlashback && !hasOnScreenText) {
       const kinds = carriedRequired.map((beat) => beat.id).join(", ");
-      issueLines.push(`- 片段 ${segment.index}: 承载的信息节拍（${kinds}）没有呈现手段。背景/设定/钩子类内容必须用 [Flashback] 闪回镜头、台词 <d>（含画外音）或屏幕可读文字把具体信息呈现给观众；仅靠抱头、颤抖等反应动作只表达了"有信息涌入"，观众无法理解剧情。`);
+      hintLines.push(`- 片段 ${segment.index}: 承载的信息节拍（${kinds}）没有台词/闪回/屏幕文字呈现手段。若为剧情型创意，背景/设定/钩子类内容需用 [Flashback]、台词 <d> 或屏幕文字把信息呈现给观众；展示型创意以画面呈现（奇观即信息）则可忽略。`);
     }
   }
 
-  if (issueLines.length) throw new Error(`剧本结构校验失败：\n${issueLines.join("\n")}`);
-  return { plotBeats: [...beats.values()], characters, segments: segmentsAssembled };
+  return { plotBeats: [...beats.values()], characters, segments, hints: hintLines };
 }
 
 export function buildChapterScriptCharacterDigests(rows: Array<Record<string, unknown>>): Array<{ name: string; digest: string }> {
@@ -597,7 +684,7 @@ export function buildChapterScriptPrompt(input: {
   return [
     `作品名称：${input.projectTitle}`,
     `章节序号：第 ${input.narrativeOrder} 章《${input.chapterTitle}》`,
-    "任务：把本章正文改写为短剧分镜剧本提示词（MiniMax H3 全参考模式）。先给出本章出场人物的 appearanceEn 英文外观基线（各片段 subjectDefinitions 必须复用同一外形描述），再拆分片段。",
+    "任务：把本章正文改写为短剧分镜剧本提示词（MiniMax H3 全参考模式）。先给出本章出场人物的 appearanceEn 外观基线（各片段 subjectDefinitions 必须复用同一外形描述；描述性文字中英文均可，H3 对中文提示词兼容），再拆分片段。",
     ...(sharedBlock ? [sharedBlock] : []),
     [
       "剧情覆盖契约（先于拆分执行，输出为顶层 plotBeats + 各片段 beatIds 引用）：",
@@ -609,6 +696,7 @@ export function buildChapterScriptPrompt(input: {
         "- 抱头、颤抖、喘息等反应动作只能表达「有信息涌入」这一事件，不能替代信息内容本身；只写反应动作会被判定为呈现缺失。",
       ].join("\n"),
       `- 片段数量下限：本章至少拆出 ${input.minSegments} 个片段（按正文篇幅推导），不足即视为剧情省略。`,
+      `片段时长统一落在 ${MIN_SEGMENT_SECONDS}-${MAX_SEGMENT_SECONDS}s 区间，禁止贴下限：宏大场面、战斗交锋与冲击性瞬间取区间上沿（约 12-15 秒）让画面充分展开；对话交锋与反应镜头也至少 10 秒，用镜头细节与氛围填充而非快切。`,
     ].join("\n"),
     [
       "剧集剧作契约（提示层，与剧情覆盖契约配合执行）：",
@@ -823,7 +911,7 @@ export async function generateChapterScriptH3(input: {
     workflowRunId: workflowId,
     taskId: `${workflowId}:script`,
     promptContext: promptPackage.manifest,
-    extraValidate: (value) => structuralIssueSummary(value, minSegments, shared),
+    // 零阻断契约：不传 extraValidate——结构观察不回灌 repair，产物直接组装显示。
   });
 
   const normalized = normalizeChapterScriptOutput(generated.value, { minSegments, shared });
@@ -849,19 +937,9 @@ export async function generateChapterScriptH3(input: {
     sourceFingerprint,
     minSegments,
     plotBeats: normalized.plotBeats,
-    cinematicHints: computeCinematicHints(normalized.segments),
+    cinematicHints: [...normalized.hints, ...computeCinematicHints(normalized.segments)],
     sharedSubjects: { definitionText: buildSharedSubjectLibraryText(shared), maxLabel: shared.maxLabel },
     characters: normalized.characters,
     segments: normalized.segments,
   };
-}
-
-/** repair 循环契约校验：把结构问题压缩成模型可读的错误列表。 */
-function structuralIssueSummary(value: ChapterScriptModelOutput, minSegments?: number, shared?: SharedSubjectPreset): string[] {
-  try {
-    const { segments } = normalizeChapterScriptOutput(value, { minSegments, shared });
-    return segments.length ? [] : ["segments 为空"];
-  } catch (error) {
-    return [error instanceof Error ? error.message : String(error)];
-  }
 }

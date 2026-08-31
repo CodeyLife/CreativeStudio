@@ -31,10 +31,11 @@ const DEFAULT_TARGET_SECONDS = 30;
 const MIN_IDEA_LENGTH = 10;
 const MAX_SEGMENTS = 36;
 
+/** 与后端 deriveShortScriptMin/MaxSegments 对齐：下限按最长单段 15s、上限按最短单段 10s 推导。 */
 function deriveSegmentRange(targetSeconds: number) {
   return {
-    min: Math.max(1, Math.ceil(targetSeconds / 10)),
-    max: Math.min(MAX_SEGMENTS, Math.max(1, Math.ceil(targetSeconds / 5))),
+    min: Math.max(1, Math.ceil(targetSeconds / 15)),
+    max: Math.min(MAX_SEGMENTS, Math.max(1, Math.ceil(targetSeconds / 10))),
   };
 }
 
@@ -75,7 +76,7 @@ export function ShortScriptCreateForm({ idea, onIdeaChange, instruction, onInstr
           marks={{ [MIN_TARGET_SECONDS]: `${MIN_TARGET_SECONDS}s`, [DEFAULT_TARGET_SECONDS]: `${DEFAULT_TARGET_SECONDS}s`, [MAX_TARGET_SECONDS]: `${MAX_TARGET_SECONDS}s` }}
           tooltip={{ formatter: (value) => `${value} 秒` }}
         />
-        <span className="pb-script-duration-hint">约 {segmentRange.min}-{segmentRange.max} 个片段（每段 5-10 秒）</span>
+        <span className="pb-script-duration-hint">约 {segmentRange.min}-{segmentRange.max} 个片段（每段 10-15 秒）</span>
       </div>
       <Input.TextArea
         value={instruction}
