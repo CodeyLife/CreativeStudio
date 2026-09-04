@@ -1,5 +1,10 @@
 import { createHash } from "node:crypto";
 
+import { MAX_CHAPTER_HINTS, MAX_EXPECTED_CHAPTER_COUNT } from "./story-arc-limits";
+
+// 浏览器安全叶子模块 story-arc-limits 持有常量；这里 re-export 维持既有引用方兼容。
+export { MAX_CHAPTER_HINTS, MAX_EXPECTED_CHAPTER_COUNT } from "./story-arc-limits";
+
 export type ArcPlanningStatus = "generating" | "awaiting-review" | "approved" | "stale" | "failed";
 export type ArcExecutionStatus = "planned" | "active" | "completed" | "abandoned";
 
@@ -8,11 +13,6 @@ export interface StoryArcThreadResponsibility {
   responsibility: string;
   nextAdvance: string;
 }
-
-// TODO P2: 这两个上限应可配置——当前 80 覆盖单弧最大合理章数，
-// 16 与单批次章节窗口对齐。未来应由项目级配置或弧级预算决定，而非硬编码。
-export const MAX_EXPECTED_CHAPTER_COUNT = 80;
-export const MAX_CHAPTER_HINTS = 16;
 
 /**
  * 外部剧情编排（由外部大模型或用户提供，系统完善）。

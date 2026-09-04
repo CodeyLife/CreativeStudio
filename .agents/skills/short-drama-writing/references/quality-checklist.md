@@ -8,11 +8,15 @@ Run this after drafting a storyboard and before delivery. Each item is a questio
 - [ ] Every information block is *presented* — flashback frames, spoken lines, or on-screen text — not just reacted to.
 - [ ] No segment exists without a beat; no invented plot exists beyond the prose.
 
-## 2. Shot density and rhythm
+## 2. Shot density, picture design and rhythm
 
 - [ ] Every `[Shot N]` states framing (shot size, and angle when meaningful).
+- [ ] Every shot states composition: where the subject sits, plus at least one of foreground occlusion / lead-in line / layer separation / negative space with a job.
 - [ ] Every shot names its camera behavior (motion type per the H3 grammar, or a deliberate static hold).
-- [ ] Every shot has a light/atmosphere element (source, direction, or airborne particle).
+- [ ] Every shot has a light/atmosphere element with a real highlight-shadow falloff (source, direction, or airborne particle).
+- [ ] Every shot names a dominant colour and an accent, and says which element carries the accent.
+- [ ] Anti-flat pass: no centred bare medium shot, no flat even light, no neutral frame, no constant-speed motion. Any hit is rewritten, not decorated with extra detail.
+- [ ] The opening style line is reconstructable (aspect/focal feel, medium, lighting system, colour base), not a generic "cinematic" tag.
 - [ ] Each segment has one rhythm peak and one brake; the pattern differs across segments (not five identical builds).
 - [ ] Shot 1 of the chapter (or segment) opens with an establishing beat; the last shot of each segment exits toward the next.
 - [ ] Signature moments (where the prose peaks) use the build → peak → shock → afterglow pattern; no fabricated spectacle elsewhere.

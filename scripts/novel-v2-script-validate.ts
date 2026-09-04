@@ -5,8 +5,8 @@
  * - repair 触发率（model_invocations 中同一 workflow 的调用次数与 schema-validation 失败）
  * - cinematicHints 密度（提示级镜头语言缺失 / 片段数）
  * - 时长窗口命中（创意短剧总时长 vs 目标偏差）
- * - 剧作层 LLM 评审（题材无关维度：开场钩子 / 情绪节点节奏 / 出口钩子 / 伏笔-反转配对；
- *   文本意见契约：通过只输出单行 PASSED，复用 parseTextReview 解析）
+ * 产物内容质量不在此评审（2026-09-03 用户指令删除剧作层 LLM 评审），
+ * 以生成指标与人工复核为准。
  *
  * 用法：
  *   npx tsx scripts/novel-v2-script-validate.ts --project <projectId> \
@@ -27,8 +27,6 @@ import { resolveNovelRuntimeConfig } from "../src/novel-v2/runtime-config";
 import { loadRuntimeEnv } from "./runtime-env.mjs";
 import { generateChapterScriptH3 } from "../src/novel-v2/application/chapter-script-h3";
 import { generateShortScriptH3, DEFAULT_SHORT_SCRIPT_TARGET_SECONDS, MIN_IDEA_LENGTH, SHORT_SCRIPT_TOTAL_DURATION_TOLERANCE_SECONDS } from "../src/novel-v2/application/short-script-h3";
-import { parseTextReview } from "../src/novel-v2/text-review";
-import type { ModelPurpose } from "../src/novel-v2/model-purposes";
 
 /** 跨题材通用默认创意（谁/何处/冲突齐备，不绑定任何特定作品、题材或角色名）。 */
 const DEFAULT_IDEA = "深夜便利店的店主发现每晚十一点整都会来一位只买同一种关东煮的沉默客人，直到某晚对方留下一张写着他自己名字的字条，而字迹正是十年前失踪的合伙人留下的。";
@@ -67,6 +65,8 @@ interface WorkflowInvocationStats {
 
 async function collectInvocationStats(repository: NovelPostgresRepository, sinceMs: number): Promise<WorkflowInvocationStats[]> {
   // 归因：时间窗 + purpose=writing.script + 剧本 workflow 前缀（chapter-script: / short-script:）。
+  // sinceMs 是 Date.now() 毫秒值；PG timestamp 无法解析毫秒整数（22008 out of range），
+  // 须转 ISO 字符串再绑定参数（此前直接绑毫秒值导致统计阶段必然崩溃，报告永远无法产出）。
   const result = await repository.pool.query<{
     workflow_run_id: string;
     status: string;
@@ -80,7 +80,7 @@ async function collectInvocationStats(repository: NovelPostgresRepository, since
      WHERE purpose='writing.script' AND created_at >= $1
        AND (workflow_run_id LIKE 'chapter-script:%' OR workflow_run_id LIKE 'short-script:%')
      ORDER BY created_at`,
-    [sinceMs],
+    [new Date(sinceMs).toISOString()],
   );
   const byWorkflow = new Map<string, WorkflowInvocationStats>();
   for (const row of result.rows) {
@@ -102,21 +102,7 @@ async function collectInvocationStats(repository: NovelPostgresRepository, since
   return [...byWorkflow.values()];
 }
 
-/** 剧作层评审 prompt（题材无关维度；意见契约与规划级审核一致：通过只输出单行 PASSED）。 */
-function buildDramaturgyReviewPrompt(kind: "chapter-script" | "short-script", scriptText: string): string {
-  return [
-    `你是短剧分镜剧本的剧作层审核员。以下是一条${kind === "chapter-script" ? "由小说章节改编" : "由核心创意生成"}的短剧分镜剧本（每个片段为一条 MiniMax H3 视频生成提示词）。`,
-    "只从剧作层审核，忽略提示词格式与镜头语言细节：",
-    "1. 开场钩子：第 1 个片段的前 3 秒是否落在冲突现场或临界点（直接冲突、强悬念、极致反差、身份落差、倒计时压力之一）；铺垫性开场视为失败。",
-    "2. 情绪节点节奏：是否每 2-4 个片段落一个情绪节点（对话冲突、动作冲突或信息揭示），且前 1/3 片段内完成第一次小反转。",
-    "3. 出口即钩子：每个片段的出口是否抛出问题或抬高压（未揭的身份、被推翻的假设、逼近的危险、两难抉择、逼近的期限）。",
-    "4. 伏笔与反转：每个反转是否有前文已呈现的伏笔支撑（plant → overlook → detonate）。",
-    "判定契约：全部达标时只输出单行 PASSED；任一维度不达标时，输出可执行的意见清单（每条注明片段序号、违反的维度、如何修改），不要输出其他总结。",
-    "",
-    "剧本全文：",
-    scriptText,
-  ].join("\n");
-}
+/** 剧作层 LLM 评审已按用户指令删除（2026-09-03）：产物质量以生成指标与人工复核为准。 */
 
 async function main() {
   const args = parseArgs(process.argv);
@@ -139,7 +125,7 @@ async function main() {
   const { gateway: model } = await createRuntimeModelGateway(repository, objects);
 
   const startedAt = Date.now();
-  interface PathResult { ok: boolean; reused?: boolean; error?: string; reviewText?: string; [key: string]: unknown }
+  interface PathResult { ok: boolean; reused?: boolean; error?: string; [key: string]: unknown }
   const paths: Record<string, PathResult> = {};
 
   // ---------- 路径一：章节剧本（可选，须同时提供 --project） ----------
@@ -155,7 +141,6 @@ async function main() {
         artifactId: record.artifactId,
         segmentCount: record.segments.length,
         cinematicHintCount: record.cinematicHints.length,
-        reviewText: record.segments.map((segment) => `${segment.index}. ${segment.title}\n${segment.promptText}`).join("\n\n---\n\n"),
       };
     } catch (error) {
       paths.chapterScript = { ok: false, error: error instanceof Error ? error.message : String(error) };
@@ -180,7 +165,6 @@ async function main() {
       segmentCount: record.segments.length,
       cinematicHintCount: record.cinematicHints.length,
       cinematicHintDensity: record.segments.length ? Number((record.cinematicHints.length / record.segments.length).toFixed(2)) : 0,
-      reviewText: record.segments.map((segment) => `${segment.index}. ${segment.title}\n${segment.promptText}`).join("\n\n---\n\n"),
     };
   } catch (error) {
     paths.shortScript = { ok: false, error: error instanceof Error ? error.message : String(error) };
@@ -191,30 +175,6 @@ async function main() {
     ...workflow,
     firstPassSuccess: workflow.invocations === 1 && workflow.schemaValidationFailures === 0,
   }));
-
-  // ---------- 剧作层 LLM 评审 ----------
-  // TODO P2: 评审结论回流 learning assessment 后，此报告同时作为闭环证据源。
-  const reviewPurposes: ModelPurpose[] = ["review.prose", "review.structure", "writing.script"];
-  for (const [kind, path] of Object.entries(paths)) {
-    if (!path.ok || !path.reviewText) continue;
-    const prompt = buildDramaturgyReviewPrompt(kind as "chapter-script" | "short-script", path.reviewText);
-    let verdict: string | undefined;
-    let opinion: string | undefined;
-    let error: string | undefined;
-    for (const purpose of reviewPurposes) {
-      try {
-        const result = await model.generateText({ purpose, prompt });
-        const parsed = parseTextReview(result.text);
-        verdict = parsed.verdict;
-        opinion = parsed.opinion;
-        break;
-      } catch (err) {
-        error = err instanceof Error ? err.message : String(err);
-      }
-    }
-    delete path.reviewText; // 全文不入报告，评审结论与指标为准
-    path.dramaturgyReview = verdict ? { verdict, opinion: opinion || "" } : { verdict: "error", opinion: error ?? "评审调用失败" };
-  }
 
   // ---------- 输出 ----------
   const lines: string[] = [
@@ -230,7 +190,6 @@ async function main() {
     } else {
       lines.push(`  错误：${paths.chapterScript.error}`);
     }
-    if (paths.chapterScript.dramaturgyReview) lines.push(`  剧作层评审：${JSON.stringify(paths.chapterScript.dramaturgyReview)}`);
     lines.push("");
   }
   if (paths.shortScript) {
@@ -241,7 +200,6 @@ async function main() {
     } else {
       lines.push(`  错误：${paths.shortScript.error}`);
     }
-    if (paths.shortScript.dramaturgyReview) lines.push(`  剧作层评审：${JSON.stringify(paths.shortScript.dramaturgyReview)}`);
     lines.push("");
   }
   if (invocations.length) {

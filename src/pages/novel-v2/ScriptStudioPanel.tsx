@@ -6,14 +6,16 @@
  *   + 可选改编指令 → POST 同步生成（幂等：同创意+时长+作用域复用既有产物）
  * - 关联作品（可选）：填写时产物关联该作品（衍生短剧），仅影响 prompt
  *   的作品标题注入与历史列表过滤；缺省为独立短剧
- * - 历史区：全部创意短剧（独立 + 关联本作品）的摘要卡片，点击加载完整产物
- * - 产物视图复用章节剧本的 ScriptGeneratedView（横向 Tabs 逐段 promptText）
+ * - 历史区（左侧栏）：全部创意短剧摘要卡片，点击加载完整产物，支持删除
+ * - 详情区（右侧主区）：核心创意卡片（支持一键复制）+ 完整产物视图
+ *   （复用章节剧本的 ScriptGeneratedView，横向 Tabs 逐段 promptText）
  * ============================================================ */
 import { useCallback, useEffect, useState } from "react";
-import { Alert, Button, Empty, Input, Slider, Tag, Tooltip, message } from "antd";
-import { LoadingOutlined, ReloadOutlined, VideoCameraOutlined } from "@ant-design/icons";
+import { Alert, Button, Empty, Input, Popconfirm, Slider, Tag, Tooltip, message } from "antd";
+import { BulbOutlined, CopyOutlined, DeleteOutlined, LoadingOutlined, ReloadOutlined, VideoCameraOutlined } from "@ant-design/icons";
 
 import {
+  deleteShortScript,
   fetchShortScript,
   fetchShortScriptList,
   generateShortScript,
@@ -96,7 +98,7 @@ export function ShortScriptCreateForm({ idea, onIdeaChange, instruction, onInstr
   );
 }
 
-/** 历史剧本摘要卡片（导出以便后续 SSR 单测渲染） */
+/** 历史剧本摘要卡片（导出以便后续 SSR 单测渲染）；删除按钮独立于卡片主体，避免 button 嵌套 */
 export function ShortScriptHistoryCard({ script, active, loading, onClick }: { script: NovelShortScriptSummaryView; active: boolean; loading: boolean; onClick: () => void }) {
   const ideaPreview = script.idea.length > 40 ? `${script.idea.slice(0, 40)}…` : script.idea;
   return (
@@ -126,6 +128,7 @@ export default function ScriptStudioPanel({ projectId }: { projectId?: string })
   const [historyError, setHistoryError] = useState<string | undefined>(undefined);
   const [activeScriptId, setActiveScriptId] = useState<string | undefined>(undefined);
   const [detailLoading, setDetailLoading] = useState(false);
+  const [deletingId, setDeletingId] = useState<string | undefined>(undefined);
 
   const refreshHistory = useCallback(async () => {
     try {
@@ -182,6 +185,23 @@ export default function ScriptStudioPanel({ projectId }: { projectId?: string })
     }
   }
 
+  async function remove(scriptId: string) {
+    setDeletingId(scriptId);
+    try {
+      await deleteShortScript(scriptId);
+      message.success("已删除该短剧记录");
+      setHistory((prev) => prev.filter((item) => item.scriptId !== scriptId));
+      if (activeScriptId === scriptId) {
+        setActiveScriptId(undefined);
+        setView(undefined);
+      }
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : String(err));
+    } finally {
+      setDeletingId(undefined);
+    }
+  }
+
   return (
     <div className="pb-script-studio">
       <section className="pb-card">
@@ -206,35 +226,83 @@ export default function ScriptStudioPanel({ projectId }: { projectId?: string })
         />
       </section>
 
-      <section className="pb-card">
-        <header className="pb-card-head">
-          <span className="pb-card-title">历史剧本{projectId ? "（本作品）" : "（全部）"}</span>
-          <span className="pb-card-head-right">
-            <Tooltip title="刷新历史列表"><Button size="small" icon={<ReloadOutlined />} onClick={() => void refreshHistory()}>刷新</Button></Tooltip>
-          </span>
-        </header>
-        {historyError && <Alert type="error" showIcon message="历史剧本读取失败" description={historyError} />}
-        {!historyError && history.length === 0 && <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={projectId ? "本作品还没有衍生短剧；在上方输入核心创意开始创作" : "还没有创意短剧；在上方输入核心创意开始创作（无需选择作品）"} />}
-        {history.length > 0 && (
-          <div className="pb-script-history-list">
-            {history.map((script) => (
-              <ShortScriptHistoryCard
-                key={script.scriptId}
-                script={script}
-                active={activeScriptId === script.scriptId}
-                loading={detailLoading && activeScriptId === script.scriptId}
-                onClick={() => void loadDetail(script.scriptId)}
-              />
-            ))}
-          </div>
-        )}
-        {detailLoading && <div className="pb-loading"><LoadingOutlined /> 读取剧本…</div>}
-        {!detailLoading && view?.exists && (
-          <div className="pb-script-studio-detail">
-            <ScriptGeneratedView view={view} onCopy={copy} />
-          </div>
-        )}
-      </section>
+      <div className="pb-script-studio-body">
+        <section className="pb-card pb-script-history-pane">
+          <header className="pb-card-head">
+            <span className="pb-card-title">历史剧本{projectId ? "（本作品）" : "（全部）"}</span>
+            <span className="pb-card-head-right">
+              <Tooltip title="刷新历史列表"><Button size="small" icon={<ReloadOutlined />} onClick={() => void refreshHistory()}>刷新</Button></Tooltip>
+            </span>
+          </header>
+          {historyError && <Alert type="error" showIcon message="历史剧本读取失败" description={historyError} />}
+          {!historyError && history.length === 0 && <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={projectId ? "本作品还没有衍生短剧；在上方输入核心创意开始创作" : "还没有创意短剧；在上方输入核心创意开始创作（无需选择作品）"} />}
+          {history.length > 0 && (
+            <div className="pb-script-history-list">
+              {history.map((script) => (
+                <div key={script.scriptId} className={`pb-script-history-item ${activeScriptId === script.scriptId ? "is-active" : ""}`}>
+                  <ShortScriptHistoryCard
+                    script={script}
+                    active={activeScriptId === script.scriptId}
+                    loading={detailLoading && activeScriptId === script.scriptId}
+                    onClick={() => void loadDetail(script.scriptId)}
+                  />
+                  <Popconfirm
+                    title="删除这条短剧记录？"
+                    description="删除后无法恢复，产物文件将一并清理"
+                    okText="删除"
+                    cancelText="取消"
+                    okButtonProps={{ danger: true, loading: deletingId === script.scriptId }}
+                    onConfirm={() => void remove(script.scriptId)}
+                  >
+                    <Tooltip title="删除该记录">
+                      <Button className="pb-script-history-remove" size="small" type="text" danger icon={<DeleteOutlined />} aria-label={`删除剧本：${script.idea.slice(0, 20)}`} />
+                    </Tooltip>
+                  </Popconfirm>
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+
+        <section className="pb-card pb-script-detail-pane">
+          <header className="pb-card-head">
+            <span className="pb-card-title">剧本详情</span>
+          </header>
+          {detailLoading && <div className="pb-loading"><LoadingOutlined /> 读取剧本…</div>}
+          {!detailLoading && view?.exists && (
+            <div className="pb-script-studio-detail">
+              <div className="pb-script-detail-head">
+                <div className="pb-script-detail-idea">
+                  <span className="pb-script-detail-idea-label"><BulbOutlined /> 核心创意</span>
+                  <p className="pb-script-detail-idea-text">{view.idea ?? "未记录创意"}</p>
+                  {view.instruction && <p className="pb-script-detail-instruction">改编指令：{view.instruction}</p>}
+                </div>
+                <span className="pb-script-detail-actions">
+                  <Tooltip title="复制核心创意文本，便于重写或迁移到其他工具">
+                    <Button size="small" icon={<CopyOutlined />} disabled={!view.idea} onClick={() => void copy(view.idea ?? "", "核心创意")}>复制创意</Button>
+                  </Tooltip>
+                  {view.scriptId && (
+                    <Popconfirm
+                      title="删除这条短剧记录？"
+                      description="删除后无法恢复，产物文件将一并清理"
+                      okText="删除"
+                      cancelText="取消"
+                      okButtonProps={{ danger: true, loading: deletingId === view.scriptId }}
+                      onConfirm={() => void remove(view.scriptId!)}
+                    >
+                      <Button size="small" danger icon={<DeleteOutlined />}>删除</Button>
+                    </Popconfirm>
+                  )}
+                </span>
+              </div>
+              <ScriptGeneratedView view={view} onCopy={copy} />
+            </div>
+          )}
+          {!detailLoading && !view?.exists && (
+            <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="从左侧历史列表选择一条记录查看，或在上方生成新剧本" />
+          )}
+        </section>
+      </div>
     </div>
   );
 }

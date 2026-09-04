@@ -320,6 +320,7 @@ describe("long-form prompt contracts", () => {
       "arc-context-recent",
       "arc-context-open-elements",
       "arc-context-feedback-state",
+      "arc-context-serial-signals",
       "arc-context-receipt",
     ]);
     expect(sections.find((section) => section.id === "arc-context-recent")?.text).toContain("叙事截止点：第 3 章");

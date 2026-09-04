@@ -4702,6 +4702,17 @@ export class NovelPostgresRepository {
     return result.rows[0] ? shortScriptFromRow(result.rows[0]) : undefined;
   }
 
+  /**
+   * 删除创意短剧产物行并返回被删记录（含 objectKey），供调用方清理对象存储；
+   * 不存在时返回 undefined（删除语义幂等，由 REST 层映射 404）。
+   */
+  async deleteShortScript(id: string): Promise<StoredShortScript | undefined> {
+    const stored = await this.getShortScript(id);
+    if (!stored) return undefined;
+    await this.pool.query("DELETE FROM short_scripts WHERE id=$1", [id]);
+    return stored;
+  }
+
   async findShortScriptByFingerprint(fingerprint: string): Promise<StoredShortScript | undefined> {
     const result = await this.pool.query<ShortScriptRow>(SHORT_SCRIPT_SELECT_SQL + " WHERE source_fingerprint=$1 ORDER BY created_at DESC LIMIT 1", [fingerprint]);
     return result.rows[0] ? shortScriptFromRow(result.rows[0]) : undefined;

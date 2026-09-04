@@ -851,6 +851,11 @@ export function generateShortScript(
   });
 }
 
+/** 删除指定创意短剧产物（行 + 对象存储文本一并清理） */
+export function deleteShortScript(scriptId: string): Promise<{ deleted: boolean; scriptId: string }> {
+  return novelFetch(`/v2/short-script-h3/${enc(scriptId)}`, { method: "DELETE" });
+}
+
 // ---------- 写 ----------
 export function useCreateNovelProject() {
   const qc = useQueryClient();

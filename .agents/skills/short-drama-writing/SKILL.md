@@ -59,14 +59,25 @@ The segment contract above is the unit; the episode is the product. Full detail 
 
 ## The Shot Equation
 
-Every `[Shot N]` should answer four questions at once. Aim for all four in every shot; a deliberate static shot is acceptable but must still name its framing and light.
+Every `[Shot N]` should answer six questions at once. Framing, camera, light, and state change describe *what happens in front of the lens*. Composition and colour are the **picture-design layer** — they decide whether a frame looks designed or merely recorded. Composition and colour are also the largest single source of "flat, forgettable" output, because centred framing and undifferentiated colour are exactly what a video model renders by default when the prompt does not specify otherwise.
 
 1. **Framing (shot size + angle):** extreme close-up / close-up / medium close-up / medium shot / medium-wide / wide / extreme wide; eye-level, low-angle, high-angle, overhead, dutch, over-the-shoulder, POV.
-2. **Camera behavior:** the H3 three-dimension grammar — motion type (push in / pull out / pan / truck / tilt / pedestal / zoom / arc / tracking / static / shake / roll), amplitude, speed — written as one natural English action, not stacked labels.
-3. **Light and atmosphere:** source (lamp, window, moon, fire, neon), direction (backlit, rim-lit, side-lit), quality (hard/soft), color temperature, and atmospheric elements (dust motes, drifting mist, rain streaks, floating embers, steam).
-4. **State change:** what visibly changes during the shot — position, expression, object state, light level — ending in a state the next shot can inherit.
+2. **Composition (picture-design layer):** where the subject sits in the frame and how the frame is structured — third-lines / edge / corner / dead-centre (centre needs a reason: menace, isolation, standoff); foreground occlusion (a doorway, branches, an object, another character's shoulder — a frame-within-the-frame or a darkened foreground layer); lead-in lines (a road, a railing, a light shaft, a gaze line pointing at the subject); foreground / midground / background separation; what the negative space is doing; symmetry or deliberate imbalance.
+3. **Camera behavior:** the H3 three-dimension grammar — motion type (push in / pull out / pan / truck / tilt / pedestal / zoom / arc / tracking / static / shake / roll), amplitude, speed — written as one natural English action, not stacked labels.
+4. **Light and atmosphere:** source (lamp, window, moon, fire, neon), direction (backlit, rim-lit, side-lit, top-lit), quality (hard/soft), color temperature, and atmospheric elements (dust motes, drifting mist, rain streaks, floating embers, steam). Highlights and shadows must carry a real falloff — flat, evenly spread light produces no picture.
+5. **Colour design (picture-design layer):** one dominant colour and one accent colour per scene; name which element carries the accent and whether it contrasts or answers the dominant (a single vermilion figure in a blue-grey battlefield; cold blue window light in a warm amber room). Colour shifts with emotional turns and with time/space changes. Writing "cinematic" or "tasteful grade" without naming a concrete colour relationship is no colour design at all.
+6. **State change:** what visibly changes during the shot — position, expression, object state, light level, colour — ending in a state the next shot can inherit.
 
-A full style line precedes `[Shot 1]`: aspect-ratio feel, film texture, palette, and era tone (for example: live-action cinematic, desaturated cold palette with warm single-source accents).
+Aim for all six in every shot; a deliberate static shot is acceptable but must still name its framing, composition, and light.
+
+**Anti-flat defaults.** These four are what a video model renders when the prompt does not specify otherwise. Self-check every shot and rewrite on a hit:
+
+- **Bare medium shot** — subject dead-centre, no foreground occlusion, no lead-in line, no layer separation.
+- **Flat light** — evenly spread, no highlight/shadow falloff.
+- **Neutral frame** — no dominant/accent colour relationship.
+- **Constant-speed motion** — no velocity contrast across the shot.
+
+A full style line precedes `[Shot 1]`, specific enough to reconstruct: aspect ratio and focal feel (2.39:1 anamorphic, vertical 9:16 wide-angle), medium (film grain / clean digital), lighting system (single hard source with chiaroscuro falloff / soft diffusion), colour base (teal-amber contrast, desaturated cold with one warm source), and era tone. "Live-action cinematic" is not a style line.
 
 ## Genre Visual Effects
 
@@ -89,7 +100,8 @@ Worldbuilding elements that are *visible* in the story (glowing energy channels,
 ## Failure Handling
 
 - Beat missing from all segments → re-enumerate and re-map; information blocks are never dropped.
-- A shot reads as plot summary → rewrite with the Shot Equation; a sentence without a lens or a light is not yet a shot.
+- A shot reads as plot summary → rewrite with the Shot Equation; a sentence without a lens, a composition, or a light is not yet a shot.
+- A shot hits an anti-flat default (centred bare medium shot, flat even light, neutral frame, constant-speed motion) → rewrite the offending variable rather than adding detail elsewhere.
 - Segment flat (no peak) → find the prose's strongest change inside it and stage that as the peak; if truly static, make the brake deliberate (a held detail shot) and let an adjacent segment carry the peak.
 - Episode opens with routine/scenery → start on the brink of the chapter's first clash; backfill context through presentation channels.
 - Emotion cadence broken (3+ segments without a node) → redistribute peaks so a clash or reveal lands every 2-4 segments; add brakes, not filler.

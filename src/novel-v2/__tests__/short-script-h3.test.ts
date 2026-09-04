@@ -188,7 +188,7 @@ describe("buildShortScriptPrompt", () => {
     const short = raw.split("short.script: |")[1] ?? "";
     for (const token of [
       "创意意图忠实性",
-      "展示型创意禁止自行注入对抗事件",
+      "展示型创意禁止自行注入任何剧情型要素",
       "开场即冲突",
       "出口即钩子",
       "台词密度",

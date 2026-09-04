@@ -45,7 +45,7 @@ If a preset library exists (defined by the author before generation), its subjec
 
 | Symptom | Root cause | Fix |
 | --- | --- | --- |
-| Segments read as plot summary | Shots written without the Shot Equation | Rewrite each `[Shot N]` with framing, camera, light, state change |
+| Segments read as plot summary | Shots written without the Shot Equation | Rewrite each `[Shot N]` with framing, composition, camera, light, colour, state change |
 | Background dropped | Beat mapped but never presented | Give it flashback/dialogue/on-screen-text presence in its carrying segment |
 | All segments same intensity | No peak/brake design | Assign rhythm intents; move the peak to the prose's strongest change |
 | Viewers lost after a hook | The deadline/setup it references was dropped earlier | Restore the setup beat that gives the hook meaning |

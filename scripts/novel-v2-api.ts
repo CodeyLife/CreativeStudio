@@ -733,6 +733,14 @@ const server = createServer(async (request, response) => {
       return send(response, 200, { scripts });
     }
     const independentShortScriptDetailMatch = request.url?.match(/^\/v2\/short-script-h3\/([^/?]+)$/);
+    if (request.method === "DELETE" && independentShortScriptDetailMatch) {
+      const scriptId = decodeURIComponent(independentShortScriptDetailMatch[1]);
+      const removed = await repository.deleteShortScript(scriptId);
+      if (!removed) return send(response, 404, { error: "指定的创意短剧产物不存在" });
+      // 同步清理对象存储中的产物文本；失败不回滚行删除（残留对象属孤儿，由审计任务回收）。
+      if (removed.objectKey) await objectStore.delete(removed.objectKey).catch(() => undefined);
+      return send(response, 200, { deleted: true, scriptId });
+    }
     if (request.method === "GET" && independentShortScriptDetailMatch) {
       const stored = await repository.getShortScript(decodeURIComponent(independentShortScriptDetailMatch[1]));
       if (!stored) return send(response, 404, { error: "指定的创意短剧产物不存在" });
