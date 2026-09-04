@@ -38,6 +38,8 @@ const IDEA =
     "深夜便利店的店主发现每晚十一点整都会来一位只买同一种关东煮的沉默客人，直到某晚对方留下一张写着他自己名字的字条，而字迹正是十年前失踪的合伙人留下的。",
   );
 const DURATION = Number(pickArg("duration", "30")) || 30;
+// 可选导演指令；传不同 instruction 会改变源指纹，从而绕过幂等复用、强制新建一版。
+const INSTRUCTION = pickArg("instruction", "");
 
 const withTimeout = <T>(promise: Promise<T>, ms: number, label: string): Promise<T> =>
   Promise.race([
@@ -82,11 +84,11 @@ async function main() {
     console.log("  " + skill.skillText.slice(0, 240).replace(/\n/g, "\n  "));
   }
 
-  console.log(`\n===== [2/3] novel_short_script_h3(idea, targetDurationSeconds=${DURATION}) 真实 LLM 生成 =====`);
+  console.log(`\n===== [2/3] novel_short_script_h3(idea, targetDurationSeconds=${DURATION}${INSTRUCTION ? `, instruction="${INSTRUCTION}"` : ""}) 真实 LLM 生成 =====`);
   let generated: unknown = null;
   try {
     const genResp = await withTimeout(
-      executeTool("novel_short_script_h3", { idea: IDEA, targetDurationSeconds: DURATION }, ctx),
+      executeTool("novel_short_script_h3", { idea: IDEA, instruction: INSTRUCTION, targetDurationSeconds: DURATION }, ctx),
       120_000,
       "novel_short_script_h3",
     );
@@ -147,7 +149,7 @@ async function main() {
     };
     const subResp = await executeTool(
       "novel_short_script_h3_submit",
-      { idea: IDEA, payload, targetDurationSeconds: DURATION },
+      { idea: IDEA, instruction: INSTRUCTION, payload, targetDurationSeconds: DURATION },
       ctx,
     );
     const sub = summarizeResponse(subResp) as { isError?: boolean; scriptId?: string; origin?: string; segments?: unknown[]; error?: string };
@@ -160,7 +162,7 @@ async function main() {
   }
 
   const reportPath = "tmp/mcp-smoke-report.json";
-  writeFileSync(reportPath, JSON.stringify({ idea: IDEA, targetDurationSeconds: DURATION, generated }, null, 2), "utf8");
+  writeFileSync(reportPath, JSON.stringify({ idea: IDEA, instruction: INSTRUCTION, targetDurationSeconds: DURATION, generated }, null, 2), "utf8");
   console.log(`\n报告已写入 ${reportPath}`);
   process.exit(0);
 }
