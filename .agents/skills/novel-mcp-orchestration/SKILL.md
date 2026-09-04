@@ -34,7 +34,7 @@ metadata:
 | 推进 | novel_action_execute(work.accept/retry/recover/run.pause/resume/cancel)、novel_chapter_review_decision(approve)、novel_story_arc_batch_start |
 | 编辑 | novel_chapter_review_issue_add、novel_chapter_review(mode=targeted)、novel_chapter_review_decision(revise+feedback)、novel_action_execute(work.revise)、novel_story_arc_orchestrate |
 | 迭代优化 | novel_closed_loop_run、novel_rule_candidate_create/get、novel_rule_evidence_submit、novel_rule_foundation_evaluate、novel_rule_review_submit、novel_rule_promote、novel_rule_rollback |
-| 派生产物 | novel_chapter_script_h3（定稿章节 → MiniMax H3 Ref2VA 短剧剧本提示词）、novel_short_script_h3（核心创意 → 短剧脚本提示词，projectId 可选、可完全独立于小说项目） |
+| 派生产物 | novel_chapter_script_h3（定稿章节 → MiniMax H3 Ref2VA 短剧剧本提示词）、novel_short_script_h3（核心创意 → 短剧脚本提示词，projectId 可选、可完全独立于小说项目）、novel_short_script_h3_brainstorm（开放创意方向 → N 个截然不同的具体奇观候选，创意发散不生成脚本不落库） |
 | 查询 | novel_catalog_get、novel_context_get、novel_artifact_list、novel_story_arc_get、novel_workflow_get/list |
 
 ## 全流程各阶段
@@ -184,7 +184,20 @@ novel_chapter_script_h3(projectId, documentId, instruction?)
   → artifacts(kind=chapter-script)，返回各片段 promptText
 novel_short_script_h3(idea, instruction?, targetDurationSeconds?, projectId?)
   → short_scripts 独立表（projectId 缺省=独立短剧，不依赖任何小说项目）
+novel_short_script_h3_brainstorm(idea, count?, targetDurationSeconds?, instruction?)
+  → 开放创意方向穷举 N 个截然不同的具体奇观候选（创意发散，不生成脚本不落库）
 ```
+
+**候选奇观发散（novel_short_script_h3_brainstorm）**：
+- 用途：开放命题（如「设计一个云上奇观」）直接喂给 `novel_short_script_h3` 会因
+  缺主语塌缩到该题材默认母题（东方仙侠+云上→倒悬巨钟），每次同款。本工具在
+  正式生成前先让模型以「创意策划」视角穷举 N（2-6，默认 3）个彼此明显不同的
+  可拍奇观，规避该塌缩。
+- 只调模型做创意发散，**不生成脚本、不落库**；返回的每候选 `wonder` 已是可直接
+  喂给 `novel_short_script_h3` 的 `idea` 字符串，`why` 说明其相对其它候选的差异点。
+- 标准用法：先 `novel_short_script_h3_brainstorm(idea, count)` 拿候选 → 挑定其一
+  → `novel_short_script_h3(idea=candidate.wonder, targetDurationSeconds?)` 生成完整脚本。
+- 可选 `instruction` 作为穷举时的额外约束（如「避免钟类母题」）。
 
 **路径 A（章节派生）**：
 - 仅适用于已有正式 revision 的 final 章节；是正文的只读派生，不走工作流、
@@ -272,6 +285,7 @@ novel_rule_promote(candidateId) / novel_rule_rollback(candidateId)
 | 生成下一章 | novel_chapter_generate |
 | 定稿章节转短剧剧本（H3 视频提示词） | novel_chapter_script_h3 → 产物 kind=chapter-script；方法论见 h3-prompt-writing skill |
 | 从核心创意直接写短剧（无需小说项目） | novel_short_script_h3 → short_scripts 独立表（projectId 可选关联作品）；REST /v2/short-script-h3 读取 |
+| 开放创意方向要多个非默认母题候选 | novel_short_script_h3_brainstorm(idea, count=3) → 穷举 N 个截然不同的具体奇观；挑定后 novel_short_script_h3(idea=candidate.wonder) 生成 |
 | 追进度 | novel_workflow_get(workflowId) |
 | 人工定稿/修订 | novel_chapter_review_decision(approve/revise/feedback) |
 | 追加编辑意见 | novel_chapter_review_issue_add → novel_chapter_review(mode=targeted) |
