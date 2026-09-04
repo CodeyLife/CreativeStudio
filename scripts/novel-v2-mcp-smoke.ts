@@ -26,8 +26,18 @@ import { createConfiguredSkillProvider } from "../src/novel-v2/skill-runtime";
 import { executeTool } from "../src/novel-v2/mcp";
 import type { ToolContext } from "../src/novel-v2/mcp/types";
 
+const pickArg = (name: string, fallback: string): string => {
+  const i = process.argv.indexOf(`--${name}`);
+  return i >= 0 && process.argv[i + 1] ? process.argv[i + 1] : fallback;
+};
+
+// 默认复用上一次的便利店创意；可用 --idea "..." 覆盖，--duration 15 改时长（秒）。
 const IDEA =
-  "深夜便利店的店主发现每晚十一点整都会来一位只买同一种关东煮的沉默客人，直到某晚对方留下一张写着他自己名字的字条，而字迹正是十年前失踪的合伙人留下的。";
+  pickArg(
+    "idea",
+    "深夜便利店的店主发现每晚十一点整都会来一位只买同一种关东煮的沉默客人，直到某晚对方留下一张写着他自己名字的字条，而字迹正是十年前失踪的合伙人留下的。",
+  );
+const DURATION = Number(pickArg("duration", "30")) || 30;
 
 const withTimeout = <T>(promise: Promise<T>, ms: number, label: string): Promise<T> =>
   Promise.race([
@@ -72,11 +82,11 @@ async function main() {
     console.log("  " + skill.skillText.slice(0, 240).replace(/\n/g, "\n  "));
   }
 
-  console.log("\n===== [2/3] novel_short_script_h3(idea, targetDurationSeconds=30) 真实 LLM 生成 =====");
+  console.log(`\n===== [2/3] novel_short_script_h3(idea, targetDurationSeconds=${DURATION}) 真实 LLM 生成 =====`);
   let generated: unknown = null;
   try {
     const genResp = await withTimeout(
-      executeTool("novel_short_script_h3", { idea: IDEA, targetDurationSeconds: 30 }, ctx),
+      executeTool("novel_short_script_h3", { idea: IDEA, targetDurationSeconds: DURATION }, ctx),
       120_000,
       "novel_short_script_h3",
     );
@@ -137,7 +147,7 @@ async function main() {
     };
     const subResp = await executeTool(
       "novel_short_script_h3_submit",
-      { idea: IDEA, payload, targetDurationSeconds: 30 },
+      { idea: IDEA, payload, targetDurationSeconds: DURATION },
       ctx,
     );
     const sub = summarizeResponse(subResp) as { isError?: boolean; scriptId?: string; origin?: string; segments?: unknown[]; error?: string };
@@ -150,7 +160,7 @@ async function main() {
   }
 
   const reportPath = "tmp/mcp-smoke-report.json";
-  writeFileSync(reportPath, JSON.stringify({ idea: IDEA, generated }, null, 2), "utf8");
+  writeFileSync(reportPath, JSON.stringify({ idea: IDEA, targetDurationSeconds: DURATION, generated }, null, 2), "utf8");
   console.log(`\n报告已写入 ${reportPath}`);
   process.exit(0);
 }
