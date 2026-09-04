@@ -498,3 +498,106 @@ export async function submitExternalShortScriptH3(input: {
     segments: normalized.segments,
   };
 }
+
+/**
+ * 开放创意方向 → N 个截然不同的具体奇观候选（创意发散，不生成脚本、不落库）。
+ *
+ * 设计依据：实测开放命题（如「设计一个云上奇观」）直接喂给 generateShortScriptH3 时，
+ * 模型因缺主语塌缩到该题材默认母题（东方仙侠+云上→倒悬巨钟），每次同款。该工具在
+ * 正式生成前先让模型以「创意策划」视角穷举 N 个彼此明显不同的可拍奇观，每个候选
+ * 已是可直接喂给 novel_short_script_h3 的 idea 字符串；编排者挑定其一后再走
+ * novel_short_script_h3 真实生成。属「外部编排者给方向」层的创意发散，与 AGENTS.md
+ * 的治理/产出解耦一致——本工具只产出方向（opinion），不产出正文、不落库。
+ *
+ * 不依赖 repository/objects/skillProvider，仅调模型网关，故快速且解耦。
+ */
+export interface ShortScriptWonderCandidate {
+  /** 穷举出的具体可拍奇观（含明确核心意象），可直接作为 novel_short_script_h3 的 idea。 */
+  wonder: string;
+  /** 该候选相对其它候选的差异点（一句），供编排者挑选用。 */
+  why: string;
+}
+
+export const MIN_SHORT_SCRIPT_BRAINSTORM_COUNT = 2;
+export const MAX_SHORT_SCRIPT_BRAINSTORM_COUNT = 6;
+
+export async function brainstormShortScriptWonders(input: {
+  /** 开放核心创意方向：写清题材/风格/场景/目标即可，无需指定具体奇观（≥ MIN_IDEA_LENGTH）。 */
+  idea: string;
+  /** 穷举候选数，clamp 到 [MIN, MAX]，默认 3。 */
+  count?: number;
+  /** 可选，目标时长提示（秒），仅告知模型每个候选的体量预期，不改变穷举行为。 */
+  targetDurationSeconds?: number;
+  /** 可选，穷举时的额外约束（如「避免钟类母题」）。 */
+  instruction?: string;
+}, deps: {
+  model: ModelGateway;
+  routingSnapshot?: ModelRoutingSnapshot;
+  candidateStartIndex?: number;
+}): Promise<{ idea: string; count: number; candidates: ShortScriptWonderCandidate[] }> {
+  const idea = input.idea?.trim() ?? "";
+  if (idea.length < MIN_IDEA_LENGTH) {
+    throw new ShortScriptInputError(400, `核心创意过短：至少 ${MIN_IDEA_LENGTH} 个字符，须写清题材/风格/场景/目标`);
+  }
+  const count = Math.min(
+    MAX_SHORT_SCRIPT_BRAINSTORM_COUNT,
+    Math.max(MIN_SHORT_SCRIPT_BRAINSTORM_COUNT, Math.round(input.count ?? 3) || 3),
+  );
+
+  const system =
+    "你是东方仙侠短剧的创意策划，擅长把开放的世界观方向转化为具体、可拍、有视觉奇观的短剧创意。";
+  const durationHint = typeof input.targetDurationSeconds === "number" && Number.isFinite(input.targetDurationSeconds)
+    ? `每个候选的预期体量为约 ${Math.round(input.targetDurationSeconds)} 秒短片，奇观规模须与该时长相称。\n`
+    : "";
+  const instructionHint = input.instruction?.trim() ? `额外约束：${input.instruction.trim()}\n` : "";
+  const prompt =
+    `给定一句开放的核心创意方向，请穷举提出 ${count} 个彼此截然不同、各自拥有独立核心奇观意象的短剧创意。\n` +
+    `要求：\n` +
+    `1. 每个创意必须是具体可拍的视觉奇观，明确写出"核心意象是什么"（如某种悬浮建筑、自然现象、法器、生灵、天地异象）；\n` +
+    `2. 各创意之间核心意象必须明显不同，不得雷同；\n` +
+    `3. 保持给定方向的题材、风格、场景与气质；\n` +
+    `4. 每个创意写成一句/两句可直接作为拍摄脚本创意的话（含具体核心意象与场景），并附一句说明它为何区别于其它候选。\n` +
+    durationHint +
+    instructionHint +
+    `核心创意方向：${idea}\n` +
+    `请输出 ${count} 个候选（每个含 wonder 与 why）。`;
+
+  const schema = {
+    type: "object",
+    properties: {
+      wonders: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            wonder: { type: "string", minLength: 10 },
+            why: { type: "string", minLength: 4 },
+          },
+          required: ["wonder", "why"],
+          additionalProperties: false,
+        },
+        minItems: count,
+        maxItems: count,
+      },
+    },
+    required: ["wonders"],
+    additionalProperties: false,
+  };
+
+  const generated = await deps.model.generateStructured<{ wonders: Array<{ wonder: string; why: string }> }>({
+    purpose: "writing.script",
+    system,
+    prompt,
+    schema,
+    schemaName: "short-script-wonders",
+    maxTokens: 2000,
+    routingSnapshot: deps.routingSnapshot,
+    candidateStartIndex: deps.candidateStartIndex,
+  });
+
+  const raw = (generated.value?.wonders ?? [])
+    .slice(0, count)
+    .filter((w) => w && w.wonder && w.wonder.trim().length >= MIN_IDEA_LENGTH);
+  const candidates: ShortScriptWonderCandidate[] = raw.map((w) => ({ wonder: w.wonder.trim(), why: w.why?.trim() ?? "" }));
+  return { idea, count, candidates };
+}

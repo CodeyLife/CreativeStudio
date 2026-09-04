@@ -9,8 +9,9 @@
  *   A. 单生成（默认）：novel_short_script_h3(idea, targetDurationSeconds[, instruction])
  *      - 真实 LLM 生成成功 → 打印片段 promptText
  *      - 失败（沙箱无外网/密钥不可用）→ 降级走 novel_short_script_h3_submit 双轨
- *   B. 候选模式（--candidates N ≥ 2）：先直接调模型网关穷举 N 个截然不同的具体奇观，
- *      再逐个走 novel_short_script_h3 真实生成，用于证明开放命题也能产出多样非默认母题。
+ *   B. 候选模式（--candidates N ≥ 2）：先经正式 MCP 工具 novel_short_script_h3_brainstorm
+ *      穷举 N 个截然不同的具体奇观，再逐个走 novel_short_script_h3 真实生成，
+ *      用于证明开放命题也能产出多样非默认母题（且冒烟测试正式工具链路本身）。
  *
  * 参数：--idea "..."  --duration 15  --instruction "..."  --candidates 3
  */
@@ -56,37 +57,6 @@ function summarizeResponse(response: { isError?: boolean; content?: Array<{ text
   } catch {
     return text;
   }
-}
-
-const buildWonderSchema = (n: number) => ({
-  type: "object",
-  properties: { wonders: { type: "array", items: { type: "string" }, minItems: n, maxItems: n } },
-  required: ["wonders"],
-  additionalProperties: false,
-});
-
-/** 直接调模型网关，从开放创意方向穷举 N 个截然不同的具体奇观。 */
-async function brainstormWonders(ctx: ToolContext, idea: string, n: number): Promise<string[]> {
-  const system =
-    "你是东方仙侠短剧的创意策划，擅长把开放的世界观方向转化为具体、可拍、有视觉奇观的短剧创意。";
-  const prompt =
-    `给定一句开放的核心创意方向，请穷举提出 ${n} 个彼此截然不同、各自拥有独立核心奇观意象的短剧创意。\n` +
-    `要求：\n` +
-    `1. 每个创意必须是具体可拍的视觉奇观，明确写出"核心意象是什么"（如某种悬浮建筑、自然现象、法器、生灵、天地异象）；\n` +
-    `2. 各创意之间核心意象必须明显不同，不得雷同；\n` +
-    `3. 避免出现"倒悬巨钟/钟"这类已被用烂的母题；\n` +
-    `4. 保持东方仙侠气质与"云上"场景。\n` +
-    `核心创意方向：${idea}\n` +
-    `请直接输出 ${n} 个创意字符串（每个一两句话，含具体核心意象）。`;
-  const result = await ctx.model.generateStructured<{ wonders: string[] }>({
-    purpose: "writing.script",
-    system,
-    prompt,
-    schema: buildWonderSchema(n),
-    schemaName: "short-script-wonders",
-    maxTokens: 2000,
-  });
-  return (result.value?.wonders ?? []).slice(0, n);
 }
 
 /** 单生成模式：真实 LLM 生成，失败降级到 submit 外部产出双轨。返回生成的记录对象。 */
@@ -166,10 +136,27 @@ async function runSingleMode(ctx: ToolContext): Promise<unknown> {
   }
 }
 
-/** 候选模式：穷举 N 个具体奇观 → 逐个走 MCP 真实生成。 */
+/** 候选模式：经正式 MCP 工具 novel_short_script_h3_brainstorm 穷举 N 个具体奇观 → 逐个走 novel_short_script_h3 真实生成。 */
 async function runCandidateMode(ctx: ToolContext, n: number): Promise<unknown[]> {
-  console.log(`\n===== [2] 穷举 ${n} 个候选奇观（直接调模型网关 brainstorm）=====`);
-  const wonders = await withTimeout(brainstormWonders(ctx, IDEA, n), 120_000, "brainstorm");
+  console.log(`\n===== [2] 穷举 ${n} 个候选奇观（MCP 工具 novel_short_script_h3_brainstorm）=====`);
+  const bResp = await withTimeout(
+    executeTool(
+      "novel_short_script_h3_brainstorm",
+      { idea: IDEA, count: n, targetDurationSeconds: DURATION, instruction: INSTRUCTION },
+      ctx,
+    ),
+    120_000,
+    "brainstorm",
+  );
+  const brainstorm = summarizeResponse(bResp) as {
+    isError?: boolean;
+    candidates?: Array<{ index?: number; wonder?: string; why?: string }>;
+    error?: string;
+  };
+  if (bResp.isError || brainstorm.error || !brainstorm.candidates?.length) {
+    throw new Error(brainstorm.error ?? "brainstorm 未返回候选");
+  }
+  const wonders = (brainstorm.candidates ?? []).map((c) => c.wonder ?? "").filter(Boolean);
   console.log(`  ✓ 穷举出 ${wonders.length} 个候选：`);
   wonders.forEach((w, i) => console.log(`    ${i + 1}. ${w}`));
 
@@ -177,6 +164,7 @@ async function runCandidateMode(ctx: ToolContext, n: number): Promise<unknown[]>
   const candidates: unknown[] = [];
   for (let i = 0; i < wonders.length; i++) {
     const w = wonders[i];
+    const why = (brainstorm.candidates ?? [])[i]?.why ?? "";
     console.log(`\n--- 候选 ${i + 1}/${wonders.length}：${w.slice(0, 56)}${w.length > 56 ? "…" : ""} ---`);
     try {
       const resp = await withTimeout(
@@ -188,11 +176,11 @@ async function runCandidateMode(ctx: ToolContext, n: number): Promise<unknown[]>
       if (resp.isError || gen.error) throw new Error(gen.error ?? "unknown error");
       const title = (gen.segments ?? [])[0] ? ((gen.segments as any[])[0].title ?? "") : "";
       console.log(`  ✓ 生成成功（scriptId=${gen.scriptId}，复用=${gen.reused ?? false}，片段数=${(gen.segments ?? []).length}，标题=${title}）`);
-      candidates.push({ idea: w, instruction: "", targetDurationSeconds: DURATION, generated: gen });
+      candidates.push({ idea: w, why, instruction: "", targetDurationSeconds: DURATION, generated: gen });
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       console.log(`  ✗ 候选 ${i + 1} 生成失败：${msg}`);
-      candidates.push({ idea: w, instruction: "", targetDurationSeconds: DURATION, generated: null, error: msg });
+      candidates.push({ idea: w, why, instruction: "", targetDurationSeconds: DURATION, generated: null, error: msg });
     }
   }
   return candidates;

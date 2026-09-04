@@ -40,7 +40,7 @@ import { DEFAULT_ARTIFACT_LIST_LIMIT, DEFAULT_WORKFLOW_LIST_LIMIT } from "./tool
 import { startStoryArcBatchPlanning, startStoryArcOrchestratedPlanning, startStoryArcPlanning, startStoryArcReview } from "../application/story-arc-workflow";
 import { parseCreativeBrief } from "../application/creative-brief";
 import { generateChapterScriptH3, submitExternalChapterScriptH3 } from "../application/chapter-script-h3";
-import { generateShortScriptH3, submitExternalShortScriptH3 } from "../application/short-script-h3";
+import { generateShortScriptH3, submitExternalShortScriptH3, brainstormShortScriptWonders } from "../application/short-script-h3";
 import { ContentObjectStore } from "../object-store";
 import { createConfiguredSkillProvider, resolveStageSkillBundle, renderSkillInstruction, SKILL_EXECUTION_POLICIES } from "../skill-runtime";
 import {
@@ -1275,6 +1275,45 @@ const novel_short_script_h3: ToolHandler = async (args, ctx) => {
 };
 
 /**
+ * 开放创意方向 → N 个截然不同的具体奇观候选（创意发散，不生成脚本、不落库）。
+ *
+ * 设计依据：开放命题直接喂给 novel_short_script_h3 时模型会塌缩到默认母题
+ * （东方仙侠+云上→倒悬巨钟）。本工具在正式生成前先让模型以「创意策划」视角穷举
+ * N 个彼此明显不同的可拍奇观，每个候选 wonder 已是可直接喂给 novel_short_script_h3
+ * 的 idea 字符串；编排者挑定其一后再生成。属「外部编排者给方向」层的创意发散。
+ */
+const novel_short_script_h3_brainstorm: ToolHandler = async (args, ctx) => {
+  const idea = asString(args.idea);
+  if (!idea) throw new Error("idea 必填且非空");
+  if (!ctx.model) throw new Error("novel_short_script_h3_brainstorm 需要 ToolContext.model（LLM 网关）");
+
+  const countRaw = args.count;
+  const count = typeof countRaw === "number" && Number.isFinite(countRaw) ? Math.round(countRaw) : undefined;
+  const targetDurationSecondsRaw = args.targetDurationSeconds;
+  const targetDurationSeconds = typeof targetDurationSecondsRaw === "number" && Number.isFinite(targetDurationSecondsRaw)
+    ? Math.round(targetDurationSecondsRaw)
+    : undefined;
+  const instruction = asString(args.instruction) || undefined;
+
+  const result = await brainstormShortScriptWonders(
+    { idea, count, targetDurationSeconds, instruction },
+    { model: ctx.model },
+  );
+
+  return {
+    idea: result.idea,
+    count: result.count,
+    candidates: result.candidates.map((candidate, index) => ({
+      index: index + 1,
+      wonder: candidate.wonder,
+      why: candidate.why,
+      nextAction: "挑定一个候选后调用 novel_short_script_h3(idea=candidate.wonder, targetDurationSeconds?) 生成完整脚本",
+    })),
+    note: `本工具只做创意发散，不生成脚本、不落库；候选数 = ${result.count}`,
+  };
+};
+
+/**
  * 读取指定执行点的已解析 Skill 指引文本（通用）。
  *
  * 设计依据：支持外部 MCP 接手短剧内容产出——先读 skill 拿到 h3-video-prompt
@@ -1487,6 +1526,7 @@ export const TOOL_HANDLERS: Record<string, ToolHandler> = {
   novel_chapter_generate,
   novel_chapter_script_h3,
   novel_short_script_h3,
+  novel_short_script_h3_brainstorm,
   novel_story_arc_start,
   novel_story_arc_get,
   novel_story_arc_review,

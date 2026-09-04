@@ -187,13 +187,14 @@ export const TOOL_NAMES = [
   "novel_project_create",
   "novel_project_list",
   "novel_project_delete",
-  // 规划与创作（11）
+  // 规划与创作（12）
   "novel_bootstrap_run",
   "novel_chapter_review",
   "novel_chapter_review_issue_add",
   "novel_chapter_generate",
   "novel_chapter_script_h3",
   "novel_short_script_h3",
+  "novel_short_script_h3_brainstorm",
   "novel_story_arc_start",
   "novel_story_arc_get",
   "novel_story_arc_review",
@@ -692,6 +693,22 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
         idea: { type: "string", minLength: 10, description: "核心创意：写清谁、何处、什么冲突（至少 10 字符）" },
         instruction: { type: "string", description: "可选，短剧创作指令/特殊要求" },
         targetDurationSeconds: { type: "integer", minimum: 10, maximum: 180, description: "目标总时长（秒），默认 30，超界收敛到边界" },
+      },
+      required: ["idea"],
+      additionalProperties: false,
+    },
+  },
+
+  {
+    name: "novel_short_script_h3_brainstorm",
+    description: "从一句开放的核心创意方向穷举 N 个彼此截然不同、各自拥有独立核心奇观意象的短剧创意候选（用于规避「开放命题塌缩到模型默认母题」问题：如开放命题喂给 novel_short_script_h3 会反复产出倒悬巨钟）。本工具只调模型做创意发散，不生成完整脚本、不落库；返回的每候选 wonder 已是可直接喂给 novel_short_script_h3 的 idea 字符串，编排者挑定其一后再调用 novel_short_script_h3 生成。需要 ToolContext.model。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        idea: { type: "string", minLength: 10, description: "开放核心创意方向：写清题材/风格/场景/目标即可，无需指定具体奇观（至少 10 字符）" },
+        count: { type: "integer", minimum: 2, maximum: 6, description: "穷举候选数，2-6，默认 3" },
+        targetDurationSeconds: { type: "integer", minimum: 10, maximum: 180, description: "可选，目标时长提示（秒），仅告知模型每个候选的体量预期，不改变穷举行为" },
+        instruction: { type: "string", description: "可选，穷举时的额外约束（如「避免钟类母题」）" },
       },
       required: ["idea"],
       additionalProperties: false,

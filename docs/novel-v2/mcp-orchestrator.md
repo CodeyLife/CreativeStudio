@@ -102,6 +102,7 @@ novel_chapter_review_decision(workflowId, artifactId, decision=approve|revise|re
 ```
 novel_chapter_script_h3(projectId, documentId, instruction?)   # 定稿正文 → Ref2VA 分镜提示词
 novel_short_script_h3(idea, instruction?, targetDurationSeconds?, projectId?)   # 核心创意 → 短剧脚本提示词（projectId 缺省=独立短剧，不依赖任何小说项目）
+novel_short_script_h3_brainstorm(idea, count?, targetDurationSeconds?, instruction?)   # 开放创意方向 → N 个截然不同的具体奇观候选（创意发散，不生成脚本不落库；返回的 wonder 直接作 novel_short_script_h3 的 idea）
 novel_artifact_list(projectId, kind="chapter-script")           # 历史章节剧本产物
 novel_artifact_list(projectId, kind="short-script")             # 仅迁移前历史产物（v2 起新产物落 short_scripts 表，经 REST /v2/short-script-h3 读取）
 novel_artifact_get(artifactId)                                  # 完整章节剧本
@@ -165,7 +166,7 @@ novel_receipt_get(receiptId)
 7. **串行约束**：同项目章节审校互斥（`projectActiveReviewWorkflowId`），外部模型必须等当前审校完成后启动下一个。
 8. **编排权威顺序**：已定稿事实 / 叙事状态账本 / 作者边界 > 外部剧情编排 > 模型自行发挥；编排只给方向，不给假事实。
 
-## 4. 工具清单（40 个）
+## 4. 工具清单（41 个）
 
 | 组 | 工具 |
 | --- | --- |
@@ -173,7 +174,7 @@ novel_receipt_get(receiptId)
 | Catalog / Receipt（3） | novel_catalog_get、novel_receipt_get、novel_rule_target_get |
 | Craft Rule 演进（7） | novel_rule_candidate_create、novel_rule_candidate_get、novel_rule_evidence_submit、novel_rule_foundation_evaluate、novel_rule_review_submit、novel_rule_promote、novel_rule_rollback |
 | 项目生命周期（3） | novel_project_create、novel_project_list、novel_project_delete |
-| 规划与创作（14） | novel_bootstrap_run、novel_story_arc_start、novel_story_arc_get、novel_story_arc_review、novel_story_arc_batch_start、novel_story_arc_orchestrate、novel_chapter_review、novel_chapter_review_issue_add、novel_chapter_generate、novel_chapter_script_h3、novel_short_script_h3、novel_skill_get、novel_short_script_h3_submit、novel_chapter_script_h3_submit |
+| 规划与创作（15） | novel_bootstrap_run、novel_story_arc_start、novel_story_arc_get、novel_story_arc_review、novel_story_arc_batch_start、novel_story_arc_orchestrate、novel_chapter_review、novel_chapter_review_issue_add、novel_chapter_generate、novel_chapter_script_h3、novel_short_script_h3、novel_short_script_h3_brainstorm、novel_skill_get、novel_short_script_h3_submit、novel_chapter_script_h3_submit |
 | 评估闭环（1） | novel_closed_loop_run |
 | Workflow 查询（2） | novel_workflow_get、novel_workflow_list |
 | Workflow 决策（1） | novel_chapter_review_decision |
