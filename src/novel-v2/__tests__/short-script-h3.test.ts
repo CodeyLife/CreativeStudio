@@ -9,6 +9,7 @@
  * 结构规则、校验逻辑与断言全部题材无关（泛化优先约束针对规则文本，
  * 不禁止测试样本携带题材）。
  */
+import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import { NovelPostgresRepository, type StoredShortScript } from "../postgres-repository";
 import {
@@ -27,6 +28,7 @@ import {
   SHORT_SCRIPT_KIND,
   SHORT_SCRIPT_TOTAL_DURATION_TOLERANCE_SECONDS,
   observeShortScriptTotalDuration,
+  submitExternalShortScriptH3,
 } from "../application/short-script-h3";
 
 const IDEA = "深夜便利店店员发现连续三晚同一时刻进店的顾客们买走的商品首字拼成同一句警告，而第四晚进店的是他自己。";
@@ -151,7 +153,7 @@ describe("目标时长与分段预算", () => {
 });
 
 describe("buildShortScriptPrompt", () => {
-  it("embeds the idea, duration budget, coverage and dramaturgy contracts, plus the idea-faithfulness boundary", () => {
+  it("embeds the idea, duration budget and coverage contract, and hands dramaturgy to the runtime skill (v8 dedup)", () => {
     const prompt = buildShortScriptPrompt({
       projectTitle: "深夜便利店",
       idea: IDEA,
@@ -165,17 +167,39 @@ describe("buildShortScriptPrompt", () => {
     expect(prompt).toContain("剧情覆盖契约");
     expect(prompt).toContain("信息呈现手段（硬性规则，剧情型创意适用");
     expect(prompt).toContain("片段数须落在 3-6 个之间");
-    expect(prompt).toContain("创意意图忠实性");
-    expect(prompt).toContain("展示型创意禁止自行注入对抗事件");
-    expect(prompt).toContain("剧集剧作契约");
-    expect(prompt).toContain("开场即冲突");
-    expect(prompt).toContain("出口即钩子");
-    expect(prompt).toContain("台词密度");
-    expect(prompt).toContain("反转须有伏笔");
-    expect(prompt).toContain("人物经济");
+    // v8 去重：创意类型判定与剧作层契约迁至运行时 skill（h3-video-prompt），
+    // 代码侧不再重复——重复段挤占注意力预算，长指引被模型做词汇层合规而非真正执行。
+    expect(prompt).not.toContain("创意意图忠实性");
+    expect(prompt).not.toContain("展示型创意禁止自行注入对抗事件");
+    expect(prompt).not.toContain("剧集剧作契约");
+    expect(prompt).not.toContain("开场即冲突");
+    expect(prompt).not.toContain("人物经济");
+    // 代码侧仍保留的运行时事实：时长预算、边界、作者指令
     expect(prompt).toContain("忠实于核心创意给定的设定");
     expect(prompt).toContain("作者指令");
     expect(prompt).toContain("结尾停在第四晚开门瞬间");
+    expect(Number(SHORT_SCRIPT_CONTRACT_VERSION)).toBeGreaterThanOrEqual(8);
+  });
+
+  it("keeps the idea-faithfulness and picture-design contracts in the runtime skill (guard against silent loss after dedup)", () => {
+    // 守护测试：契约迁出代码侧后，若 skill 侧被误删或改坏，代码侧测试不会再发现。
+    // 此处锚定 workspace skill 源文件，保证两端不同步时测试失败而非静默降级。
+    const raw = readFileSync(new URL("../../../skills/novel-v2/h3-video-prompt.yaml", import.meta.url), "utf8");
+    const short = raw.split("short.script: |")[1] ?? "";
+    for (const token of [
+      "创意意图忠实性",
+      "展示型创意禁止自行注入对抗事件",
+      "开场即冲突",
+      "出口即钩子",
+      "台词密度",
+      "反转须有伏笔",
+      "人物经济",
+      "构图设计",
+      "色彩设计",
+      "反平庸默认态",
+    ]) {
+      expect(short, `skill 契约缺失：${token}`).toContain(token);
+    }
   });
 });
 
@@ -342,3 +366,61 @@ describe("generateShortScriptH3（结构复用与幂等）", () => {
     expect(linked.scriptId).not.toBe(independent.scriptId);
   });
 });
+
+describe("submitExternalShortScriptH3（外部 MCP 接手产出）", () => {
+  const submitObjects = { putText: vi.fn(async () => ({ key: "objects/test-short-script" })) };
+
+  it("rejects an idea shorter than the minimum creative unit with a 400-style error", async () => {
+    const { repository } = mockRepository();
+    await expect(submitExternalShortScriptH3(
+      { idea: "太短", payload: { segments: [clerkSegment(12)] } },
+      { repository, objects: submitObjects as never },
+    )).rejects.toThrow(ShortScriptInputError);
+    await expect(submitExternalShortScriptH3(
+      { idea: "太短", payload: { segments: [clerkSegment(12)] } },
+      { repository, objects: submitObjects as never },
+    )).rejects.toThrow(new RegExp(`至少 ${MIN_IDEA_LENGTH} 个字符`));
+  });
+
+  it("rejects payload without segments", async () => {
+    const { repository } = mockRepository();
+    await expect(submitExternalShortScriptH3(
+      { idea: IDEA, payload: { plotBeats: [], characters: [] } },
+      { repository, objects: submitObjects as never },
+    )).rejects.toThrow(/payload\.segments 必填且非空/);
+  });
+
+  it("assembles external model-shaped JSON, marks origin and persists", async () => {
+    const { repository, recordShortScript } = mockRepository();
+    const record = await submitExternalShortScriptH3(
+      { idea: IDEA, instruction: "结尾停在第四晚开门瞬间", payload: shortScriptOutput(30) },
+      { repository, objects: submitObjects as never },
+    );
+    expect(record.reused).toBeUndefined();
+    expect(record.scriptId).toEqual(expect.any(String));
+    expect(record.targetDurationSeconds).toBe(30);
+    expect(record.segments).toHaveLength(2);
+    expect(record.segments[0].promptText).toContain("subject_definitions:");
+    expect(record.plotBeats[0].id).toBe("beat-pattern");
+    expect(recordShortScript).toHaveBeenCalledTimes(1);
+    const stored = recordShortScript.mock.calls[0][0] as StoredShortScript;
+    // 外部产出双轨：origin 标记与系统内部生成区分，指纹前缀 ext: 避免跨轨误复用。
+    expect(stored.payload.origin).toBe("external-short-script-h3");
+    expect(stored.payload.kind).toBe(SHORT_SCRIPT_KIND);
+    expect(stored.sourceFingerprint).toMatch(/^ext:/);
+  });
+
+  it("reuses identical external content (ext: fingerprint) without regenerating", async () => {
+    const { repository, recordShortScript, findShortScriptByFingerprint } = mockRepository({ existingStored: mockStoredScript() });
+    const record = await submitExternalShortScriptH3(
+      { idea: IDEA, payload: shortScriptOutput(30) },
+      { repository, objects: submitObjects as never },
+    );
+    expect(record.reused).toBe(true);
+    expect(record.scriptId).toBe("script-stored");
+    expect(record.segments).toHaveLength(2);
+    expect(recordShortScript).not.toHaveBeenCalled();
+    expect(findShortScriptByFingerprint.mock.calls[0][0] as string).toMatch(/^ext:/);
+  });
+});
+

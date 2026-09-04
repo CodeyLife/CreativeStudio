@@ -1,5 +1,5 @@
 /**
- * V2 MCP 工具定义：37 个工具的 inputSchema（JSON Schema draft-07）。
+ * V2 MCP 工具定义：40 个工具的 inputSchema（JSON Schema draft-07）。
  *
  * 设计依据：AGENTS.md 架构阶段和 V2 MCP 工具契约。
  *
@@ -21,7 +21,8 @@
  */
 import type { ToolDefinition } from "./types";
 import { readerReconstructionSchema } from "../reader-reconstruction-schema";
-import { MAX_CHAPTER_HINTS, MAX_EXPECTED_CHAPTER_COUNT } from "../application/story-arc";
+// 常量来自浏览器安全的叶子模块（story-arc.ts 依赖 node:crypto，禁止进入前端包）
+import { MAX_CHAPTER_HINTS, MAX_EXPECTED_CHAPTER_COUNT } from "../application/story-arc-limits";
 
 // TODO P2: 分页默认值与上限应可配置——当前默认 20/50、上限 100 适配 MCP 单次响应。
 // 未来应由 API 网关或项目级配置决定，而非硬编码。
@@ -198,6 +199,10 @@ export const TOOL_NAMES = [
   "novel_story_arc_review",
   "novel_story_arc_batch_start",
   "novel_story_arc_orchestrate",
+  // 外部产出与 Skill 读取（3，v2 新增）
+  "novel_skill_get",
+  "novel_short_script_h3_submit",
+  "novel_chapter_script_h3_submit",
   // 评估闭环（1，v2 新增）
   "novel_closed_loop_run",
   // Workflow 查询（2，新增）
@@ -745,6 +750,75 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
         authorIntent: { type: "string", description: "可选，作者整体意图说明（并入规划上下文，权威低于已定稿事实）" },
       },
       required: ["projectId", "plotOutline"],
+      additionalProperties: false,
+    },
+  },
+
+  // ===== 外部产出与 Skill 读取（3，v2 新增）=====
+
+  {
+    name: "novel_skill_get",
+    description: "读取指定执行点的已解析运行时 Skill 指引文本（含 h3-video-prompt 等短剧剧本方法论），供外部 MCP 接手短剧内容产出：先读 skill 拿到方法论，再按核心创意与时长参数自行产出模型形态 JSON，最后用 novel_short_script_h3_submit / novel_chapter_script_h3_submit 落库。返回 skillText（可注入外部模型 prompt）、resolvedSkills 与 availableSkills（含各 skill 的 executionPoints，供发现合法执行点）。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        executionPoint: { type: "string", description: "Skill 执行点；短剧创意脚本用 short.script，章节派生短剧用 chapter.script；其余执行点（chapter.drafting 等）亦可读取" },
+        projectId: { type: "string", description: "可选；DB 源 skill 按项目过滤（workspace 源忽略）" },
+      },
+      required: ["executionPoint"],
+      additionalProperties: false,
+    },
+  },
+
+  {
+    name: "novel_short_script_h3_submit",
+    description: "外部 MCP 接手短剧内容产出：提交自行生成的模型形态剧本 JSON（plotBeats / characters / segments 六段字段），系统负责零阻断组装 promptText、结构观察、契约版本与落库（short_scripts 独立表）。read-only 派生产物，不进正文质量门。幂等：同一外部内容重放复用既有产物（指纹前缀 ext: 与系统内部生成区分）。与 novel_short_script_h3（系统内部生成）互为双轨。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        idea: { type: "string", minLength: 10, description: "核心创意：写清谁、何处、什么冲突（至少 10 字符）" },
+        instruction: { type: "string", description: "可选，短剧创作指令" },
+        targetDurationSeconds: { type: "integer", minimum: 10, maximum: 180, description: "目标总时长（秒），默认 30，超界收敛" },
+        projectId: { type: "string", description: "可选：关联小说作品（衍生短剧）" },
+        payload: {
+          type: "object",
+          description: "外部模型产出的剧本 JSON：{plotBeats:[{id,kind,summary}], characters:[{name,appearanceEn}], segments:[{title,synopsis,durationSeconds,beatIds,subjectDefinitions,summary,retentionAnalysis,detailedDescription,overallSoundscape,nonDiegeticMusic}]}",
+          properties: {
+            plotBeats: { type: "array" },
+            characters: { type: "array" },
+            segments: { type: "array" },
+          },
+          required: ["segments"],
+          additionalProperties: true,
+        },
+      },
+      required: ["idea", "payload"],
+      additionalProperties: false,
+    },
+  },
+
+  {
+    name: "novel_chapter_script_h3_submit",
+    description: "外部 MCP 接手章节派生短剧内容产出：提交为已定稿章节自行生成的模型形态剧本 JSON，系统负责零阻断组装与落库（artifacts kind=chapter-script）。需 projectId+documentId 且章节须为定稿（与系统内部生成同门禁）。read-only 派生产物，不进正文质量门。幂等：同一外部内容重放复用既有产物（指纹前缀 ext:）。与 novel_chapter_script_h3（系统内部生成）互为双轨。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectId: { type: "string", minLength: 1 },
+        documentId: { type: "string", minLength: 1, description: "目标章节 document（须已有正式 revision 的定稿）" },
+        instruction: { type: "string", description: "可选，改编指令" },
+        payload: {
+          type: "object",
+          description: "外部模型产出的剧本 JSON（同 novel_short_script_h3_submit 的 segments 结构）",
+          properties: {
+            plotBeats: { type: "array" },
+            characters: { type: "array" },
+            segments: { type: "array" },
+          },
+          required: ["segments"],
+          additionalProperties: true,
+        },
+      },
+      required: ["projectId", "documentId", "payload"],
       additionalProperties: false,
     },
   },

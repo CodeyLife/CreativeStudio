@@ -113,6 +113,26 @@ novel_artifact_get(artifactId)                                  # 完整章节�
 
 作者可经前端（或 `GET/PUT /v2/projects/:id/script-h3/subject-preset`）预设**项目级共享 subject_definitions**（`<Subject N>` 行格式）：生成时片段直接复用共享主体（不重写），片段内只写新增主体（编号从共享最大编号 +1 续接），无新增时片段省略 subject_definitions 区块；共享库以独立块随产物导出供 H3 前置拼接。该预设管理不经 MCP（前端/REST 专属），但编排触发的生成会读取同一份项目级预设；修改预设后需对章节点重新生成。
 
+### 2.6 短剧脚本外部产出（外部 MCP 接手内容创作）
+
+短剧脚本是正文/创意的**只读派生产物**（`kind=chapter-script` / 独立表 `short_scripts`），**不进正文质量门**，因此外部编排者可在不违反「治理与产出解耦」原则的前提下**接手内容产出**——系统仍掌握组装、结构观察、契约版本与持久化，外部 MCP 负责实际创作。这构成与系统内部生成的**双轨模式**：
+
+| 工具 | 角色 | 产出方 |
+| --- | --- | --- |
+| `novel_short_script_h3` | 核心创意 → 短剧脚本 | 系统内部模型（`ToolContext.model`） |
+| `novel_short_script_h3_submit` | 提交外部产出的模型形态 JSON 落库 | **外部 MCP** |
+| `novel_chapter_script_h3` | 定稿章节 → 短剧剧本 | 系统内部模型 |
+| `novel_chapter_script_h3_submit` | 提交外部产出的模型形态 JSON 落库 | **外部 MCP** |
+| `novel_skill_get(executionPoint)` | 读取运行时 Skill 指引文本（如 `short.script` 的 h3-video-prompt 方法论） | 系统解析、外部消费 |
+
+外部 MCP 接手短剧产出的标准流程：
+
+1. `novel_skill_get(executionPoint="short.script")` 读取已解析的 h3-video-prompt 方法论（`skillText` 注入外部模型 prompt），并借 `availableSkills[].executionPoints` 发现合法执行点；
+2. 外部模型按方法论，依据核心创意（`idea`）、目标时长（`targetDurationSeconds`）等参数自行产出**模型形态剧本 JSON**（`plotBeats` / `characters` / 每段六段字段 `subjectDefinitions`·`summary`·`retentionAnalysis`·`detailedDescription`·`overallSoundscape`·`nonDiegeticMusic`）；
+3. `novel_short_script_h3_submit(idea, payload, …)` 或 `novel_chapter_script_h3_submit(projectId, documentId, payload)` 提交，系统复用 `normalizeChapterScriptOutput` 做**零阻断组装**（`promptText`、结构提示、契约版本）并落库；`origin` 标记为 `external-*`，指纹前缀 `ext:` 与系统内部输入指纹区分，同内容幂等复用。
+
+边界：外部 MCP 产出的是脚本提示词（H3 Ref2VA 六段），**不是小说正文**；章节派生门禁与内部一致（章节须为定稿，否则 `ChapterScriptSourceError(409)`）。该能力仅放开「短剧派生产物」的产出权，正文/蓝图等仍受「外部模型直接改正文、直接改 blueprint 无对应工具」约束。
+
 ### 阶段 3 事实梳理与记忆
 
 ```
@@ -145,7 +165,7 @@ novel_receipt_get(receiptId)
 7. **串行约束**：同项目章节审校互斥（`projectActiveReviewWorkflowId`），外部模型必须等当前审校完成后启动下一个。
 8. **编排权威顺序**：已定稿事实 / 叙事状态账本 / 作者边界 > 外部剧情编排 > 模型自行发挥；编排只给方向，不给假事实。
 
-## 4. 工具清单（37 个）
+## 4. 工具清单（40 个）
 
 | 组 | 工具 |
 | --- | --- |
@@ -153,7 +173,7 @@ novel_receipt_get(receiptId)
 | Catalog / Receipt（3） | novel_catalog_get、novel_receipt_get、novel_rule_target_get |
 | Craft Rule 演进（7） | novel_rule_candidate_create、novel_rule_candidate_get、novel_rule_evidence_submit、novel_rule_foundation_evaluate、novel_rule_review_submit、novel_rule_promote、novel_rule_rollback |
 | 项目生命周期（3） | novel_project_create、novel_project_list、novel_project_delete |
-| 规划与创作（11） | novel_bootstrap_run、novel_story_arc_start、novel_story_arc_get、novel_story_arc_review、novel_story_arc_batch_start、novel_story_arc_orchestrate、novel_chapter_review、novel_chapter_review_issue_add、novel_chapter_generate、novel_chapter_script_h3、novel_short_script_h3 |
+| 规划与创作（14） | novel_bootstrap_run、novel_story_arc_start、novel_story_arc_get、novel_story_arc_review、novel_story_arc_batch_start、novel_story_arc_orchestrate、novel_chapter_review、novel_chapter_review_issue_add、novel_chapter_generate、novel_chapter_script_h3、novel_short_script_h3、novel_skill_get、novel_short_script_h3_submit、novel_chapter_script_h3_submit |
 | 评估闭环（1） | novel_closed_loop_run |
 | Workflow 查询（2） | novel_workflow_get、novel_workflow_list |
 | Workflow 决策（1） | novel_chapter_review_decision |

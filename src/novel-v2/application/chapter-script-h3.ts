@@ -59,7 +59,7 @@ export const SCRIPT_EXECUTION_POINT = "chapter.script" as const;
  * 网关不得嗅探错误文案（文案是实现细节，状态码才是跨层契约）。
  */
 export class ChapterScriptSourceError extends Error {
-  constructor(readonly statusCode: 404 | 409, message: string) {
+  constructor(readonly statusCode: 404 | 409 | 400, message: string) {
     super(message);
     this.name = "ChapterScriptSourceError";
   }
@@ -99,8 +99,33 @@ export class ChapterScriptSourceError extends Error {
  *    （场景/世界观/氛围展示，无人物对抗）按视觉展示模式组织节拍，
  *    不强行注入追击/战斗等对抗事件；冲突导向剧作契约仅对剧情型创意生效
  *    （根因：实测展示型创意被套进冲突模板，产出追兵/迎敌剧情）。
+ * v10：震撼强度契约（skill v1.5.0）——宏大/冲击/展示镜头必须执行强度层：
+ *     单镜主视觉焦点、动态张力（蓄力→爆发，禁全程匀速慢镜）、尺度对比句
+ *     （渺小锚点 vs 巨物）、光效反差（逆光剪影/强光柱/明暗爆发）、冲击时间感
+ *     （根因：v9 产物细节充分但生成画面仍平淡，震撼缺失源于镜头缺强度——
+ *     动态、尺度、光效、冲击四变量全弱，而非细节不足）。
+ * v11：画面设计层契约（skill v1.6.0）——镜头四要素扩为六要素，补上构图设计
+ *     （主体在画框的位置、前景遮挡、引导线、层次分割、框中框、负空间）与色彩
+ *     设计（每场主色 + 强调色、色彩随情绪与时空转场）；新增反平庸默认态清单
+ *     （裸中景 / 平光 / 中性色彩 / 匀速运镜四条，逐镜自检命中即重写）；开场
+ *     风格句升级为可复原的具体参照（画幅焦段 / 介质质感 / 光影体系 / 色彩基调）。
+ *     根因：v10 的四个强度变量（动态、尺度、光效、冲击）全在事件层面——镜头里
+ *     发生了什么；而"平平无奇"是画面层面的问题——画框里怎么安排、色彩怎么设计，
+ *     这一层全库关键词命中为 0。居中构图与无色彩设计恰是视频模型的默认出片态，
+ *     故 v10 加了强度仍平淡。
+ *     配套减负：代码侧删除与 skill 指引重复 27%（8-gram 实测）的剧作段与体量段
+ *     ——重复段挤占注意力预算，长指引被模型做词汇层合规（换大词、加 violent）
+ *     而非真正执行；去重后新增的画面设计层才有预算落地。
+ * v12：画面层三处细化（skill v1.6.1，与 short 契约 v9 同源）——针对 v11 实测仍偏
+ *      "廉价震撼"的三类问题：① 天光改为受控明暗雕塑，禁止硬爆白 god-ray
+ *      （veiled through haze），去掉生硬刺目纯白刀光；② 动态张力须服务沉浸，
+ *      禁止无铺垫猛拽/急甩/瞬切（whiplash/snap），展示型奇观优先缓慢庄严连续
+ *      运动与优雅涌起；③ 宏大场景除尺度对比外，逼模型把建筑本身设计得崇高
+ *      （垂直拔升/无尽重复韵律/超验尺度/标志轮廓/表面密度/主导画框）。根因：
+ *      这三项在 v11 由契约明文主张（blinding god-ray、violent 猛冲、仅"小人
+ *      对比"交代尺度），模型照抄，故产物出现刺目天光、出戏快镜、建筑空旷。
  */
-export const SCRIPT_CONTRACT_VERSION = "9";
+export const SCRIPT_CONTRACT_VERSION = "12";
 
 /** 剧情节拍种类：memory/setup/hook 属"信息承载必需"类，需要显式呈现手段。 */
 export const PLOT_BEAT_KINDS = ["event", "dialogue", "memory", "setup", "hook", "decision"] as const;
@@ -217,7 +242,7 @@ export interface ChapterScriptRecord {
   minSegments?: number;
   /** 模型穷举的剧情节拍清单（审计与覆盖校验依据） */
   plotBeats: PlotBeat[];
-  /** 影视镜头语言提示（提示级，不阻断）：缺少运镜/景别描述的镜头清单 */
+  /** 提示级观察（不阻断）：切点时序问题（开场带时间戳/缺切点/超时长/非递增）与结构观察清单 */
   cinematicHints: string[];
   /** 本次生成使用的项目级共享定义（独立块文本 + 最大编号）；definitionText 空串表示无共享 */
   sharedSubjects: { definitionText: string; maxLabel: number };
@@ -401,7 +426,7 @@ function verifyReferenceLabels(fields: ChapterScriptSegmentFields, shared: Share
     if (!trimmed) continue;
     const label = definedSubjectLabel(trimmed);
     if (!label) {
-      hints.push(`subject_definitions 中存在非 <Subject N> 开头的行：${trimmed.slice(0, 40)}`);
+      hints.push(`subject_definitions 中存在非 <Subject N> 开头的行：${trimmed.slice(0, 40)}——注意 <Subject N> 不限于人物，纯环境奇观（无人物）也必须把环境/建筑/自然现象定义为环境主体标签（如 <Subject 1> is the floating immortal mountain），禁止只写描述清单不建标签`);
       continue;
     }
     const number = Number(label.replace(/\D+/gu, ""));
@@ -491,24 +516,15 @@ export function collectSegmentHintIssues(fields: ChapterScriptSegmentFields, sha
 
 /**
  * 影视镜头语言提示（提示级，不阻断、不回灌 repair）。
- * 方法论来源：.agents/skills/short-drama-writing（镜头四要素：景别/角度/运镜/光线氛围）。
- * 逐 [Shot N] 检查运镜或景别词覆盖；缺失的镜头输出可读提示，供前端与编排者参考。
+ * 仅做切点时序观察：开场镜头时间戳、缺切点、超时长、非递增。
+ * 不做镜头四要素（景别/角度/运镜/光线氛围）覆盖检测——描述语言放开中文后
+ * （v1.4.2）英文术语词表无法覆盖中文镜头描述，误报率高、价值低，已移除
+ * （根因：中文"大远景主观俯视角/中景弧形环绕"被英文词表判为缺失）。
  */
 export function computeCinematicHints(segments: ReadonlyArray<AssembledChapterScriptSegment>): string[] {
   const hints: string[] = [];
   for (const segment of segments) {
     const description = segment.detailedDescription;
-    const markers = [...description.matchAll(/\[Shot\s+(\d+)\]/gu)];
-    markers.forEach((marker, position) => {
-      const shotStart = marker.index! + marker[0].length;
-      const shotEnd = position + 1 < markers.length ? markers[position + 1].index! : description.length;
-      const shotText = description.slice(shotStart, shotEnd);
-      const hasCamera = /\b(camera|push(?:es)? in|pull(?:s)? out|pan(?:s)?|truck(?:s)?|tilt(?:s)?|pedestal|zoom(?:s)?|arc shot|tracking shot|static shot|shake(?:s)?|roll(?:s)?|POV)\b/iu.test(shotText);
-      const hasFraming = /\b(extreme close-up|close-up|medium close-up|medium shot|medium-wide|medium wide|wide shot|extreme wide|low-angle|low angle|high-angle|high angle|overhead|dutch|over-the-shoulder)\b/iu.test(shotText);
-      if (!hasCamera && !hasFraming) {
-        hints.push(`片段 ${segment.index} [Shot ${marker[1]}] 缺少运镜或景别描述——建议补写镜头四要素（景别/角度/运镜/光线氛围），参见 short-drama-writing 技能`);
-      }
-    });
     // 提示级时序观察（不阻断）：H3 生成器对切点风格差异兼容性好，
     // 开场镜头时间戳、缺切点、超时长、非递增只在 hints 中提示，不再回灌 repair。
     const timeline = collectShotTimeline(description);
@@ -696,22 +712,19 @@ export function buildChapterScriptPrompt(input: {
         "- 抱头、颤抖、喘息等反应动作只能表达「有信息涌入」这一事件，不能替代信息内容本身；只写反应动作会被判定为呈现缺失。",
       ].join("\n"),
       `- 片段数量下限：本章至少拆出 ${input.minSegments} 个片段（按正文篇幅推导），不足即视为剧情省略。`,
-      `片段时长统一落在 ${MIN_SEGMENT_SECONDS}-${MAX_SEGMENT_SECONDS}s 区间，禁止贴下限：宏大场面、战斗交锋与冲击性瞬间取区间上沿（约 12-15 秒）让画面充分展开；对话交锋与反应镜头也至少 10 秒，用镜头细节与氛围填充而非快切。`,
+      `片段时长统一落在 ${MIN_SEGMENT_SECONDS}-${MAX_SEGMENT_SECONDS}s 区间，按信息密度取值（分配口径见 skill 指引，此处不重复）。`,
     ].join("\n"),
-    [
-      "剧集剧作契约（提示层，与剧情覆盖契约配合执行）：",
-      "- 开场即冲突：第 1 个片段的第一个镜头落在冲突现场或其临界点，开场 3 秒内呈现钩子形态之一（直接冲突、强悬念、极致反差、身份落差、倒计时压力）；本章的核心冲突、对立双方、主角即时目标须在前 10 秒内可见或可闻。铺垫性开场（日常流程、纯环境交代先行）视为失败。",
-      "- 情绪节点节奏：每 2-4 个片段落一个情绪节点（对话冲突、动作冲突或信息揭示），前 1/3 的片段内完成第一次小反转；连续 3 个片段无节点视为节奏断裂。",
-      "- 出口即钩子：每个片段的出口状态抛出问题或抬高压（未揭的身份、被推翻的假设、逼近的危险、两难抉择、逼近的期限）；末片段在冲击瞬间切卡（揭示、接触或决定发生的一刻），不在余韵处收尾——观众应带着未解的钩子离开。",
-      "- 台词密度：每句台词至少承担身份/关系确认、冲突引爆、后果陈述之一，纯填充性寒暄压缩掉；关键情绪节拍静音可读（表情、动作或屏幕可读文字）。对白语义仍受上方忠实性边界约束。",
-      "- 反转须有伏笔：每个反转必须对应正文前文已呈现过的伏笔（plant → overlook → detonate）；正文未铺垫的反转不得新增，伏笔应经插入镜头、台词或可读细节在早期片段中可见。",
-      "- 人物经济：镜头内出场人物围绕核心三角（主角、对手、助力者）加少量配角组织；人物标签靠稳定的视觉锚点（标志道具、服饰、特征）跨片段复用同一外形。",
-    ].join("\n"),
+    // 剧集剧作层（开场即冲突 / 情绪节点节奏 / 出口即钩子 / 台词密度 / 反转须有伏笔 /
+    // 人物经济）与镜头层（六要素 / 反平庸默认态 / 震撼强度 / 冲击细节 / 描述体量）均由
+    // 运行时 skill（h3-video-prompt，priority=required）注入，此处不再重复。
+    // 根因：两者此前重复 27%（8-gram 实测），重复段挤占注意力预算，导致长指引被
+    // 模型做词汇层合规（换大词、加 violent）而非真正执行；去重后新增的画面设计层
+    // 才有预算落地。代码侧仅保留 skill 不掌握的运行时事实（节拍映射、共享主体、边界）。
     input.characters.length
       ? `人物设定摘要（事实参照）：\n${input.characters.map((character) => `- ${character.name}${character.digest ? `：${character.digest}` : ""}`).join("\n")}`
       : "人物设定摘要：（无；请依据正文自行给出 appearanceEn 基线）",
     input.instruction?.trim() ? `作者指令（优先遵守其与格式规范相容的部分）：${input.instruction.trim()}` : "",
-    "边界：忠实于正文已发生的事实、因果与对白语义，不新增情节、角色或结局改动；叙述性心理描写转为可观察的表情、动作或选择。",
+    "边界：忠实于正文已发生的事实、因果与对白语义，不新增情节、角色或结局改动；正文中的专有概念（移动/驾驭方式、器物、礼仪、景观类型）必须在描述中展开为其文化语境的标准物理呈现（姿态、接触点、构图与地理形态），不得用字面直译、近似动作或模板化场景顶替；叙述性心理描写转为可观察的表情、动作或选择。",
     "章节正文：",
     input.plainText.trim(),
   ].filter(Boolean).join("\n\n");
@@ -783,11 +796,13 @@ async function persistChapterScriptArtifact(repository: NovelPostgresRepository,
   characters: ChapterScriptCharacterSheet[];
   segments: AssembledChapterScriptSegment[];
   workflowId: string;
+  /** 产出来源标记：系统内部生成=chapter-script-h3，外部 MCP 接手产出=external-chapter-script-h3。 */
+  origin?: string;
 }): Promise<string> {
   const artifactText = context.segments.map((segment) => `${segment.index}. ${segment.title}\n${segment.promptText}`).join("\n\n---\n\n");
   const object = await objects.putText(artifactText);
   const structuredData: Record<string, unknown> = {
-    origin: "chapter-script-h3",
+    origin: context.origin ?? "chapter-script-h3",
     documentId: context.documentId,
     revisionId: context.revisionId,
     narrativeOrder: context.narrativeOrder,
@@ -839,10 +854,19 @@ export async function generateChapterScriptH3(input: {
     throw new ChapterScriptSourceError(409, "只能为已有正式 revision 的定稿章节生成剧本提示词");
   }
 
-  // 幂等键绑定章节定稿内容 + 共享定义内容（documentId + revision 内容哈希 + 共享文本哈希）：
-  // 同一定稿与同一共享定义重放复用既有产物；改稿或修改共享定义后自然失效重生成。
+  // 幂等键绑定章节定稿内容 + 共享定义内容 + skill 版本（documentId + revision 内容哈希
+  // + 共享文本哈希 + skill 版本串）：同一定稿、共享定义与 skill 指引重放复用既有产物；
+  // 改稿、修改共享定义或更新 skill 后自然失效重生成（与 short-script-h3 同机制）。
   const sharedHash = createHash("sha256").update(shared.lines.join("\n")).digest("hex");
-  const sourceFingerprint = createHash("sha256").update(`${input.documentId}:${source.contentHash}:${source.sourceRevisionId}:${sharedHash}`).digest("hex");
+  const workflowId = `chapter-script:${input.documentId}:${randomUUID()}`;
+  const skillBundle = await resolveStageSkillBundle({
+    projectId: input.projectId,
+    provider: deps.skillProvider,
+    executionPoint: SCRIPT_EXECUTION_POINT,
+    preflightId: workflowId,
+  });
+  const skillVersionPart = skillBundle.skills.map((skill) => `${skill.skillId}@${skill.version}`).sort().join("+");
+  const sourceFingerprint = createHash("sha256").update(`${input.documentId}:${source.contentHash}:${source.sourceRevisionId}:${sharedHash}:${skillVersionPart}`).digest("hex");
   const existingArtifact = await deps.repository.pool.query<{ id: string }>(
     "SELECT id FROM artifacts WHERE project_id=$1 AND kind=$2 AND payload->>'sourceFingerprint'=$3 AND payload->>'contractVersion'=$4 ORDER BY created_at DESC LIMIT 1",
     [input.projectId, CHAPTER_SCRIPT_ARTIFACT_KIND, sourceFingerprint, SCRIPT_CONTRACT_VERSION],
@@ -859,13 +883,6 @@ export async function generateChapterScriptH3(input: {
   ]);
   const minSegments = deriveMinSegments(plainText);
 
-  const workflowId = `chapter-script:${input.documentId}:${randomUUID()}`;
-  const skillBundle = await resolveStageSkillBundle({
-    projectId: input.projectId,
-    provider: deps.skillProvider,
-    executionPoint: SCRIPT_EXECUTION_POINT,
-    preflightId: workflowId,
-  });
   const skillSections = buildSkillContextSections(skillBundle, SCRIPT_EXECUTION_POINT);
   const promptPackage = compileStageContext({
     projectId: input.projectId,
@@ -935,6 +952,98 @@ export async function generateChapterScriptH3(input: {
     artifactId,
     revisionId: source.sourceRevisionId,
     sourceFingerprint,
+    minSegments,
+    plotBeats: normalized.plotBeats,
+    cinematicHints: [...normalized.hints, ...computeCinematicHints(normalized.segments)],
+    sharedSubjects: { definitionText: buildSharedSubjectLibraryText(shared), maxLabel: shared.maxLabel },
+    characters: normalized.characters,
+    segments: normalized.segments,
+  };
+}
+
+/**
+ * 外部 MCP 接手章节派生短剧内容产出：接收外部已生成的「模型形态」剧本 JSON
+ * （plotBeats / characters / segments 六段字段），系统负责零阻断组装与落库
+ * （artifacts kind=chapter-script）。与 generateChapterScriptH3（系统内部模型生成）
+ * 互为双轨。设计依据同 submitExternalShortScriptH3（短剧脚本为只读派生、不进正文质量门）。
+ *
+ * 门禁与系统内部一致：documentId 对应的章节须为已定稿（有正式 revision），否则抛
+ * ChapterScriptSourceError(409)；共享 subject 预设从仓储读取，使引用一致性校验与内部对齐。
+ * 幂等：以外部内容哈希（documentId+revisionId+共享哈希+契约版本+归一化内容）为指纹，
+ * 同内容重放复用既有产物（前缀 ext: 与系统内部输入指纹区分）。
+ */
+export async function submitExternalChapterScriptH3(input: {
+  projectId: string;
+  documentId: string;
+  instruction?: string;
+  /** 外部模型产出的剧本 JSON：{ plotBeats?, characters?, segments }。 */
+  payload: { plotBeats?: unknown; characters?: unknown; segments?: unknown };
+}, deps: {
+  repository: NovelPostgresRepository;
+  objects: ObjectStoreAdapter;
+  /** 项目级共享 subject_definitions 预设文本；空串表示无共享（与内部生成对齐）。 */
+  sharedSubjectsText?: string;
+}): Promise<ChapterScriptRecord> {
+  const shared = parseSharedSubjectPreset(deps.sharedSubjectsText);
+  const source = await deps.repository.getFinalDocumentContentRef(input.projectId, input.documentId);
+  if (!source) throw new ChapterScriptSourceError(404, "章节不存在");
+  if (source.status !== "final" || !source.sourceRevisionId || !source.objectKey || !source.contentHash) {
+    throw new ChapterScriptSourceError(409, "只能为已有正式 revision 的定稿章节生成剧本提示词");
+  }
+
+  const rawSegments = Array.isArray(input.payload.segments) ? input.payload.segments : [];
+  if (!rawSegments.length) {
+    throw new ChapterScriptSourceError(400, "payload.segments 必填且非空（外部 MCP 产出的模型形态片段数组）");
+  }
+
+  // 篇幅推导覆盖下限与内部生成对齐（零阻断提示级，不阻断）。
+  const plainText = await deps.objects.getText(source.objectKey);
+  const minSegments = deriveMinSegments(plainText);
+
+  const normalized = normalizeChapterScriptOutput(input.payload, { minSegments, shared });
+
+  const workflowId = `chapter-script-external:${input.documentId}:${randomUUID()}`;
+  // 内容指纹：外部产出以内容本身为幂等依据（与系统内部输入指纹区分）。
+  const sharedHash = createHash("sha256").update(shared.lines.join("\n")).digest("hex");
+  const contentFingerprint = createHash("sha256").update(
+    `${input.documentId}:${source.sourceRevisionId}:${sharedHash}:${SCRIPT_CONTRACT_VERSION}:`
+      + JSON.stringify({
+        pb: normalized.plotBeats,
+        ch: normalized.characters,
+        sg: normalized.segments.map((segment) => ({ ...segment })),
+      }),
+  ).digest("hex");
+  const externalFingerprint = `ext:${contentFingerprint}`;
+  const existingArtifact = await deps.repository.pool.query<{ id: string }>(
+    "SELECT id FROM artifacts WHERE project_id=$1 AND kind=$2 AND payload->>'sourceFingerprint'=$3 AND payload->>'contractVersion'=$4 ORDER BY created_at DESC LIMIT 1",
+    [input.projectId, CHAPTER_SCRIPT_ARTIFACT_KIND, externalFingerprint, SCRIPT_CONTRACT_VERSION],
+  );
+  if (existingArtifact.rowCount) {
+    const stored = await readStoredChapterScript(deps.repository, existingArtifact.rows[0].id);
+    if (stored) return { ...stored, reused: true, cinematicHints: computeCinematicHints(stored.segments) };
+  }
+
+  const artifactId = await persistChapterScriptArtifact(deps.repository, deps.objects, {
+    projectId: input.projectId,
+    documentId: input.documentId,
+    revisionId: source.sourceRevisionId,
+    revision: source.revision,
+    narrativeOrder: source.narrativeOrder,
+    sourceFingerprint: externalFingerprint,
+    minSegments,
+    shared,
+    plotBeats: normalized.plotBeats,
+    characters: normalized.characters,
+    segments: normalized.segments,
+    workflowId,
+    origin: "external-chapter-script-h3",
+  });
+  return {
+    projectId: input.projectId,
+    documentId: input.documentId,
+    artifactId,
+    revisionId: source.sourceRevisionId,
+    sourceFingerprint: externalFingerprint,
     minSegments,
     plotBeats: normalized.plotBeats,
     cinematicHints: [...normalized.hints, ...computeCinematicHints(normalized.segments)],

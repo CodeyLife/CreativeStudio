@@ -31,6 +31,7 @@ import type {
   CreativeRunPolicy,
   CreativeWorkKind,
   NovelIntent,
+  SkillExecutionPoint,
 } from "../protocol";
 import { startNovelBootstrap } from "../application/bootstrap";
 import { provisionalTitle } from "../application/provisional-title";
@@ -38,10 +39,10 @@ import { parseStoryArcPlotOutline, validateStoryArcPlotOutline } from "../applic
 import { DEFAULT_ARTIFACT_LIST_LIMIT, DEFAULT_WORKFLOW_LIST_LIMIT } from "./tool-definitions";
 import { startStoryArcBatchPlanning, startStoryArcOrchestratedPlanning, startStoryArcPlanning, startStoryArcReview } from "../application/story-arc-workflow";
 import { parseCreativeBrief } from "../application/creative-brief";
-import { generateChapterScriptH3 } from "../application/chapter-script-h3";
-import { generateShortScriptH3 } from "../application/short-script-h3";
+import { generateChapterScriptH3, submitExternalChapterScriptH3 } from "../application/chapter-script-h3";
+import { generateShortScriptH3, submitExternalShortScriptH3 } from "../application/short-script-h3";
 import { ContentObjectStore } from "../object-store";
-import { createConfiguredSkillProvider } from "../skill-runtime";
+import { createConfiguredSkillProvider, resolveStageSkillBundle, renderSkillInstruction, SKILL_EXECUTION_POLICIES } from "../skill-runtime";
 import {
   createCreativeRun,
   executeCreativeCommand,
@@ -1273,6 +1274,181 @@ const novel_short_script_h3: ToolHandler = async (args, ctx) => {
   };
 };
 
+/**
+ * 读取指定执行点的已解析 Skill 指引文本（通用）。
+ *
+ * 设计依据：支持外部 MCP 接手短剧内容产出——先读 skill 拿到 h3-video-prompt
+ * 方法论，再自行产出模型形态 JSON 落库。校验 executionPoint 为合法执行点
+ * （SKILL_EXECUTION_POLICIES 键），解析并渲染该执行点的 skill 文本；同时返回
+ * availableSkills（含各 skill 的 executionPoints）供外部发现合法执行点。
+ */
+const novel_skill_get: ToolHandler = async (args, ctx) => {
+  const executionPoint = asString(args.executionPoint);
+  if (!executionPoint) throw new Error("executionPoint 必填且非空");
+  if (!(executionPoint in SKILL_EXECUTION_POLICIES)) {
+    const valid = Object.keys(SKILL_EXECUTION_POLICIES).join(" / ");
+    throw new Error(`executionPoint 非法：${executionPoint}；合法执行点见 availableSkills[].executionPoints，如 ${valid}`);
+  }
+  const projectId = asString(args.projectId) || undefined;
+  const provider = createConfiguredSkillProvider({ databaseList: (pid) => ctx.repository.listSkills(pid) });
+
+  // 发现：列出当前 provider 下所有可用 skill 及其执行点（即使目标点解析失败也返回，便于外部探索）。
+  let availableSkills: Array<{ skillId: string; version: string; executionPoints: string[] }> = [];
+  try {
+    const descriptors = await provider.list(projectId ?? "");
+    availableSkills = descriptors.map((descriptor) => ({
+      skillId: descriptor.skillId,
+      version: descriptor.version,
+      executionPoints: (descriptor.executionPoints ?? []).map(String),
+    }));
+  } catch {
+    // provider 源不可用时忽略发现，仅影响 availableSkills 完整性。
+  }
+
+  try {
+    const bundle = await resolveStageSkillBundle({
+      projectId: projectId ?? "",
+      provider,
+      executionPoint: executionPoint as SkillExecutionPoint,
+      preflightId: `skill-get:${executionPoint}`,
+    });
+    const skillText = renderSkillInstruction(bundle, executionPoint);
+    return {
+      executionPoint,
+      skillText,
+      resolvedSkills: bundle.skills.map((skill) => ({
+        skillId: skill.skillId,
+        version: skill.version,
+        priority: skill.priority,
+        executionPoints: (skill.executionPoints ?? []).map(String),
+      })),
+      resolution: bundle.resolution,
+      availableSkills,
+      nextAction: "将 skillText 作为外部 MCP 创作短剧脚本的方法论，按核心创意与时长参数产出模型形态 JSON，再用 novel_short_script_h3_submit / novel_chapter_script_h3_submit 落库",
+    };
+  } catch (error) {
+    return {
+      executionPoint,
+      skillText: "",
+      resolvedSkills: [],
+      availableSkills,
+      note: `该执行点暂无可用 skill：${(error as Error)?.message ?? String(error)}；可用执行点见 availableSkills[].executionPoints`,
+    };
+  }
+};
+
+/**
+ * 外部 MCP 接手短剧内容产出（核心创意路径）。
+ *
+ * 设计依据：与 novel_short_script_h3（系统内部生成）互为双轨。外部 MCP 自行产出
+ * 模型形态剧本 JSON 后提交，系统复用 normalizeChapterScriptOutput 零阻断组装 +
+ * 落库；短剧脚本是正文只读派生，不进正文质量门，故允许外部产出（mcp-orchestrator
+ * 外部编排「治理与产出解耦」原则在该派生产物上的放宽为可读）。
+ */
+const novel_short_script_h3_submit: ToolHandler = async (args, ctx) => {
+  const idea = asString(args.idea);
+  if (!idea) throw new Error("idea 必填且非空");
+  const payload = asRecord(args.payload);
+  if (!payload) throw new Error("payload 必填（外部 MCP 产出的模型形态剧本 JSON）");
+  if (!Array.isArray(payload.segments) || !payload.segments.length) {
+    throw new Error("payload.segments 必填且非空");
+  }
+  const projectId = asString(args.projectId) || undefined;
+  const targetDurationSecondsRaw = args.targetDurationSeconds;
+  const targetDurationSeconds = typeof targetDurationSecondsRaw === "number" && Number.isFinite(targetDurationSecondsRaw)
+    ? Math.round(targetDurationSecondsRaw)
+    : undefined;
+
+  const record = await submitExternalShortScriptH3(
+    {
+      projectId,
+      idea,
+      instruction: asString(args.instruction) || undefined,
+      ...(targetDurationSeconds !== undefined ? { targetDurationSeconds } : {}),
+      payload: { plotBeats: payload.plotBeats, characters: payload.characters, segments: payload.segments },
+    },
+    {
+      repository: ctx.repository,
+      objects: new ContentObjectStore(),
+    },
+  );
+
+  return {
+    projectId: record.projectId,
+    scriptId: record.scriptId,
+    sourceFingerprint: record.sourceFingerprint,
+    reused: record.reused ?? false,
+    origin: "external",
+    mode: "ref2va",
+    targetDurationSeconds: record.targetDurationSeconds,
+    plotBeats: record.plotBeats,
+    cinematicHints: record.cinematicHints,
+    characterBaselines: record.characters,
+    segments: record.segments.map((segment) => ({
+      index: segment.index,
+      title: segment.title,
+      synopsis: segment.synopsis,
+      durationSeconds: segment.durationSeconds,
+      promptText: segment.promptText,
+    })),
+    nextAction: "把各片段 promptText 直接送入 MiniMax H3；本产物由外部 MCP 产出（origin=external），存储于 short_scripts 独立表",
+  };
+};
+
+/**
+ * 外部 MCP 接手章节派生短剧内容产出。
+ *
+ * 设计依据：与 novel_chapter_script_h3（系统内部生成）互为双轨。门禁与内部一致
+ * （章节须为定稿），共享预设从仓储读取，使引用一致性校验对齐。
+ */
+const novel_chapter_script_h3_submit: ToolHandler = async (args, ctx) => {
+  const projectId = asString(args.projectId);
+  const documentId = asString(args.documentId);
+  if (!projectId || !documentId) throw new Error("projectId/documentId 必填且非空");
+  const payload = asRecord(args.payload);
+  if (!payload) throw new Error("payload 必填（外部 MCP 产出的模型形态剧本 JSON）");
+  if (!Array.isArray(payload.segments) || !payload.segments.length) {
+    throw new Error("payload.segments 必填且非空");
+  }
+  const sharedSubjectsText = await ctx.repository.getChapterScriptSubjectPreset(projectId);
+  const record = await submitExternalChapterScriptH3(
+    {
+      projectId,
+      documentId,
+      instruction: asString(args.instruction) || undefined,
+      payload: { plotBeats: payload.plotBeats, characters: payload.characters, segments: payload.segments },
+    },
+    {
+      repository: ctx.repository,
+      objects: new ContentObjectStore(),
+      sharedSubjectsText,
+    },
+  );
+
+  return {
+    projectId: record.projectId,
+    documentId: record.documentId,
+    artifactId: record.artifactId,
+    sourceFingerprint: record.sourceFingerprint,
+    reused: record.reused ?? false,
+    origin: "external",
+    mode: "ref2va",
+    minSegments: record.minSegments,
+    plotBeats: record.plotBeats,
+    cinematicHints: record.cinematicHints,
+    sharedSubjects: record.sharedSubjects,
+    characterBaselines: record.characters,
+    segments: record.segments.map((segment) => ({
+      index: segment.index,
+      title: segment.title,
+      synopsis: segment.synopsis,
+      durationSeconds: segment.durationSeconds,
+      promptText: segment.promptText,
+    })),
+    nextAction: "把各片段 promptText 送入 MiniMax H3；本产物由外部 MCP 产出（origin=external）",
+  };
+};
+
 // ===== Handler 注册表 =====
 
 export const TOOL_HANDLERS: Record<string, ToolHandler> = {
@@ -1316,6 +1492,11 @@ export const TOOL_HANDLERS: Record<string, ToolHandler> = {
   novel_story_arc_review,
   novel_story_arc_batch_start,
   novel_story_arc_orchestrate,
+
+  // 外部产出与 Skill 读取（3，v2 新增）
+  novel_skill_get,
+  novel_short_script_h3_submit,
+  novel_chapter_script_h3_submit,
 
   // 评估闭环（1）
   novel_closed_loop_run,

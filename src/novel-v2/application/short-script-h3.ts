@@ -88,9 +88,32 @@ export interface ShortScriptRecord {
  *      展示型创意按视觉展示模式组织节拍，不强行注入对抗事件；冲突导向剧作
  *      契约仅对剧情型创意生效——根因：实测「展示修仙界山河」创意被套进
  *      冲突模板，产出追兵/迎敌剧情）；
+ * v7 = 震撼强度契约（skill v1.5.0）——宏大/冲击/展示镜头必须执行强度层：
+ *      单镜主视觉焦点、动态张力（蓄力→爆发，禁全程匀速慢镜）、尺度对比句
+ *      （渺小锚点 vs 巨物）、光效反差（逆光剪影/强光柱/明暗爆发）、冲击时间感
+ *      （根因：v6 产物细节充分但生成画面仍平淡，震撼缺失源于镜头缺强度——
+ *      动态、尺度、光效、冲击四变量全弱，而非细节不足）。
+ * v8 = 画面设计层契约（skill v1.6.0，与章节剧本契约 v11 同源）——镜头四要素
+ *      扩为六要素，补上构图设计（主体位置 / 前景遮挡 / 引导线 / 层次分割 /
+ *      框中框 / 负空间）与色彩设计（每场主色 + 强调色、色彩随情绪与时空转场）；
+ *      新增反平庸默认态清单（裸中景 / 平光 / 中性色彩 / 匀速运镜，命中即重写）；
+ *      风格句升级为可复原的具体参照。
+ *      根因同章节 v11：v7 的四个强度变量全在事件层面（镜头里发生什么），
+ *      而"平平无奇"是画面层面问题（画框里怎么安排、色彩怎么设计），这一层
+ *      全库关键词命中为 0，且居中构图与无色彩设计正是视频模型默认出片态。
+ *      配套减负：代码侧删除与 skill 指引重复的类型判定段与剧作段（重复段挤占
+ *      注意力预算，长指引被模型做词汇层合规而非真正执行），只保留运行时事实。
  * v1 产物由迁移 050 带入新表，读取层零转换（payload 结构一致）。
+ * v9 = 画面层三处细化（skill v1.6.1，与章节剧本契约 v12 同源）——针对 v8 实测
+ *      仍偏"廉价震撼"的三类问题：① 天光改为受控明暗雕塑，禁止硬爆白 god-ray
+ *      （veiled through haze），去掉生硬刺目纯白刀光；② 动态张力须服务沉浸，
+ *      禁止无铺垫猛拽/急甩/瞬切（whiplash/snap），展示型奇观优先缓慢庄严连续
+ *      运动与优雅涌起；③ 宏大场景除尺度对比外，逼模型把建筑本身设计得崇高
+ *      （垂直拔升/无尽重复韵律/超验尺度/标志轮廓/表面密度/主导画框）。根因：
+ *      这三项在 v8 由契约明文主张（blinding god-ray、violent 猛冲、仅"小人对比"
+ *      交代尺度），模型照抄，故产物出现刺目天光、出戏快镜、建筑空旷。
  */
-export const SHORT_SCRIPT_CONTRACT_VERSION = "6";
+export const SHORT_SCRIPT_CONTRACT_VERSION = "9";
 
 /** 目标时长 clamp：超出上下限时收敛到边界而非拒绝（运营参数级输入）。 */
 export function clampShortScriptTargetSeconds(target: number | undefined): number {
@@ -155,25 +178,14 @@ export function buildShortScriptPrompt(input: {
         "- 抱头、颤抖、喘息等反应动作只能表达「有信息涌入」这一事件，不能替代信息内容本身；只写反应动作会被判定为呈现缺失。",
       ].join("\n"),
       `- 时长预算：目标时长 ${input.targetDurationSeconds} 秒；片段数须落在 ${input.minSegments}-${input.maxSegments} 个之间（每段 ${MIN_SEGMENT_SECONDS}-${MAX_SEGMENT_SECONDS}s），各片段 durationSeconds 之和须落在目标 ±${SHORT_SCRIPT_TOTAL_DURATION_TOLERANCE_SECONDS}s 容差内。片段时长禁止贴下限：宏大场面、战斗交锋与冲击性瞬间取区间上沿（约 12-15 秒）让画面充分展开；对话交锋与反应镜头也至少 10 秒，用镜头细节与氛围填充而非快切。`,
-      "描述体量：视频生成器只能依据文字复原画面，凡未写出的细节在成片中不存在。detailedDescription 每片段约 350-500 英文词，逐镜头写全四要素（景别角度/运镜/光线氛围/状态变化）与主体外观；summary 为点名主体与动作变化的完整句；retentionAnalysis 每行说明保留的具体内容；overallSoundscape 分层写底层环境声与间歇动作声。禁止概要化、清单化或以一词带过。",
+      "描述体量：视频生成器只能依据文字复原画面，凡未写出的细节在成片中不存在。detailedDescription 每片段约 350-500 英文词或等体量中文，逐镜头写全 skill 指引的镜头六要素（景别角度/构图设计/运镜/光线氛围/色彩设计/状态变化）与主体外观；summary、retentionAnalysis、overallSoundscape 的写法见 skill 指引。禁止概要化、清单化或以一词带过。",
     ].join("\n"),
-    [
-      "创意意图忠实性（先于剧作契约执行的类型判定）：",
-      "- 先判定创意类型：创意文本描述了人物对抗、危机、目标追求或事件冲突 → 剧情型；创意文本只描述场景、世界观、氛围或视觉奇观（如展示山河、建筑、飞行视角、自然现象），没有人物对抗与危机 → 展示型。",
-      "- 展示型创意按视觉展示模式组织节拍：以空间巡游（视角推移/升维/穿越）、规模递进（近景细节 → 中景场面 → 大全景奇观）、光影氛围变化为节拍，观众的情绪来自视觉震撼与沉浸，不来自冲突解决。",
-      "- 展示型创意禁止自行注入对抗事件：追击、打斗、追兵、敌人、危机、坠落遇险等剧情型元素不得出现，除非创意文本本身写明。此判定优先级高于下方剧作契约。",
-      "- 剧情型创意才执行下方冲突导向契约；展示型创意的节奏感来自视角与规模的递进变化（类似预告片的奇观递进），出口落在最强视觉冲击上而非冲突钩子。",
-    ].join("\n"),
-    [
-      "剧集剧作契约（提示层，仅剧情型创意执行；展示型创意按上方视觉展示模式替代）：",
-      "- 开场即冲突：第 1 个片段的第一个镜头落在冲突现场或其临界点，开场 3 秒内呈现钩子形态之一（直接冲突、强悬念、极致反差、身份落差、倒计时压力）；创意的核心冲突、对立双方、主角即时目标须在前 10 秒内可见或可闻。铺垫性开场（日常流程、纯环境交代先行）视为失败。",
-      "- 情绪节点节奏：每 2-4 个片段落一个情绪节点（对话冲突、动作冲突或信息揭示），前 1/3 的片段内完成第一次小反转；连续 3 个片段无节点视为节奏断裂。",
-      "- 出口即钩子：每个片段的出口状态抛出问题或抬高压（未揭的身份、被推翻的假设、逼近的危险、两难抉择、逼近的期限）；单条短剧也须在情绪闭环完成后的最强钩子瞬间收尾——观众应带着未解的钩子或余震离开，不在平淡余韵处结束。",
-      "- 台词密度：每句台词至少承担身份/关系确认、冲突引爆、后果陈述之一，纯填充性寒暄压缩掉；台词口语化、短句、可念出口；关键情绪节拍静音可读（表情、动作或屏幕可读文字）。",
-      "- 反转须有伏笔：每个反转必须对应前文片段已呈现过的伏笔（plant → overlook → detonate）；伏笔应经插入镜头、台词或可读细节在早期片段中可见。",
-      "- 人物经济：出场人物围绕核心三角（主角、对手、助力者）加少量配角组织；人物标签靠稳定的视觉锚点（标志道具、服饰、特征）跨片段复用同一外形。",
-    ].join("\n"),
-    "边界：忠实于核心创意给定的设定、冲突与人物关系，可以合理补全细节，不得新增与创意冲突的设定、人物或结局走向；无对白来源约束时台词自拟，但语义须与节拍承载的信息一致。",
+    // 创意意图忠实性（剧情型 / 展示型判定）与剧集剧作层（开场即冲突 / 情绪闭环 / 出口即
+    // 钩子 / 台词密度 / 反转须有伏笔 / 人物经济）均由运行时 skill（h3-video-prompt，
+    // priority=required）注入，此处不再重复。与章节链路同因：重复段此前挤占注意力预算，
+    // 长指引被模型做词汇层合规（换大词、加 violent）而非真正执行；去重后新增的画面
+    // 设计层才有预算落地。代码侧仅保留 skill 不掌握的运行时事实（时长预算、节拍映射、边界）。
+    "边界：忠实于核心创意给定的设定、冲突与人物关系，可以合理补全细节，不得新增与创意冲突的设定、人物或结局走向；创意点名的核心意象（标志性移动/驾驭方式、点名景观、标志性场面）属于不得替换范畴——专有概念必须在描述中展开为其文化语境的标准物理呈现（姿态、接触点、构图与地理形态），不得用字面直译、近似动作或模板化场景顶替；无对白来源约束时台词自拟，但语义须与节拍承载的信息一致。",
     input.instruction?.trim() ? `作者指令（优先遵守其与格式规范相容的部分）：${input.instruction.trim()}` : "",
   ].filter(Boolean).join("\n\n");
 }
@@ -226,11 +238,13 @@ async function persistShortScript(repository: NovelPostgresRepository, objects: 
   characters: ChapterScriptCharacterSheet[];
   segments: AssembledChapterScriptSegment[];
   workflowId: string;
+  /** 产出来源标记：系统内部生成=short-script-h3，外部 MCP 接手产出=external-short-script-h3。 */
+  origin?: string;
 }): Promise<string> {
   const scriptText = context.segments.map((segment) => `${segment.index}. ${segment.title}\n${segment.promptText}`).join("\n\n---\n\n");
   const object = await objects.putText(scriptText);
   const payload: Record<string, unknown> = {
-    origin: "short-script-h3",
+    origin: context.origin ?? "short-script-h3",
     mode: "ref2va",
     kind: SHORT_SCRIPT_KIND,
     idea: context.idea,
@@ -283,19 +297,6 @@ export async function generateShortScriptH3(input: {
   const minSegments = deriveShortScriptMinSegments(targetDurationSeconds);
   const maxSegments = deriveShortScriptMaxSegments(targetDurationSeconds);
 
-  // 幂等键绑定创意输入全量（作用域 + idea + instruction + target）+ 契约版本：
-  // 同输入重放复用既有产物；改创意、切换关联作用域或契约升级后自然失效重生成。
-  // 作用域占位 "independent" 隔离独立/关联两种产物（同一创意不跨作用域误复用）。
-  const sourceFingerprint = createHash("sha256").update(
-    `${projectId ?? "independent"}:${idea}:${input.instruction?.trim() ?? ""}:${targetDurationSeconds}:${SHORT_SCRIPT_CONTRACT_VERSION}`,
-  ).digest("hex");
-  const existing = await deps.repository.findShortScriptByFingerprint(sourceFingerprint);
-  if (existing) {
-    const stored = storedShortScriptToRecord(existing);
-    if (stored) return { ...stored, reused: true };
-  }
-
-  const projectTitle = await loadProjectTitle(deps.repository, projectId);
   const workflowId = `short-script:${randomUUID()}`;
   // skill 解析与 promptContext 对 projectId 无实质依赖（listSkills 不按项目过滤），
   // 独立模式传空串占位。
@@ -307,6 +308,24 @@ export async function generateShortScriptH3(input: {
     preflightId: workflowId,
   });
   const skillSections = buildSkillContextSections(skillBundle, SHORT_SCRIPT_EXECUTION_POINT);
+
+  // 幂等键绑定创意输入全量（作用域 + idea + instruction + target）+ 契约版本 + skill 版本：
+  // 同输入重放复用既有产物；改创意、切换关联作用域、契约升级或 skill 升级后自然失效重生成。
+  // skill 版本纳入幂等键的根因：指引（skill 内容）是产物内容的直接决定因素，纯文本修订
+  // （如 v1.5.x 一镜到底契约）虽不改结构契约，但会改变模型生成行为；不纳入则改指引后
+  // 同输入永远复用旧产物，无法验证新效果（实测盲点：v1.5.2→v1.5.3 后同创意被幂等挡住）。
+  // 作用域占位 "independent" 隔离独立/关联两种产物（同一创意不跨作用域误复用）。
+  const skillVersionPart = skillBundle.skills.map((skill) => `${skill.skillId}@${skill.version}`).sort().join("+");
+  const sourceFingerprint = createHash("sha256").update(
+    `${projectId ?? "independent"}:${idea}:${input.instruction?.trim() ?? ""}:${targetDurationSeconds}:${SHORT_SCRIPT_CONTRACT_VERSION}:${skillVersionPart}`,
+  ).digest("hex");
+  const existing = await deps.repository.findShortScriptByFingerprint(sourceFingerprint);
+  if (existing) {
+    const stored = storedShortScriptToRecord(existing);
+    if (stored) return { ...stored, reused: true };
+  }
+
+  const projectTitle = await loadProjectTitle(deps.repository, projectId);
   const schema = buildShortScriptSchema(targetDurationSeconds);
   const promptPackage = compileStageContext({
     projectId: skillScopeId,
@@ -377,6 +396,99 @@ export async function generateShortScriptH3(input: {
     projectId,
     scriptId,
     sourceFingerprint,
+    idea,
+    instruction: input.instruction?.trim() || undefined,
+    targetDurationSeconds,
+    plotBeats: normalized.plotBeats,
+    cinematicHints: [...hints, ...computeCinematicHints(normalized.segments)],
+    characters: normalized.characters,
+    segments: normalized.segments,
+  };
+}
+
+/**
+ * 外部 MCP 接手短剧内容产出：接收外部已生成的「模型形态」剧本 JSON
+ * （plotBeats / characters / segments 六段字段），系统负责零阻断组装 promptText、
+ * 结构观察、契约版本与落库。与 generateShortScriptH3（系统内部模型生成）互为双轨。
+ *
+ * 设计依据：mcp-orchestrator.md 外部编排「治理与产出解耦」原则——短剧脚本是正文
+ * 的只读派生物（不进正文质量门），故允许外部 MCP 直接产出内容；系统仍掌握
+ * 组装、结构观察、契约版本与持久化（来源标记 origin=external-short-script-h3），
+ * 不把产出权完全外溢。
+ *
+ * 幂等：以外部内容哈希（idea+instruction+target+契约版本+归一化内容）为指纹，
+ * 同内容重放复用既有产物（前缀 ext: 与系统内部输入指纹区分，避免跨轨误复用）。
+ *
+ * 入参 payload 只要求 segments 非空（零阻断契约：缺字段进 hints 不阻断）；
+ * 外部 MCP 应先经 novel_skill_get 读取 h3-video-prompt 方法论再产出。
+ */
+export async function submitExternalShortScriptH3(input: {
+  /** 可选关联作品（衍生短剧）；缺省为独立短剧。 */
+  projectId?: string;
+  idea: string;
+  instruction?: string;
+  targetDurationSeconds?: number;
+  /** 外部模型产出的剧本 JSON：{ plotBeats?, characters?, segments }。 */
+  payload: { plotBeats?: unknown; characters?: unknown; segments?: unknown };
+}, deps: {
+  repository: NovelPostgresRepository;
+  objects: ObjectStoreAdapter;
+}): Promise<ShortScriptRecord> {
+  const idea = input.idea?.trim() ?? "";
+  if (idea.length < MIN_IDEA_LENGTH) {
+    throw new ShortScriptInputError(400, `核心创意过短：至少 ${MIN_IDEA_LENGTH} 个字符，须写清谁、何处、什么冲突`);
+  }
+  const projectId = input.projectId?.trim() || undefined;
+  const targetDurationSeconds = clampShortScriptTargetSeconds(input.targetDurationSeconds);
+  const minSegments = deriveShortScriptMinSegments(targetDurationSeconds);
+
+  const rawSegments = Array.isArray(input.payload.segments) ? input.payload.segments : [];
+  if (!rawSegments.length) {
+    throw new ShortScriptInputError(400, "payload.segments 必填且非空（外部 MCP 产出的模型形态片段数组）");
+  }
+
+  // 复用共享零阻断组装：把外部模型形态 JSON 归一化为可落库片段。
+  const normalized = normalizeChapterScriptOutput(input.payload, { minSegments, shared: { lines: [], maxLabel: 0 } });
+  const hints = [...normalized.hints];
+  if (normalized.segments.length > deriveShortScriptMaxSegments(targetDurationSeconds)) {
+    hints.push(`- 片段数 ${normalized.segments.length} 超过目标时长预算上限 ${deriveShortScriptMaxSegments(targetDurationSeconds)}（每段至少 ${MIN_SEGMENT_SECONDS}s）；供人工复核`);
+  }
+  const totalIssue = observeShortScriptTotalDuration(normalized.segments, targetDurationSeconds);
+  if (totalIssue) hints.push(`- ${totalIssue}`);
+
+  const workflowId = `short-script-external:${randomUUID()}`;
+  // 内容指纹：外部产出以内容本身为幂等依据（与系统内部输入指纹区分）。
+  const contentFingerprint = createHash("sha256").update(
+    `${projectId ?? "independent"}:${idea}:${input.instruction?.trim() ?? ""}:${targetDurationSeconds}:${SHORT_SCRIPT_CONTRACT_VERSION}:`
+      + JSON.stringify({
+        pb: normalized.plotBeats,
+        ch: normalized.characters,
+        sg: normalized.segments.map((segment) => ({ ...segment })),
+      }),
+  ).digest("hex");
+  const externalFingerprint = `ext:${contentFingerprint}`;
+  const existing = await deps.repository.findShortScriptByFingerprint(externalFingerprint);
+  if (existing) {
+    const stored = storedShortScriptToRecord(existing);
+    if (stored) return { ...stored, reused: true };
+  }
+
+  const scriptId = await persistShortScript(deps.repository, deps.objects, {
+    projectId,
+    idea,
+    instruction: input.instruction?.trim() || undefined,
+    targetDurationSeconds,
+    sourceFingerprint: externalFingerprint,
+    plotBeats: normalized.plotBeats,
+    characters: normalized.characters,
+    segments: normalized.segments,
+    workflowId,
+    origin: "external-short-script-h3",
+  });
+  return {
+    projectId,
+    scriptId,
+    sourceFingerprint: externalFingerprint,
     idea,
     instruction: input.instruction?.trim() || undefined,
     targetDurationSeconds,

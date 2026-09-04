@@ -4,6 +4,10 @@
  * 契约：每条片段提示词自包含六段（subject_definitions → non_diegetic_music）；
  * 顶层 plotBeats 穷举剧情节拍，segments 用 beatIds 引用；
  * v5 增剧集剧作层提示契约（开场即冲突/情绪节点节奏/出口即钩子/台词密度/伏笔链/人物经济）；
+ * v11 上述剧作层与镜头层契约迁出代码侧、改由运行时 skill（h3-video-prompt）承载
+ *     （根因：与 skill 指引重复 27%，重复段挤占注意力预算致长指引被词汇层合规），
+ *     并新增画面设计层（构图设计/色彩设计/反平庸默认态）；代码侧只保留运行时事实，
+ *     测试改为断言"契约不在代码侧 + 契约仍在 skill 侧"的双向守护。
  * 零阻断契约（2026-08-31，用户指令：产物不做任何校验，直接显示）：结构观察
  * （标签/时序/标记/时长/节拍覆盖/呈现手段）全部只进 hints，normalize 仅在
  * 完全无可展示片段时失败；时长非法回退中点、越界夹回界内。
@@ -11,13 +15,17 @@
  * 校验逻辑与断言全部题材无关，不构成 case-specific 产品契约（泛化优先约束针对
  * 规则与规则文本，不禁止测试样本携带题材）。
  */
-import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
+import { describe, expect, it, vi } from "vitest";
+import type { Artifact } from "../protocol";
+import { NovelPostgresRepository } from "../postgres-repository";
 import {
   assembleSegmentPromptText,
   buildChapterScriptCharacterDigests,
   buildChapterScriptPrompt,
   buildSharedSubjectLibraryText,
   CHAPTER_SCRIPT_H3_SCHEMA,
+  CHAPTER_SCRIPT_ARTIFACT_KIND,
   computeCinematicHints,
   deriveMinSegments,
   MAX_SEGMENTS_PER_CHAPTER,
@@ -28,6 +36,7 @@ import {
   parseSharedSubjectPreset,
   SCRIPT_CONTRACT_VERSION,
   validateChapterScriptSegment,
+  submitExternalChapterScriptH3,
 } from "../application/chapter-script-h3";
 
 const COURIER_BASELINE = "A middle-aged courier with short black hair, stubble, a faded grey uniform jacket and a scuffed delivery satchel.";
@@ -373,7 +382,9 @@ describe("normalizeChapterScriptOutput", () => {
 });
 
 describe("影视镜头语言提示（cinematicHints，提示级）", () => {
-  it("flags shots missing camera motion or framing vocabulary without blocking", () => {
+  it("no longer flags shots missing camera motion or framing vocabulary", () => {
+    // 描述语言放开中文后（v1.4.2）英文术语词表无法覆盖中文镜头描述，误报率高，
+    // 该检测已移除；无运镜/景别词的镜头不应产生"缺少镜头四要素"提示。
     const flat = {
       ...courierSegment(),
       detailedDescription: [
@@ -383,12 +394,23 @@ describe("影视镜头语言提示（cinematicHints，提示级）", () => {
       ].join("\n"),
     };
     const hints = computeCinematicHints([{ ...courierSegment(), index: 1, promptText: "" }, { ...flat, index: 2, promptText: "" }]);
-    expect(hints.some((hint) => hint.startsWith("片段 1"))).toBe(false);
-    expect(hints.filter((hint) => hint.startsWith("片段 2")).length).toBe(2);
-    expect(hints[0]).toContain("镜头四要素");
+    expect(hints.some((hint) => hint.includes("缺少运镜") || hint.includes("镜头四要素"))).toBe(false);
   });
 
-  it("passes shots that carry camera motion or framing vocabulary", () => {
+  it("keeps shot-timing observations (开场镜头携带时间戳)", () => {
+    const badTiming = {
+      ...courierSegment(),
+      detailedDescription: [
+        "Live-action cinematic look.",
+        "[Shot 1] At 00:00.500, the courier stands in the alley under lamplight.",
+        "[Shot 2] At 00:02.000, the shot cuts to <Subject 1> staring at his calloused palms.",
+      ].join("\n"),
+    };
+    const hints = computeCinematicHints([{ ...badTiming, index: 1, promptText: "" }]);
+    expect(hints.some((hint) => hint.includes("[Shot 1] 携带"))).toBe(true);
+  });
+
+  it("passes shots with clean timing", () => {
     const cinematic = {
       ...courierSegment(),
       detailedDescription: courierSectionFields().detailedDescription,
@@ -432,7 +454,7 @@ describe("buildChapterScriptCharacterDigests / buildChapterScriptPrompt", () => 
     expect(prompt.endsWith("陈默蹲下检查拉链……")).toBe(true);
   });
 
-  it("embeds the v5 episode dramaturgy contract (hook opening, cadence, cut-point exits, dialogue density, plant chain, character economy)", () => {
+  it("hands the episode dramaturgy contract to the runtime skill instead of duplicating it in the prompt (v11 dedup)", () => {
     const prompt = buildChapterScriptPrompt({
       projectTitle: "长夜货运",
       chapterTitle: "空袋",
@@ -442,17 +464,37 @@ describe("buildChapterScriptCharacterDigests / buildChapterScriptPrompt", () => 
       minSegments: 6,
       shared: { lines: [], maxLabel: 0 },
     });
-    expect(prompt).toContain("剧集剧作契约");
-    expect(prompt).toContain("开场即冲突");
-    expect(prompt).toContain("铺垫性开场");
-    expect(prompt).toContain("情绪节点节奏");
-    expect(prompt).toContain("出口即钩子");
-    expect(prompt).toContain("冲击瞬间切卡");
-    expect(prompt).toContain("台词密度");
-    expect(prompt).toContain("反转须有伏笔");
-    expect(prompt).toContain("人物经济");
-    // v6=描述体量契约；本用例锚定剧集剧作层引入后契约不再回退（v5 起 >= 5）
-    expect(Number(SCRIPT_CONTRACT_VERSION)).toBeGreaterThanOrEqual(5);
+    // v11 去重：剧作层与镜头层契约由运行时 skill（h3-video-prompt，priority=required）注入，
+    // 代码侧不再重复——重复段挤占注意力预算，长指引被模型做词汇层合规而非真正执行。
+    expect(prompt).not.toContain("剧集剧作契约");
+    expect(prompt).not.toContain("开场即冲突");
+    expect(prompt).not.toContain("人物经济");
+    // 代码侧仍必须承载 skill 不掌握的运行时事实：节拍映射、呈现手段、时长区间、边界。
+    expect(prompt).toContain("剧情覆盖契约");
+    expect(prompt).toContain("不能替代信息内容本身");
+    expect(prompt).toContain(`片段时长统一落在 ${MIN_SEGMENT_SECONDS}-${MAX_SEGMENT_SECONDS}s 区间`);
+    expect(prompt).toContain("每个片段用 beatIds 声明它承载的节拍");
+    expect(Number(SCRIPT_CONTRACT_VERSION)).toBeGreaterThanOrEqual(11);
+  });
+
+  it("keeps the dramaturgy and picture-design contracts in the runtime skill (guard against silent loss after dedup)", () => {
+    // 守护测试：契约迁出代码侧后，若 skill 侧被误删或改坏，代码侧测试不会再发现。
+    // 此处直接锚定 workspace skill 源文件，保证两端不同步时测试失败而非静默降级。
+    const raw = readFileSync(new URL("../../../skills/novel-v2/h3-video-prompt.yaml", import.meta.url), "utf8");
+    const chapter = raw.split("short.script: |")[0].split("chapter.script: |")[1] ?? "";
+    for (const token of [
+      "开场即冲突",
+      "情绪节点节奏",
+      "出口即钩子",
+      "台词密度",
+      "反转须有伏笔",
+      "人物经济",
+      "构图设计",
+      "色彩设计",
+      "反平庸默认态",
+    ]) {
+      expect(chapter, `skill 契约缺失：${token}`).toContain(token);
+    }
   });
 
   it("injects the user-preset shared definitions with reuse rules when present", () => {
@@ -470,5 +512,89 @@ describe("buildChapterScriptCharacterDigests / buildChapterScriptPrompt", () => 
     expect(prompt).toContain("以上 <Subject 1>~<Subject 2> 已由作者预设定义");
     expect(prompt).toContain("编号从 <Subject 3> 起连续递增");
     expect(prompt).toContain("subjectDefinitions 返回空字符串");
+  });
+});
+
+describe("submitExternalChapterScriptH3（外部 MCP 接手产出）", () => {
+  const submitObjects = {
+    getText: vi.fn(async () => "楚衡头痛惊醒，确认身处陌生木屋。记忆碎片涌入，得知杂役弟子身份与欠供守夜死因。"),
+    putText: vi.fn(async () => ({ key: "objects/test-chapter-script" })),
+  };
+
+  function mockChapterRepository(options: { existingArtifactId?: string; status?: string; storedArtifact?: unknown } = {}) {
+    const repository = Object.create(NovelPostgresRepository.prototype) as NovelPostgresRepository;
+    const finalDoc = {
+      title: "测试章节",
+      status: options.status ?? "final",
+      narrativeOrder: 1,
+      revision: 1,
+      sourceRevisionId: "rev-1",
+      artifactId: "art-1",
+      contentHash: "hash-1",
+      objectKey: "objects/chapter",
+    };
+    const getFinalDocumentContentRef = vi.fn(async () => finalDoc);
+    const getChapterScriptSubjectPreset = vi.fn(async () => "");
+    const poolQuery = vi.fn(async () => ({
+      rows: options.existingArtifactId ? [{ id: options.existingArtifactId }] : [],
+      rowCount: options.existingArtifactId ? 1 : 0,
+    }));
+    const recordArtifact = vi.fn(async (_artifact: Artifact) => {});
+    const getArtifact = vi.fn(async () => options.storedArtifact ?? {
+      id: "art-stored",
+      kind: CHAPTER_SCRIPT_ARTIFACT_KIND,
+      projectId: "project-1",
+      structuredData: { ...validScript(), documentId: "doc-1", sourceFingerprint: "ext-stored", contractVersion: SCRIPT_CONTRACT_VERSION },
+    });
+    Object.defineProperty(repository, "getFinalDocumentContentRef", { value: getFinalDocumentContentRef });
+    Object.defineProperty(repository, "getChapterScriptSubjectPreset", { value: getChapterScriptSubjectPreset });
+    Object.defineProperty(repository, "pool", { value: { query: poolQuery } });
+    Object.defineProperty(repository, "recordArtifact", { value: recordArtifact });
+    Object.defineProperty(repository, "getArtifact", { value: getArtifact });
+    return { repository, getFinalDocumentContentRef, getChapterScriptSubjectPreset, poolQuery, recordArtifact, getArtifact };
+  }
+
+  it("rejects a non-final chapter with a 409-style error", async () => {
+    const { repository } = mockChapterRepository({ status: "drafting" });
+    await expect(submitExternalChapterScriptH3(
+      { projectId: "project-1", documentId: "doc-1", payload: validScript() },
+      { repository, objects: submitObjects as never },
+    )).rejects.toThrow(/只能为已有正式 revision 的定稿章节/);
+  });
+
+  it("rejects payload without segments", async () => {
+    const { repository } = mockChapterRepository();
+    await expect(submitExternalChapterScriptH3(
+      { projectId: "project-1", documentId: "doc-1", payload: { plotBeats: [], characters: [] } },
+      { repository, objects: submitObjects as never },
+    )).rejects.toThrow(/payload\.segments 必填且非空/);
+  });
+
+  it("assembles external chapter script and marks origin=external-chapter-script-h3", async () => {
+    const { repository, recordArtifact } = mockChapterRepository();
+    const record = await submitExternalChapterScriptH3(
+      { projectId: "project-1", documentId: "doc-1", payload: validScript() },
+      { repository, objects: submitObjects as never },
+    );
+    expect(record.reused).toBeUndefined();
+    expect(record.artifactId).toEqual(expect.any(String));
+    expect(record.segments).toHaveLength(2);
+    expect(record.segments[0].promptText).toContain("subject_definitions:");
+    expect(recordArtifact).toHaveBeenCalledTimes(1);
+    const stored = recordArtifact.mock.calls[0][0] as unknown as Artifact;
+    expect(stored.kind).toBe(CHAPTER_SCRIPT_ARTIFACT_KIND);
+    expect((stored.structuredData as Record<string, unknown>).origin).toBe("external-chapter-script-h3");
+    expect((stored.structuredData as Record<string, unknown>).sourceFingerprint).toMatch(/^ext:/);
+  });
+
+  it("reuses identical external content (ext: fingerprint) without re-recording", async () => {
+    const { repository, recordArtifact } = mockChapterRepository({ existingArtifactId: "art-stored" });
+    const record = await submitExternalChapterScriptH3(
+      { projectId: "project-1", documentId: "doc-1", payload: validScript() },
+      { repository, objects: submitObjects as never },
+    );
+    expect(record.reused).toBe(true);
+    expect(record.artifactId).toBe("art-stored");
+    expect(recordArtifact).not.toHaveBeenCalled();
   });
 });
