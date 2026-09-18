@@ -77,11 +77,14 @@ novel_story_arc_orchestrate(projectId, plotOutline, reviewPolicy, authorIntent?)
     development[]?, resolution?, exitState?,
     threadResponsibilities[]?, expectedChapterCount?, phases[]?,
     chapterHints[]?, plotNotes?   # 自由剧情编排说明
+    # threadResponsibilities 条目 = { threadRef, responsibility, nextAdvance, foreshadowingRefs[]? }
   }
   authorIntent? = 作者整体意图说明（并入规划上下文，权威低于已定稿事实）
 ```
 
 外部大模型（或用户）提供**剧情编排**（本弧讲什么、核心冲突、发展阶梯、终点、责任线、逐章提示），系统负责**完善**：把编排对照冻结事实与叙事状态账本做事实梳理，补全场景因果、章节状态转换、连续性约束与章节蓝图，再走正式弧审核 → 修订闭环。编排是设计意图基线，权威低于已定稿事实与作者边界；编排与事实冲突时以事实为准，编排未覆盖的部分由规划器按正式契约生成。外部编排会作为 section 注入规划/审核/修订 prompt，并写入蓝图 artifact 的 provenance。
+
+`threadResponsibilities[].foreshadowingRefs` 是**伏笔归属声明**（本条线本弧承担哪几条伏笔，取值用开放伏笔的 id 或登记名原文）：系统据此写 `foreshadowing.thread_id`，让到期账与静默账可按线追责。约束在提交边界生效——认领必须是弧级 `foreshadowingRefs` 账内的引用，账外认领按 blocking 回流重生成（与未解析引用同一哲学：不静默丢弃、不影子新建）；一条伏笔被多线同时认领时不猜承担者，留痕于审计 `story-arc.references-normalized` 的 `threadBindingAmbiguous`。字段可选，旧编排与旧蓝图零回归。
 
 ### 阶段 2 正文生成与审核闭环
 

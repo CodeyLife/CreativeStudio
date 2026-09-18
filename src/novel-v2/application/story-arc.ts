@@ -12,6 +12,13 @@ export interface StoryArcThreadResponsibility {
   threadRef: string;
   responsibility: string;
   nextAdvance: string;
+  /**
+   * 本条线在本弧承担的伏笔（**只能取弧级 foreshadowingRefs 中已出现的引用**，不新增账目）。
+   * 伏笔账的 thread_id 归属以此为唯一证据来源：弧级 foreshadowingRefs 是扁平账，实测一条弧
+   * 并行 4-7 条线，从"同弧共现"推断具体归属等于伪造关联（旧启发式因此恒不命中，
+   * 见 docs/novel-v2/product-audit-20260910.md §五 2026-09-19 复测）。
+   */
+  foreshadowingRefs?: string[];
 }
 
 /**
@@ -68,7 +75,12 @@ export function parseStoryArcPlotOutline(value: unknown): StoryArcPlotOutline {
       if (!threadRef || !responsibility || !nextAdvance) {
         throw new Error(`plotOutline.threadResponsibilities 第 ${index + 1} 项必须同时包含非空的 threadRef/responsibility/nextAdvance`);
       }
-      return { threadRef, responsibility, nextAdvance };
+      const rawThreadForeshadowing = item.foreshadowingRefs;
+      if (rawThreadForeshadowing !== undefined && (!Array.isArray(rawThreadForeshadowing) || rawThreadForeshadowing.some((ref) => typeof ref !== "string" || !ref.trim()))) {
+        throw new Error(`plotOutline.threadResponsibilities 第 ${index + 1} 项的 foreshadowingRefs 必须是非空字符串数组（本条线承担的伏笔引用）`);
+      }
+      const threadForeshadowingRefs = strings(rawThreadForeshadowing).map((ref) => ref.trim());
+      return { threadRef, responsibility, nextAdvance, ...(threadForeshadowingRefs.length ? { foreshadowingRefs: threadForeshadowingRefs } : {}) };
     });
   }
 
@@ -589,7 +601,10 @@ function parseThreadResponsibilities(value: unknown): StoryArcThreadResponsibili
     const threadRef = typeof item.threadRef === "string" ? item.threadRef.trim() : "";
     const responsibility = typeof item.responsibility === "string" ? item.responsibility.trim() : "";
     const nextAdvance = typeof item.nextAdvance === "string" ? item.nextAdvance.trim() : "";
-    return threadRef && responsibility && nextAdvance ? [{ threadRef, responsibility, nextAdvance }] : [];
+    const foreshadowingRefs = strings(item.foreshadowingRefs).map((ref) => ref.trim()).filter(Boolean);
+    return threadRef && responsibility && nextAdvance
+      ? [{ threadRef, responsibility, nextAdvance, ...(foreshadowingRefs.length ? { foreshadowingRefs } : {}) }]
+      : [];
   });
 }
 

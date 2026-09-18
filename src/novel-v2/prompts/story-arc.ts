@@ -34,7 +34,12 @@ const storyArcPlanSchema = {
     // PL-2 修复①（引用字段形态门）：形如 `kind:token` 的 id 后不得拖尾其他文本——
     // 历史上 "<threadId> <slug>" 复合串被逐轮复制放大成影子对象。中文登记名（无冒号
     // 前缀）不受影响；确需新建用显式 new:<名称>（new: 前缀后是名称不是 id，形态合法）。
-    threadResponsibilities: { type: "array", items: { type: "object", additionalProperties: false, required: ["threadRef", "responsibility", "nextAdvance"], properties: { threadRef: { type: "string", minLength: 1, pattern: "^(?!\\S*:[\\w.-]+\\s)" }, responsibility: { type: "string", minLength: 1 }, nextAdvance: { type: "string", minLength: 1 } } } },
+    // 线程级伏笔认领（PL-5④ 判据收口，2026-09-19）：thread_id 是单值列，归属只能是声明；
+    // 弧级 foreshadowingRefs 是扁平账而一条弧实测并行 4-7 条线，共现推断恒不可判定。
+    // 该字段进 required 是原生结构化门的硬约束（assertNativeJsonSchema 要求对象
+    // properties 全部出现在 required），"无人承担"以空数组表达；解析面仍按可选处理，
+    // 旧弧与旧载荷零回归。
+    threadResponsibilities: { type: "array", items: { type: "object", additionalProperties: false, required: ["threadRef", "responsibility", "nextAdvance", "foreshadowingRefs"], properties: { threadRef: { type: "string", minLength: 1, pattern: "^(?!\\S*:[\\w.-]+\\s)" }, responsibility: { type: "string", minLength: 1 }, nextAdvance: { type: "string", minLength: 1 }, foreshadowingRefs: { type: "array", items: { type: "string", pattern: "^(?!\\S*:[\\w.-]+\\s)" }, description: "本条线在本弧承担的伏笔引用，只能取 arc.foreshadowingRefs 中已出现的值；本条线不承担伏笔时给空数组" } } } },
     foreshadowingRefs: { type: "array", items: { type: "string", pattern: "^(?!\\S*:[\\w.-]+\\s)" } },
     expectedChapterCount: { type: "integer", minimum: 1, maximum: MAX_EXPECTED_CHAPTER_COUNT },
     // PL-6：阶段必须显式绑定弧内章节序号（1-based，覆盖本弧全部计划章节、互不重叠）——
@@ -181,7 +186,7 @@ export function renderStoryArcPlotOutline(outline: StoryArcPlotOutline): string 
     outline.development?.length ? `发展阶梯：${outline.development.map((item, index) => `${index + 1}. ${item}`).join("；")}` : "",
     outline.resolution ? `解决：${outline.resolution}` : "",
     outline.exitState ? `退出状态：${outline.exitState}` : "",
-    outline.threadResponsibilities?.length ? `编排责任线：${outline.threadResponsibilities.map((item) => `${item.threadRef}：${item.responsibility}；下一次推进=${item.nextAdvance}`).join("\n")}` : "",
+    outline.threadResponsibilities?.length ? `编排责任线：${outline.threadResponsibilities.map((item) => `${item.threadRef}：${item.responsibility}；下一次推进=${item.nextAdvance}${item.foreshadowingRefs?.length ? `；本弧承担伏笔=${item.foreshadowingRefs.join("、")}` : ""}`).join("\n")}` : "",
     outline.expectedChapterCount ? `期望章节数：${outline.expectedChapterCount}` : "",
     outline.phases?.length ? `阶段：${outline.phases.map((item) => `${item.title}（${item.objective}）`).join("；")}` : "",
     outline.chapterHints?.length ? `逐章提示：${outline.chapterHints.map((item, index) => `第${index + 1}章：${item}`).join("\n")}` : "",
@@ -393,6 +398,7 @@ export function buildStoryArcPrompt(input: StoryArcPromptInput): string {
     "先写清故事弧入口状态、主要欲望/压力、关键选择、代价、退出状态和新问题；每个阶段都要说明它改变了什么人物选择、关系状态、信息分布、资源条件或读者期待。",
     "每个阶段（phase）用 chapterOrdinals 显式列出它覆盖的弧内章节序号（1-based，从 1 开始连续覆盖到 expectedChapterCount，阶段之间不重叠、不遗漏）：系统按这份绑定呈现章节所属阶段，不做任何等分推算。chapterOrdinals 只填弧内序号、绝不填全书流水章号——弧第一章=1，即使全书已连续八十多章也不例外。",
     "主线、支线、人物线、关系线和世界压力线要直接在 threadResponsibilities 中标明本弧责任、交汇/退出条件和未回收承诺，并写清下一推进条件。若某条线本弧暂缓，写清可验证的保持/观察责任和触发条件；没有剧情线时数组为空。不为了填满结构而制造无依据事件，也不提前消费后续答案。",
+    "伏笔归属写在线上：本弧 foreshadowingRefs 里的每条伏笔，把它的引用同时填进实际承担它的那条线的 threadResponsibilities[].foreshadowingRefs（取值必须是弧级 foreshadowingRefs 中已出现的那个值，不能新增账目）；一条伏笔只能由一条线承担，本条线不承担伏笔时该数组给空，暂无承担者的伏笔交作者分流，不要为清空而摊派。",
     REFERENCE_FIELD_CONTRACT,
     "上下文优先级：已定稿事实、叙事状态账本和明确作者边界高于当前故事弧草案；开放线索是待判断的责任与素材，不是本批次必须兑现的事件；规划反馈只用于修复共享机制，不把某一章的表面问题复制成剧情规则。",
     "外部剧情编排（如有）是设计意图基线，不是逐字清单：规划器负责把它完善为规范蓝图——对照冻结事实与叙事状态账本做事实梳理，补全场景因果、章节状态转换、连续性约束与责任承接。编排与已定稿事实冲突时以已定稿事实为准；编排未覆盖的部分按本提示词其余规则生成；不得为了贴合编排而虚构事实、提前消费后续答案或改写人物知识边界。",
@@ -415,6 +421,7 @@ export function buildStoryArcPlanPrompt(input: StoryArcPromptInput, target?: Sto
     "先写清故事弧入口状态、主要欲望/压力、关键选择、代价、退出状态和新问题；每个阶段都要说明它改变了什么人物选择、关系状态、信息分布、资源条件或读者期待。",
     "每个阶段（phase）用 chapterOrdinals 显式列出它覆盖的弧内章节序号（1-based，覆盖到 expectedChapterCount，阶段之间不重叠、不遗漏）：系统按这份绑定呈现章节所属阶段，不做任何等分推算。chapterOrdinals 只填弧内序号、绝不填全书流水章号——弧第一章=1，即使全书已连续八十多章也不例外。",
     "主线、支线、人物线、关系线和世界压力线要直接在 threadResponsibilities 中标明当前责任、交汇/退出条件和未回收承诺。没有剧情线时数组为空，不为了填满结构制造无依据事件，也不提前消费后续答案。",
+    "伏笔归属写在线上：本弧 foreshadowingRefs 里的每条伏笔，把它的引用同时填进实际承担它的那条线的 threadResponsibilities[].foreshadowingRefs（取值必须是弧级 foreshadowingRefs 中已出现的那个值，不能新增账目）；一条伏笔只能由一条线承担，本条线不承担伏笔时该数组给空，暂无承担者的伏笔交作者分流，不要为清空而摊派。",
     REFERENCE_FIELD_CONTRACT,
     "上下文优先级：已定稿事实、叙事状态账本和明确作者边界高于当前故事弧草案；开放线索是待判断的责任与素材，不是本批次必须兑现的事件；规划反馈只用于修复共享机制。",
     "外部剧情编排（如有）是设计意图基线，不是逐字清单：规划器负责把它完善为规范蓝图——对照冻结事实与叙事状态账本做事实梳理，补全场景因果、章节状态转换、连续性约束与责任承接。编排与已定稿事实冲突时以已定稿事实为准；编排未覆盖的部分按本提示词其余规则生成；不得为了贴合编排而虚构事实、提前消费后续答案或改写人物知识边界。",

@@ -158,12 +158,19 @@ novel_story_arc_orchestrate(projectId, plotOutline, reviewPolicy=auto)
 
 - 系统负责**完善**：对照冻结事实与叙事状态账本做事实梳理，补全场景因果、
   章节状态转换、连续性约束与章节蓝图，再走正式弧审核 → 修订闭环。
+- **伏笔归属写在线上报**：`threadResponsibilities[].foreshadowingRefs` 声明"本条线本弧
+  承担哪几条伏笔"，取值必须是本弧伏笔账（弧级 foreshadowingRefs / `novel_context_get`
+  的开放伏笔 id）中已出现的引用。系统据此写 `foreshadowing.thread_id`，让到期账与静默账
+  可按线追责。一条伏笔只能归一条线（多线同时认领=归属不可判定，系统留空并在审计
+  `threadBindingAmbiguous` 里留痕）；无人承担的宁可留空交作者分流，不要为清空而摊派。
 - 编排权威顺序：已定稿事实 / 叙事状态账本 / 作者边界 > 你的编排 > 模型自行发挥。
   编排与事实冲突时系统以事实为准，你不需要预先消化全部事实——但**先调用
   `novel_context_get` 做事实梳理**，能显著减少修订轮次。
 - 编排被拒绝的边界：没有 objective；只有 objective 没有实质编排内容
   （至少给 development / plotNotes / entryState / chapterHints 之一）；
-  threadResponsibilities 条目缺字段或 threadRef 重复；expectedChapterCount 越界。
+  threadResponsibilities 条目缺字段或 threadRef 重复；expectedChapterCount 越界；
+  线程的 foreshadowingRefs 不是非空字符串数组；弧蓝图阶段认领了弧账之外的伏笔
+  （阻止批准，按意见改回账内引用）。
 
 ### 阶段 2 正文生成与审核闭环
 

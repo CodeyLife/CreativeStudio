@@ -70,7 +70,7 @@ import type { ObjectStoreAdapter } from "./object-store";
 import { countNovelCharacters } from "./word-count";
 import type { ObjectStoreIdentity } from "./object-store";
 import { normalizeManuscriptStructuralReview } from "./application/manuscript-structure";
-import { arcCompletionPredicateSql, auditNamedReferences, auditStoryArcBatchRanges, canonicalReferenceId, findEmbeddedInternalIdentifiers, normalizeThreadResponsibilityReferences, parseExplicitNewReference, resolveNamedReference, sanitizeReferenceToken, type NamedReferenceCandidate, type StoryArcIntegrityIssue } from "./application/story-arc-integrity";
+import { arcCompletionPredicateSql, auditNamedReferences, auditStoryArcBatchRanges, canonicalReferenceId, findEmbeddedInternalIdentifiers, normalizeThreadResponsibilityReferences, parseExplicitNewReference, planThreadForeshadowingBindings, resolveNamedReference, sanitizeReferenceToken, type NamedReferenceCandidate, type StoryArcIntegrityIssue } from "./application/story-arc-integrity";
 import { auditFullBookArchitecture } from "./application/full-book-architecture";
 import { CHAPTER_NARRATIVE_FUNCTIONS, canGenerateNextStoryArcBatch, inspectStoryArcEnsemble, MAX_STORY_ARC_BATCH_WINDOW, normalizeChapterPlanningContext, parseStoryArcBundle, parseStoryArcPlan, planningContextFingerprint, resolveArcPhase, validateStoryArcPlanContracts, type ArcPlanningStatus, type ChapterBlueprint, type ChapterBlueprintRecord, type ChapterPlanningContext, type ChapterSceneBlueprint, type NarrativeArcPlan, type StoryArcBatchRecord, type StoryArcBundle, type StoryArcContextReceipt, type StoryArcPlotOutline, type StoryArcRebaseTarget, type StoryArcRecord } from "./application/story-arc";
 import type { StoryArcReviewOutput } from "./prompts/story-arc";
@@ -3456,13 +3456,33 @@ export class NovelPostgresRepository {
       const normalizedPayload = { ...rawPayload, threadResponsibilities, foreshadowingRefs };
       validateStoryArcPlanContracts(parseStoryArcPlan(normalizedPayload));
       await client.query("UPDATE arcs SET payload=$3,updated_at=now() WHERE id=$1 AND project_id=$2", [arcId, projectId, normalizedPayload]);
-      // PL-5 修复④：伏笔 thread_id 关联此前从未写入（实测 0/138），与剧情线完全脱钩。
-      // 泛化回填——本弧归一后的 canonical 伏笔引用与线程责任在此唯一同时可得。仅当本弧
-      // **恰好一条**线程责任时，才把本弧引用且尚未归属的开放伏笔绑到该线；多线弧无法从
-      // 共现推断具体归属（foreshadowingRefs 不与特定 thread 配对），保守留空交人工/弧审核，
-      // 避免伪造关联。planted_revision 归属的弧不在此处理（无弧引用即无证据）。
+      // PL-5 修复④ 的判据面收口（2026-09-19）：归属证据由线程自己声明，不再从共现推断
+      //（旧"恰好一条线程才绑"判据在真实数据上恒不命中——24 条弧全部并行 4-7 条线，
+      //  全表 thread_id 绑定 0 行，见 product-audit-20260910 §五）。认领引用先经本弧
+      //  同一次归一的 raw→canonical 映射翻译，避免第二套解析真源；账外认领按 blocking
+      //  回流 planner（不静默丢弃，也不新建对象）。
+      const canonicalByRawRef = new Map(mappings.filter((mapping) => mapping.kind === "foreshadowing").map((mapping) => [mapping.input, mapping.canonicalId]));
+      const threadBindings = planThreadForeshadowingBindings({
+        arcForeshadowingRefs: foreshadowingRefs,
+        responsibilities: threadResponsibilities.map((responsibility) => ({
+          threadRef: responsibility.threadRef,
+          foreshadowingRefs: (responsibility.foreshadowingRefs ?? []).map((ref) => canonicalByRawRef.get(ref) ?? ref),
+        })),
+      });
+      if (threadBindings.violations.length) {
+        throw new Error(`剧情线认领了本弧伏笔账之外的引用（${threadBindings.violations.length} 处）：${threadBindings.violations.map((violation) => `线程“${violation.threadRef}”→“${violation.input}”`).join("、")}。线程的 foreshadowingRefs 只能填本弧 foreshadowingRefs 中已出现的引用；确属新增伏笔请先登记进弧级账。`);
+      }
+      for (const binding of threadBindings.bindings) {
+        await client.query(
+          `UPDATE foreshadowing SET thread_id=$2
+           WHERE project_id=$1 AND id=ANY($3::text[]) AND thread_id IS NULL AND status='open'`,
+          [projectId, binding.threadId, binding.foreshadowingIds],
+        );
+      }
+      // 兜底保持原语义：无认领信息（旧弧/旧 planner 输出）时，仍只在本弧恰好一条线程责任
+      // 时才绑；多线程弧留空交人工/弧审核。planted_revision 归属的弧不在此处理。
       const arcThreadRefs = [...new Set(threadResponsibilities.map((responsibility) => responsibility.threadRef).filter(Boolean))];
-      if (arcThreadRefs.length === 1 && foreshadowingRefs.length) {
+      if (!threadBindings.bindings.length && arcThreadRefs.length === 1 && foreshadowingRefs.length) {
         await client.query(
           `UPDATE foreshadowing SET thread_id=$2
            WHERE project_id=$1 AND id=ANY($3::text[]) AND thread_id IS NULL AND status='open'`,
@@ -3471,7 +3491,7 @@ export class NovelPostgresRepository {
       }
       await client.query(
         "INSERT INTO audit_records(project_id,actor,action,aggregate_type,aggregate_id,payload) VALUES($1,$2,'story-arc.references-normalized','story-arc',$3,$4)",
-        [projectId, actor, arcId, { mappings, created: [...new Set(created)] }],
+        [projectId, actor, arcId, { mappings, created: [...new Set(created)], threadBindings: threadBindings.bindings, threadBindingAmbiguous: threadBindings.ambiguous }],
       );
       await client.query("COMMIT");
       return { arc: await this.getStoryArc(projectId, arcId), mappings, created: [...new Set(created)] };

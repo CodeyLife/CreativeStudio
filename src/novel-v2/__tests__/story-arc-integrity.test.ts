@@ -1,7 +1,9 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
-import { auditNamedReferences, auditStoryArcBatchRanges, canonicalReferenceId, findEmbeddedInternalIdentifiers, normalizeThreadResponsibilityReferences, parseExplicitNewReference, resolveNamedReference, sanitizeReferenceToken } from "../application/story-arc-integrity";
-import { parseStoryArcPlan, resolveArcPhase } from "../application/story-arc";
+import { auditNamedReferences, auditStoryArcBatchRanges, canonicalReferenceId, findEmbeddedInternalIdentifiers, normalizeThreadResponsibilityReferences, parseExplicitNewReference, planThreadForeshadowingBindings, resolveNamedReference, sanitizeReferenceToken } from "../application/story-arc-integrity";
+import { parseStoryArcBundle, parseStoryArcPlan, parseStoryArcPlotOutline, resolveArcPhase } from "../application/story-arc";
+import { renderStoryArcPlotOutline, storyArcBundleSchema } from "../prompts/story-arc";
+import { TOOL_DEFINITIONS } from "../mcp/tool-definitions";
 import { buildNarrativeRhythmSnapshotQuery, NovelPostgresRepository } from "../postgres-repository";
 import { isPostgresUnavailable } from "./test-db";
 
@@ -423,6 +425,62 @@ describe("story arc reference normalization integration (PL-2)", () => {
     expect(report.plotThreads.resolvedNewlyCreated).toBe(1);
   });
 
+  it("threads claim ledger foreshadowings explicitly: binds, refuses out-of-ledger claims, leaves multi-claim unbound", async () => {
+    if (!available || !repository) return;
+    const threadA = canonicalReferenceId("thread", projectId, "铜镜承担线");
+    const threadB = canonicalReferenceId("thread", projectId, "笔迹承担线");
+    const inLedger = canonicalReferenceId("foreshadowing", projectId, "井底铜镜泛潮");
+    const outOfLedger = canonicalReferenceId("foreshadowing", projectId, "未入账的伏笔");
+    await repository.pool.query(
+      "INSERT INTO plot_threads(id,project_id,title,status,payload) VALUES($1,$2,'铜镜承担线','open','{}'::jsonb),($3,$2,'笔迹承担线','open','{}'::jsonb)",
+      [threadA, projectId, threadB],
+    );
+    await repository.pool.query(
+      "INSERT INTO foreshadowing(id,project_id,status,payload,narrative_order) VALUES($1,$2,'open',$3,9),($4,$2,'open',$5,9)",
+      [inLedger, projectId, { description: "井底铜镜泛潮" }, outOfLedger, { description: "未入账的伏笔" }],
+    );
+    const setAttributedArc = async (claims: Array<{ thread: string; refs?: string[] }>) => {
+      const payload = {
+        title: "测试弧", objective: "目的", entryState: "入", centralConflict: "争", development: ["a"], resolution: "解", exitState: "出",
+        threadResponsibilities: claims.map((claim) => ({ threadRef: claim.thread, responsibility: "推进", nextAdvance: "下一步", ...(claim.refs?.length ? { foreshadowingRefs: claim.refs } : {}) })),
+        foreshadowingRefs: [inLedger], expectedChapterCount: 3, phases: [{ title: "阶段", objective: "目标" }],
+      };
+      await repository!.pool.query("UPDATE arcs SET payload=$2::jsonb WHERE id=$1", [arcId, JSON.stringify(payload)]);
+    };
+    const resetBindings = async () => { await repository!.pool.query("UPDATE foreshadowing SET thread_id=NULL WHERE project_id=$1", [projectId]); };
+    const boundThread = async (foreshadowingId: string) => (await repository!.pool.query<{ thread_id: string | null }>("SELECT thread_id FROM foreshadowing WHERE id=$1", [foreshadowingId])).rows[0]?.thread_id ?? null;
+
+    await setAttributedArc([{ thread: "铜镜承担线", refs: [inLedger] }, { thread: "笔迹承担线" }]);
+    await resetBindings();
+    await repository.normalizeStoryArcReferences(projectId, arcId);
+    expect(await boundThread(inLedger)).toBe(threadA);
+
+    await setAttributedArc([{ thread: "铜镜承担线", refs: [outOfLedger] }, { thread: "笔迹承担线" }]);
+    await resetBindings();
+    await expect(repository.normalizeStoryArcReferences(projectId, arcId)).rejects.toThrow(/本弧伏笔账之外/);
+    expect(await boundThread(outOfLedger)).toBeNull();
+    expect(await boundThread(inLedger)).toBeNull();
+
+    await setAttributedArc([{ thread: "铜镜承担线", refs: [inLedger] }, { thread: "笔迹承担线", refs: [inLedger] }]);
+    await resetBindings();
+    await repository.normalizeStoryArcReferences(projectId, arcId);
+    expect(await boundThread(inLedger)).toBeNull();
+    const audit = await repository.pool.query<{ payload: { threadBindingAmbiguous?: string[] } }>(
+      "SELECT payload FROM audit_records WHERE project_id=$1 AND action='story-arc.references-normalized' ORDER BY id DESC LIMIT 1", [projectId]);
+    expect(audit.rows[0]?.payload.threadBindingAmbiguous).toEqual([inLedger]);
+
+    // 零回归面：无认领信息时旧兜底语义不变——多线程弧不绑，单线程弧照旧绑。
+    await setAttributedArc([{ thread: "铜镜承担线" }, { thread: "笔迹承担线" }]);
+    await resetBindings();
+    await repository.normalizeStoryArcReferences(projectId, arcId);
+    expect(await boundThread(inLedger)).toBeNull();
+    await setAttributedArc([{ thread: "铜镜承担线" }]);
+    await resetBindings();
+    await repository.normalizeStoryArcReferences(projectId, arcId);
+    expect(await boundThread(inLedger)).toBe(threadA);
+    await resetBindings();
+  });
+
   it("flags thread titles carrying embedded machine identifiers so health stops blessing shadows", async () => {
     if (!available || !repository) return;
     await repository.pool.query(
@@ -748,5 +806,86 @@ describe("PL-6 连载健康度与阶段绑定", () => {
     expect(parsed.phases[0]).toMatchObject({ title: "起", chapterOrdinals: [1, 2] });
     expect(parsed.phases[1]?.chapterOrdinals).toBeUndefined();
     expect(parsed.phases[2]?.chapterOrdinals).toBeUndefined();
+  });
+});
+
+describe("伏笔归属按线程声明（PL-5④ 判据收口，2026-09-19）", () => {
+  const THREAD_A = "thread:p:aaa";
+  const THREAD_B = "thread:p:bbb";
+  const FS_IN = "foreshadowing:p:in";
+  const FS_OUT = "foreshadowing:p:out";
+
+  it("认领弧账内引用才绑；账外报 violation；多线认领留 ambiguous 不绑", () => {
+    expect(planThreadForeshadowingBindings({
+      arcForeshadowingRefs: [FS_IN],
+      responsibilities: [{ threadRef: THREAD_A, foreshadowingRefs: [FS_IN] }, { threadRef: THREAD_B }],
+    })).toEqual({ bindings: [{ threadId: THREAD_A, foreshadowingIds: [FS_IN] }], violations: [], ambiguous: [] });
+
+    const outOfLedger = planThreadForeshadowingBindings({
+      arcForeshadowingRefs: [FS_IN],
+      responsibilities: [{ threadRef: THREAD_A, foreshadowingRefs: [FS_OUT] }],
+    });
+    expect(outOfLedger.bindings).toEqual([]);
+    expect(outOfLedger.violations).toEqual([{ threadRef: THREAD_A, input: FS_OUT }]);
+    expect(outOfLedger.ambiguous).toEqual([]);
+
+    const shared = planThreadForeshadowingBindings({
+      arcForeshadowingRefs: [FS_IN],
+      responsibilities: [{ threadRef: THREAD_A, foreshadowingRefs: [FS_IN] }, { threadRef: THREAD_B, foreshadowingRefs: [FS_IN] }],
+    });
+    expect(shared.bindings).toEqual([]);
+    expect(shared.violations).toEqual([]);
+    expect(shared.ambiguous).toEqual([FS_IN]);
+    // 无认领信息（旧 planner 输出）不产生任何绑定计划——单线程兜底由调用方按其原语义处理。
+    expect(planThreadForeshadowingBindings({ arcForeshadowingRefs: [FS_IN], responsibilities: [{ threadRef: THREAD_A }, { threadRef: THREAD_B }] }))
+      .toEqual({ bindings: [], violations: [], ambiguous: [] });
+  });
+
+  it("外部编排与弧蓝图两面都解析该字段，旧载荷零回归；畸形输入抛回不静默吞", () => {
+    const outline = parseStoryArcPlotOutline({
+      objective: "本弧讲什么",
+      threadResponsibilities: [
+        { threadRef: "铜镜线", responsibility: "推进", nextAdvance: "下一步", foreshadowingRefs: [FS_IN] },
+        { threadRef: "笔迹线", responsibility: "推进", nextAdvance: "下一步" },
+      ],
+    });
+    expect(outline.threadResponsibilities?.[0]?.foreshadowingRefs).toEqual([FS_IN]);
+    expect(outline.threadResponsibilities?.[1]?.foreshadowingRefs).toBeUndefined();
+    expect(() => parseStoryArcPlotOutline({ objective: "o", centralConflict: "c", threadResponsibilities: [{ threadRef: "t", responsibility: "r", nextAdvance: "n", foreshadowingRefs: "不是数组" }] })).toThrow(/foreshadowingRefs/);
+    expect(() => parseStoryArcPlotOutline({ objective: "o", centralConflict: "c", threadResponsibilities: [{ threadRef: "t", responsibility: "r", nextAdvance: "n", foreshadowingRefs: ["  "] }] })).toThrow(/foreshadowingRefs/);
+
+    const bundle = parseStoryArcBundle({
+      arc: { title: "t", objective: "o", threadResponsibilities: [{ threadRef: "铜镜线", responsibility: "r", nextAdvance: "n", foreshadowingRefs: [FS_IN] }], foreshadowingRefs: [FS_IN] },
+      batch: { batchIndex: 1, startChapterIndex: 1, complete: false },
+      chapters: [{ title: "章", stateTransition: { before: "b", after: "a", evidence: "e" }, scenes: [{ title: "s", situation: "sit", observableActions: ["act"], outcome: "out" }] }],
+    });
+    expect(bundle.arc.threadResponsibilities[0]?.foreshadowingRefs).toEqual([FS_IN]);
+    // 旧形态（无该字段）解析后不得凭空出现键
+    expect(parseStoryArcPlan({ title: "t", objective: "o", threadResponsibilities: [{ threadRef: "t", responsibility: "r", nextAdvance: "n" }] }).threadResponsibilities[0]).not.toHaveProperty("foreshadowingRefs");
+    // 编排注入规划上下文时归属声明必须可见，否则编排者的认领被静默丢弃
+    expect(renderStoryArcPlotOutline(outline)).toContain(`本弧承担伏笔=${FS_IN}`);
+  });
+
+  it("接线锁：生成面 schema、外部工具 schema、repository 消费面三处同源", async () => {
+    const planResponsibilities = (storyArcBundleSchema as unknown as {
+      properties: { arc: { properties: { threadResponsibilities: { items: { properties: Record<string, unknown>; required: string[] } } } } };
+    }).properties.arc.properties.threadResponsibilities.items;
+    expect(Object.keys(planResponsibilities.properties)).toContain("foreshadowingRefs");
+    // 原生结构化门（assertNativeJsonSchema）要求对象 properties 全部进 required，
+    // "本条线不承担伏笔"因此以空数组表达而非省略字段。
+    expect(planResponsibilities.required).toContain("foreshadowingRefs");
+
+    const orchestrate = TOOL_DEFINITIONS.find((tool) => tool.name === "novel_story_arc_orchestrate");
+    const externalFace = (orchestrate?.inputSchema as unknown as {
+      properties: { plotOutline: { properties: { threadResponsibilities: { items: { properties: Record<string, unknown> } } } } };
+    }).properties.plotOutline.properties.threadResponsibilities.items.properties;
+    expect(Object.keys(externalFace)).toContain("foreshadowingRefs");
+
+    const { readFileSync } = await import("node:fs");
+    const { fileURLToPath } = await import("node:url");
+    const repositorySource = readFileSync(fileURLToPath(new URL("../postgres-repository.ts", import.meta.url)), "utf8");
+    expect(repositorySource.match(/planThreadForeshadowingBindings\(\{/g)?.length).toBe(1);
+    // 兜底不得在无认领时抢绑（否则单值列被旧启发式覆写声明）
+    expect(repositorySource).toContain("if (!threadBindings.bindings.length && arcThreadRefs.length === 1");
   });
 });

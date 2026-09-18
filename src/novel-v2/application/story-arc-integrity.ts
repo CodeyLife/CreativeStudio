@@ -185,6 +185,51 @@ export function normalizeThreadResponsibilityReferences<T extends { threadRef: s
   });
 }
 
+/**
+ * 伏笔→剧情线归属计划（PL-5④ 的判据面收口，2026-09-19）。
+ *
+ * `foreshadowing.thread_id` 是单值列，"哪条线承担这条伏笔"因此只能是**声明**，不能是推断。
+ * 旧判据"本弧恰好一条线程责任时把本弧引用的开放伏笔全绑过去"在真实数据上恒不命中：
+ * 实测本项目 24 条弧的 threadResponsibilities 全部声明 4-7 条线 ⇒ 可绑弧 0 条、
+ * 全表 thread_id 绑定 0 行（见 product-audit-20260910 §五）。归属证据改由线程自己带
+ * （threadResponsibilities[].foreshadowingRefs），本函数只做保守判定，不碰数据库，
+ * 因此弧审核面与回填面可共用同一判据。
+ *
+ * 规则：
+ * - 线程只能认领**本弧伏笔账内**的引用（入参应已完成 raw→canonical 翻译）；账外认领
+ *   返回 violations 交调用方按 blocking 回流，既不静默丢弃也不新建对象；
+ * - 同一条伏笔被多条线同时认领 ⇒ 单值列无法表达共同承担，不绑定，但计入 ambiguous
+ *   留痕（静默跳过与静默失败同罪），由作者/下弧修订收敛为单一承担者。
+ */
+export function planThreadForeshadowingBindings(input: {
+  arcForeshadowingRefs: readonly string[];
+  responsibilities: readonly { threadRef: string; foreshadowingRefs?: readonly string[] }[];
+}): { bindings: Array<{ threadId: string; foreshadowingIds: string[] }>; violations: Array<{ threadRef: string; input: string }>; ambiguous: string[] } {
+  const allowed = new Set(input.arcForeshadowingRefs);
+  const violations: Array<{ threadRef: string; input: string }> = [];
+  const owners = new Map<string, Set<string>>();
+  for (const responsibility of input.responsibilities) {
+    for (const ref of responsibility.foreshadowingRefs ?? []) {
+      if (!allowed.has(ref)) {
+        violations.push({ threadRef: responsibility.threadRef, input: ref });
+        continue;
+      }
+      owners.set(ref, (owners.get(ref) ?? new Set<string>()).add(responsibility.threadRef));
+    }
+  }
+  const byThread = new Map<string, string[]>();
+  const ambiguous: string[] = [];
+  for (const [foreshadowingId, threadRefs] of owners) {
+    if (threadRefs.size !== 1) {
+      ambiguous.push(foreshadowingId);
+      continue;
+    }
+    const threadId = [...threadRefs][0]!;
+    byThread.set(threadId, [...(byThread.get(threadId) ?? []), foreshadowingId]);
+  }
+  return { bindings: [...byThread].map(([threadId, foreshadowingIds]) => ({ threadId, foreshadowingIds })), violations, ambiguous: ambiguous.sort() };
+}
+
 export function canonicalReferenceId(kind: "thread" | "foreshadowing", projectId: string, input: string): string {
   const digest = createHash("sha256").update(`${projectId}\n${normalizedLabel(input)}`).digest("hex").slice(0, 16);
   return `${kind}:${projectId}:${digest}`;
