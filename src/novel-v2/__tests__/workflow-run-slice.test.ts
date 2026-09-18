@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { Pool } from "pg";
-import { WorkflowRunSlice, type OutboxWriter } from "../repository/workflow-run-slice";
+import { WorkflowRunSlice } from "../repository/workflow-run-slice";
+import type { OutboxWriter } from "../repository/shared";
 import { HUMAN_GATE_WORKFLOW_RUN_STATUSES_SQL, TERMINAL_WORKFLOW_RUN_STATUSES_SQL } from "../run-lifecycle";
 
 /**

@@ -21,10 +21,7 @@ import type { Pool } from "pg";
 import type { WorkflowRunRecord } from "../protocol";
 import { HUMAN_GATE_RESUME_WORKFLOW_RUN_STATUS, HUMAN_GATE_WORKFLOW_RUN_STATUSES_SQL, isForbiddenTerminalOverwrite, terminalOverwriteGuardSql, type WorkflowRunStatus } from "../run-lifecycle";
 import { withTerminalOutcome } from "../terminal-outcome";
-import { workflowFromRow, type WorkflowRunRow } from "./shared";
-
-/** outbox 追加器（由仓储提供，保证事件归属规则只有一份实现）。 */
-export type OutboxWriter = (aggregateType: string, aggregateId: string, eventType: string, payload: Record<string, unknown>) => Promise<number>;
+import { workflowFromRow, type OutboxWriter, type WorkflowRunRow } from "./shared";
 
 const RUN_COLUMNS = "id,workflow_type,project_id,temporal_workflow_id,status,payload,created_at,updated_at";
 

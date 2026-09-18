@@ -12,6 +12,9 @@
 import type { WorkflowRunRecord } from "../protocol";
 import { toWorkflowRunStatus } from "../run-lifecycle";
 
+/** outbox 追加器（由仓储提供，保证事件归属规则只有一份实现）。 */
+export type OutboxWriter = (aggregateType: string, aggregateId: string, eventType: string, payload: Record<string, unknown>) => Promise<number>;
+
 export type WorkflowRunRow = { id: string; workflow_type: string; project_id: string; temporal_workflow_id: string; status: string; payload: Record<string, unknown>; created_at: Date | string; updated_at: Date | string };
 
 export function iso(value: Date | string) { return value instanceof Date ? value.toISOString() : value; }
