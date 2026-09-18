@@ -1314,9 +1314,9 @@ const novel_chapter_review_decision: ToolHandler = async (args, ctx) => {
     await ctx.repository.recordTaskSignal({ workflowId, taskId: artifactId, signal: "humanSignal", payload: signalPayload });
     await ctx.temporal.workflow.getHandle(workflowId).signal("humanSignal", signalPayload);
 
-    // 3. 更新工作流状态为 running
+    // 3. 更新工作流状态为 running（守卫式：仍处人工门才回写，工作流已自行推进时不覆态）
     const stage = decision === "approve" ? "fact-extraction" : decision === "revise" ? "revision" : "manuscript-approval";
-    await ctx.repository.updateWorkflowRunStatus(workflowId, "running", { stage, decision, pendingHumanDecisionSubmitted: true });
+    await ctx.repository.resumeWorkflowRunFromHumanGate(workflowId, { stage, decision, pendingHumanDecisionSubmitted: true });
 
     return {
       accepted: true,

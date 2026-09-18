@@ -57,6 +57,13 @@ export const HUMAN_GATE_WORKFLOW_RUN_STATUSES = [
 /** 活跃态：仍在推进、超时即视为僵尸，由 reconcile 收编为 failed。 */
 export const ACTIVE_WORKFLOW_RUN_STATUSES = ["accepted", "running"] as const satisfies readonly WorkflowRunStatus[];
 
+/**
+ * 人工门被外部提交裁决后的回写目标态。这是**唯一**允许工作流以外的写入者改的态，
+ * 且必须配守卫（见 `resumeWorkflowRunFromHumanGate`）：信号送达后工作流可能已经
+ * 自行推进甚至进入终态，无守卫的回写会把终态覆成 running，再被对账收编为 failed。
+ */
+export const HUMAN_GATE_RESUME_WORKFLOW_RUN_STATUS = "running" satisfies WorkflowRunStatus;
+
 /** 外部等待态：单独的墙钟预算（受 Temporal history retention 窗口约束）。 */
 export const WAITING_EXTERNAL_WORKFLOW_RUN_STATUS = "waiting-external" as const satisfies WorkflowRunStatus;
 

@@ -1414,7 +1414,7 @@ const server = createServer(async (request, response) => {
         await repository.recordTaskSignal({ workflowId, taskId, signal: "humanSignal", payload: signalPayload });
         await temporal.workflow.getHandle(workflowId).signal("humanSignal", signalPayload);
         const stage = decision === "approve" ? "fact-extraction" : decision === "revise" ? "revision" : "manuscript-approval";
-        await repository.updateWorkflowRunStatus(workflowId, "running", { stage, decision, pendingHumanDecisionSubmitted: true });
+        await repository.resumeWorkflowRunFromHumanGate(workflowId, { stage, decision, pendingHumanDecisionSubmitted: true });
         return send(response, 202, { accepted: true, workflowId, taskId, approvalEvidenceId: claimed.evidence.id });
       } catch (error) {
         await repository.releaseHumanDecisionClaim(workflowId, taskId).catch(() => undefined);
@@ -1446,7 +1446,7 @@ const server = createServer(async (request, response) => {
         await handle.signal(signal, payload);
         if (humanDecisionClaimed) {
           const stage = humanDecision === "approve" ? "fact-extraction" : humanDecision === "revise" ? "revision" : "manuscript-approval";
-          await repository.updateWorkflowRunStatus(workflowId, "running", { stage, decision: humanDecision, pendingHumanDecisionSubmitted: true });
+          await repository.resumeWorkflowRunFromHumanGate(workflowId, { stage, decision: humanDecision, pendingHumanDecisionSubmitted: true });
         }
         return send(response, 202, { accepted: true, workflowId, taskId });
       } catch (error) {

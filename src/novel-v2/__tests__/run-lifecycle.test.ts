@@ -1,9 +1,13 @@
 import { readFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { NovelPostgresRepository } from "../postgres-repository";
+import { isPostgresUnavailable } from "./test-db";
 import {
   ACTIVE_WORKFLOW_RUN_STATUSES,
   ACTIVE_WORKFLOW_RUN_STATUSES_SQL,
+  HUMAN_GATE_RESUME_WORKFLOW_RUN_STATUS,
   HUMAN_GATE_WORKFLOW_RUN_STATUSES,
   HUMAN_GATE_WORKFLOW_RUN_STATUSES_SQL,
   TERMINAL_WORKFLOW_RUN_STATUSES,
@@ -74,13 +78,24 @@ describe("run 状态写入面接线锁", () => {
     expect(terminalOutcome).not.toMatch(/new Set\(\["completed"/);
   });
 
-  it("workflow_runs.status 只有两个写入者：受控漏斗与带乐观守卫的对账", () => {
+  it("workflow_runs.status 写入者只有三个：受控漏斗、乐观守卫对账、人工门守卫回写", () => {
     const writers = [...repository.matchAll(/UPDATE workflow_runs SET status/g)].length;
-    expect(writers).toBe(2);
+    expect(writers).toBe(3);
     // 对账那条必须自带乐观并发守卫（WHERE status=旧快照），否则会用过期判据覆写新鲜事实。
     expect(repository).toContain("WHERE temporal_workflow_id=$1 AND status=$2");
     // 漏斗的状态参数必须是词表类型，不是宽 string。
     expect(repository).toMatch(/updateWorkflowRunStatus\(temporalWorkflowId: string, status: WorkflowRunStatus/);
+    // 第三条是人工门回写：判据必须写进 UPDATE 的 WHERE（先读后判会留竞态窗口）。
+    expect(repository).toMatch(/AND status IN \(\$\{HUMAN_GATE_WORKFLOW_RUN_STATUSES_SQL\}\)/);
+  });
+
+  it("人工裁决链路的状态回写一律走守卫方法（未命中即由工作流独占状态）", () => {
+    const api = readFileSync(fileURLToPath(new URL("../../../scripts/novel-v2-api.ts", import.meta.url)), "utf8");
+    const handlers = readFileSync(fileURLToPath(new URL("../mcp/handlers.ts", import.meta.url)), "utf8");
+    expect([...api.matchAll(/resumeWorkflowRunFromHumanGate\(/g)].length).toBe(2);
+    expect([...handlers.matchAll(/resumeWorkflowRunFromHumanGate\(/g)].length).toBe(1);
+    // 反向：gate→running 不得再直接用无守卫漏斗。
+    expect(`${api}${handlers}`).not.toMatch(/updateWorkflowRunStatus\([^\n]*"running",[^\n]*pendingHumanDecisionSubmitted/);
   });
 
   it("对账候选查询取词表常量，不再内联状态清单", () => {
@@ -98,5 +113,66 @@ describe("run 状态写入面接线锁", () => {
     expect([...HUMAN_GATE_WORKFLOW_RUN_STATUSES].sort()).toEqual<WorkflowRunStatus[]>(
       ["manual-review-required", "rebuild-requested", "regression-validation-required"],
     );
+  });
+});
+
+const TEST_DB_URL = process.env.TEST_DATABASE_URL ?? "postgresql://ymcp:ymcp@127.0.0.1:5432/ymcp_test";
+
+/**
+ * 人工门 → running 回写的真实落库验证。
+ *
+ * 竞态本身不可在单测里复现（要靠信号与写入的时序巧合），但守卫的**判据**可以：
+ * 正向证明"仍处门态才回写"，反向证明"终态绝不被覆、payload 绝不被合并"——后者正是
+ * 旧写法把成功裁决改写回 running 的形态。事件面同批验证，避免守卫方法悄悄丢了留痕。
+ */
+describe("人工门守卫回写（落库）", () => {
+  let repo: NovelPostgresRepository;
+  let available = false;
+  const projectId = `test-gate-resume-${randomUUID().slice(0, 8)}`;
+
+  beforeAll(async () => {
+    try {
+      repo = new NovelPostgresRepository(TEST_DB_URL);
+      await repo.migrate();
+      await repo.ensureProject(projectId, "Gate Resume Test");
+      available = true;
+    } catch (error) {
+      if (!isPostgresUnavailable(error)) throw error;
+      console.warn(`[run-lifecycle.test] Postgres 不可用，跳过集成测试: ${(error as Error).message}`);
+    }
+  }, 30_000);
+
+  afterAll(async () => {
+    if (!available) return;
+    await repo.deleteProject(projectId).catch(() => undefined);
+    await repo.close();
+  });
+
+  it("门态回写生效并留事件；终态既不改状态也不并 payload（双向）", async () => {
+    if (!available) return;
+    expect(ACTIVE_WORKFLOW_RUN_STATUSES).toContain(HUMAN_GATE_RESUME_WORKFLOW_RUN_STATUS);
+
+    const gateId = `gate-${randomUUID()}`;
+    await repo.putWorkflowRun({ id: `run-${randomUUID()}`, workflowType: "chapter-review", projectId, temporalWorkflowId: gateId, status: "manual-review-required" });
+    const resumed = await repo.resumeWorkflowRunFromHumanGate(gateId, { stage: "revision", decision: "revise", pendingHumanDecisionSubmitted: true });
+    expect(resumed?.status).toBe("running");
+    expect(resumed?.payload.decision).toBe("revise");
+    const events = await repo.pool.query<{ event_type: string }>(
+      "SELECT event_type FROM outbox_events WHERE aggregate_type='workflow-run' AND aggregate_id=$1 ORDER BY id",
+      [gateId],
+    );
+    expect(events.rows.map((row) => row.event_type)).toEqual(["workflow.manual-review-required", "workflow.running", "workflow.progress.revision"]);
+
+    const doneId = `done-${randomUUID()}`;
+    await repo.putWorkflowRun({ id: `run-${randomUUID()}`, workflowType: "chapter-review", projectId, temporalWorkflowId: doneId, status: "completed" });
+    const untouched = await repo.resumeWorkflowRunFromHumanGate(doneId, { stage: "fact-extraction", decision: "approve", pendingHumanDecisionSubmitted: true });
+    expect(untouched).toBeUndefined();
+    const row = await repo.pool.query<{ status: string; payload: Record<string, unknown> }>(
+      "SELECT status,payload FROM workflow_runs WHERE temporal_workflow_id=$1",
+      [doneId],
+    );
+    expect(row.rows[0].status).toBe("completed");
+    expect(row.rows[0].payload.decision).toBeUndefined();
+    expect(row.rows[0].payload.terminalOutcome).toBe("succeeded");
   });
 });

@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { foundationArtifactToMemoryClaim, foundationClaimId } from "./foundation-memory";
 import { CLAIM_PROJECTION_SET_SQL, retrievalVisibleClaimsSql, retiredByVisibleKillerSql } from "./memory-visibility";
-import { ACTIVE_WORKFLOW_RUN_STATUSES_SQL, WAITING_EXTERNAL_WORKFLOW_RUN_STATUS_SQL, toWorkflowRunStatus, type WorkflowRunStatus } from "./run-lifecycle";
+import { ACTIVE_WORKFLOW_RUN_STATUSES_SQL, HUMAN_GATE_RESUME_WORKFLOW_RUN_STATUS, HUMAN_GATE_WORKFLOW_RUN_STATUSES_SQL, WAITING_EXTERNAL_WORKFLOW_RUN_STATUS_SQL, toWorkflowRunStatus, type WorkflowRunStatus } from "./run-lifecycle";
 import { normalizeFoundationStructuredDataFlat, validateFoundationTaskContract } from "./application/foundation-contract";
 import { foundationContractFingerprint } from "./application/foundation-contract-fingerprint";
 import { assertCompleteChapterReviewEvidence } from "./application/chapter-approval";
@@ -2724,17 +2724,41 @@ export class NovelPostgresRepository {
   async updateWorkflowRunStatus(temporalWorkflowId: string, status: WorkflowRunStatus, payload: Record<string, unknown> = {}) {
     const result = await this.pool.query<WorkflowRunRow>("UPDATE workflow_runs SET status=$2,payload=payload || $3,updated_at=now() WHERE temporal_workflow_id=$1 RETURNING id,workflow_type,project_id,temporal_workflow_id,status,payload,created_at,updated_at", [temporalWorkflowId, status, withTerminalOutcome(status, payload)]);
     if (!result.rowCount) return undefined;
-    const row = workflowFromRow(result.rows[0]);
-    await this.appendOutbox("workflow-run", row.temporalWorkflowId, `workflow.${status}`, { projectId: row.projectId, workflowId: row.temporalWorkflowId, runId: row.id, ...payload });
+    return this.announceWorkflowRunStatus(result.rows[0], status, payload);
+  }
+
+  /**
+   * 人工门 → running 的**守卫式**回写（供提交人工裁决的消费面使用）。
+   *
+   * 为什么要守卫：裁决链路是 claimApprovalEvidence → signal(humanSignal) → 回写状态。
+   * 信号一送达，工作流就恢复自驱——reject/abandon 这类短路径可能在回写落地前已经写完
+   * 终态。无守卫的回写会把 `completed`/`failed` 覆回 `running`，而工作流此后不再写自己
+   * 的终态，该 run 就只能等对账把"僵尸 running"收编成 `failed`：一次成功的裁决最终以
+   * 失败收场。守卫放进 UPDATE 的 WHERE 里（不是先读后判），所以判据与写入同一原子内，
+   * 不存在竞态窗口；未命中即返回 undefined，交由工作流这一个写入者继续负责状态。
+   */
+  async resumeWorkflowRunFromHumanGate(temporalWorkflowId: string, payload: Record<string, unknown> = {}) {
+    const status = HUMAN_GATE_RESUME_WORKFLOW_RUN_STATUS;
+    const result = await this.pool.query<WorkflowRunRow>(`UPDATE workflow_runs SET status=$2,payload=payload || $3,updated_at=now()
+      WHERE temporal_workflow_id=$1 AND status IN (${HUMAN_GATE_WORKFLOW_RUN_STATUSES_SQL})
+      RETURNING id,workflow_type,project_id,temporal_workflow_id,status,payload,created_at,updated_at`, [temporalWorkflowId, status, withTerminalOutcome(status, payload)]);
+    if (!result.rowCount) return undefined;
+    return this.announceWorkflowRunStatus(result.rows[0], status, payload);
+  }
+
+  /** 状态写入后的事件面：run 状态变更与有语义 progress 事件双写（两条写入路径共用，避免口径分叉）。 */
+  private async announceWorkflowRunStatus(row: WorkflowRunRow, status: WorkflowRunStatus, payload: Record<string, unknown>) {
+    const record = workflowFromRow(row);
+    await this.appendOutbox("workflow-run", record.temporalWorkflowId, `workflow.${status}`, { projectId: record.projectId, workflowId: record.temporalWorkflowId, runId: record.id, ...payload });
     // OR-C1（product-audit-20260910 E4）：有语义 progress 事件双写持久事件表。
     // run payload 的 stage 键是"后写覆盖"的当前态展示位，守卫决策（revision-decision/
     // revision-reverted/manual-review-required…）若无追加式留痕则事后无法回答
     // "阈值挡下过什么"。规则泛化：凡带 stage 的写入即按 `workflow.progress.<stage>`
     // 落一条事件，不设阶段白名单——新阶段零登记自动可审计。
     if (typeof payload.stage === "string" && payload.stage.trim()) {
-      await this.appendOutbox("workflow-run", row.temporalWorkflowId, `workflow.progress.${payload.stage.trim()}`, { projectId: row.projectId, workflowId: row.temporalWorkflowId, runId: row.id, ...payload });
+      await this.appendOutbox("workflow-run", record.temporalWorkflowId, `workflow.progress.${payload.stage.trim()}`, { projectId: record.projectId, workflowId: record.temporalWorkflowId, runId: record.id, ...payload });
     }
-    return row;
+    return record;
   }
 
   async claimApprovalEvidence(input: { workflowId: string; artifactId: string; decision: ApprovalEvidence["decision"]; actorSource: ApprovalEvidence["actorSource"]; actorId: string; feedback?: string; revisionBase?: "current" | "previous" }) {
