@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { foundationArtifactToMemoryClaim, foundationClaimId } from "./foundation-memory";
 import { CLAIM_PROJECTION_SET_SQL, retrievalVisibleClaimsSql, retiredByVisibleKillerSql } from "./memory-visibility";
-import { ACTIVE_WORKFLOW_RUN_STATUSES_SQL, HUMAN_GATE_RESUME_WORKFLOW_RUN_STATUS, HUMAN_GATE_WORKFLOW_RUN_STATUSES_SQL, WAITING_EXTERNAL_WORKFLOW_RUN_STATUS_SQL, toWorkflowRunStatus, type WorkflowRunStatus } from "./run-lifecycle";
+import { ACTIVE_WORKFLOW_RUN_STATUSES_SQL, HUMAN_GATE_RESUME_WORKFLOW_RUN_STATUS, HUMAN_GATE_WORKFLOW_RUN_STATUSES_SQL, WAITING_EXTERNAL_WORKFLOW_RUN_STATUS_SQL, isForbiddenTerminalOverwrite, terminalOverwriteGuardSql, toWorkflowRunStatus, type WorkflowRunStatus } from "./run-lifecycle";
 import { normalizeFoundationStructuredDataFlat, validateFoundationTaskContract } from "./application/foundation-contract";
 import { foundationContractFingerprint } from "./application/foundation-contract-fingerprint";
 import { assertCompleteChapterReviewEvidence } from "./application/chapter-approval";
@@ -2722,9 +2722,28 @@ export class NovelPostgresRepository {
   }
 
   async updateWorkflowRunStatus(temporalWorkflowId: string, status: WorkflowRunStatus, payload: Record<string, unknown> = {}) {
-    const result = await this.pool.query<WorkflowRunRow>("UPDATE workflow_runs SET status=$2,payload=payload || $3,updated_at=now() WHERE temporal_workflow_id=$1 RETURNING id,workflow_type,project_id,temporal_workflow_id,status,payload,created_at,updated_at", [temporalWorkflowId, status, withTerminalOutcome(status, payload)]);
-    if (!result.rowCount) return undefined;
+    const result = await this.pool.query<WorkflowRunRow>(`UPDATE workflow_runs SET status=$2,payload=payload || $3,updated_at=now()
+      WHERE temporal_workflow_id=$1 ${terminalOverwriteGuardSql("$2")}
+      RETURNING id,workflow_type,project_id,temporal_workflow_id,status,payload,created_at,updated_at`, [temporalWorkflowId, status, withTerminalOutcome(status, payload)]);
+    if (!result.rowCount) return this.diagnoseRefusedStatusUpdate(temporalWorkflowId, status);
     return this.announceWorkflowRunStatus(result.rows[0], status, payload);
+  }
+
+  /**
+   * 零行更新的原因区分（守卫不得静默）。
+   *
+   * 行不存在是正常竞态（run 尚未落库或已随项目删除）；被终态守卫挡下则必须留痕，
+   * 否则装了守卫反而比没有更糟——原来至少看得见覆写结果，现在只剩一次 no-op。
+   * 判据本身已经在 UPDATE 的 WHERE 里原子生效，这里只做事后归因（多读一次当前行，
+   * 取值可能已更新，故只用于留痕不用于二次决策）。
+   */
+  private async diagnoseRefusedStatusUpdate(temporalWorkflowId: string, status: WorkflowRunStatus) {
+    const current = await this.pool.query<{ status: string }>("SELECT status FROM workflow_runs WHERE temporal_workflow_id=$1", [temporalWorkflowId]);
+    const from = current.rows[0]?.status;
+    if (from && isForbiddenTerminalOverwrite(from, status)) {
+      await this.appendOutbox("workflow-run", temporalWorkflowId, "workflow.transition-refused", { from, to: status, rule: "terminal-absorbing-except-redrive" });
+    }
+    return undefined;
   }
 
   /**

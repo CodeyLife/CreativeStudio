@@ -12,12 +12,15 @@ import {
   HUMAN_GATE_WORKFLOW_RUN_STATUSES_SQL,
   TERMINAL_WORKFLOW_RUN_STATUSES,
   TERMINAL_WORKFLOW_RUN_STATUSES_SQL,
+  TERMINAL_REDRIVE_WORKFLOW_RUN_STATUS,
   WAITING_EXTERNAL_WORKFLOW_RUN_STATUS,
   WAITING_EXTERNAL_WORKFLOW_RUN_STATUS_SQL,
   WORKFLOW_RUN_STATUSES,
+  isForbiddenTerminalOverwrite,
   isHumanGateWorkflowRunStatus,
   isTerminalWorkflowRunStatus,
   isWorkflowRunStatus,
+  terminalOverwriteGuardSql,
   type WorkflowRunStatus,
 } from "../run-lifecycle";
 import { isTerminalWorkflowStatus, withTerminalOutcome } from "../terminal-outcome";
@@ -51,6 +54,35 @@ describe("workflow_runs 生命周期词表", () => {
     expect(TERMINAL_WORKFLOW_RUN_STATUSES_SQL).toBe(sqlOf(TERMINAL_WORKFLOW_RUN_STATUSES));
     expect(HUMAN_GATE_WORKFLOW_RUN_STATUSES_SQL).toBe(sqlOf(HUMAN_GATE_WORKFLOW_RUN_STATUSES));
     expect(WAITING_EXTERNAL_WORKFLOW_RUN_STATUS_SQL).toBe(`'${WAITING_EXTERNAL_WORKFLOW_RUN_STATUS}'`);
+  });
+
+  it("终态吸收规则的三条边界都按观测收口（复活挡、重申与重驱动放）", () => {
+    for (const from of TERMINAL_WORKFLOW_RUN_STATUSES) {
+      // ③ 复活：终态 → 非终态且非 accepted ⇒ 挡
+      for (const to of [...ACTIVE_WORKFLOW_RUN_STATUSES, ...HUMAN_GATE_WORKFLOW_RUN_STATUSES, WAITING_EXTERNAL_WORKFLOW_RUN_STATUS].filter((status) => status !== TERMINAL_REDRIVE_WORKFLOW_RUN_STATUS)) {
+        expect(isForbiddenTerminalOverwrite(from, to), `${from}->${to}`).toBe(true);
+      }
+      // ① 重驱动：同一 intent 键控 workflowId 再收一次 ⇒ 放（历史观测 4 次）
+      expect(isForbiddenTerminalOverwrite(from, TERMINAL_REDRIVE_WORKFLOW_RUN_STATUS), `${from}->accepted`).toBe(false);
+      // ② 重申业务结局：终态 → 终态 ⇒ 放（对账/审计会重写终态行）
+      for (const to of TERMINAL_WORKFLOW_RUN_STATUSES) expect(isForbiddenTerminalOverwrite(from, to), `${from}->${to}`).toBe(false);
+    }
+    // 非终态出发一律放开（含新态首用：零历史的 waiting-external / 人工门族不得被挡）
+    for (const from of [...ACTIVE_WORKFLOW_RUN_STATUSES, ...HUMAN_GATE_WORKFLOW_RUN_STATUSES, WAITING_EXTERNAL_WORKFLOW_RUN_STATUS]) {
+      for (const to of WORKFLOW_RUN_STATUSES) expect(isForbiddenTerminalOverwrite(from, to), `${from}->${to}`).toBe(false);
+    }
+  });
+
+  it("SQL 守卫由词表派生，且与 TS 判据同集合（两处各自演化即红）", () => {
+    const sql = terminalOverwriteGuardSql("$2");
+    expect(sql).toContain(`status NOT IN (${TERMINAL_WORKFLOW_RUN_STATUSES_SQL})`);
+    expect(sql).toContain(`$2='${TERMINAL_REDRIVE_WORKFLOW_RUN_STATUS}'`);
+    for (const status of WORKFLOW_RUN_STATUSES) {
+      const allowedByTs = !isForbiddenTerminalOverwrite("completed", status);
+      // SQL 里出现该目标态时（终态集或 accepted），必须与 TS 判据一致
+      const allowedBySql = TERMINAL_WORKFLOW_RUN_STATUSES.includes(status as (typeof TERMINAL_WORKFLOW_RUN_STATUSES)[number]) || status === TERMINAL_REDRIVE_WORKFLOW_RUN_STATUS;
+      expect(allowedBySql, status).toBe(allowedByTs);
+    }
   });
 
   it("每个终态都能派生出 terminalOutcome（含作者放弃/拒绝两种曾漏覆盖的结局）", () => {
@@ -87,6 +119,10 @@ describe("run 状态写入面接线锁", () => {
     expect(repository).toMatch(/updateWorkflowRunStatus\(temporalWorkflowId: string, status: WorkflowRunStatus/);
     // 第三条是人工门回写：判据必须写进 UPDATE 的 WHERE（先读后判会留竞态窗口）。
     expect(repository).toMatch(/AND status IN \(\$\{HUMAN_GATE_WORKFLOW_RUN_STATUSES_SQL\}\)/);
+    // 漏斗本体必须挂终态吸收守卫（删掉即回到"任何写入者都能复活终态 run"的旧形态）。
+    expect(repository).toMatch(/WHERE temporal_workflow_id=\$1 \$\{terminalOverwriteGuardSql\("\$2"\)\}/);
+    // 守卫挡下时不得静默：留一条 refusal 事件供审计发现覆写尝试。
+    expect(repository).toContain('"workflow.transition-refused"');
   });
 
   it("人工裁决链路的状态回写一律走守卫方法（未命中即由工作流独占状态）", () => {
@@ -174,5 +210,30 @@ describe("人工门守卫回写（落库）", () => {
     expect(row.rows[0].status).toBe("completed");
     expect(row.rows[0].payload.decision).toBeUndefined();
     expect(row.rows[0].payload.terminalOutcome).toBe("succeeded");
+  });
+
+  it("终态吸收：复活被挡且留 refusal 事件；重申终态与重驱动照旧放行", async () => {
+    if (!available) return;
+    const doneId = `absorb-${randomUUID()}`;
+    await repo.putWorkflowRun({ id: `run-${randomUUID()}`, workflowType: "chapter-review", projectId, temporalWorkflowId: doneId, status: "running" });
+    await repo.updateWorkflowRunStatus(doneId, "completed", { stage: "fact-extraction" });
+
+    const resurrected = await repo.updateWorkflowRunStatus(doneId, "running", { stage: "revision" });
+    expect(resurrected).toBeUndefined();
+    const row = await repo.pool.query<{ status: string; payload: Record<string, unknown> }>("SELECT status,payload FROM workflow_runs WHERE temporal_workflow_id=$1", [doneId]);
+    expect(row.rows[0].status).toBe("completed");
+    // 被挡的写入连 payload 都不留，否则"复活失败"仍会污染展示位。
+    expect(row.rows[0].payload.stage).toBe("fact-extraction");
+
+    const refused = await repo.pool.query<{ payload: Record<string, unknown> }>(
+      "SELECT payload FROM outbox_events WHERE aggregate_type='workflow-run' AND aggregate_id=$1 AND event_type='workflow.transition-refused'",
+      [doneId],
+    );
+    expect(refused.rowCount).toBe(1);
+    expect(refused.rows[0].payload).toMatchObject({ from: "completed", to: "running", rule: "terminal-absorbing-except-redrive" });
+
+    // 放行面②：重申业务结局（终态→终态）；放行面①：重驱动（终态→accepted）。
+    expect((await repo.updateWorkflowRunStatus(doneId, "failed", { error: "restated" }))?.status).toBe("failed");
+    expect((await repo.updateWorkflowRunStatus(doneId, "accepted", { redrive: true }))?.status).toBe("accepted");
   });
 });

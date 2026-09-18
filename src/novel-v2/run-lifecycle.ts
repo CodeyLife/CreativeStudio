@@ -90,6 +90,45 @@ export function isWorkflowRunStatus(status: string): status is WorkflowRunStatus
 }
 
 /**
+ * 终态的唯一合法逃逸目标：`accepted`（重驱动）。
+ *
+ * 运行库取证（ymcp，2026-09-19，3,725 条状态变更事件 / 513 个 run）：终态之后的写入
+ * **只出现过** `failed -> accepted`（3 次）与 `completed -> accepted`（1 次），全部是
+ * 同一 intent 键控的 workflowId 被重新驱动（`putWorkflowRun` 的 intake/re-drive 路径
+ * 写 `accepted`），没有一次终态被直接改写回 `running` 等非终态。
+ */
+export const TERMINAL_REDRIVE_WORKFLOW_RUN_STATUS = "accepted" satisfies WorkflowRunStatus;
+
+/**
+ * 拒写集（不是合法集）：终态 → **非终态且非重驱动目标** 一律非法。
+ *
+ * 三条边界，都来自观测：
+ * ① 终态 → `accepted` 合法——同一 intent 键控的 workflowId 被重新驱动（观测 4 次）；
+ * ② 终态 → 终态 合法——业务结局可以被重申（如先落 `completed` 再显式改标
+ *    `business-revision-exhausted`，对账与审计都会重写终态行），挡它会把正常留痕改成 no-op；
+ * ③ 终态 → 其余（running / waiting-external / 人工门态）非法——"复活已结束的 run"正是
+ *    人工门竞态那一类 bug 的通用形态（见 `resumeWorkflowRunFromHumanGate`），且在 3,725 条
+ *    历史事件里**零观测**，即没有生产者路径依赖它。
+ *
+ * 为什么不装完整"合法迁移表"：词表里 `waiting-external` / `regression-validation-required`
+ * / `rebuild-requested` 在该运行库零历史事件（新于数据或该项目未走到），以观测集为正集
+ * 等于禁止一切未观测的合法首用——写失败退化成静默 no-op，比现状更糟。
+ */
+export function isForbiddenTerminalOverwrite(from: string, to: string): boolean {
+  return isTerminalWorkflowRunStatus(from) && !isTerminalWorkflowRunStatus(to) && to !== TERMINAL_REDRIVE_WORKFLOW_RUN_STATUS;
+}
+
+/**
+ * 把上面那条判据表达成 SQL 片段，供状态漏斗写进 UPDATE 的 WHERE（判据与写入同一原子内）。
+ * `toStatusParam` 是目标态的绑定占位符名（如 `$2`）；目标态走参数而非内联，避免词表
+ * 值在 SQL 里出现第二份字面量。
+ */
+export function terminalOverwriteGuardSql(toStatusParam: string): string {
+  const redrive = TERMINAL_REDRIVE_WORKFLOW_RUN_STATUS;
+  return `AND (status NOT IN (${TERMINAL_WORKFLOW_RUN_STATUSES_SQL}) OR ${toStatusParam} IN (${TERMINAL_WORKFLOW_RUN_STATUSES_SQL}) OR ${toStatusParam}='${redrive}')`;
+}
+
+/**
  * 读取侧收口：数据库列的真实取值域比词表更宽（历史版本写入过已废弃态与旧拼写），
  * 而 TS 无法校验来自数据库的字符串。这里不做静默改写也不抛错——原样透出并集中在
  * 这一个可搜索的 cast 点，避免 mapper 里散落 `as`。写入侧才是受控面
