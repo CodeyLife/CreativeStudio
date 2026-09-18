@@ -10,6 +10,7 @@ import type { ReviewerRole } from "../prompts/chapter-review";
 import type { ChapterChangeScope } from "../protocol";
 import type { RevisionAttempt } from "../prompts/chapter-revision";
 import type { ModelRoutingSnapshot, ModelTaskRecord } from "../model-routing";
+import { EXTERNAL_TASK_WAIT_WINDOW, ExternalFallbackBudgetExhaustedError, ExternalTaskInbox, externalDeliveryValue, type ExternalWaitOutcome } from "./external-task-protocol";
 import { buildChapterGatePayload, finalizeChapterLifecycle, runChapterLifecycle } from "../application/chapter-lifecycle";
 import type { BookSynopsisRecord, BookTitleCandidate, BookTitleCandidatesRecord } from "../application/book-synopsis";
 import { assertCompleteChapterReviewEvidence } from "../application/chapter-approval";
@@ -156,21 +157,11 @@ export const humanSignal = defineSignal<[unknown]>("humanSignal");
 export const storyArcApprovedSignal = defineSignal<[unknown]>("storyArcApproved");
 
 /**
- * OR-B3（product-audit-20260910 E3）外部回退显式预算：外部任务等待超时（无人认领）
- * 每次消耗一档预算，超限不再空转至候选越界，转 manual-review-required 由人/编排者
- * 裁决（形态对齐 revision-policy 的 DEFAULT_MAX_AUTO_REVISIONS——workflow 沙箱纯常量，
- * 不读 env 保确定性）。
- * 阈值依据：一次生成链（draft+3 审+revision+learning…）单任务通常 1-2 档内被认领，
- * 6 档 = 90 分钟无认领即视为"外部执行者缺位"而非慢，继续轮询只烧墙钟。
+ * 外部任务等待协议的常量与错误类型住在 ./external-task-protocol（workflow bundle 安全
+ * 叶子模块，可直接单测）；这里再导出以保住既有消费面（外部回退预算测试与编排文档
+ * 引用的就是这两个符号名）。
  */
-export const MAX_EXTERNAL_FALLBACK_ADVANCES = 6;
-
-export class ExternalFallbackBudgetExhaustedError extends Error {
-  constructor(readonly advances: number, readonly modelTaskId: string) {
-    super(`外部回退预算耗尽（${advances} 档超时无人认领），已转 manual-review-required`);
-    this.name = "ExternalFallbackBudgetExhaustedError";
-  }
-}
+export { EXTERNAL_TASK_WAIT_WINDOW, ExternalFallbackBudgetExhaustedError, MAX_EXTERNAL_FALLBACK_ADVANCES } from "./external-task-protocol";
 
 type HumanDecision = { decision: ApprovalEvidence["decision"]; authorId: string; actorSource: ApprovalEvidence["actorSource"]; approvalEvidenceId: string; feedback?: string; revisionBase?: "current" | "previous"; approvedArtifactId: string };
 
@@ -236,8 +227,7 @@ async function runAllReviewers(params: { workflowId: string; blueprintId: string
 
 export async function novelIntentWorkflow(intent: NovelIntent, workflowId = `novel-intent-${intent.id}`): Promise<ExecutionBlueprint> {
   const signals: Array<{ type: string; payload: unknown }> = [];
-  const externalResults = new Map<string, Record<string, unknown>>();
-  const externalFailures = new Map<string, Record<string, unknown>>();
+  const externalTasks = new ExternalTaskInbox();
   let humanDecision: HumanDecision | undefined;
   const persistSignal = async (type: string, payload: unknown) => {
     signals.push({ type, payload });
@@ -249,13 +239,13 @@ export async function novelIntentWorkflow(intent: NovelIntent, workflowId = `nov
   setHandler(artifactSignal, async (payload) => {
     await persistSignal("artifact", payload);
     const body = (payload && typeof payload === "object" ? payload : {}) as Record<string, unknown>;
-    if (typeof body.modelTaskId === "string") externalResults.set(body.modelTaskId, body);
+    externalTasks.deliver(body);
   });
   setHandler(reviewSignal, async (payload) => { await persistSignal("review", payload); });
   setHandler(failSignal, async (payload) => {
     await persistSignal("fail", payload);
     const body = (payload && typeof payload === "object" ? payload : {}) as Record<string, unknown>;
-    if (typeof body.modelTaskId === "string") externalFailures.set(body.modelTaskId, body);
+    externalTasks.reject(body);
   });
   setHandler(humanSignal, async (payload) => {
     await persistSignal("humanSignal", payload);
@@ -300,28 +290,13 @@ export async function novelIntentWorkflow(intent: NovelIntent, workflowId = `nov
       await activities.updateWorkflowStatus({ workflowId, status: "completed", payload: { blueprintId: blueprint.id, signalCount: signals.length } });
       return blueprint;
     }
-    let externalAdvances = 0;
-    const waitForExternal = async (task: ModelTaskRecord): Promise<{ result?: Record<string, unknown>; failed: boolean }> => {
-      const completed = await condition(() => externalResults.has(task.id) || externalFailures.has(task.id), "15 minutes");
-      if (!completed) {
-        await activities.expireExternalModelTask({ modelTaskId: task.id, reason: "外部模型任务等待超时" });
-        // OR-B3 显式预算：无人认领的超时不再无限空转到候选越界。
-        externalAdvances += 1;
-        if (externalAdvances > MAX_EXTERNAL_FALLBACK_ADVANCES) {
-          await activities.updateWorkflowStatus({ workflowId, status: "manual-review-required", payload: { reason: "external-fallback-budget-exhausted", advances: externalAdvances, modelTaskId: task.id } });
-          throw new ExternalFallbackBudgetExhaustedError(externalAdvances, task.id);
-        }
-        return { failed: true };
-      }
-      if (externalFailures.has(task.id)) {
-        externalFailures.delete(task.id);
-        return { failed: true };
-      }
-      const payload = externalResults.get(task.id);
-      externalResults.delete(task.id);
-      const result = payload?.result;
-      return { failed: false, result: result && typeof result === "object" ? result as Record<string, unknown> : undefined };
-    };
+    const waitForExternal = (task: ModelTaskRecord): Promise<ExternalWaitOutcome> =>
+      externalTasks.waitWithinBudget(
+        task,
+        (predicate) => condition(predicate, EXTERNAL_TASK_WAIT_WINDOW),
+        (modelTaskId, reason) => activities.expireExternalModelTask({ modelTaskId, reason }),
+        async (advances, modelTaskId) => { await activities.updateWorkflowStatus({ workflowId, status: "manual-review-required", payload: { reason: "external-fallback-budget-exhausted", advances, modelTaskId } }); },
+      );
 
     const useContextRefs = patched("chapter-context-refs-v1");
     const runDraft = async (): Promise<{ artifact: Artifact; text: string }> => {
@@ -332,8 +307,8 @@ export async function novelIntentWorkflow(intent: NovelIntent, workflowId = `nov
           : await activities.draft({ workflowId, intent, blueprint, memory, skills, routingSnapshot, candidateStartIndex, foundationArtifacts, planningContext });
         if (generated.kind === "completed") return generated;
         const external = await waitForExternal(generated.task);
-        if (external.failed) { candidateStartIndex = generated.task.candidateIndex + 1; continue; }
-        const text = typeof external.result?.text === "string" ? external.result.text : undefined;
+        if (external.status !== "resolved") { candidateStartIndex = generated.task.candidateIndex + 1; continue; }
+        const text = typeof external.value?.text === "string" ? external.value.text : undefined;
         if (!text) throw new Error("外部草稿任务未返回 text");
         return activities.materializeExternalText({ projectId: intent.projectId, modelTaskId: generated.task.id, text, kind: "draft", baseRevision: blueprint.baseRevision });
       }
@@ -347,8 +322,8 @@ export async function novelIntentWorkflow(intent: NovelIntent, workflowId = `nov
           : await activities.revise({ workflowId, intent, artifact: current.artifact, text: current.text, reviews, ...(directedIssues ? { directedIssues } : {}), ...(authorInstruction ? { authorInstruction } : {}), memory, blueprint, skills, routingSnapshot, candidateStartIndex, planningContext });
         if (generated.kind === "completed") return generated;
         const external = await waitForExternal(generated.task);
-        if (external.failed) { candidateStartIndex = generated.task.candidateIndex + 1; continue; }
-        const text = typeof external.result?.text === "string" ? external.result.text : undefined;
+        if (external.status !== "resolved") { candidateStartIndex = generated.task.candidateIndex + 1; continue; }
+        const text = typeof external.value?.text === "string" ? external.value.text : undefined;
         if (!text) throw new Error("外部修订任务未返回 text");
         return activities.materializeExternalText({ projectId: intent.projectId, modelTaskId: generated.task.id, text, kind: "revision", baseRevision: current.artifact.baseRevision });
       }
@@ -362,8 +337,8 @@ export async function novelIntentWorkflow(intent: NovelIntent, workflowId = `nov
           : await activities.review({ workflowId, artifact: current.artifact, text: current.text, blueprint, memory, skills, role, identity, routingSnapshot, candidateStartIndex, narrativeOrder: snapshot.targetDocumentOrder, planningContext });
         if (generated.kind === "completed") return generated.review;
         const external = await waitForExternal(generated.task);
-        if (external.failed) { candidateStartIndex = generated.task.candidateIndex + 1; continue; }
-        const value = external.result?.value ?? external.result;
+        if (external.status !== "resolved") { candidateStartIndex = generated.task.candidateIndex + 1; continue; }
+        const value = external.value?.value ?? external.value;
         return activities.materializeExternalReview({ modelTaskId: generated.task.id, artifact: current.artifact, identity, role, value });
       }
     };
@@ -376,7 +351,7 @@ export async function novelIntentWorkflow(intent: NovelIntent, workflowId = `nov
         const generated = await activities.assessLearning({ projectId: intent.projectId, workflowId, assessmentKey, artifact: current.artifact, reviews, routingSnapshot, candidateStartIndex, narrativeOrder: snapshot.targetDocumentOrder, documentId: intent.target?.id });
         if (generated.kind === "completed") return generated.assessment;
         const external = await waitForExternal(generated.task);
-        if (external.failed) { candidateStartIndex = generated.task.candidateIndex + 1; continue; }
+        if (external.status !== "resolved") { candidateStartIndex = generated.task.candidateIndex + 1; continue; }
         return activities.materializeExternalLearning({ modelTaskId: generated.task.id, projectId: intent.projectId, workflowId, artifact: current.artifact, reviews });
       }
     };
@@ -394,7 +369,7 @@ export async function novelIntentWorkflow(intent: NovelIntent, workflowId = `nov
         const generated = await activities.extractFacts({ workflowId, projectId: intent.projectId, artifact: current.artifact, text: current.text, blueprint, routingSnapshot, candidateStartIndex, documentId: intent.target?.id, narrativeOrder: snapshot.targetDocumentOrder });
         if (generated.kind === "completed") return generated.artifact;
         const external = await waitForExternal(generated.task);
-        if (external.failed) { candidateStartIndex = generated.task.candidateIndex + 1; continue; }
+        if (external.status !== "resolved") { candidateStartIndex = generated.task.candidateIndex + 1; continue; }
         return activities.materializeExternalFacts({ modelTaskId: generated.task.id, projectId: intent.projectId, artifact: generated.artifact, text: current.text, documentId: intent.target?.id, narrativeOrder: snapshot.targetDocumentOrder });
       }
     };
@@ -418,7 +393,7 @@ export async function novelIntentWorkflow(intent: NovelIntent, workflowId = `nov
         const generated = await activities.enrichCharacters({ workflowId, projectId: intent.projectId, documentId, revisionId, narrativeOrder, artifact: current.artifact, factArtifact, text: current.text, routingSnapshot, candidateStartIndex });
         if (generated.kind === "completed") return;
         const external = await waitForExternal(generated.task);
-        if (external.failed) { candidateStartIndex = generated.task.candidateIndex + 1; continue; }
+        if (external.status !== "resolved") { candidateStartIndex = generated.task.candidateIndex + 1; continue; }
         await activities.materializeExternalEnrichment({ modelTaskId: generated.task.id, projectId: intent.projectId, documentId, revisionId, narrativeOrder, artifact: current.artifact, text: current.text });
         return;
       }
@@ -695,15 +670,14 @@ export interface BookSynopsisWorkflowInput {
 }
 
 export async function bookSynopsisWorkflow(params: BookSynopsisWorkflowInput): Promise<void> {
-  const externalResults = new Map<string, Record<string, unknown>>();
-  const externalFailures = new Map<string, Record<string, unknown>>();
+  const externalTasks = new ExternalTaskInbox();
   setHandler(artifactSignal, (payload) => {
     const body = payload && typeof payload === "object" ? payload as Record<string, unknown> : {};
-    if (typeof body.modelTaskId === "string") externalResults.set(body.modelTaskId, body);
+    externalTasks.deliver(body);
   });
   setHandler(failSignal, (payload) => {
     const body = payload && typeof payload === "object" ? payload as Record<string, unknown> : {};
-    if (typeof body.modelTaskId === "string") externalFailures.set(body.modelTaskId, body);
+    externalTasks.reject(body);
   });
 
   await activities.updateWorkflowStatus({ workflowId: params.workflowId, status: "running", payload: { sourceFingerprint: params.sourceFingerprint } });
@@ -717,16 +691,15 @@ export async function bookSynopsisWorkflow(params: BookSynopsisWorkflowInput): P
         break;
       }
       await activities.updateWorkflowStatus({ workflowId: params.workflowId, status: "waiting-external", payload: { sourceFingerprint: params.sourceFingerprint, modelTaskId: generated.task.id } });
-      const completed = await condition(() => externalResults.has(generated.task.id) || externalFailures.has(generated.task.id), "15 minutes");
-      if (!completed || externalFailures.has(generated.task.id)) {
-        await activities.expireExternalModelTask({ modelTaskId: generated.task.id, reason: completed ? "外部作品简介任务失败" : "外部作品简介任务等待超时" });
-        candidateStartIndex = generated.task.candidateIndex + 1;
-        continue;
-      }
-      const payload = externalResults.get(generated.task.id) ?? {};
-      externalResults.delete(generated.task.id);
+      const outcome = await externalTasks.wait(
+        generated.task,
+        (predicate) => condition(predicate, EXTERNAL_TASK_WAIT_WINDOW),
+        (modelTaskId, reason) => activities.expireExternalModelTask({ modelTaskId, reason }),
+        "外部作品简介任务",
+      );
+      if (outcome.status !== "resolved") { candidateStartIndex = generated.task.candidateIndex + 1; continue; }
       try {
-        text = (await activities.materializeExternalBookSynopsis({ modelTaskId: generated.task.id, value: (payload.result as Record<string, unknown> | undefined)?.value })).text;
+        text = (await activities.materializeExternalBookSynopsis({ modelTaskId: generated.task.id, value: externalDeliveryValue(outcome).value })).text;
       } catch (error) {
         await activities.expireExternalModelTask({ modelTaskId: generated.task.id, reason: failureMessage(error) });
         candidateStartIndex = generated.task.candidateIndex + 1;
@@ -743,15 +716,14 @@ export async function bookSynopsisWorkflow(params: BookSynopsisWorkflowInput): P
 export type BookTitleCandidatesWorkflowInput = BookSynopsisWorkflowInput;
 
 export async function bookTitleCandidatesWorkflow(params: BookTitleCandidatesWorkflowInput): Promise<void> {
-  const externalResults = new Map<string, Record<string, unknown>>();
-  const externalFailures = new Map<string, Record<string, unknown>>();
+  const externalTasks = new ExternalTaskInbox();
   setHandler(artifactSignal, (payload) => {
     const body = payload && typeof payload === "object" ? payload as Record<string, unknown> : {};
-    if (typeof body.modelTaskId === "string") externalResults.set(body.modelTaskId, body);
+    externalTasks.deliver(body);
   });
   setHandler(failSignal, (payload) => {
     const body = payload && typeof payload === "object" ? payload as Record<string, unknown> : {};
-    if (typeof body.modelTaskId === "string") externalFailures.set(body.modelTaskId, body);
+    externalTasks.reject(body);
   });
 
   await activities.updateWorkflowStatus({ workflowId: params.workflowId, status: "running", payload: { sourceFingerprint: params.sourceFingerprint } });
@@ -765,16 +737,15 @@ export async function bookTitleCandidatesWorkflow(params: BookTitleCandidatesWor
         break;
       }
       await activities.updateWorkflowStatus({ workflowId: params.workflowId, status: "waiting-external", payload: { sourceFingerprint: params.sourceFingerprint, modelTaskId: generated.task.id } });
-      const completed = await condition(() => externalResults.has(generated.task.id) || externalFailures.has(generated.task.id), "15 minutes");
-      if (!completed || externalFailures.has(generated.task.id)) {
-        await activities.expireExternalModelTask({ modelTaskId: generated.task.id, reason: completed ? "外部书名生成任务失败" : "外部书名生成任务等待超时" });
-        candidateStartIndex = generated.task.candidateIndex + 1;
-        continue;
-      }
-      const payload = externalResults.get(generated.task.id) ?? {};
-      externalResults.delete(generated.task.id);
+      const outcome = await externalTasks.wait(
+        generated.task,
+        (predicate) => condition(predicate, EXTERNAL_TASK_WAIT_WINDOW),
+        (modelTaskId, reason) => activities.expireExternalModelTask({ modelTaskId, reason }),
+        "外部书名生成任务",
+      );
+      if (outcome.status !== "resolved") { candidateStartIndex = generated.task.candidateIndex + 1; continue; }
       try {
-        candidates = (await activities.materializeExternalBookTitleCandidates({ modelTaskId: generated.task.id, value: (payload.result as Record<string, unknown> | undefined)?.value })).candidates;
+        candidates = (await activities.materializeExternalBookTitleCandidates({ modelTaskId: generated.task.id, value: externalDeliveryValue(outcome).value })).candidates;
       } catch (error) {
         await activities.expireExternalModelTask({ modelTaskId: generated.task.id, reason: failureMessage(error) });
         candidateStartIndex = generated.task.candidateIndex + 1;
@@ -793,15 +764,14 @@ export interface ChapterTitleWorkflowInput extends BookSynopsisWorkflowInput {
 }
 
 export async function chapterTitleWorkflow(params: ChapterTitleWorkflowInput): Promise<void> {
-  const externalResults = new Map<string, Record<string, unknown>>();
-  const externalFailures = new Map<string, Record<string, unknown>>();
+  const externalTasks = new ExternalTaskInbox();
   setHandler(artifactSignal, (payload) => {
     const body = payload && typeof payload === "object" ? payload as Record<string, unknown> : {};
-    if (typeof body.modelTaskId === "string") externalResults.set(body.modelTaskId, body);
+    externalTasks.deliver(body);
   });
   setHandler(failSignal, (payload) => {
     const body = payload && typeof payload === "object" ? payload as Record<string, unknown> : {};
-    if (typeof body.modelTaskId === "string") externalFailures.set(body.modelTaskId, body);
+    externalTasks.reject(body);
   });
 
   await activities.updateWorkflowStatus({ workflowId: params.workflowId, status: "running", payload: { documentId: params.documentId, sourceFingerprint: params.sourceFingerprint } });
@@ -815,16 +785,15 @@ export async function chapterTitleWorkflow(params: ChapterTitleWorkflowInput): P
         break;
       }
       await activities.updateWorkflowStatus({ workflowId: params.workflowId, status: "waiting-external", payload: { documentId: params.documentId, sourceFingerprint: params.sourceFingerprint, modelTaskId: generated.task.id } });
-      const completed = await condition(() => externalResults.has(generated.task.id) || externalFailures.has(generated.task.id), "15 minutes");
-      if (!completed || externalFailures.has(generated.task.id)) {
-        await activities.expireExternalModelTask({ modelTaskId: generated.task.id, reason: completed ? "外部章节命名任务失败" : "外部章节命名任务等待超时" });
-        candidateStartIndex = generated.task.candidateIndex + 1;
-        continue;
-      }
-      const payload = externalResults.get(generated.task.id) ?? {};
-      externalResults.delete(generated.task.id);
+      const outcome = await externalTasks.wait(
+        generated.task,
+        (predicate) => condition(predicate, EXTERNAL_TASK_WAIT_WINDOW),
+        (modelTaskId, reason) => activities.expireExternalModelTask({ modelTaskId, reason }),
+        "外部章节命名任务",
+      );
+      if (outcome.status !== "resolved") { candidateStartIndex = generated.task.candidateIndex + 1; continue; }
       try {
-        title = (await activities.materializeExternalChapterTitle({ modelTaskId: generated.task.id, value: (payload.result as Record<string, unknown> | undefined)?.value })).title;
+        title = (await activities.materializeExternalChapterTitle({ modelTaskId: generated.task.id, value: externalDeliveryValue(outcome).value })).title;
       } catch (error) {
         await activities.expireExternalModelTask({ modelTaskId: generated.task.id, reason: failureMessage(error) });
         candidateStartIndex = generated.task.candidateIndex + 1;
@@ -850,8 +819,7 @@ export async function storyArcPlanningWorkflow(params: StoryArcPlanningWorkflowI
     startToCloseTimeout: "30 minutes",
     retry: { maximumAttempts: 1, nonRetryableErrorTypes: ["NonRetryableModelTransportError", "ModelTransportError"] },
   });
-  const externalResults = new Map<string, Record<string, unknown>>();
-  const externalFailures = new Map<string, Record<string, unknown>>();
+  const externalTasks = new ExternalTaskInbox();
   let approved = false;
   // 人工门作者决策（弧6 实践批）：manual 策略下审核 verdict=revise 时 approve 被
   // repository 门禁正当拒绝，但此前门只等批准信号——作者意见无处可交，唯一出路
@@ -869,21 +837,18 @@ export async function storyArcPlanningWorkflow(params: StoryArcPlanningWorkflowI
   });
   setHandler(artifactSignal, (payload) => {
     const body = payload && typeof payload === "object" ? payload as Record<string, unknown> : {};
-    if (typeof body.modelTaskId === "string") externalResults.set(body.modelTaskId, body);
+    externalTasks.deliver(body);
   });
   setHandler(failSignal, (payload) => {
     const body = payload && typeof payload === "object" ? payload as Record<string, unknown> : {};
-    if (typeof body.modelTaskId === "string") externalFailures.set(body.modelTaskId, body);
+    externalTasks.reject(body);
   });
 
   const waitForExternal = async (task: ModelTaskRecord): Promise<Record<string, unknown>> => {
-    const completed = await condition(() => externalResults.has(task.id) || externalFailures.has(task.id), "15 minutes");
-    if (!completed) throw new Error(`外部模型任务等待超时：${task.id}`);
-    if (externalFailures.has(task.id)) throw new Error(`外部模型任务失败：${task.id}`);
-    const payload = externalResults.get(task.id) ?? {};
-    externalResults.delete(task.id);
-    const result = payload.result;
-    return result && typeof result === "object" ? result as Record<string, unknown> : {};
+    // 弧链的回退统一在外层 catch（expire + 换下一候选），这里不重复 expire。
+    const outcome = await externalTasks.wait(task, (predicate) => condition(predicate, EXTERNAL_TASK_WAIT_WINDOW), async () => undefined, "外部模型任务");
+    if (outcome.status !== "resolved") throw new Error(`外部模型任务未交付：${task.id}（${outcome.status}）`);
+    return outcome.value ?? {};
   };
 
   const generateBundle = async (candidateStartIndex?: number): Promise<{ artifact: Artifact; bundle: StoryArcBundle }> => {
@@ -945,11 +910,24 @@ export async function storyArcPlanningWorkflow(params: StoryArcPlanningWorkflowI
   const reviewStrategy = storyArcReviewStrategy(reviewPolicy);
   const routingSnapshot = await activities.getStoryArcRoutingSnapshot();
   await activities.updateWorkflowStatus({ workflowId: params.workflowId, status: "running", payload: { arcId: params.arcId, mode: params.mode, reviewPolicy, routingSnapshotId: routingSnapshot.id, orchestrated: Boolean(params.plotOutline) } });
+  // 学习评估是定稿之后的增值环节：一次无人认领的外部任务不得把整弧 run 打成 failed
+  // （弧已投影入库，失败信号只会误导编排者）。非交付 → expire 留痕后降级跳过。
+  const learningDegrades = patched("story-arc-learning-degrade-v1");
   const runStoryArcLearning = async (current: { artifact: Artifact }, reviewed: { artifact: Artifact; review: StoryArcReviewOutput }, candidateStartIndex?: number): Promise<void> => {
     if (reviewed.review.verdict !== "revise" || !reviewed.review.opinion.trim()) return;
     const generated = await storyArcModelActivities.assessStoryArcLearning({ projectId: params.projectId, workflowId: params.workflowId, artifact: current.artifact, reviewArtifact: reviewed.artifact, review: reviewed.review, routingSnapshot, candidateStartIndex });
     if (generated.kind === "completed") return;
-    await activities.materializeExternalStoryArcLearning({ modelTaskId: generated.task.id, projectId: params.projectId, workflowId: params.workflowId, artifact: current.artifact, reviewArtifact: reviewed.artifact, review: reviewed.review, value: (await waitForExternal(generated.task)).value });
+    if (!learningDegrades) {
+      await activities.materializeExternalStoryArcLearning({ modelTaskId: generated.task.id, projectId: params.projectId, workflowId: params.workflowId, artifact: current.artifact, reviewArtifact: reviewed.artifact, review: reviewed.review, value: (await waitForExternal(generated.task)).value });
+      return;
+    }
+    const outcome = await externalTasks.wait(generated.task, (predicate) => condition(predicate, EXTERNAL_TASK_WAIT_WINDOW), async () => undefined, "外部故事弧学习评估任务");
+    if (outcome.status === "resolved") {
+      await activities.materializeExternalStoryArcLearning({ modelTaskId: generated.task.id, projectId: params.projectId, workflowId: params.workflowId, artifact: current.artifact, reviewArtifact: reviewed.artifact, review: reviewed.review, value: (outcome.value ?? {}).value });
+      return;
+    }
+    // 无人认领才需要关行留痕；显式失败的 reason 已由 failModelTask 落库。
+    if (outcome.status === "unclaimed") await activities.expireExternalModelTask({ modelTaskId: generated.task.id, reason: "外部故事弧学习评估任务等待超时" });
   };
   try {
     let current = params.existingArtifactId
@@ -1066,8 +1044,7 @@ export async function creativeRunWorkflow(runId: string): Promise<void> {
   let cancelled = false;
   const reviewedWorkItems = new Set<string>(); // 已收到 reviewSubmitted 的 work items
   const requestedWorkItems = new Set<string>();
-  const externalResults = new Map<string, Record<string, unknown>>();
-  const externalFailures = new Map<string, Record<string, unknown>>();
+  const externalTasks = new ExternalTaskInbox();
   // Signal handlers
   setHandler(pauseCreativeRunSignal, () => {
     paused = true;
@@ -1086,35 +1063,20 @@ export async function creativeRunWorkflow(runId: string): Promise<void> {
   });
   setHandler(artifactSignal, (payload) => {
     const body = (payload && typeof payload === "object" ? payload : {}) as Record<string, unknown>;
-    if (typeof body.modelTaskId === "string") externalResults.set(body.modelTaskId, body);
+    externalTasks.deliver(body);
   });
   setHandler(failSignal, (payload) => {
     const body = (payload && typeof payload === "object" ? payload : {}) as Record<string, unknown>;
-    if (typeof body.modelTaskId === "string") externalFailures.set(body.modelTaskId, body);
+    externalTasks.reject(body);
   });
 
-  let externalAdvances = 0;
-  const waitForExternal = async (task: ModelTaskRecord): Promise<{ result?: Record<string, unknown>; failed: boolean }> => {
-    const completed = await condition(() => externalResults.has(task.id) || externalFailures.has(task.id), "15 minutes");
-    if (!completed) {
-      await activities.expireExternalModelTask({ modelTaskId: task.id, reason: "外部模型任务等待超时" });
-      // OR-B3 显式预算（同章节主循环语义）。
-      externalAdvances += 1;
-      if (externalAdvances > MAX_EXTERNAL_FALLBACK_ADVANCES) {
-        await activities.updateWorkflowStatus({ workflowId: runId, status: "manual-review-required", payload: { runId, reason: "external-fallback-budget-exhausted", advances: externalAdvances, modelTaskId: task.id } });
-        throw new ExternalFallbackBudgetExhaustedError(externalAdvances, task.id);
-      }
-      return { failed: true };
-    }
-    if (externalFailures.has(task.id)) {
-      externalFailures.delete(task.id);
-      return { failed: true };
-    }
-    const payload = externalResults.get(task.id);
-    externalResults.delete(task.id);
-    const result = payload?.result;
-    return { failed: false, result: result && typeof result === "object" ? result as Record<string, unknown> : undefined };
-  };
+  const waitForExternal = (task: ModelTaskRecord): Promise<ExternalWaitOutcome> =>
+    externalTasks.waitWithinBudget(
+      task,
+      (predicate) => condition(predicate, EXTERNAL_TASK_WAIT_WINDOW),
+      (modelTaskId, reason) => activities.expireExternalModelTask({ modelTaskId, reason }),
+      async (advances, modelTaskId) => { await activities.updateWorkflowStatus({ workflowId: runId, status: "manual-review-required", payload: { runId, reason: "external-fallback-budget-exhausted", advances, modelTaskId } }); },
+    );
 
   // 1. 加载 run
   const run = await activities.loadRun({ runId });
@@ -1229,7 +1191,7 @@ export async function processWorkItem(params: {
   reviewedWorkItems: Set<string>;
   retryCount: Map<string, number>;
   maxRetries: number;
-  waitForExternal(task: ModelTaskRecord): Promise<{ result?: Record<string, unknown>; failed: boolean }>;
+  waitForExternal(task: ModelTaskRecord): Promise<ExternalWaitOutcome>;
   isCancelled: () => boolean;
   isPaused: () => boolean;
 }): Promise<void> {
@@ -1277,11 +1239,11 @@ export async function processWorkItem(params: {
         payload: { workItemId: work.id, modelTaskId: generated.task.id, taskKey: work.taskKey },
       });
       const external = await waitForExternal(generated.task);
-      if (external.failed) {
+      if (external.status !== "resolved") {
         candidateStartIndex = generated.task.candidateIndex + 1;
         continue;
       }
-      const value = external.result?.value ?? external.result;
+      const value = external.value?.value ?? external.value;
       if (!value) throw new Error(`外部 foundation 任务未返回结构化结果：${generated.task.id}`);
       const artifact = await activities.materializeExternalFoundation({
         modelTaskId: generated.task.id,
@@ -1304,8 +1266,8 @@ export async function processWorkItem(params: {
     if (foundationReview.kind === "external") {
       await activities.recordEvent({ runId, eventType: "work.foundation-review.external-pending", payload: { workItemId: work.id, modelTaskId: foundationReview.task.id, taskKey: work.taskKey } });
       const external = await waitForExternal(foundationReview.task);
-      if (external.failed) throw new Error(`外部 foundation 审核任务失败：${foundationReview.task.id}`);
-      const materialized = await activities.materializeExternalFoundationReview({ modelTaskId: foundationReview.task.id, workItemId: work.id, value: external.result?.value ?? external.result });
+      if (external.status !== "resolved") throw new Error(`外部 foundation 审核任务失败：${foundationReview.task.id}`);
+      const materialized = await activities.materializeExternalFoundationReview({ modelTaskId: foundationReview.task.id, workItemId: work.id, value: external.value?.value ?? external.value });
       foundationOpinion = materialized.summary;
     } else {
       foundationOpinion = foundationReview.review.summary;
@@ -1459,8 +1421,7 @@ export async function chapterReviewWorkflow(params: {
   let iteration = 0;
   let finalScore: number | undefined;
   let humanDecision: HumanDecision | undefined;
-  const externalResults = new Map<string, Record<string, unknown>>();
-  const externalFailures = new Map<string, Record<string, unknown>>();
+  const externalTasks = new ExternalTaskInbox();
   const persistSignal = async (type: string, payload: unknown) => {
     const body = (payload && typeof payload === "object" ? payload : {}) as Record<string, unknown>;
     await activities.recordWorkflowSignal({ workflowId, taskId: typeof body.taskId === "string" ? body.taskId : `${workflowId}:external`, signal: type, payload: body });
@@ -1470,13 +1431,13 @@ export async function chapterReviewWorkflow(params: {
   setHandler(artifactSignal, async (payload) => {
     await persistSignal("artifact", payload);
     const body = (payload && typeof payload === "object" ? payload : {}) as Record<string, unknown>;
-    if (typeof body.modelTaskId === "string") externalResults.set(body.modelTaskId, body);
+    externalTasks.deliver(body);
   });
   setHandler(reviewSignal, async (payload) => { await persistSignal("review", payload); });
   setHandler(failSignal, async (payload) => {
     await persistSignal("fail", payload);
     const body = (payload && typeof payload === "object" ? payload : {}) as Record<string, unknown>;
-    if (typeof body.modelTaskId === "string") externalFailures.set(body.modelTaskId, body);
+    externalTasks.reject(body);
   });
   setHandler(humanSignal, async (payload) => {
     await persistSignal("humanSignal", payload);
@@ -1486,27 +1447,13 @@ export async function chapterReviewWorkflow(params: {
     if (!evidenceId) throw new Error("人工决策 signal 缺少 approvalEvidenceId");
     humanDecision = humanDecisionFromEvidence(await activities.loadApprovalEvidence({ workflowId, approvalEvidenceId: evidenceId }));
   });
-  let externalAdvances = 0;
-  const waitForExternal = async (task: ModelTaskRecord): Promise<{ result?: Record<string, unknown>; failed: boolean }> => {
-    const completed = await condition(() => externalResults.has(task.id) || externalFailures.has(task.id), "15 minutes");
-    if (!completed) {
-      await activities.expireExternalModelTask({ modelTaskId: task.id, reason: "外部模型任务等待超时" });
-      externalAdvances += 1;
-      if (externalAdvances > MAX_EXTERNAL_FALLBACK_ADVANCES) {
-        await activities.updateWorkflowStatus({ workflowId, status: "manual-review-required", payload: { reason: "external-fallback-budget-exhausted", advances: externalAdvances, modelTaskId: task.id } });
-        throw new ExternalFallbackBudgetExhaustedError(externalAdvances, task.id);
-      }
-      return { failed: true };
-    }
-    if (externalFailures.has(task.id)) {
-      externalFailures.delete(task.id);
-      return { failed: true };
-    }
-    const payload = externalResults.get(task.id);
-    externalResults.delete(task.id);
-    const result = payload?.result;
-    return { failed: false, result: result && typeof result === "object" ? result as Record<string, unknown> : undefined };
-  };
+  const waitForExternal = (task: ModelTaskRecord): Promise<ExternalWaitOutcome> =>
+    externalTasks.waitWithinBudget(
+      task,
+      (predicate) => condition(predicate, EXTERNAL_TASK_WAIT_WINDOW),
+      (modelTaskId, reason) => activities.expireExternalModelTask({ modelTaskId, reason }),
+      async (advances, modelTaskId) => { await activities.updateWorkflowStatus({ workflowId, status: "manual-review-required", payload: { reason: "external-fallback-budget-exhausted", advances, modelTaskId } }); },
+    );
 
   // 1. 标记运行中
   await activities.updateWorkflowStatus({
@@ -1806,11 +1753,11 @@ export async function chapterReviewWorkflow(params: {
         });
         if (generated.kind === "completed") return generated.review;
         const external = await waitForExternal(generated.task);
-        if (external.failed) {
+        if (external.status !== "resolved") {
           candidateStartIndex = generated.task.candidateIndex + 1;
           continue;
         }
-        const value = external.result?.value ?? external.result;
+        const value = external.value?.value ?? external.value;
         return activities.materializeExternalReview({ modelTaskId: generated.task.id, artifact: current.artifact, identity, role, value, suppressChapterSnapshotPromotion: Boolean(targetedReview) });
       }
     }
@@ -1863,7 +1810,7 @@ export async function chapterReviewWorkflow(params: {
         });
         if (generated.kind === "completed") return { artifact: generated.artifact, text: generated.text };
         const external = await waitForExternal(generated.task);
-        if (external.failed) {
+        if (external.status !== "resolved") {
           candidateStartIndex = generated.task.candidateIndex + 1;
           continue;
         }
@@ -1876,7 +1823,7 @@ export async function chapterReviewWorkflow(params: {
             continue;
           }
         }
-        const text = typeof external.result?.text === "string" ? external.result.text : undefined;
+        const text = typeof external.value?.text === "string" ? external.value.text : undefined;
         if (!text) throw new Error("外部章节修订任务未返回 text");
         return activities.materializeExternalText({ projectId: params.projectId, modelTaskId: generated.task.id, text, kind: "revision", baseRevision: current.artifact.baseRevision });
       }
@@ -1899,7 +1846,7 @@ export async function chapterReviewWorkflow(params: {
         });
         if (generated.kind === "completed") return generated.assessment;
         const external = await waitForExternal(generated.task);
-        if (external.failed) {
+        if (external.status !== "resolved") {
           candidateStartIndex = generated.task.candidateIndex + 1;
           continue;
         }
@@ -1931,7 +1878,7 @@ export async function chapterReviewWorkflow(params: {
         });
         if (generated.kind === "completed") return generated.artifact;
         const external = await waitForExternal(generated.task);
-        if (external.failed) {
+        if (external.status !== "resolved") {
           candidateStartIndex = generated.task.candidateIndex + 1;
           continue;
         }
@@ -1964,7 +1911,7 @@ export async function chapterReviewWorkflow(params: {
         });
         if (generated.kind === "completed") return;
         const external = await waitForExternal(generated.task);
-        if (external.failed) { candidateStartIndex = generated.task.candidateIndex + 1; continue; }
+        if (external.status !== "resolved") { candidateStartIndex = generated.task.candidateIndex + 1; continue; }
         await activities.materializeExternalEnrichment({
           modelTaskId: generated.task.id,
           projectId: params.projectId,

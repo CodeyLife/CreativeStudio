@@ -84,7 +84,7 @@ function makeParams(overrides: Record<string, unknown> = {}) {
     reviewedWorkItems: new Set<string>(),
     retryCount: new Map<string, number>(),
     maxRetries: 2,
-    waitForExternal: async () => ({ failed: true }),
+    waitForExternal: async () => ({ status: "unclaimed" }),
     isCancelled: () => false,
     isPaused: () => false,
     ...overrides,
