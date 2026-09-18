@@ -4,8 +4,9 @@ import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { NovelPostgresRepository } from "../postgres-repository";
+import { buildMemoryBundle, createPreflightPlan } from "../cognition";
 import { CLAIM_PROJECTION_SET_SQL, retrievalVisibleClaimsSql, retiredByVisibleKillerSql, isVisibleClaimAuthority } from "../memory-visibility";
-import type { MemoryClaim } from "../protocol";
+import type { MemoryClaim, NovelIntent } from "../protocol";
 
 const TEST_DB_URL = process.env.TEST_DATABASE_URL ?? "postgresql://ymcp:ymcp@127.0.0.1:5432/ymcp_test";
 
@@ -103,6 +104,44 @@ describe("blind-kill invariant against PostgreSQL", () => {
     expect(await indexedVisible()).toBe(true);
     const hits = await repository.searchMemory({ projectId, facets: [{ kind: "fact", query: "灵石", required: true }] });
     expect(hits.some((hit) => hit.id === derivedId)).toBe(true);
+  });
+
+  it("检索面把身份指纹带进选形层：同槽位第四条按配额排除", async () => {
+    if (!available) return;
+    // 回归锁（product-audit-20260910 §五"配额未获生产检验"的根因）：词法命中的 hit 字面量
+    // 曾不映射 identity_hash/value_hash，而槽位配额与同值判重都以 identityHash 为键 ⇒
+    // 配额在产线上一次都没触发过（400 份真实 manifest 里 identity-slot-quota 计数为 0），
+    // 只在单元测试里"看着有效"——因为测试自己把字段造好了。这条用例走真实检索读出路径。
+    const slotProject = `test-slot-quota-${randomUUID().slice(0, 8)}`;
+    await repository.ensureProject(slotProject, "Slot Quota Test");
+    const ids = Array.from({ length: 4 }, (_, index) => `claim-slot-${index}-${randomUUID().slice(0, 8)}`);
+    // 指纹由生产侧算好后入库（fact-extraction / character-enrichment 各自 factIdentityHash），
+    // 这里按同一形态种四条同槽位不同值的声明，检验的是"库里有 → 检索面必须带出来"这一段。
+    const slotIdentity = `slot-${randomUUID().slice(0, 8)}`;
+    await repository.recordMemoryClaims({
+      projectId: slotProject,
+      claims: ids.map((id, index) => claim(slotProject, {
+        id, subjectRefs: ["hero"], predicate: "持有", content: `主角持有第${index + 1}号灵砂`, authority: "derived",
+        identityHash: slotIdentity, valueHash: `value-${index}`, narrativeRange: { start: index + 1, end: index + 1 },
+      })),
+    });
+    try {
+      const hits = await repository.searchMemory({ projectId: slotProject, facets: [{ kind: "fact", query: "灵砂", required: true }] });
+      expect(hits.map((hit) => hit.id).sort()).toEqual([...ids].sort());
+      expect(hits.every((hit) => hit.identityHash === slotIdentity)).toBe(true);
+      expect(new Set(hits.map((hit) => hit.valueHash)).size).toBe(4);
+
+      const intent: NovelIntent = { id: "intent-slot", projectId: slotProject, source: "web", objective: "续写第 12 章", target: { kind: "chapter", id: "doc-12", order: 12 }, requestedStage: "drafting", createdAt: 1, idempotencyKey: "slot-1" };
+      const plan = createPreflightPlan(intent, { projectId: slotProject, currentRevision: 11, targetDocumentId: "doc-12", targetDocumentOrder: 12 });
+      const bundle = await buildMemoryBundle(plan, { projectId: slotProject, provider: { search: async () => hits }, tokenBudget: 24_000 });
+      const selected = bundle.claims.filter((item) => ids.includes(item.id));
+      expect(selected).toHaveLength(3);
+      const excluded = (bundle.selectionReceipts ?? []).filter((receipt) => receipt.status === "excluded" && ids.includes(receipt.claimId));
+      expect(excluded).toHaveLength(1);
+      expect(excluded[0]).toMatchObject({ reason: "identity-slot-quota" });
+    } finally {
+      await repository.deleteProject(slotProject).catch(() => undefined);
+    }
   });
 
   it("候选积压面板可对真实 Postgres 执行且逐章聚合正确（FM-2；回归：可见数查询漏传参数导致整工具 'there is no parameter $1' 出生即坏）", async () => {

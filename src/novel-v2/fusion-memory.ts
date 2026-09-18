@@ -124,6 +124,11 @@ export class FusionMemoryProvider implements MemoryProvider {
           const rankField = track.name === "semantic" ? "semanticRank" : track.name === "lexical" ? "lexicalRank" : "graphRank";
           fused.set(hit.id, {
             ...existing,
+            // 指纹字段按"任一带得到就用"合并：槽位配额与同值判重以 identityHash 为键，
+            // 而各轨提供的字段完整度不同（语义轨从索引 payload 全量还原，词法轨曾漏），
+            // 让哈希存在与否取决于轨道先后顺序等于把配额变成随机行为。
+            identityHash: existing.identityHash ?? hit.identityHash,
+            valueHash: existing.valueHash ?? hit.valueHash,
             score: mergedScore,
             matchedFacets: [...new Set([
               ...(existing.matchedFacets ?? [existing.matchedFacet]),

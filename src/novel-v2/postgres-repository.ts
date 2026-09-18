@@ -980,6 +980,10 @@ export class NovelPostgresRepository {
           sourceArtifactId: row.source_artifact_id ?? undefined,
           decidedBy: row.decided_by ?? undefined,
           decidedAt: row.decided_at ? iso(row.decided_at) : undefined,
+          // 检索面必须带 identity/value 指纹：槽位配额与"同槽位同值跨管道判重"都以
+          // identityHash 为键（cognition.ts 的 countSlot/semanticKey），漏字段=配额恒不触发。
+          identityHash: row.identity_hash ?? undefined,
+          valueHash: row.value_hash ?? undefined,
           // P2-G2: score 用 lexicalRank 加权（0.7 lexical + 0.3 confidence）
           score: 0.7 * lexicalRank + 0.3 * Number(row.confidence),
           matchedFacet: facet.kind,

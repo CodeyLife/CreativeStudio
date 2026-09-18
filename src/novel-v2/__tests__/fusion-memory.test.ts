@@ -52,4 +52,18 @@ describe("FusionMemoryProvider", () => {
     const results = await provider.search({ projectId: "project-1", facets: [{ kind: "fact", query: "事实", required: true }] });
     expect(results).toHaveLength(40);
   });
+
+  it("身份指纹跨轨保留：载荷缺字段时由另一轨补上，配额不得取决于轨道顺序", async () => {
+    // 槽位配额与同值判重以 identityHash 为键；融合层若只保留先到那轨的字段，
+    // 同一 claim 的"有没有指纹"就变成召回顺序的函数（旧索引载荷/词法轨都曾缺）。
+    const staleIndexPayload = hit("fact", 0.7);
+    const lexicalWithFingerprint = { ...hit("fact", 0.9), identityHash: "slot-hero-held", valueHash: "value-9" };
+    const provider = new FusionMemoryProvider({
+      semantic: { search: async () => [staleIndexPayload] } as MemoryProvider,
+      lexical: { search: async () => [lexicalWithFingerprint] },
+    });
+    const results = await provider.search({ projectId: "project-1", facets: [{ kind: "fact", query: "世界观", required: true }] });
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ identityHash: "slot-hero-held", valueHash: "value-9" });
+  });
 });
