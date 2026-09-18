@@ -358,6 +358,13 @@ export interface PromptContextManifest {
   /** 因预算被排除的条目数，包含上游已在记忆选择阶段标记为 budget 的 receipt。 */
   budgetExcludedSectionCount: number;
   estimatedInputTokens: number;
+  /**
+   * 同一段装配文本按 **AUDIT 口径**（CJK 感知）重算的估算值，与 `estimatedInputTokens`
+   * （BUDGET 口径）逐部分同形，只换折算系数。存在理由：口径合并需要"同一串文本 × 两种口径
+   * × provider 实测"的三元组，而运行库 426 行实测证明旧的跨文本对比不可行（两数来自不同
+   * 字符串，比值被文本覆盖差支配）。可选——历史 manifest 没有这个键。
+   */
+  estimatedInputTokensAuditBasis?: number;
   sections: PromptContextSectionReceipt[];
   skillManifest?: SkillResolutionManifest;
   fingerprint: string;

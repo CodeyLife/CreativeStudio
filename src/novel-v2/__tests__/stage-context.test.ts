@@ -36,6 +36,25 @@ describe("stage context compiler", () => {
     expect(result.manifest.sections.find((item) => item.id === "duplicate")?.reason).toBe("duplicate-content");
   });
 
+  it("同一装配串同时留两口径估算，比值方向随文本类型翻转（口径合并的前置观测面）", () => {
+    const cjk = compileStageContext({
+      projectId: "p1", workflowId: "wf-basis-cjk", purpose: "writing.draft", stage: "drafting",
+      maxInputTokens: 8_000, reservedOutputTokens: 500, system: "你是中文长篇编辑，输出保持克制。",
+      sections: [{ id: "m", kind: "manuscript", title: "正文", text: "他在长街上听见城墙那头的号角".repeat(20), priority: "required", provenanceRefs: [] }],
+    }).manifest;
+    const latin = compileStageContext({
+      projectId: "p1", workflowId: "wf-basis-latin", purpose: "writing.draft", stage: "drafting",
+      maxInputTokens: 8_000, reservedOutputTokens: 500, system: "You are a novel editor producing restrained output.",
+      sections: [{ id: "m", kind: "manuscript", title: "manuscript", text: "the long street stayed quiet. ".repeat(80), priority: "required", provenanceRefs: [] }],
+    }).manifest;
+
+    // 两数来自同一段装配文本（逐部分同形，只差折算系数），故比值就是口径因子。
+    expect(cjk.estimatedInputTokensAuditBasis).toBeTypeOf("number");
+    expect(latin.estimatedInputTokensAuditBasis).toBeTypeOf("number");
+    expect(cjk.estimatedInputTokensAuditBasis!).toBeGreaterThan(cjk.estimatedInputTokens);
+    expect(latin.estimatedInputTokensAuditBasis!).toBeLessThan(latin.estimatedInputTokens);
+  });
+
   it("drops soft context but fails explicitly when required context cannot fit", () => {
     const soft = compileStageContext({
       projectId: "p1", workflowId: "wf1", purpose: "writing.draft", stage: "drafting",

@@ -106,10 +106,19 @@ describe("token 估算接线锁（防止口径再次分叉）", () => {
     expect([...gateway.matchAll(/estimatedInputTokens = estimateBudgetTokens\(/g)].length).toBe(2);
   });
 
-  it("预算/淘汰侧文件不得直接引用审计口径", () => {
-    for (const file of ["src/novel-v2/cognition.ts", "src/novel-v2/stage-context.ts", "src/novel-v2/temporal/activities.ts"]) {
+  it("淘汰/预算判据不得改用审计口径，观测字段不得改用预算口径（逐字段绑定）", () => {
+    // 判据侧：cognition 与 activities 只允许预算口径。
+    for (const file of ["src/novel-v2/cognition.ts", "src/novel-v2/temporal/activities.ts"]) {
       expect(read(file), file).not.toMatch(/estimateTokens\(/);
     }
+    // 装配侧：usableTokens / requiredInputTokens / estimatedInputTokens 三处判据走预算，
+    // 只有观测字段 estimatedInputTokensAuditBasis 走审计口径。写反=预算判据被换掉。
+    const stage = read("src/novel-v2/stage-context.ts");
+    expect(stage).toMatch(/const usableTokens = Math\.max\(0, request\.maxInputTokens - request\.reservedOutputTokens - systemTokens - schemaTokens\)/);
+    expect(stage).toMatch(/systemTokens = estimateStageTokens\(/);
+    expect(stage).toMatch(/estimatedInputTokens: systemTokens \+ schemaTokens \+ estimateStageTokens\(instruction\)/);
+    expect(stage).toMatch(/estimatedInputTokensAuditBasis: auditSystemTokens \+ auditSchemaTokens \+ estimateTokens\(instruction\)/);
+    expect([...stage.matchAll(/(?<![A-Za-z])estimateTokens\(/g)].length).toBe(3);
   });
 
   it("记忆选择收据的 tokenCost 两条路径同式（曾经一处含分隔符一处不含）", () => {

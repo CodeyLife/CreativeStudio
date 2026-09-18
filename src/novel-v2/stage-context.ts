@@ -1,4 +1,4 @@
-import { estimateBudgetTokens } from "./token-estimate";
+import { estimateBudgetTokens, estimateTokens } from "./token-estimate";
 import { canonicalSha256 } from "./canonical-json";
 import type {
   PromptContextManifest,
@@ -94,6 +94,10 @@ function materializeInjectedSkills(
 export function compileStageContext(request: StageContextRequest, now = Date.now()): StagePromptPackage {
   const systemTokens = estimateStageTokens(request.system ?? "");
   const schemaTokens = request.schema ? estimateStageTokens(JSON.stringify(request.schema)) : 0;
+  // 同一段文本的第二口径（AUDIT），逐部分同形重算、只换折算系数：两数的比值才是干净的
+  // 口径因子。跨文本比较（本 manifest vs 网关留痕）已被 426 行运行库实测证伪。
+  const auditSystemTokens = estimateTokens(request.system ?? "");
+  const auditSchemaTokens = request.schema ? estimateTokens(JSON.stringify(request.schema)) : 0;
   const usableTokens = Math.max(0, request.maxInputTokens - request.reservedOutputTokens - systemTokens - schemaTokens);
   const normalized = request.sections.map(normalizeSection);
   const receipts: PromptContextSectionReceipt[] = [];
@@ -150,6 +154,7 @@ export function compileStageContext(request: StageContextRequest, now = Date.now
     requiredInputTokens,
     budgetExcludedSectionCount: receipts.filter((item) => item.reason === "budget").length,
     estimatedInputTokens: systemTokens + schemaTokens + estimateStageTokens(instruction),
+    estimatedInputTokensAuditBasis: auditSystemTokens + auditSchemaTokens + estimateTokens(instruction),
     skillManifest,
     sections: receipts,
   };
