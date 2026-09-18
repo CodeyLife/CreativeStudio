@@ -154,12 +154,15 @@ export function compileStageContext(request: StageContextRequest, now = Date.now
     requiredInputTokens,
     budgetExcludedSectionCount: receipts.filter((item) => item.reason === "budget").length,
     estimatedInputTokens: systemTokens + schemaTokens + estimateStageTokens(instruction),
-    estimatedInputTokensAuditBasis: auditSystemTokens + auditSchemaTokens + estimateTokens(instruction),
     skillManifest,
     sections: receipts,
   };
   const fingerprint = canonicalSha256(manifestBase);
-  const manifest: PromptContextManifest = { id: `prompt-context:${request.workflowId}:${fingerprint.slice(0, 16)}`, ...manifestBase, fingerprint, createdAt: now };
+  // 审计口径的估算值刻意不进 manifestBase（即不参与 fingerprint）：它是同一段装配文本的
+  // 派生观测，不是改变送检内容的输入事实。更要紧的是 activities.ts 的 inputFingerprint 会把
+  // promptContext.fingerprint 与 contextRefs.contextManifestId 一起哈希进外部任务的幂等键——
+  // 让一个纯观测字段参与指纹，等于在部署时给在途运行换任务 id（重复物化或交付时判"指纹不匹配"）。
+  const manifest: PromptContextManifest = { id: `prompt-context:${request.workflowId}:${fingerprint.slice(0, 16)}`, ...manifestBase, estimatedInputTokensAuditBasis: auditSystemTokens + auditSchemaTokens + estimateTokens(instruction), fingerprint, createdAt: now };
   const missingRequired = receipts.filter((item) => item.reason === "budget" && (item.priority === "critical" || item.priority === "required"));
   if (missingRequired.length) {
     throw new StageContextBudgetError(manifest, requiredInputTokens);

@@ -3,6 +3,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import ts from "typescript";
 import { compileStageContext, createStageGoalContract, StageContextBudgetError } from "../stage-context";
+import { canonicalSha256 } from "../canonical-json";
 
 function productionTypeScriptFiles(root: string): string[] {
   return readdirSync(root, { withFileTypes: true }).flatMap((entry) => {
@@ -53,6 +54,26 @@ describe("stage context compiler", () => {
     expect(latin.estimatedInputTokensAuditBasis).toBeTypeOf("number");
     expect(cjk.estimatedInputTokensAuditBasis!).toBeGreaterThan(cjk.estimatedInputTokens);
     expect(latin.estimatedInputTokensAuditBasis!).toBeLessThan(latin.estimatedInputTokens);
+  });
+
+  it("派生的审计口径不进 fingerprint（在途外部任务的幂等键依赖它）", () => {
+    const manifest = compileStageContext({
+      projectId: "p1", workflowId: "wf-fp", purpose: "writing.draft", stage: "drafting",
+      maxInputTokens: 8_000, reservedOutputTokens: 500, system: "你是中文长篇编辑。",
+      sections: [{ id: "m", kind: "manuscript", title: "正文", text: "他在长街上听见号角".repeat(12), priority: "required", provenanceRefs: [] }],
+    }).manifest;
+    expect(manifest.estimatedInputTokensAuditBasis).toBeTypeOf("number");
+    // fingerprint 必须恰等于"去掉 id/fingerprint/createdAt 与这个派生观测字段"后的规范化哈希；
+    // 若把它并进 manifestBase，activities 的 inputFingerprint（含 promptContext.fingerprint 与
+    // contextManifestId）会随观测字段变化，等于给部署时在途的外部任务换幂等键。
+    const hashed: Record<string, unknown> = { ...manifest };
+    delete hashed.id;
+    delete hashed.fingerprint;
+    delete hashed.createdAt;
+    delete hashed.estimatedInputTokensAuditBasis;
+    expect(canonicalSha256(hashed)).toBe(manifest.fingerprint);
+    hashed.estimatedInputTokensAuditBasis = manifest.estimatedInputTokensAuditBasis;
+    expect(canonicalSha256(hashed)).not.toBe(manifest.fingerprint);
   });
 
   it("drops soft context but fails explicitly when required context cannot fit", () => {
