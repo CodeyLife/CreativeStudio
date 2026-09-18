@@ -12,6 +12,7 @@
  * - skill-iteration 测试验证 learning.underlyingMechanism 被传递
  */
 import { describe, expect, it, beforeAll, afterAll, vi } from "vitest";
+import { isPostgresUnavailable } from "./test-db";
 import { randomUUID } from "node:crypto";
 import { NovelPostgresRepository } from "../postgres-repository";
 import { InMemoryModelGateway } from "../model-gateway";
@@ -50,8 +51,18 @@ import type {
 // ===== 测试夹具 =====
 
 const TEST_DB_URL = process.env.TEST_DATABASE_URL ?? "postgresql://ymcp:ymcp@127.0.0.1:5432/ymcp_test";
-const integrationEnabled = Boolean(process.env.TEST_DATABASE_URL);
-const integrationIt = integrationEnabled ? it : it.skip;
+/**
+ * 集成面可达性判据：必须来自真实连接，而不是 TEST_DATABASE_URL 是否被设置。
+ * 旧写法 `Boolean(process.env.TEST_DATABASE_URL)` 在本仓库的日常环境下恒为 false，
+ * 于是 promote 幂等 / stale-baseline / 回滚等 7 条真库用例长期静默跳过——
+ * 与 workflow-map 记录的"收集期求值恒 skip"同一族缺陷的第二个实例。
+ */
+let integrationAvailable = false;
+const integrationIt = (name: string, fn: () => Promise<void>) =>
+  it(name, async (ctx) => {
+    if (!integrationAvailable) return ctx.skip();
+    await fn();
+  });
 
 function makeSkill(overrides: Partial<SkillDescriptor> = {}): SkillDescriptor {
   return {
@@ -439,11 +450,15 @@ describe("evaluation integration", () => {
         },
       ],
     }));
-    if (integrationEnabled) {
+    try {
       repository = new NovelPostgresRepository(TEST_DB_URL);
       await repository.pool.query("SELECT 1");
       await repository.migrate();
       postgresAvailable = true;
+      integrationAvailable = true;
+    } catch (error) {
+      if (!isPostgresUnavailable(error)) throw error;
+      console.warn(`[evaluation.test] Postgres 不可用，集成用例运行期跳过: ${(error as Error).message}`);
     }
   }, 30000);
 
@@ -453,8 +468,19 @@ describe("evaluation integration", () => {
     }
   });
 
-  it("reports whether integration mode is enabled", () => {
-    expect(postgresAvailable).toBe(integrationEnabled);
+  it("集成面由真实可达性决定，且与连接探测一致（不得靠环境变量存在性静默假绿）", async () => {
+    const probe = new NovelPostgresRepository(TEST_DB_URL);
+    let reachable = true;
+    try {
+      await probe.pool.query("SELECT 1");
+    } catch (error) {
+      if (!isPostgresUnavailable(error)) throw error;
+      reachable = false;
+    } finally {
+      await probe.close();
+    }
+    expect(postgresAvailable).toBe(reachable);
+    expect(integrationAvailable).toBe(reachable);
   });
 
   describe("project-snapshot", () => {

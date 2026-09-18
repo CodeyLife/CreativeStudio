@@ -217,7 +217,16 @@ describe("creative-execution integration", () => {
     if (repository) await repository.close();
   });
 
-  (postgresAvailable ? describe : describe.skip)("with postgres", () => {
+  describe("with postgres", () => {
+    // 收集期条件 describe 的历史教训（见 mcp-tool-gateway.test.ts 同源注释）：
+    // `postgresAvailable ? describe : describe.skip` 在收集期求值，彼时 beforeAll 未跑、
+    // 恒为 false——真库用例在数据库可用的开发机上被整批静默跳过。运行期 ctx.skip()
+    // 才把跳过如实呈现为 skipped，可用时则真的执行。
+    const itDb = (name: string, fn: () => Promise<void>) =>
+      it(name, async (ctx) => {
+        if (!postgresAvailable) return ctx.skip();
+        await fn();
+      });
     // 辅助：创建项目 + run
     async function setupProjectAndRun(mode: "chapter" | "segment-auto" = "chapter", policy?: Partial<CreativeRunPolicy>) {
       const projectId = `ce-${randomUUID().slice(0, 8)}`;
@@ -237,7 +246,7 @@ describe("creative-execution integration", () => {
     // ===== B.1 run-manager =====
 
     describe("run-manager", () => {
-      it("creates run with pending status and default policy", async () => {
+      itDb("creates run with pending status and default policy", async () => {
         const { run } = await setupProjectAndRun();
         expect(run.status).toBe("pending");
         expect(run.policy.maxRetries).toBe(2);
@@ -245,18 +254,18 @@ describe("creative-execution integration", () => {
         expect(run.policy.autoAcceptThreshold).toBe(3.7);
       });
 
-      it("getCreativeRun returns run for existing id", async () => {
+      itDb("getCreativeRun returns run for existing id", async () => {
         const { run } = await setupProjectAndRun();
         const fetched = await getCreativeRun(repository, run.id);
         expect(fetched?.id).toBe(run.id);
       });
 
-      it("getCreativeRun returns null for non-existent id", async () => {
+      itDb("getCreativeRun returns null for non-existent id", async () => {
         const fetched = await getCreativeRun(repository, "nonexistent-run-id");
         expect(fetched).toBeNull();
       });
 
-      it("listCreativeRuns filters by project", async () => {
+      itDb("listCreativeRuns filters by project", async () => {
         const { projectId, run } = await setupProjectAndRun();
         // 创建另一个项目的 run 避免污染
         const otherProjectId = `ce-${randomUUID().slice(0, 8)}`;
@@ -268,17 +277,17 @@ describe("creative-execution integration", () => {
         expect(runs[0].id).toBe(run.id);
       });
 
-      it("pending → pause throws (requires running)", async () => {
+      itDb("pending → pause throws (requires running)", async () => {
         const { run } = await setupProjectAndRun();
         await expect(pauseCreativeRun(repository, run.id)).rejects.toThrow(/无法暂停/);
       });
 
-      it("pending → resume throws (requires paused)", async () => {
+      itDb("pending → resume throws (requires paused)", async () => {
         const { run } = await setupProjectAndRun();
         await expect(resumeCreativeRun(repository, run.id)).rejects.toThrow(/无法恢复/);
       });
 
-      it("moves a running run with failed work into the failed terminal state", async () => {
+      itDb("moves a running run with failed work into the failed terminal state", async () => {
         const { run } = await setupProjectAndRun();
         await setRunStatus(run.id, "running");
         const work = await enqueueCreativeWork(repository, run.id, { kind: "generation", instruction: "生成章节" });
@@ -294,7 +303,7 @@ describe("creative-execution integration", () => {
     // ===== B.2 work-item =====
 
     describe("work-item", () => {
-      it("enqueue → status=pending, parameters.iteration=1", async () => {
+      itDb("enqueue → status=pending, parameters.iteration=1", async () => {
         const { run } = await setupProjectAndRun();
         const work = await enqueueCreativeWork(repository, run.id, {
           kind: "generation",
@@ -304,7 +313,7 @@ describe("creative-execution integration", () => {
         expect(work.parameters.iteration).toBe(1);
       });
 
-      it("instruction empty throws (boundary)", async () => {
+      itDb("instruction empty throws (boundary)", async () => {
         const { run } = await setupProjectAndRun();
         await expect(
           enqueueCreativeWork(repository, run.id, { kind: "generation", instruction: "" }),
@@ -314,14 +323,14 @@ describe("creative-execution integration", () => {
         ).rejects.toThrow(/instruction/);
       });
 
-      it("rejects retired foundation task keys at the work queue boundary", async () => {
+      itDb("rejects retired foundation task keys at the work queue boundary", async () => {
         const { run } = await setupProjectAndRun();
         await expect(
           enqueueCreativeWork(repository, run.id, { kind: "generation", taskKey: "relations", instruction: "生成旧关系规划" }),
         ).rejects.toThrow(/已退役/);
       });
 
-      it("start → status=running", async () => {
+      itDb("start → status=running", async () => {
         const { run } = await setupProjectAndRun();
         const work = await enqueueCreativeWork(repository, run.id, {
           kind: "generation",
@@ -331,7 +340,7 @@ describe("creative-execution integration", () => {
         expect(started.status).toBe("running");
       });
 
-      it("accept → status=accepted", async () => {
+      itDb("accept → status=accepted", async () => {
         const { run } = await setupProjectAndRun();
         const work = await enqueueCreativeWork(repository, run.id, {
           kind: "generation",
@@ -342,7 +351,7 @@ describe("creative-execution integration", () => {
         expect(accepted.status).toBe("accepted");
       });
 
-      it("revise → status=pending, iteration=2", async () => {
+      itDb("revise → status=pending, iteration=2", async () => {
         const { run } = await setupProjectAndRun();
         const work = await enqueueCreativeWork(repository, run.id, {
           kind: "generation",
@@ -355,7 +364,7 @@ describe("creative-execution integration", () => {
         expect(revised.parameters.iteration).toBe(2);
       });
 
-      it("accepted → start throws (illegal transition)", async () => {
+      itDb("accepted → start throws (illegal transition)", async () => {
         const { run } = await setupProjectAndRun();
         const work = await enqueueCreativeWork(repository, run.id, {
           kind: "generation",
@@ -366,7 +375,7 @@ describe("creative-execution integration", () => {
         await expect(startWork(repository, work.id)).rejects.toThrow(/无法启动/);
       });
 
-      it("dependsOn cross-run throws", async () => {
+      itDb("dependsOn cross-run throws", async () => {
         const { run: run1 } = await setupProjectAndRun();
         const { run: run2 } = await setupProjectAndRun();
         const workA = await enqueueCreativeWork(repository, run1.id, {
@@ -386,7 +395,7 @@ describe("creative-execution integration", () => {
     // ===== B.3 review-gate =====
 
     describe("review-gate", () => {
-      it("manual gate: checkGate always passed=false", async () => {
+      itDb("manual gate: checkGate always passed=false", async () => {
         const { run } = await setupProjectAndRun();
         const work = await enqueueCreativeWork(repository, run.id, {
           kind: "generation",
@@ -407,7 +416,7 @@ describe("creative-execution integration", () => {
         expect(gate.passed).toBe(false);
       });
 
-      it("none gate: checkGate always passed=true", async () => {
+      itDb("none gate: checkGate always passed=true", async () => {
         const { run } = await setupProjectAndRun();
         const work = await enqueueCreativeWork(repository, run.id, {
           kind: "generation",
@@ -421,7 +430,7 @@ describe("creative-execution integration", () => {
         expect(gate.passed).toBe(true);
       });
 
-      it("auto gate + no review → passed=false", async () => {
+      itDb("auto gate + no review → passed=false", async () => {
         const { run } = await setupProjectAndRun();
         const work = await enqueueCreativeWork(repository, run.id, {
           kind: "generation",
@@ -436,7 +445,7 @@ describe("creative-execution integration", () => {
         expect(gate.passed).toBe(false);
       });
 
-      it("auto gate + passed review + score >= threshold → passed=true", async () => {
+      itDb("auto gate + passed review + score >= threshold → passed=true", async () => {
         const { run } = await setupProjectAndRun();
         const work = await enqueueCreativeWork(repository, run.id, {
           kind: "generation",
@@ -458,7 +467,7 @@ describe("creative-execution integration", () => {
         expect(gate.passed).toBe(true);
       });
 
-      it("boundary: auto gate + score exactly equals threshold → passed=true", async () => {
+      itDb("boundary: auto gate + score exactly equals threshold → passed=true", async () => {
         const { run } = await setupProjectAndRun();
         const work = await enqueueCreativeWork(repository, run.id, {
           kind: "generation",
@@ -485,7 +494,7 @@ describe("creative-execution integration", () => {
     // ===== B.4 command-router =====
 
     describe("command-router", () => {
-      it("idempotency: same idempotencyKey returns cached result (counterexample)", async () => {
+      itDb("idempotency: same idempotencyKey returns cached result (counterexample)", async () => {
         const { run } = await setupProjectAndRun();
         const work = await enqueueCreativeWork(repository, run.id, {
           kind: "generation",
@@ -513,7 +522,7 @@ describe("creative-execution integration", () => {
         expect(result2.summary).toBe(result1.summary);
       });
 
-      it("run.pause command → run.status=paused", async () => {
+      itDb("run.pause command → run.status=paused", async () => {
         const { run } = await setupProjectAndRun();
         await setRunStatus(run.id, "running");
         const result = await executeCreativeCommand(repository, {
@@ -524,7 +533,7 @@ describe("creative-execution integration", () => {
         expect(result.status).toBe("paused");
       });
 
-      it("run.cancel command → run.status=cancelled", async () => {
+      itDb("run.cancel command → run.status=cancelled", async () => {
         const { run } = await setupProjectAndRun();
         await setRunStatus(run.id, "running");
         const result = await executeCreativeCommand(repository, {
@@ -535,7 +544,7 @@ describe("creative-execution integration", () => {
         expect(result.status).toBe("cancelled");
       });
 
-      it("unknown command type throws (route fallback)", async () => {
+      itDb("unknown command type throws (route fallback)", async () => {
         const { run } = await setupProjectAndRun();
         await expect(
           executeCreativeCommand(repository, {
@@ -550,12 +559,12 @@ describe("creative-execution integration", () => {
     // ===== B.5 snapshot =====
 
     describe("snapshot", () => {
-      it("non-existent run → null", async () => {
+      itDb("non-existent run → null", async () => {
         const snapshot = await getRunSnapshot(repository, "nonexistent-run-id");
         expect(snapshot).toBeNull();
       });
 
-      it("existing run → run + workItems + reviews + events", async () => {
+      itDb("existing run → run + workItems + reviews + events", async () => {
         const { run } = await setupProjectAndRun();
         const work = await enqueueCreativeWork(repository, run.id, {
           kind: "generation",
@@ -578,7 +587,7 @@ describe("creative-execution integration", () => {
         expect(snapshot!.events.length).toBeGreaterThanOrEqual(3);
       });
 
-      it("afterSequence incremental: no new events → empty; new event → returned", async () => {
+      itDb("afterSequence incremental: no new events → empty; new event → returned", async () => {
         const { run } = await setupProjectAndRun();
         // 初始快照：至少有 run.created 事件
         const initial = await getRunSnapshot(repository, run.id);
