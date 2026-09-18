@@ -17,19 +17,16 @@ import type {
 import type { ChapterPlanningContext } from "./application/story-arc";
 import { CHAPTER_CHANGE_SCOPES } from "./prompts/chapter-review";
 import { canonicalSha256 } from "./canonical-json";
+import { estimateBudgetTokens } from "./token-estimate";
 
 export { createConfiguredSkillProvider, createDatabaseSkillProvider, createWorkspaceSkillProvider, renderSkillInstruction, resolveStageSkillBundle, skillPromptSection } from "./skill-runtime";
-
-function estimateTokens(text: string): number {
-  return Math.ceil(text.length / 2);
-}
 
 function authorityRank(authority: MemoryBundle["claims"][number]["authority"]): number {
   return ({ approved: 4, author: 3, derived: 2, candidate: 1, rejected: 0 } as const)[authority] ?? 0;
 }
 
 function compareCandidates(left: MemoryHit, right: MemoryHit): number {
-  const tokenDifference = estimateTokens(`${left.title}\n${left.content}`) - estimateTokens(`${right.title}\n${right.content}`);
+  const tokenDifference = estimateBudgetTokens(`${left.title}\n${left.content}`) - estimateBudgetTokens(`${right.title}\n${right.content}`);
   return authorityRank(right.authority) - authorityRank(left.authority)
     || right.score - left.score
     || right.confidence - left.confidence
@@ -43,7 +40,7 @@ function selectionReceipt(claim: MemoryHit, status: MemorySelectionReceipt["stat
     matchedFacets: matchedFacetsOf(claim),
     score: claim.score,
     authority: claim.authority,
-    tokenCost: estimateTokens(`${claim.title}\n${claim.content}`),
+    tokenCost: estimateBudgetTokens(`${claim.title}\n${claim.content}`),
     status,
     reason,
     sourceRevisionIds: claim.sourceRevisionIds,
@@ -278,7 +275,7 @@ export async function buildMemoryBundle(plan: PreflightPlan, input: { projectId:
   };
   const select = (claim: MemoryHit, reason: MemorySelectionReceipt["reason"]): boolean => {
     if (selected.has(claim.id)) return true;
-    const cost = estimateTokens(`${claim.title}\n${claim.content}`);
+    const cost = estimateBudgetTokens(`${claim.title}\n${claim.content}`);
     if (spent + cost > tokenBudget) return false;
     spent += cost;
     selected.set(claim.id, { claim, reason });
@@ -288,7 +285,7 @@ export async function buildMemoryBundle(plan: PreflightPlan, input: { projectId:
   const pinned = ordered.filter((candidate) => pinnedIds.has(candidate.id));
   for (const claim of pinned) {
     if (!select(claim, "pinned-narrative")) {
-      const cost = estimateTokens(`${claim.title}\n${claim.content}`);
+      const cost = estimateBudgetTokens(`${claim.title}\n${claim.content}`);
       throw new Error(`冻结叙事上下文超过记忆预算：${claim.id} 需要约 ${cost} tokens，已使用 ${spent}/${tokenBudget}。请提高预算或压缩叙事状态账本，不能静默丢弃 pinned 内容。`);
     }
   }
@@ -301,7 +298,7 @@ export async function buildMemoryBundle(plan: PreflightPlan, input: { projectId:
     }
     if (!facetCandidates.some((claim) => selected.has(claim.id)) && facetCandidates.length) {
       const candidate = facetCandidates[0];
-      const cost = estimateTokens(`${candidate.title}\n${candidate.content}`);
+      const cost = estimateBudgetTokens(`${candidate.title}\n${candidate.content}`);
       throw new Error(`必要记忆 facet ${facet} 超过记忆预算：${candidate.id} 需要约 ${cost} tokens，已使用 ${spent}/${tokenBudget}。请提高预算或压缩必要上下文，不能静默丢弃 required-facet 内容。`);
     }
   }
@@ -346,7 +343,7 @@ export function buildContextManifest(plan: PreflightPlan, memory: MemoryBundle, 
   const includedClaimIds = [...new Set(receipts.filter((receipt) => receipt.status === "included").map((receipt) => receipt.claimId))];
   const includedSet = new Set(includedClaimIds);
   const excludedClaimIds = [...new Set(receipts.filter((receipt) => receipt.status === "excluded" && !includedSet.has(receipt.claimId)).map((receipt) => receipt.claimId))];
-  const estimatedTokens = memory.claims.reduce((sum, claim) => sum + estimateTokens(`${claim.title}\n${claim.content}`), 0);
+  const estimatedTokens = memory.claims.reduce((sum, claim) => sum + estimateBudgetTokens(`${claim.title}\n${claim.content}`), 0);
   const manifest: ContextManifest = {
     id: `context:${plan.id}`,
     projectId: plan.projectId,

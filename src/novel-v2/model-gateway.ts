@@ -14,6 +14,7 @@ import {
 } from "./model-routing";
 import type { PromptContextManifest } from "./protocol";
 import { parseStructuredJson } from "./structured-json";
+import { estimateBudgetTokens, estimateTokens } from "./token-estimate";
 
 export interface ModelUsage {
   model: string;
@@ -264,13 +265,6 @@ function nextApiCandidateIndex(route: ModelRoute, currentIndex: number): number 
   return offset < 0 ? undefined : currentIndex + 1 + offset;
 }
 
-function tokenEstimate(text: string): number {
-  if (!text.trim()) return 0;
-  const cjk = (text.match(/[\u3400-\u9fff\uf900-\ufaff]/gu) ?? []).length;
-  const other = Math.max(0, text.length - cjk);
-  return Math.max(1, Math.ceil(cjk * 0.75 + other / 4));
-}
-
 export function normalizeUsage(
   usageValue: unknown,
   inputText: string,
@@ -283,8 +277,8 @@ export function normalizeUsage(
   const providerInputTokens = finiteToken(usage.input_tokens ?? usage.prompt_tokens ?? usage.promptTokens ?? inputDetails.total_tokens);
   const providerOutputTokens = finiteToken(usage.output_tokens ?? usage.completion_tokens ?? usage.completionTokens ?? outputDetails.total_tokens);
   const providerCachedInputTokens = finiteToken(inputDetails.cached_tokens ?? inputDetails.cachedTokens);
-  const estimatedInputTokens = tokenEstimate(inputText);
-  const estimatedOutputTokens = tokenEstimate(outputText);
+  const estimatedInputTokens = estimateTokens(inputText);
+  const estimatedOutputTokens = estimateTokens(outputText);
   const hasProviderInput = providerInputTokens !== undefined;
   const hasProviderOutput = providerOutputTokens !== undefined;
   const usageSource = hasProviderInput && hasProviderOutput ? "provider" : hasProviderInput || hasProviderOutput ? "mixed" : "estimated";
@@ -610,7 +604,9 @@ export class RoutedModelGateway implements ModelGateway {
     const outputReserve = Math.max(1, Math.min(input.maxTokens ?? route.maxOutputTokens ?? 4_096, route.maxOutputTokens ?? Number.MAX_SAFE_INTEGER));
     const profileInputLimit = profile.contextWindow ? Math.max(0, profile.contextWindow - outputReserve) : Number.MAX_SAFE_INTEGER;
     const effectiveInputLimit = Math.min(route.maxInputTokens ?? Number.MAX_SAFE_INTEGER, input.promptContext?.maxInputTokens ?? Number.MAX_SAFE_INTEGER, profileInputLimit);
-    const estimatedInputTokens = Math.ceil(`${input.system ?? ""}\n${transportPrompt}`.length / 2);
+    // 预算闸与 effectiveInputLimit 同源口径（BUDGET basis）：route/purpose 的 maxInputTokens
+    // 是贴着这份估算的历史分布调出来的，换口径等于作废这轮标定；见 token-estimate 的合并条件。
+    const estimatedInputTokens = estimateBudgetTokens(`${input.system ?? ""}\n${transportPrompt}`);
     if (estimatedInputTokens > effectiveInputLimit) {
       const error = new ModelContextBudgetError(estimatedInputTokens, effectiveInputLimit, input.purpose);
       await this.recordPrompt({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, candidateIndex, status: "failed", system: input.system, prompt: transportPrompt, promptFingerprint: fingerprint, contextManifest: input.promptContext, errorCategory: error.category });
@@ -665,7 +661,7 @@ export class RoutedModelGateway implements ModelGateway {
   private async invokeExternalMcpWait(input: BaseModelInput & { prompt: string }, snapshot: ModelRoutingSnapshot, route: ModelRoute, candidateIndex: number): Promise<never> {
     const fingerprint = promptFingerprint(input.system, input.prompt);
     const effectiveInputLimit = Math.min(route.maxInputTokens ?? Number.MAX_SAFE_INTEGER, input.promptContext?.maxInputTokens ?? Number.MAX_SAFE_INTEGER);
-    const estimatedInputTokens = Math.ceil(`${input.system ?? ""}\n${input.prompt}`.length / 2);
+    const estimatedInputTokens = estimateBudgetTokens(`${input.system ?? ""}\n${input.prompt}`);
     if (estimatedInputTokens > effectiveInputLimit) {
       const error = new ModelContextBudgetError(estimatedInputTokens, effectiveInputLimit, input.purpose);
       await this.recordPrompt({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, candidateIndex, status: "failed", system: input.system, prompt: input.prompt, promptFingerprint: fingerprint, contextManifest: input.promptContext, errorCategory: error.category });

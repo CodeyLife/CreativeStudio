@@ -6,6 +6,7 @@ import { canonicalSha256 } from "../canonical-json";
 import { extractAssetMentions, groupAssetSpans, type AssetMention } from "../asset-ledger";
 import { NovelPostgresRepository } from "../postgres-repository";
 import type { WorkflowRunStatus } from "../run-lifecycle";
+import { estimateBudgetTokens } from "../token-estimate";
 import type { ModelGateway } from "../model-gateway";
 import { ExternalMcpRequiredError, type ModelExecutionProvenance, type ModelPurpose, type ModelRoutingSnapshot, type ModelTaskRecord, type ModelWorkPackage } from "../model-routing";
 import { ContentObjectStore } from "../object-store";
@@ -1430,7 +1431,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
         matchedFacets: matchedFacetsOf(claim),
         score: claim.score,
         authority: claim.authority,
-        tokenCost: Math.ceil((claim.title.length + claim.content.length) / 2),
+        tokenCost: estimateBudgetTokens(`${claim.title}\n${claim.content}`),
         status: includedIds.has(claim.id) ? "included" as const : "excluded" as const,
         reason: includedIds.has(claim.id) ? (previousReceipts.get(claim.id)?.reason ?? "ranked-fill") : "future-cutoff" as const,
         sourceRevisionIds: claim.sourceRevisionIds,

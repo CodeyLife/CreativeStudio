@@ -1,3 +1,4 @@
+import { estimateBudgetTokens } from "./token-estimate";
 import { canonicalSha256 } from "./canonical-json";
 import type {
   PromptContextManifest,
@@ -23,9 +24,8 @@ export class StageContextBudgetError extends Error {
   }
 }
 
-export function estimateStageTokens(value: string): number {
-  return Math.ceil(value.length / 2);
-}
+/** 阶段装配走预算口径（与 maxInputTokens/reservedOutputTokens 常数共同标定）；保留本名是因为调用点语义贴近阶段装配。 */
+export const estimateStageTokens = estimateBudgetTokens;
 
 export function createStageGoalContract(input: Omit<StageGoalContract, "id" | "fingerprint" | "createdAt"> & { id?: string; createdAt?: number }): StageGoalContract {
   const createdAt = input.createdAt ?? Date.now();
