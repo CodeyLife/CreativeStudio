@@ -523,12 +523,25 @@ export class NovelPostgresRepository {
    * 的保守面：keeper=最早登记行，变体 status 翻 'merged'（非破坏，open 消费面自然出局），
    * 描述进 keeper.mergedFrom、keywords/possiblePayoffs 并集、变体 payload.mergedInto 指向
    * keeper。幂等：变体已标 merged 不再出现于 open 扫描面，keeper 侧重复描述由集合去重吸收。
+   *
+   * 2026-09-19 两处判据面收口（product-audit-20260910 §五复测）：
+   * ① 分桶键加 project_id。此前扫描面无项目约束、分组只按 narrative_order，两个项目
+   *    的"第 31 章"行会进同一桶——在阈值 0.24 的传递闭包下即跨项目归并（A 项目的伏笔
+   *    被 B 项目的行吃掉账）。运行库实测当前只有一个项目携带伏笔账，故属潜伏缺陷而非
+   *    事故，但多项目是本仓库的既有契约，不能靠"暂时只有一个项目"保平安。
+   * ② `narrative_order IS NULL` 的行并入独立桶（此前 WHERE 整批排除）。检测面
+   *    （getArchitectureHealth）跨全表按 narrativeTextKey+bigram Dice≥0.85 聚簇，而修复面
+   *    看不见无锚点行 ⇒ 二者判据不对称，实测残留的那 1 簇正是两条无锚点的规划期同事件
+   *    行（括注人名版与去括注版，Dice 0.92）。同桶 10 行用本面同一判据（0.24 并查集）
+   *    实测只成两簇、七条单例，无闭包吞并，故纳入是安全的。
+   *    刻意不做：跨章同文仍不归并——不同章的相同描述是"两次埋设事件"而非重复登记，
+   *    该形态由检测面 warning 交作者判断（宁缺毋伪），不因 warning 计数为 0 而放宽。
    */
   async repairForeshadowingLedgerDuplicates(): Promise<{ clusters: number; retired: number }> {
-    // 账表无时间戳列；keeper=同章字典序首行（内容派生 id 稳定），并集不丢任何变体信息，
-    // keeper 选择不影响语义。
-    const rows = await this.pool.query<{ id: string; narrative_order: number | null; payload: Record<string, unknown> }>(
-      "SELECT id, narrative_order, payload FROM foreshadowing WHERE status='open' AND narrative_order IS NOT NULL ORDER BY narrative_order, id",
+    // 账表无时间戳列；keeper=同桶字典序首行（内容派生 id 稳定），并集不丢任何变体信息，
+    // keeper 选择不影响语义。桶键=项目 + 埋设章（无锚点行以 "#" 自成一桶，不与任何章混桶）。
+    const rows = await this.pool.query<{ project_id: string; id: string; narrative_order: number | null; payload: Record<string, unknown> }>(
+      "SELECT project_id, id, narrative_order, payload FROM foreshadowing WHERE status='open' ORDER BY project_id, narrative_order NULLS LAST, id",
     );
     // 阈值 0.24（运行库校准，非猜测）：弧6 收口对全 open 账做逐对扫描，同事件变体
     // 实测带 0.25-0.41（含人物别名与句式重组；并查集传递闭包把 0.22-0.24 的同族两两
@@ -538,15 +551,16 @@ export class NovelPostgresRepository {
     // 用同法（逐对分布带）重校准，不逐例加规则。
     const THRESHOLD = 0.24;
     const norm = (s: string) => s.replace(/[^一-鿿]/g, "");
-    const byChapter = new Map<number, typeof rows.rows>();
+    const byBucket = new Map<string, typeof rows.rows>();
     for (const row of rows.rows) {
-      const list = byChapter.get(row.narrative_order!) ?? [];
+      const key = `${row.project_id}\u0000${row.narrative_order ?? "#"}`;
+      const list = byBucket.get(key) ?? [];
       list.push(row);
-      byChapter.set(row.narrative_order!, list);
+      byBucket.set(key, list);
     }
     let clusters = 0;
     let retired = 0;
-    for (const group of byChapter.values()) {
+    for (const group of byBucket.values()) {
       if (group.length < 2) continue;
       const parent = group.map((_, i) => i);
       const find = (i: number): number => (parent[i] === i ? i : (parent[i] = find(parent[i])));

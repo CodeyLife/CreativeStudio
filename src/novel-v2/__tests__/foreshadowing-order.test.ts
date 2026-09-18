@@ -463,4 +463,59 @@ describe("foreshadowing narrative visibility", () => {
     expect((keeperAgain.rows[0].payload.mergedFrom as string[]).filter((text) => text === String(byId.get(variant)!.payload.description))).toHaveLength(1);
     expect(rerun).toBeDefined();
   });
+
+  it("无锚点行自成一桶参与归并；同章同文跨项目不误并", async () => {
+    if (!available) return;
+    const otherProject = `test-foreshadowing-other-${randomUUID().slice(0, 8)}`;
+    await repository.ensureProject(otherProject, "Foreshadowing Other");
+    const order = 41;
+    const text = "井底铜镜在无人触碰时泛出一层潮气并映出非当前时间的影子";
+    const variant = "井底铜镜没有人触碰却自行泛起潮气，镜面映出的影子不属于当前时间";
+    const unrelated = "第五种笔迹的收笔与前四种都不同，说明抄册的人不止一个时期";
+    const anchorlessA = "宗门高层（玄机子）对外门某些异常迹象的例行忽视或延迟处理（暗示后续的察觉机制）";
+    const anchorlessB = "宗门高层对外门某些异常迹象的例行忽视或延迟处理（暗示后续的察觉机制）";
+    const ids = {
+      keeper: `fs-sc-k-${randomUUID().slice(0, 8)}`,
+      variant: `fs-sc-v-${randomUUID().slice(0, 8)}`,
+      unrelated: `fs-sc-x-${randomUUID().slice(0, 8)}`,
+      otherProject: `fs-sc-p-${randomUUID().slice(0, 8)}`,
+      anchorlessKeeper: `fs-na-k-${randomUUID().slice(0, 8)}`,
+      anchorlessVariant: `fs-na-v-${randomUUID().slice(0, 8)}`,
+    };
+    const seed = async (id: string, project: string, chapter: number | null, description: string) => {
+      await repository.pool.query(
+        "INSERT INTO foreshadowing(id, project_id, status, payload, narrative_order) VALUES($1,$2,'open',$3,$4)",
+        [id, project, { description, anchor: "", triggerKeywords: ["铜镜"] }, chapter],
+      );
+    };
+    await seed(ids.keeper, projectId, order, text);
+    await seed(ids.variant, projectId, order, variant);
+    await seed(ids.unrelated, projectId, order, unrelated);
+    await seed(ids.otherProject, otherProject, order, text);
+    await seed(ids.anchorlessKeeper, projectId, null, anchorlessA);
+    await seed(ids.anchorlessVariant, projectId, null, anchorlessB);
+    const { textBigramDice } = await import("../memory-grooming");
+    const norm = (s: string) => s.replace(/[^一-鿿]/g, "");
+    expect(textBigramDice(norm(text), norm(variant))).toBeGreaterThanOrEqual(0.24);
+    expect(textBigramDice(norm(text), norm(unrelated))).toBeLessThan(0.24);
+
+    await repository.repairForeshadowingLedgerDuplicates();
+
+    const rows = await repository.pool.query<{ id: string; status: string; payload: Record<string, unknown> }>(
+      "SELECT id,status,payload FROM foreshadowing WHERE id = ANY($1::text[])",
+      [[ids.keeper, ids.variant, ids.unrelated, ids.otherProject, ids.anchorlessKeeper, ids.anchorlessVariant]],
+    );
+    const byId = new Map(rows.rows.map((row) => [row.id, row]));
+    expect(byId.get(ids.keeper)!.status).toBe("open");
+    expect(byId.get(ids.variant)!.status).toBe("merged");
+    expect(byId.get(ids.unrelated)!.status).toBe("open");
+    // 跨项目负控：同章号 + 同文但不同项目，不得进同一桶（只按 narrative_order 分桶的旧实现会把它归并掉）
+    expect(byId.get(ids.otherProject)!.status).toBe("open");
+    expect(byId.get(ids.otherProject)!.payload.mergedInto ?? null).toBeNull();
+    // 无锚点面：检测面（跨全表 Dice≥0.85）能看见、修复面此前看不见的那一类
+    const anchorless = [byId.get(ids.anchorlessKeeper)!, byId.get(ids.anchorlessVariant)!];
+    expect(anchorless.filter((row) => row.status === "merged")).toHaveLength(1);
+    expect(anchorless.filter((row) => row.status === "open")).toHaveLength(1);
+    await repository.deleteProject(otherProject).catch(() => undefined);
+  });
 });
