@@ -216,11 +216,12 @@
 | 9/9 治理 §8 六项 | 3 修复/3 部分（退役只管一径、方案A 仍 23 条漏出、配额未获生产检验） | FM §三逐条 |
 | 9/9"Foundation 56→5 检索可见" | 属实但**不完整**：bundle/preflight 路径仍带 20–29 条 stale → 本轮 A2 | manifest 实算 |
 
-**2026-09-19 复测与根因（goal 迭代收口轮，读数取自 `getArchitectureHealth` 对运行库的实跑，非重算 SQL）**：total 717 / open 437 / fulfilled 63 / 窗口上界已过 244 / 未绑线程 437 / 兑现账缺失 0 / 弧孤儿 0 / 重复簇 1。三条结论：
+**2026-09-19 复测与根因（goal 迭代收口轮，读数取自 `getArchitectureHealth` 对运行库的实跑，非重算 SQL）**：total 717 / open 437 / fulfilled 63 / 窗口上界已过 244 / 未绑线程 437 / 兑现账缺失 0 / 弧孤儿 0 / 重复簇 1。四条结论（第 4 条是本轮顺带闭环的前序疑问，不属伏笔账本）：
 
 1. **重复簇 16→1，残留 1 簇暴露"检测面-修复面判据不对称"**。检测面（`getArchitectureHealth`）跨全部行、按 `narrativeTextKey` 归一后字符二元组 Dice≥0.85 聚簇；修复面（`repairForeshadowingLedgerDuplicates`，migrate 尾）`WHERE status='open' AND narrative_order IS NOT NULL` 且按章分桶、CJK-only 归一、阈值 0.24。两条差异叠加使残留簇**结构性不可达**：其实质是 2 条 `narrative_order IS NULL` 的规划期伏笔（"宗门高层（玄机子）对外门异常迹象的例行忽视"与去括注版，Dice 0.92），修复面 SQL 把它们整批排除在外。同桶共 10 条 NULL 序 open 行，用修复面同一判据（0.24 并查集）实测只成两簇（该对 0.92 + 经脉感知对 0.56）、七条单例，无传递闭包吞并——故本轮把 NULL 序行纳入修复面（独立桶，不伪装成"第 0 章"），warning 由机制清零而非人工删行。
 2. **thread_id 全表 0 绑定是判据惰性，不是漏接线**。PL-5④ 的写入口确在（`postgres-repository.ts:3451`），但判据要求"本弧**恰好一条**线程责任"才绑（多线弧不从共现推断归属，宁缺毋伪）；实测本项目 24 条弧的 `threadResponsibilities` 全部为 4–7 条线程 ⇒ eligible 弧 0 条，机制永不触发。根因不在 binder 而在**契约没有归属表达**：`threadResponsibilities` 只有 threadRef/responsibility/nextAdvance 三字段，弧级 `foreshadowingRefs` 是扁平账，模型即便心里有线也没有可写的位置（现在只被 prompt 要求把续线/保持责任写进自由文本 `responsibility`，机器不可判定）。修复形态=弧蓝图线程责任增加可选 `foreshadowingRefs`（**必须是弧级同名字段的子集**，越界即 blocking 回流，禁止发明关联），binder 按线程落 `thread_id`；同一条伏笔被多线认领时不猜承担者，改在审计 `story-arc.references-normalized` 的 `threadBindingAmbiguous` 里留痕（静默跳过与静默失败同罪）。**本轮已实施**，契约类型 / 两处解析（外部编排 + 模型输出面）/ 生成面 JSON schema / 外部工具 schema / 编排技能文档五面同批登记（教训③），旧弧与无认领输出零回归。落地中被自家守卫纠一处：生成面 schema 里字段先按"可选"写，被 `native-schema.test.ts`（`assertNativeJsonSchema` 禁止对象出现未列入 required 的 property）判不兼容，改为进 required、以空数组表达"本条线不承担伏笔"，解析面仍按可选处理。生效代价如实登记：故事弧规划的响应 schema 变了 → 该阶段 prompt 指纹变 → 部署重启时在飞的外部弧规划任务会换幂等键重开，故落位窗口应选在无在飞弧规划任务时。437 条存量 open 未绑无论如何都需要语义判定（文本等值命中 0、plot_threads 仅 7 条、伏笔 payload 无线程键——机械回填等于伪造），维持"随弧分流"现状。
 3. **学习闭环排队不变**：proposed 23 / rejected 18 / promoted 1、promotion_receipts 1。候选生成与拒绝留痕两条通道均在正常工作，卡点是作者的 promote 裁决；工程侧本轮无可推进部分（不新增自动晋升，晋升门必须是人的判断）。
+4. **前序疑问"必投材料不被截断的硬门未接线"已验结论：门在，只是不在那个文件里**。`src/lib/model-capabilities.ts` 的 `assertModelContextLimit` / `estimateTextTokens` / `resolveModelContextWindow` 实测零调用点，且它的限额来源是**进程内** `detectedContextWindows` Map（只由浏览器侧 `listChatModels` 经 `recordModelContextWindow` 写入），服务端永远拿不到 ⇒ 即便接线也是空转。同一保证实际由三处显式抛错承担：`stage-context.ts` 的 `StageContextBudgetError`（critical|required 段被预算剔除即抛，非静默降级）、`cognition.ts` 的 pinned/required-facet 溢出抛错、`model-gateway.ts` 的 `ModelContextBudgetError`；越预算的唯一兜底是定向修订按窗分批重试（设计行为，不是截断）。部署面实测（09-19）：`prompt_executions` 9,243/9,243 全部携带含 `maxInputTokens` 的 context manifest，而 7/7 provider 配置无 `contextWindow`、22/22 路由 budget 未设 `maxInputTokens` ⇒ 网关那条 `profile.contextWindow ? … : Number.MAX_SAFE_INTEGER` 的放开分支在本部署从未走到。故本项的处置不是"补接线"而是：① 该死导出建议删除并同步 spec（删除动作待作者批准，不擅自动手）；② 若将来要让 profile/route 承担限额，必须同时把"检测到的上下文窗"持久化到服务端配置，否则写侧与读侧仍在两个进程。
 
 **方法论教训（沉淀候选，走闭环）**：① 修复声明的验证必须覆盖**全部消费路径**（退役只验检索侧、"候选不泄入"只验字面契约都会漏掉真洞）；② 一次性人工收割不产生机制（zombie 收割 9 天复发）；③ 文档不声明的工具面无人使用、无人踩雷（坏 SQL 存活）——spec/工具/技能三者要同批登记。
 
@@ -230,6 +231,7 @@
 
 - 证据导出：`tmp/audit/db/`（44 份，psql→JSON）、`tmp/audit/text/`（21 章，REST 拉取）、`tmp/audit/extract*.sql`。
 - 复核脚本：正文层 `%TEMP%\fmem\*.js`（记忆层）、`tmp/audit/review-ch01-21-20260910.md`（正文层完整取证）。
+- 2026-09-19 复测取证面（对 `ymcp` 只读）：`tmp/ledger-debt.cjs`（账本与学习队列计数）、`tmp/health-recheck.ts`（直接实例化仓储跑 `getArchitectureHealth`，权威读数）、`tmp/dup-cluster.ts` 与 `tmp/null-order.ts`（重复簇成员与无锚点桶逐对相似度）、`tmp/foreshadow-recheck*.ts`（thread_id 绑定率与弧线程形态计数）、`tmp/gate-exposure.cjs` + `tmp/routing-audit*.cjs`（上下文预算门的部署面读数）。
 - 关键统计口径：检索可见集=active∧authority∈{derived,approved,author}∧不被任何 active 行 supersedes；成本归属仅计 run→project 可 join 的 1523 次调用（73 次/章），禁止表总量÷章数。
 - 未决疑问（不立案）：76 倍估算/上报比值成因、弧审核意见是否见过标题污染、生产 database 模式真实消费、面板 7→3 收缩的变更记录缺失——见各分层报告"未验证的疑问"。
 - 规划层疑问 1（弧 2 completed 写入者）已闭环：audit_records 显示弧 2 于 08-08 由 external-reviewer 批准、生成审计即 `chapterCount:8` 与 `expectedChapterCount:15` 当场矛盾（审批时无"expected=计划章数"校验，PL-1 修复需同时补此入口）；completed 时刻 08-10 04:23:47 无任何 story-arc.* 动作，仅同秒的 ch15 commit `fact-approval.policy-applied`——即完成判定 SQL 在提交管线中静默翻转，零审计留痕。修复建议补充：弧完成状态变更必须写 `story-arc.completion-reconciled` 审计动作。
