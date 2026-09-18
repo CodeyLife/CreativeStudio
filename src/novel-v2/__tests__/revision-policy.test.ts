@@ -14,6 +14,9 @@ import {
   hasBlocker,
   hasBlockerOrMajor,
   isCandidateQualityBetter,
+  MAX_REVIEWER_SCORE_DROP,
+  MIN_REVIEWER_SCORE,
+  PARTIAL_IMPROVEMENT_THRESHOLD,
   scoreReviews,
 } from "../temporal/revision-policy";
 
@@ -106,6 +109,50 @@ describe("revision-policy", () => {
     const intentEnd = source.indexOf("export async function bookSynopsisWorkflow", intentStart);
     const intentSection = source.slice(intentStart, intentEnd);
     expect(intentSection.match(/targetWordCount:/g)?.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("局部退化守卫按常量取边界：等于限值接受、超出一档拒绝、线内但破单维下限仍拒", () => {
+    // 三条用例各自只让一个判据越线，才能证明"是这条守卫在起作用"而不是连带效应；
+    // 边界值由常量算出，改常量时这些用例会跟着移动（硬编码 0.5 的写法会在常量被
+    // 调整后悄悄变成"测的不是当前策略"）。
+    //
+    // 反向验证记录：超限用例的初版是 (baseline-MAX-0.1, 5, 5)——拆掉守卫后它仍绿，
+    // 因为它同时被"最低分线"和"部分改善通道"拒掉，归因不成立。现在的形状是
+    // **候选的最低分不降、综合分更高、blocker/major 与结构门全等**，于是唯一能拒它的
+    // 就是退化早退；守卫一拆即红（已实测）。
+    const baseline = 4.2;
+    const atLimit = baseline - MAX_REVIEWER_SCORE_DROP;
+    const current = candidateQualityKey(completeReviews({
+      structure: { score: 3.6 }, character: { score: baseline }, prose: { score: baseline },
+    }), structuralReport);
+    expect(current.minimumReviewerScore).toBe(3.6);
+
+    const keyOf = ([structure, character, prose]: [number, number, number]) =>
+      candidateQualityKey(completeReviews({
+        structure: { score: structure }, character: { score: character }, prose: { score: prose },
+      }), structuralReport);
+
+    // 限内被接受：单维下降恰为上限，其余两维跃升使综合分显著上行。
+    const improved = keyOf([atLimit, 5, 5]);
+    expect(improved.overallScore - current.overallScore).toBeGreaterThanOrEqual(PARTIAL_IMPROVEMENT_THRESHOLD);
+    expect(improved.minimumReviewerScore).toBeGreaterThanOrEqual(MIN_REVIEWER_SCORE);
+    expect(isCandidateQualityBetter(improved, current)).toBe(true);
+
+    // 超限被拒绝，且拒绝理由只能来自退化守卫。
+    const overLimit = keyOf([3.7, baseline - MAX_REVIEWER_SCORE_DROP - 0.1, 5]);
+    expect(overLimit.minimumReviewerScore).toBeGreaterThanOrEqual(current.minimumReviewerScore);
+    expect(overLimit.overallScore).toBeGreaterThan(current.overallScore);
+    expect(overLimit.structuralPassed).toBe(current.structuralPassed);
+    expect(overLimit.blockerCount).toBe(current.blockerCount);
+    expect(overLimit.majorCount).toBe(current.majorCount);
+    expect(isCandidateQualityBetter(overLimit, current)).toBe(false);
+
+    // 下降幅度在线内，但把该维拉到单维下限之下 → 仍拒（均值口径掩盖单维塌陷的形状）。
+    const belowFloor = MIN_REVIEWER_SCORE - 0.1;
+    expect(belowFloor).toBeLessThan(MIN_REVIEWER_SCORE);
+    expect(isCandidateQualityBetter(keyOf([belowFloor, 5, 5]), candidateQualityKey(completeReviews({
+      structure: { score: belowFloor + 0.3 }, character: { score: 4.2 }, prose: { score: 4.2 },
+    }), structuralReport))).toBe(false);
   });
 
   it("keeps local degradation guard while allowing meaningful overall improvement", () => {

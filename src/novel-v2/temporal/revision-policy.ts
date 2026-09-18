@@ -44,9 +44,40 @@ export interface RevisionDecision {
 
 export type RevisionEvidence = "blocker" | "major" | "quality-warning" | "none";
 
+/**
+ * 自动修订轮数上限。每轮修订都要重跑三份审校与修订模型调用，成本是"轮数 × 全审核面"。
+ * 上限过小会把仍可收敛的稿子过早推给人工门（作者收到的是系统本可自查自修的退化稿）；
+ * 过大则在模型不收敛时反复消耗审核成本、并让 run 长期停在修订循环里不被对账收编。
+ * 2 轮的判据是"第一轮修结构、第二轮修语言/一致性"两类问题各一次机会，第三轮起多为
+ * 同题反复而非新增改善。
+ * TODO 可配置：应按模型档位与题材（重设定文 vs 强情节文）可调，现为全局单值。
+ */
 export const DEFAULT_MAX_AUTO_REVISIONS = 2;
+/**
+ * 采用修订稿所需的最小改善度（综合分相对基线的提升）。
+ * 根因：审校分数本身有噪声（同稿重跑即可见小幅抖动），若任何正向抖动都算"改善"，
+ * 修订循环会用抖动稿覆写上一稿，出现"越修越差却每次都算进步"。0.15 定在噪声带之上、
+ * 又低于 PARTIAL_IMPROVEMENT_THRESHOLD（后者是"允许局部退化换取整体跃升"的更高门槛）。
+ * TODO 可配置：噪声带随 reviewer 模型变，须可按路由档位校准。
+ */
 export const MIN_IMPROVEMENT_THRESHOLD = 0.15;
+/**
+ * 自动定稿的综合分门槛：低于此值即使三份审校都无 blocker/major，也不自动定稿，
+ * 转人工门（reject/manual-review-required）。
+ * 根因：三审全绿但综合平庸的稿会被静默定稿并进入长篇基线——后续章节以它为事实与
+ * 文体参照，退化的代价是复利的，因此"无人工介入"必须要求明确的质量余量而非及格线。
+ * TODO 可配置：门槛应随题材基线与全书历史分分布可调。
+ */
 export const MIN_AUTOMATIC_COMMIT_SCORE = 4.0;
+/**
+ * 单个 reviewer 分数下限。综合分达标但任一 reviewer 塌到此线以下时仍拦。
+ * 根因：综合分是均值口径，会掩盖单维塌陷（例如结构与文笔 5.0、角色一致性 2.0 的稿
+ * 综合仍在合格线上方，而角色一致性正是长篇跨章最贵的维度）。同一常量兼作
+ * `isCandidateQualityBetter` 部分改善通道的最低分守卫：整体跃升不得把任何一维
+ * 拉到合格线以下来换分。
+ * TODO 可配置：与 structural-validator 的豁免面（不参与评分）绑定，需随 reviewer
+ * 角色集合变化重估。
+ */
 export const MIN_REVIEWER_SCORE = 3.5;
 
 /**
