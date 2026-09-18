@@ -11,6 +11,7 @@ import type { ChapterChangeScope } from "../protocol";
 import type { RevisionAttempt } from "../prompts/chapter-revision";
 import type { ModelRoutingSnapshot, ModelTaskRecord } from "../model-routing";
 import { EXTERNAL_TASK_WAIT_WINDOW, ExternalFallbackBudgetExhaustedError, ExternalTaskInbox, externalDeliveryValue, type ExternalWaitOutcome } from "./external-task-protocol";
+import { HEAVY_MODEL_ACTIVITY_POLICY, STANDARD_ACTIVITY_POLICY } from "./activity-policy";
 import { buildChapterGatePayload, finalizeChapterLifecycle, runChapterLifecycle } from "../application/chapter-lifecycle";
 import type { BookSynopsisRecord, BookTitleCandidate, BookTitleCandidatesRecord } from "../application/book-synopsis";
 import { assertCompleteChapterReviewEvidence } from "../application/chapter-approval";
@@ -177,16 +178,7 @@ function humanDecisionFromEvidence(evidence: ApprovalEvidence): HumanDecision {
   };
 }
 
-const activities = proxyActivities<NovelWorkflowActivities>({
-  startToCloseTimeout: "10 minutes",
-  retry: {
-    maximumAttempts: 3,
-    // Temporal may serialize an Error subclass using its constructor name
-    // instead of the custom `name`; accept both forms so an exhausted model
-    // route reaches the durable failure state instead of lingering in retry.
-    nonRetryableErrorTypes: ["NonRetryableModelTransportError", "ModelTransportError"],
-  },
-});
+const activities = proxyActivities<NovelWorkflowActivities>(STANDARD_ACTIVITY_POLICY);
 
 /**
  * 三类 reviewer role 与 identity 的映射。
@@ -811,14 +803,8 @@ export async function storyArcPlanningWorkflow(params: StoryArcPlanningWorkflowI
   // model gateway 已在一次 activity 内完成有序候选切换；再次重试整个 activity
   // 会重复消耗所有候选并把可见的路由失败拖成长时间运行。外部任务仍由
   // generate/review/revise 自己管理，失败批次通过 MCP retryFailed 显式恢复。
-  const storyArcModelActivities = proxyActivities<NovelWorkflowActivities>({
-    // 整套重生成（generateBundle）在同一 activity 内串行执行 arc plan + chapters 两次
-    // 模型调用，10 分钟对长弧重基线不够（曾触发 activity StartToClose timeout 使弧卡
-    // 在 failed）。重任务是生成/审核/修订整弧蓝图，超时预算放宽到 30 分钟；
-    // 外部任务等待仍由 waitForExternal 的 15 分钟独立约束，不在此预算内。
-    startToCloseTimeout: "30 minutes",
-    retry: { maximumAttempts: 1, nonRetryableErrorTypes: ["NonRetryableModelTransportError", "ModelTransportError"] },
-  });
+  // 外部任务等待仍由协议模块的等待窗口独立约束，不在此活动预算内。
+  const storyArcModelActivities = proxyActivities<NovelWorkflowActivities>(HEAVY_MODEL_ACTIVITY_POLICY);
   const externalTasks = new ExternalTaskInbox();
   let approved = false;
   // 人工门作者决策（弧6 实践批）：manual 策略下审核 verdict=revise 时 approve 被
@@ -1034,10 +1020,7 @@ export async function storyArcPlanningWorkflow(params: StoryArcPlanningWorkflowI
 }
 
 export async function creativeRunWorkflow(runId: string): Promise<void> {
-  const activities = proxyActivities<CreativeWorkflowActivities>({
-    startToCloseTimeout: "10 minutes",
-    retry: { maximumAttempts: 3 },
-  });
+  const activities = proxyActivities<CreativeWorkflowActivities>(STANDARD_ACTIVITY_POLICY);
 
   // 状态变量
   let paused = false;
@@ -1412,10 +1395,7 @@ export async function chapterReviewWorkflow(params: {
   mode?: "full" | "targeted";
   targetIssueIds?: string[];
 }): Promise<void> {
-  const activities = proxyActivities<NovelWorkflowActivities>({
-    startToCloseTimeout: "10 minutes",
-    retry: { maximumAttempts: 3, nonRetryableErrorTypes: ["NonRetryableModelTransportError", "ModelTransportError"] },
-  });
+  const activities = proxyActivities<NovelWorkflowActivities>(STANDARD_ACTIVITY_POLICY);
 
   const workflowId = params.workflowId ?? `chapter-review-${params.documentId}-${Date.now()}`;
   let iteration = 0;

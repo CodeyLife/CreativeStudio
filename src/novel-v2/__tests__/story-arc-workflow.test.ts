@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { startStoryArcBatchPlanning, startStoryArcOrchestratedPlanning, startStoryArcPlanning, startStoryArcReview } from "../application/story-arc-workflow";
 import type { NovelPostgresRepository } from "../postgres-repository";
+import { HEAVY_MODEL_ACTIVITY_POLICY } from "../temporal/activity-policy";
 
 const withStoryArcWorkflowLock = async <T>(_projectId: string, _arcId: string, callback: () => Promise<T>): Promise<T> => callback();
 
@@ -195,7 +196,10 @@ describe("story arc review authority boundary", () => {
     const end = source.indexOf("export async function creativeRunWorkflow", start);
     const block = source.slice(start, end);
     expect(block).toContain("const storyArcModelActivities = proxyActivities");
-    expect(block).toContain("retry: { maximumAttempts: 1");
+    // 策略值已收进 activity-policy 表：这里锁"弧取重任务档"，并断言该档真的禁自我重试
+    // （比字面量扫描更强——档位改数值时这条会跟着红，而文本锁只会假绿）。
+    expect(block).toContain("proxyActivities<NovelWorkflowActivities>(HEAVY_MODEL_ACTIVITY_POLICY)");
+    expect(HEAVY_MODEL_ACTIVITY_POLICY.retry?.maximumAttempts).toBe(1);
     expect(block).toContain("storyArcModelActivities.generateStoryArcBundle");
   });
 
