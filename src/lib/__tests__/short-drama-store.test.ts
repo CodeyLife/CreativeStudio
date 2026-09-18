@@ -65,6 +65,29 @@ describe("workflows", () => {
     expect(b.workspaceId !== a.workspaceId).toBe(true);
   });
 
+  it("同毫秒连建的创作台仍严格最新在前（回归：时间戳并列会退化成 UUID 序）", async () => {
+    const titles = ["t1", "t2", "t3", "t4", "t5"];
+    const created = [];
+    for (const title of titles) created.push(await createShortDramaWorkspaceLocal({ title }));
+    // 毫秒分辨率下这些创建必然落在同一毫秒内
+    const list = await listShortDramaWorkspacesLocal();
+    expect(list.map((workspace) => workspace.title)).toEqual([...titles].reverse());
+    for (let index = 1; index < list.length; index += 1) {
+      expect(list[index - 1].updatedAt).toBeGreaterThan(list[index].updatedAt);
+    }
+    expect(new Set(created.map((workspace) => workspace.workspaceId)).size).toBe(titles.length);
+  });
+
+  it("时间戳并列的剧本按 scriptId 稳定全序（两次读取顺序一致）", async () => {
+    await saveShortDramaScriptLocal(scriptRecord({ scriptId: "b", localKey: "lk-b", createdAt: 7 }));
+    await saveShortDramaScriptLocal(scriptRecord({ scriptId: "a", localKey: "lk-a", createdAt: 7 }));
+    await saveShortDramaScriptLocal(scriptRecord({ scriptId: "c", localKey: "lk-c", createdAt: 9 }));
+    const first = await listShortDramaScriptsLocal();
+    const second = await listShortDramaScriptsLocal();
+    expect(second.map((script) => script.scriptId)).toEqual(first.map((script) => script.scriptId));
+    expect(first.map((script) => script.scriptId)).toEqual(["c", "b", "a"]);
+  });
+
   it("deleting a workspace cascades its materials and detaches its scripts", async () => {
     const ws = await createShortDramaWorkspaceLocal({ title: "w" });
     await addShortDramaMaterialLocal({ workspaceId: ws.workspaceId, description: "白鹤", file: makeFile("a.png", "bytes-1") });

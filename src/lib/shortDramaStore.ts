@@ -97,10 +97,25 @@ export async function computeShortDramaLocalKey(input: {
   );
 }
 
+/**
+ * 本地写入的单调时间戳。
+ *
+ * 根因：Date.now() 只有毫秒分辨率，同一毫秒内连建两条记录会得到相同时间戳，列表排序随即
+ * 退化为 IndexedDB 主键（随机 UUID）顺序——用户看到"刚建的反而排在最后"，断言顺序的测试
+ * 也会偶发红。这里保证同毫秒内严格递增（跨毫秒仍跟随真实时间），让"最新在前"在本地存储
+ * 里成为可判定事实。
+ */
+let lastLocalStamp = 0;
+function nextLocalStamp(): number {
+  const now = Date.now();
+  lastLocalStamp = now > lastLocalStamp ? now : lastLocalStamp + 1;
+  return lastLocalStamp;
+}
+
 // ---------- 创作台 ----------
 
 export async function createShortDramaWorkspaceLocal(input: { title: string; description?: string }): Promise<ShortDramaWorkspaceRecord> {
-  const now = Date.now();
+  const now = nextLocalStamp();
   const record: ShortDramaWorkspaceRecord = {
     workspaceId: crypto.randomUUID(),
     title: input.title.trim(),
@@ -114,7 +129,7 @@ export async function createShortDramaWorkspaceLocal(input: { title: string; des
 
 export async function listShortDramaWorkspacesLocal(): Promise<ShortDramaWorkspaceRecord[]> {
   const all = await entries<string, ShortDramaWorkspaceRecord>(workspacesStore);
-  return all.map(([, value]) => value).sort((a, b) => b.updatedAt - a.updatedAt);
+  return all.map(([, value]) => value).sort((a, b) => b.updatedAt - a.updatedAt || a.workspaceId.localeCompare(b.workspaceId));
 }
 
 export async function getShortDramaWorkspaceLocal(workspaceId: string): Promise<ShortDramaWorkspaceRecord | undefined> {
@@ -153,7 +168,7 @@ export async function addShortDramaMaterialLocal(input: {
     mimeType: input.file.type || "image/png",
     contentHash,
     blob: input.file,
-    createdAt: Date.now(),
+    createdAt: nextLocalStamp(),
   };
   await set(record.materialId, record, materialsStore);
   return { material: record, reused: false };
@@ -164,7 +179,7 @@ export async function listShortDramaMaterialsLocal(workspaceId: string): Promise
   return all
     .map(([, value]) => value)
     .filter((material) => material.workspaceId === workspaceId)
-    .sort((a, b) => a.createdAt - b.createdAt);
+    .sort((a, b) => a.createdAt - b.createdAt || a.materialId.localeCompare(b.materialId));
 }
 
 export async function getShortDramaMaterialLocal(workspaceId: string, materialId: string): Promise<ShortDramaMaterialRecord | undefined> {
@@ -196,7 +211,7 @@ export async function listShortDramaScriptsLocal(workspaceId?: string): Promise<
   return all
     .map(([, value]) => value)
     .filter((script) => (workspaceId === undefined ? !script.workspaceId : script.workspaceId === workspaceId))
-    .sort((a, b) => b.createdAt - a.createdAt);
+    .sort((a, b) => b.createdAt - a.createdAt || b.scriptId.localeCompare(a.scriptId));
 }
 
 export async function getShortDramaScriptLocal(scriptId: string): Promise<ShortDramaScriptRecord | undefined> {
