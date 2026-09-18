@@ -4,7 +4,7 @@ import type { ModelGateway } from "../model-gateway";
 import type { ModelRoutingSnapshot } from "../model-routing";
 import type { ObjectStoreAdapter } from "../object-store";
 import type { MemoryIndex } from "../qdrant-memory";
-import { NovelPostgresRepository } from "../postgres-repository";
+import type { ChapterStateRebuildRepositoryAccess } from "../repository-capabilities";
 import { extractFactsWithStats } from "../fact-extraction";
 import { loadCharacterIdentityRegistry } from "../character-enrichment";
 import { uniqueCharacterIdentities, type CharacterIdentityIndex } from "../character-identity";
@@ -24,7 +24,7 @@ export interface RebuildCommittedChapterStateResult {
 
 export class ChapterStateRebuildService {
   constructor(private readonly deps: {
-    repository: NovelPostgresRepository;
+    repository: ChapterStateRebuildRepositoryAccess;
     objects: ObjectStoreAdapter;
     model: ModelGateway;
     skillProvider: SkillProvider;

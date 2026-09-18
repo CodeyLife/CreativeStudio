@@ -30,7 +30,7 @@ import type {
   CreativeRunPolicy,
   ReviewIssue,
 } from "../protocol";
-import type { NovelPostgresRepository } from "../postgres-repository";
+import type { RepositoryQueryClient } from "../repository-capabilities";
 
 // ===== 行类型映射 =====
 
@@ -62,7 +62,7 @@ function mapReviewRow(row: ReviewRow): CreativeReview {
 // ===== 辅助 =====
 
 async function writeRunEvent(
-  repository: NovelPostgresRepository,
+  repository: RepositoryQueryClient,
   runId: string,
   eventType: string,
   payload: Record<string, unknown>,
@@ -132,7 +132,7 @@ function hasBlockerOrMajor(issues: Array<ReviewIssue & { status: "open" | "resol
  * - subjectArtifactId 非空
  */
 export async function submitReview(
-  repository: NovelPostgresRepository,
+  repository: RepositoryQueryClient,
   workItemId: string,
   review: CreativeReviewInput,
 ): Promise<CreativeReview> {
@@ -197,7 +197,7 @@ export async function submitReview(
  * 查询 work item 的所有审核（按 created_at ASC）。
  */
 export async function listReviews(
-  repository: NovelPostgresRepository,
+  repository: RepositoryQueryClient,
   workItemId: string,
 ): Promise<CreativeReview[]> {
   const result = await repository.pool.query<ReviewRow>(
@@ -344,7 +344,7 @@ export function evaluateReviewGate(
  * 自动从 work item 反查 runId → run.policy。
  */
 export async function checkGate(
-  repository: NovelPostgresRepository,
+  repository: RepositoryQueryClient,
   workItemId: string,
   policy: CreativeRunPolicy,
 ): Promise<CreativeReviewGate> {

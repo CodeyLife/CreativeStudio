@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { ChapterMemory, CommitRequest, CommitResult, RuntimeLearningAssessmentV2, SkillBundle } from "./protocol";
-import { NovelPostgresRepository } from "./postgres-repository";
+import type { CommitServiceRepositoryAccess } from "./repository-capabilities";
 import { ContentObjectStore, type ObjectStoreAdapter } from "./object-store";
 import type { ModelGateway } from "./model-gateway";
 import type { ModelRoutingSnapshot } from "./model-routing";
@@ -47,7 +47,7 @@ export interface ChapterMemoryDeps {
 
 export class CommitService {
   constructor(
-    private readonly repository: NovelPostgresRepository,
+    private readonly repository: CommitServiceRepositoryAccess,
     private readonly objects: ObjectStoreAdapter = new ContentObjectStore(),
     /** 可选的 chapter memory 依赖。缺失时 commit 不创建 chapter memory（向后兼容）。 */
     private readonly chapterMemoryDeps?: ChapterMemoryDeps,

@@ -1,12 +1,12 @@
 import { randomUUID } from "node:crypto";
 import type { Client } from "@temporalio/client";
-import type { NovelPostgresRepository } from "../postgres-repository";
+import type { BookSynopsisWorkflowRepositoryAccess } from "../repository-capabilities";
 import { bookSynopsisSourceFingerprint, bookTitleSourceFingerprint, missingSynopsisPlanStages } from "./book-synopsis";
 
 const ACTIVE_STATUSES = new Set(["accepted", "pending", "running", "waiting-external"]);
 
 export async function startBookSynopsisGeneration(
-  repository: NovelPostgresRepository,
+  repository: BookSynopsisWorkflowRepositoryAccess,
   temporal: Client,
   input: { projectId: string; taskQueue?: string },
 ) {
@@ -44,7 +44,7 @@ export async function startBookSynopsisGeneration(
 }
 
 export async function startBookTitleCandidateGeneration(
-  repository: NovelPostgresRepository,
+  repository: BookSynopsisWorkflowRepositoryAccess,
   temporal: Client,
   input: { projectId: string; taskQueue?: string },
 ) {

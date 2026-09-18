@@ -1,8 +1,8 @@
 import type { ContentObjectStore } from "./object-store";
-import type { NovelPostgresRepository } from "./postgres-repository";
+import type { RuntimeObjectStoreGuardAccess } from "./repository-capabilities";
 
 export async function bindRuntimeObjectStore(
-  repository: NovelPostgresRepository,
+  repository: RuntimeObjectStoreGuardAccess,
   objects: ContentObjectStore,
   service: "api" | "worker",
 ): Promise<void> {

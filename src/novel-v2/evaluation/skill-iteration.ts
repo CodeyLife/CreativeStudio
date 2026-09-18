@@ -23,7 +23,7 @@ import type {
   SkillDescriptor,
 } from "../protocol";
 import type { ModelGateway } from "../model-gateway";
-import type { NovelPostgresRepository } from "../postgres-repository";
+import type { RepositoryQueryClient } from "../repository-capabilities";
 import type { ExperimentWorkspaceHandle } from "./experiment-workspace";
 import { serializePromptSections } from "./prompt-sections";
 import { compileStageContext } from "../stage-context";
@@ -248,7 +248,7 @@ function mapSkillRow(row: SkillRow): SkillDescriptor {
  */
 export async function runSkillIteration(input: {
   workspace: ExperimentWorkspaceHandle;
-  repository: NovelPostgresRepository;
+  repository: RepositoryQueryClient;
   reviews: Review[];
   learningAssessment?: RuntimeLearningAssessmentV2;
   model: ModelGateway;

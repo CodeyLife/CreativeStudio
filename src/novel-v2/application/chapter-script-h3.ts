@@ -23,7 +23,7 @@ import type { Artifact, SkillProvider } from "../protocol";
 import type { ModelRoutingSnapshot } from "../model-routing";
 import type { ModelGateway } from "../model-gateway";
 import type { ObjectStoreAdapter } from "../object-store";
-import { NovelPostgresRepository } from "../postgres-repository";
+import type { ChapterScriptRepositoryAccess } from "../repository-capabilities";
 import { buildSkillContextSections, resolveStageSkillBundle } from "../skill-runtime";
 import { compileStageContext } from "../stage-context";
 
@@ -777,12 +777,12 @@ export function buildChapterScriptPrompt(input: {
 
 const SCRIPT_SYSTEM_BASE = "你是短剧分镜剧本提示词改写器。只依据给定正文与指令输出符合 JSON Schema 的剧本：顶层 plotBeats 是穷举的剧情节拍清单，characters 是出场人物外观基线，segments 是按播放顺序排列的片段数组（用 beatIds 引用节拍）。";
 
-async function loadProjectTitle(repository: NovelPostgresRepository, projectId: string): Promise<string> {
+async function loadProjectTitle(repository: ChapterScriptRepositoryAccess, projectId: string): Promise<string> {
   const result = await repository.pool.query<{ title: string }>("SELECT title FROM novel_projects WHERE id=$1", [projectId]);
   return result.rows[0]?.title ?? "";
 }
 
-async function loadChapterCast(projectId: string, repository: NovelPostgresRepository): Promise<Array<{ name: string; digest: string }>> {
+async function loadChapterCast(projectId: string, repository: ChapterScriptRepositoryAccess): Promise<Array<{ name: string; digest: string }>> {
   const [foundation, entities] = await Promise.all([
     repository.pool.query<{ characters: unknown }>(
       "SELECT payload->'structuredData'->'characters' AS characters FROM project_plan_sections WHERE project_id=$1 AND task_key='characters'",
@@ -807,7 +807,7 @@ async function loadChapterCast(projectId: string, repository: NovelPostgresRepos
   return [...digests.entries()].map(([name, digest]) => ({ name, digest }));
 }
 
-async function readStoredChapterScript(repository: NovelPostgresRepository, artifactId: string): Promise<ChapterScriptRecord | undefined> {
+async function readStoredChapterScript(repository: ChapterScriptRepositoryAccess, artifactId: string): Promise<ChapterScriptRecord | undefined> {
   const result = await repository.getArtifact(artifactId);
   if (!result?.structuredData || result.kind !== CHAPTER_SCRIPT_ARTIFACT_KIND) return undefined;
   const data = result.structuredData as Record<string, unknown>;
@@ -828,7 +828,7 @@ async function readStoredChapterScript(repository: NovelPostgresRepository, arti
   };
 }
 
-async function persistChapterScriptArtifact(repository: NovelPostgresRepository, objects: ObjectStoreAdapter, context: {
+async function persistChapterScriptArtifact(repository: ChapterScriptRepositoryAccess, objects: ObjectStoreAdapter, context: {
   projectId: string;
   documentId: string;
   revisionId: string;
@@ -883,7 +883,7 @@ export async function generateChapterScriptH3(input: {
   documentId: string;
   instruction?: string;
 }, deps: {
-  repository: NovelPostgresRepository;
+  repository: ChapterScriptRepositoryAccess;
   objects: ObjectStoreAdapter;
   model: ModelGateway;
   skillProvider: SkillProvider;
@@ -1024,7 +1024,7 @@ export async function submitExternalChapterScriptH3(input: {
   /** 外部模型产出的剧本 JSON：{ plotBeats?, characters?, segments }。 */
   payload: { plotBeats?: unknown; characters?: unknown; segments?: unknown };
 }, deps: {
-  repository: NovelPostgresRepository;
+  repository: ChapterScriptRepositoryAccess;
   objects: ObjectStoreAdapter;
   /** 项目级共享 subject_definitions 预设文本；空串表示无共享（与内部生成对齐）。 */
   sharedSubjectsText?: string;

@@ -21,7 +21,7 @@
  */
 import { randomUUID } from "node:crypto";
 import type { CreativeWorkItem, CreativeWorkKind, CreativeWorkStatus } from "../protocol";
-import type { NovelPostgresRepository } from "../postgres-repository";
+import type { WorkItemRepositoryAccess } from "../repository-capabilities";
 import { getCreativeRun, updateRunStatusFromWork } from "./run-manager";
 import { hasPassedIndependentReviewForArtifact, listReviews } from "./review-gate";
 import { isRetiredFoundationTaskKey, requiresFoundationAuthorConfirmation } from "../application/project-plan";
@@ -63,7 +63,7 @@ function mapWorkItemRow(row: WorkItemRow): CreativeWorkItem {
 // ===== 辅助 =====
 
 async function writeRunEvent(
-  repository: NovelPostgresRepository,
+  repository: WorkItemRepositoryAccess,
   runId: string,
   eventType: string,
   payload: Record<string, unknown>,
@@ -93,7 +93,7 @@ function assertKind(kind: string): asserts kind is CreativeWorkKind {
  * 初始 status="pending"。写 work.enqueued 事件。
  */
 export async function enqueueCreativeWork(
-  repository: NovelPostgresRepository,
+  repository: WorkItemRepositoryAccess,
   runId: string,
   input: {
     kind: CreativeWorkKind;
@@ -160,7 +160,7 @@ export async function enqueueCreativeWork(
  * 查询单个 work item。不存在返回 null。
  */
 export async function getWorkItem(
-  repository: NovelPostgresRepository,
+  repository: WorkItemRepositoryAccess,
   workItemId: string,
 ): Promise<CreativeWorkItem | null> {
   const result = await repository.pool.query<WorkItemRow>(
@@ -175,7 +175,7 @@ export async function getWorkItem(
  * 列出 run 的所有 work item（按 created_at ASC）。
  */
 export async function listWorkItems(
-  repository: NovelPostgresRepository,
+  repository: WorkItemRepositoryAccess,
   runId: string,
 ): Promise<CreativeWorkItem[]> {
   const result = await repository.pool.query<WorkItemRow>(
@@ -193,7 +193,7 @@ export async function listWorkItems(
  * TODO P2: 实际执行器由 temporal workflow 调用，本函数仅做状态转换。
  */
 export async function startWork(
-  repository: NovelPostgresRepository,
+  repository: WorkItemRepositoryAccess,
   workItemId: string,
 ): Promise<CreativeWorkItem> {
   const before = await getWorkItem(repository, workItemId);
@@ -256,7 +256,7 @@ export async function startWork(
  * 写 work.completed 事件。触发 updateRunStatusFromWork 派生 run 状态。
  */
 export async function acceptWork(
-  repository: NovelPostgresRepository,
+  repository: WorkItemRepositoryAccess,
   workItemId: string,
 ): Promise<CreativeWorkItem> {
   const before = await getWorkItem(repository, workItemId);
@@ -315,7 +315,7 @@ export async function acceptWork(
  * 写 work.revised 事件。若提供 instruction，更新 instruction 字段。
  */
 export async function reviseWork(
-  repository: NovelPostgresRepository,
+  repository: WorkItemRepositoryAccess,
   workItemId: string,
   instruction?: string,
 ): Promise<CreativeWorkItem> {
@@ -361,7 +361,7 @@ export async function reviseWork(
  * 写 work.retried 事件。
  */
 export async function retryWork(
-  repository: NovelPostgresRepository,
+  repository: WorkItemRepositoryAccess,
   workItemId: string,
 ): Promise<CreativeWorkItem> {
   const before = await getWorkItem(repository, workItemId);
@@ -397,7 +397,7 @@ export async function retryWork(
  * 写 work.recovered 事件。
  */
 export async function recoverWork(
-  repository: NovelPostgresRepository,
+  repository: WorkItemRepositoryAccess,
   workItemId: string,
   force?: boolean,
 ): Promise<CreativeWorkItem> {
@@ -439,7 +439,7 @@ export async function recoverWork(
  * 写 work.failed 事件，payload 包含 error 信息。
  */
 export async function failWork(
-  repository: NovelPostgresRepository,
+  repository: WorkItemRepositoryAccess,
   workItemId: string,
   error: string,
 ): Promise<CreativeWorkItem> {
@@ -485,7 +485,7 @@ export async function failWork(
  * 提供为公共工具函数。
  */
 export async function attachArtifact(
-  repository: NovelPostgresRepository,
+  repository: WorkItemRepositoryAccess,
   workItemId: string,
   artifactId: string,
 ): Promise<CreativeWorkItem> {

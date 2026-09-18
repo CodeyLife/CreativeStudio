@@ -3,7 +3,7 @@ import Ajv from "ajv";
 import type { Artifact, MemoryClaim, SkillBundle } from "../protocol";
 import type { ModelGateway } from "../model-gateway";
 import type { ModelRoutingSnapshot } from "../model-routing";
-import { NovelPostgresRepository } from "../postgres-repository";
+import type { CharacterEnrichmentRepositoryAccess } from "../repository-capabilities";
 import type { ContentObjectStore } from "../object-store";
 import type { MemoryIndex } from "../qdrant-memory";
 import { characterEnrichmentSchema, RELATION_PREDICATE_WORDS, type CharacterEnrichmentOutput } from "../prompts/schemas";
@@ -60,7 +60,7 @@ function foundationCharacters(value: unknown): FoundationCharacter[] {
  * 导出给 extractFacts / chapter-state-rebuild 等提取调用方复用：prompt 注入规范名册 +
  * 提取结果经同一索引归一，是"身份注册表成为共享写入契约"的最低共享层实现。
  */
-export async function loadCharacterIdentityRegistry(projectId: string, repository: NovelPostgresRepository): Promise<CharacterIdentityRegistry> {
+export async function loadCharacterIdentityRegistry(projectId: string, repository: CharacterEnrichmentRepositoryAccess): Promise<CharacterIdentityRegistry> {
   const [entities, foundation] = await Promise.all([
     repository.pool.query<CharacterEntityRow>("SELECT id, name, payload FROM entities WHERE project_id=$1 AND kind='character' AND (payload->>'mergedInto') IS NULL ORDER BY name ASC", [projectId]),
     repository.pool.query<{ characters: unknown }>("SELECT payload->'structuredData'->'characters' AS characters FROM project_plan_sections WHERE project_id=$1 AND task_key='characters'", [projectId]),
@@ -134,7 +134,7 @@ export interface EnrichCharactersInput {
 }
 
 export interface EnrichCharactersDeps {
-  repository: NovelPostgresRepository;
+  repository: CharacterEnrichmentRepositoryAccess;
   objects: ContentObjectStore;
   /** Qdrant 索引（可选，缺失时跳过向量索引）。 */
   memoryIndex?: MemoryIndex;

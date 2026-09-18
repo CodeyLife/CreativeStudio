@@ -31,7 +31,7 @@ import type {
   MemoryBundle,
 } from "../protocol";
 import type { ModelGateway } from "../model-gateway";
-import type { NovelPostgresRepository } from "../postgres-repository";
+import type { CommandRouterRepositoryAccess } from "../repository-capabilities";
 import { compileStageContext } from "../stage-context";
 import {
   cancelCreativeRun,
@@ -67,7 +67,7 @@ type CachedEventRow = {
  * 返回缓存的 CreativeActionResult（若存在）。
  */
 async function findCachedResult(
-  repository: NovelPostgresRepository,
+  repository: CommandRouterRepositoryAccess,
   runId: string,
   idempotencyKey: string,
 ): Promise<CreativeActionResult | null> {
@@ -93,7 +93,7 @@ async function findCachedResult(
  * 这是幂等性的关键：后续相同 idempotencyKey 的命令会从 payload.result 取缓存结果。
  */
 async function writeCommandEvent(
-  repository: NovelPostgresRepository,
+  repository: CommandRouterRepositoryAccess,
   runId: string,
   command: CreativeCommand,
   result: CreativeActionResult,
@@ -133,7 +133,7 @@ function extractBlueprintId(taskId: string): string {
  * 失败时返回 null（不阻塞 review，prompt 退化为无 blueprint 上下文）。
  */
 async function loadBlueprintForArtifact(
-  repository: NovelPostgresRepository,
+  repository: CommandRouterRepositoryAccess,
   artifact: { taskId: string },
 ): Promise<ExecutionBlueprint | null> {
   const blueprintId = extractBlueprintId(artifact.taskId);
@@ -149,7 +149,7 @@ async function loadBlueprintForArtifact(
  * 按 project_id + created_at DESC 取最新。无历史返回空 bundle。
  */
 async function loadLatestMemoryBundle(
-  repository: NovelPostgresRepository,
+  repository: CommandRouterRepositoryAccess,
   projectId: string,
   preflightId: string,
 ): Promise<MemoryBundle> {
@@ -225,7 +225,7 @@ function reviewerOutputToCreativeInput(
  * AGENTS.md 契约：reviewer identity = "internal"。
  */
 export async function defaultReviewer(
-  repository: NovelPostgresRepository,
+  repository: CommandRouterRepositoryAccess,
   workItemId: string,
   model: ModelGateway,
 ): Promise<CreativeReviewInput> {
@@ -364,7 +364,7 @@ function buildResult(params: {
  * @throws 若 run 不存在、work item 不存在、状态转换非法、review.request 缺少 model 等
  */
 export async function executeCreativeCommand(
-  repository: NovelPostgresRepository,
+  repository: CommandRouterRepositoryAccess,
   command: CreativeCommand & { runId: string },
   model?: ModelGateway,
 ): Promise<CreativeActionResult> {

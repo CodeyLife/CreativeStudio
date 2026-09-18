@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { Client } from "@temporalio/client";
-import type { NovelPostgresRepository } from "../postgres-repository";
+import type { StoryArcWorkflowRepositoryAccess } from "../repository-capabilities";
 import type { StoryArcPlotOutline } from "./story-arc";
 
 /**
@@ -17,14 +17,14 @@ import type { StoryArcPlotOutline } from "./story-arc";
  * 读取同一份编排作为参考。
  */
 export async function startStoryArcOrchestratedPlanning(
-  repository: NovelPostgresRepository,
+  repository: StoryArcWorkflowRepositoryAccess,
   temporal: Client,
   input: { projectId: string; plotOutline: StoryArcPlotOutline; mode: "web" | "mcp"; reviewPolicy?: "manual" | "auto"; authorIntent?: string; taskQueue?: string },
 ) {
   return repository.withStoryArcWorkflowLock(input.projectId, "next", async () => {
     const workflowId = `story-arc-${randomUUID()}`;
     const reviewPolicy = input.reviewPolicy ?? (input.mode === "mcp" ? "auto" : "manual");
-    let arc: Awaited<ReturnType<NovelPostgresRepository["getStoryArc"]>>;
+    let arc: Awaited<ReturnType<StoryArcWorkflowRepositoryAccess["getStoryArc"]>>;
     try {
       arc = await repository.createNextStoryArc({ projectId: input.projectId, workflowId, authorIntent: input.authorIntent ?? input.plotOutline.objective, plotOutline: input.plotOutline });
       await repository.putWorkflowRun({
@@ -50,7 +50,7 @@ export async function startStoryArcOrchestratedPlanning(
 }
 
 export async function startStoryArcPlanning(
-  repository: NovelPostgresRepository,
+  repository: StoryArcWorkflowRepositoryAccess,
   temporal: Client,
   input: { projectId: string; mode: "web" | "mcp"; reviewPolicy?: "manual" | "auto"; authorIntent?: string; taskQueue?: string; arcId?: string },
 ) {
@@ -62,7 +62,7 @@ export async function startStoryArcPlanning(
     // 不构成 rebase 条件——失败尝试同样会留下蓝图 artifact（弧15 三连败实证：孤儿蓝图把
     // arc_start 恢复逼进'没有可重基线的已关联章节'死路），无章节时 regenerate 才是正确语义。
     const rebase = Boolean(input.arcId && existingArc?.chapters.some((chapter) => Boolean(chapter.documentId)));
-    let arc: Awaited<ReturnType<NovelPostgresRepository["getStoryArc"]>>;
+    let arc: Awaited<ReturnType<StoryArcWorkflowRepositoryAccess["getStoryArc"]>>;
     try {
       arc = input.arcId
         ? await repository.markStoryArcGenerating(input.projectId, input.arcId, input.mode === "web" ? "web-author" : "mcp", { workflowId })
@@ -91,7 +91,7 @@ export async function startStoryArcPlanning(
 }
 
 export async function startStoryArcReview(
-  repository: NovelPostgresRepository,
+  repository: StoryArcWorkflowRepositoryAccess,
   temporal: Client,
   input: { projectId: string; arcId: string; mode: "web" | "mcp"; reviewPolicy?: "manual" | "auto"; taskQueue?: string },
 ) {
@@ -151,7 +151,7 @@ export async function startStoryArcReview(
 }
 
 export async function startStoryArcBatchPlanning(
-  repository: NovelPostgresRepository,
+  repository: StoryArcWorkflowRepositoryAccess,
   temporal: Client,
   input: { projectId: string; arcId: string; mode: "web" | "mcp"; reviewPolicy?: "manual" | "auto"; taskQueue?: string; retryFailed?: boolean },
 ) {

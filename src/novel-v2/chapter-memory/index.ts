@@ -3,7 +3,7 @@ import Ajv from "ajv";
 import type { Artifact, ChapterMemory, SkillBundle } from "../protocol";
 import type { ModelGateway } from "../model-gateway";
 import type { ModelRoutingSnapshot } from "../model-routing";
-import { NovelPostgresRepository } from "../postgres-repository";
+import type { ChapterMemoryRepositoryAccess } from "../repository-capabilities";
 import type { ObjectStoreAdapter } from "../object-store";
 import type { MemoryIndex } from "../qdrant-memory";
 import { chapterMemorySchema, type ChapterMemoryOutput } from "../prompts/schemas";
@@ -55,7 +55,7 @@ export interface CreateChapterMemoryInput {
 }
 
 export interface CreateChapterMemoryDeps {
-  repository: NovelPostgresRepository;
+  repository: ChapterMemoryRepositoryAccess;
   objects: ObjectStoreAdapter;
   /** Qdrant 索引（可选，缺失时跳过向量索引，不影响 Postgres 落库）。 */
   memoryIndex?: MemoryIndex;

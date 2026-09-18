@@ -1,12 +1,12 @@
 import { randomUUID } from "node:crypto";
 import type { Client } from "@temporalio/client";
-import type { NovelPostgresRepository } from "../postgres-repository";
+import type { ChapterTitleWorkflowRepositoryAccess } from "../repository-capabilities";
 import { chapterTitleSourceFingerprint } from "./chapter-title";
 
 const ACTIVE_STATUSES = new Set(["accepted", "pending", "running", "waiting-external"]);
 
 export async function startChapterTitleGeneration(
-  repository: NovelPostgresRepository,
+  repository: ChapterTitleWorkflowRepositoryAccess,
   temporal: Client,
   input: { projectId: string; documentId: string; taskQueue?: string },
 ) {

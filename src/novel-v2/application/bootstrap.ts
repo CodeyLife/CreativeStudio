@@ -1,6 +1,6 @@
 import type { Client } from "@temporalio/client";
 import { createCreativeRun, enqueueCreativeWork, getRunSnapshot } from "../creative";
-import type { NovelPostgresRepository } from "../postgres-repository";
+import type { BootstrapRepositoryAccess } from "../repository-capabilities";
 import { PROJECT_PLAN_STAGES } from "./project-plan";
 
 export const FOUNDATION_TASK_CHAIN = PROJECT_PLAN_STAGES;
@@ -58,7 +58,7 @@ export interface StartBootstrapInput {
  * model tasks, signals, persisted status, and Temporal history share one key.
  */
 export async function startNovelBootstrap(
-  repository: NovelPostgresRepository,
+  repository: BootstrapRepositoryAccess,
   temporal: Client,
   input: StartBootstrapInput,
 ) {

@@ -1,9 +1,9 @@
 import { ModelConfigStore } from "./model-config-store";
 import { RoutedModelGateway } from "./model-gateway";
-import type { NovelPostgresRepository } from "./postgres-repository";
+import type { ModelRuntimeRepositoryAccess } from "./repository-capabilities";
 import type { ObjectStoreAdapter } from "./object-store";
 
-export async function createRuntimeModelGateway(repository: NovelPostgresRepository, objects?: ObjectStoreAdapter) {
+export async function createRuntimeModelGateway(repository: ModelRuntimeRepositoryAccess, objects?: ObjectStoreAdapter) {
   const configStore = new ModelConfigStore();
   await configStore.load();
   await repository.projectModelRoutingConfig(configStore.getConfig(), configStore.getSnapshot());
