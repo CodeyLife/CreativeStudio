@@ -103,6 +103,7 @@ describe("workflow_runs 生命周期词表", () => {
 
 describe("run 状态写入面接线锁", () => {
   const repository = readFileSync(fileURLToPath(new URL("../postgres-repository.ts", import.meta.url)), "utf8");
+  const slice = readFileSync(fileURLToPath(new URL("../repository/workflow-run-slice.ts", import.meta.url)), "utf8");
   const terminalOutcome = readFileSync(fileURLToPath(new URL("../terminal-outcome.ts", import.meta.url)), "utf8");
 
   it("terminal-outcome 不再自带第二份终态清单", () => {
@@ -110,19 +111,25 @@ describe("run 状态写入面接线锁", () => {
     expect(terminalOutcome).not.toMatch(/new Set\(\["completed"/);
   });
 
-  it("workflow_runs.status 写入者只有三个：受控漏斗、乐观守卫对账、人工门守卫回写", () => {
-    const writers = [...repository.matchAll(/UPDATE workflow_runs SET status/g)].length;
-    expect(writers).toBe(3);
+  it("workflow_runs.status 写入者仍只有三个：slice 漏斗、slice 门态回写、仓储乐观守卫对账", () => {
+    // 拆片后写入面分散在两个文件，锁必须一起扫——否则"再开第四个写入者"不会被发现。
+    const combined = `${repository}${slice}`;
+    expect([...combined.matchAll(/UPDATE workflow_runs SET status/g)].length).toBe(3);
+    expect([...repository.matchAll(/UPDATE workflow_runs SET status/g)].length).toBe(1);
+    expect([...slice.matchAll(/UPDATE workflow_runs SET status/g)].length).toBe(2);
     // 对账那条必须自带乐观并发守卫（WHERE status=旧快照），否则会用过期判据覆写新鲜事实。
     expect(repository).toContain("WHERE temporal_workflow_id=$1 AND status=$2");
-    // 漏斗的状态参数必须是词表类型，不是宽 string。
-    expect(repository).toMatch(/updateWorkflowRunStatus\(temporalWorkflowId: string, status: WorkflowRunStatus/);
-    // 第三条是人工门回写：判据必须写进 UPDATE 的 WHERE（先读后判会留竞态窗口）。
-    expect(repository).toMatch(/AND status IN \(\$\{HUMAN_GATE_WORKFLOW_RUN_STATUSES_SQL\}\)/);
+    // 漏斗的状态参数必须是词表类型，不是宽 string；仓储侧只允许委托。
+    expect(slice).toMatch(/async updateStatus\(temporalWorkflowId: string, status: WorkflowRunStatus/);
+    expect(repository).toMatch(/async updateWorkflowRunStatus\(temporalWorkflowId: string, status: WorkflowRunStatus[^)]*\) \{\r?\n    return this\.workflowRuns\.updateStatus\(/);
+    // 门态回写：判据必须写进 UPDATE 的 WHERE（先读后判会留竞态窗口）。
+    expect(slice).toMatch(/AND status IN \(\$\{HUMAN_GATE_WORKFLOW_RUN_STATUSES_SQL\}\)/);
     // 漏斗本体必须挂终态吸收守卫（删掉即回到"任何写入者都能复活终态 run"的旧形态）。
-    expect(repository).toMatch(/WHERE temporal_workflow_id=\$1 \$\{terminalOverwriteGuardSql\("\$2"\)\}/);
+    expect(slice).toMatch(/WHERE temporal_workflow_id=\$1 \$\{terminalOverwriteGuardSql\("\$2"\)\}/);
     // 守卫挡下时不得静默：留一条 refusal 事件供审计发现覆写尝试。
-    expect(repository).toContain('"workflow.transition-refused"');
+    expect(slice).toContain('"workflow.transition-refused"');
+    // 反向：仓储里不得再留第二份状态 SQL。
+    expect(repository).not.toMatch(/UPDATE workflow_runs SET status=\$2/);
   });
 
   it("人工裁决链路的状态回写一律走守卫方法（未命中即由工作流独占状态）", () => {

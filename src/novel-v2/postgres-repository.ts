@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { foundationArtifactToMemoryClaim, foundationClaimId } from "./foundation-memory";
 import { CLAIM_PROJECTION_SET_SQL, retrievalVisibleClaimsSql, retiredByVisibleKillerSql } from "./memory-visibility";
-import { ACTIVE_WORKFLOW_RUN_STATUSES_SQL, HUMAN_GATE_RESUME_WORKFLOW_RUN_STATUS, HUMAN_GATE_WORKFLOW_RUN_STATUSES_SQL, WAITING_EXTERNAL_WORKFLOW_RUN_STATUS_SQL, isForbiddenTerminalOverwrite, terminalOverwriteGuardSql, toWorkflowRunStatus, type WorkflowRunStatus } from "./run-lifecycle";
+import { ACTIVE_WORKFLOW_RUN_STATUSES_SQL, WAITING_EXTERNAL_WORKFLOW_RUN_STATUS_SQL, type WorkflowRunStatus } from "./run-lifecycle";
 import { normalizeFoundationStructuredDataFlat, validateFoundationTaskContract } from "./application/foundation-contract";
 import { foundationContractFingerprint } from "./application/foundation-contract-fingerprint";
 import { assertCompleteChapterReviewEvidence } from "./application/chapter-approval";
@@ -62,7 +62,8 @@ import type {
 } from "./protocol";
 import type { ModelInvocationAudit, ModelPromptExecution } from "./model-gateway";
 import { embeddingFingerprint } from "./model-gateway";
-import { withTerminalOutcome } from "./terminal-outcome";
+import { iso, workflowFromRow, type WorkflowRunRow } from "./repository/shared";
+import { WorkflowRunSlice } from "./repository/workflow-run-slice";
 import type { ModelRoutingConfig, ModelRoutingSnapshot, ModelTaskRecord, ModelWorkPackage } from "./model-routing";
 import type { ObjectStoreAdapter } from "./object-store";
 import { countNovelCharacters } from "./word-count";
@@ -157,7 +158,6 @@ export interface LearningAssessmentView {
 
 type ProjectRow = { id: string; title: string; current_revision: string | number; metadata: Record<string, unknown>; created_at: Date | string; updated_at: Date | string };
 type DocumentRow = { id: string; project_id: string; title: string; narrative_order: string | number; pov_character_id: string | null; current_revision_id: string | null; status: string; created_at: Date | string; updated_at: Date | string; word_count?: string | number | null; latest_revision?: string | number | null; chapter_goal?: string | null; blocking_issue_count?: string | number | null; review_score?: string | number | null; review_verdict?: "passed" | "revise" | "blocked" | null; author_decision?: "approve" | "revise" | "reject" | "abandon" | null; review_stale?: boolean | null; arc_id?: string | null; arc_title?: string | null; arc_planning_status?: string | null };
-type WorkflowRunRow = { id: string; workflow_type: string; project_id: string; temporal_workflow_id: string; status: string; payload: Record<string, unknown>; created_at: Date | string; updated_at: Date | string };
 type ArtifactRow = { id: string; project_id: string; task_id: string; attempt_id: string; kind: Artifact["kind"]; content_hash: string; object_key: string | null; base_revision: string | number; fingerprint: string; payload: Record<string, unknown>; created_at: Date | string };
 type TaskAttemptRow = { id: string; workflow_run_id: string | null; task_id: string; lease_owner: string | null; lease_expires_at: Date | string | null; heartbeat_at: Date | string | null; status: TaskAttemptRecord["status"]; payload: Record<string, unknown> };
 type ModelTaskRow = { id: string; workflow_run_id: string; task_id: string; purpose: ModelTaskRecord["purpose"]; config_revision: string; candidate_index: number; status: ModelTaskRecord["status"]; work_package: ModelWorkPackage; result: ModelTaskRecord["result"] | null; idempotency_key: string; project_id: string | null; created_at: Date | string; updated_at: Date | string };
@@ -189,7 +189,6 @@ export function buildNarrativeRhythmSnapshotQuery(): string {
        ORDER BY d.narrative_order`;
 }
 
-function iso(value: Date | string) { return value instanceof Date ? value.toISOString() : value; }
 export function isTransientPostgresStartupError(error: unknown): boolean {
   const record = error as { code?: unknown; message?: unknown };
   const code = typeof record.code === "string" ? record.code : undefined;
@@ -221,9 +220,6 @@ function documentFromRow(row: DocumentRow): ManuscriptDocumentSummary {
     arcTitle: row.arc_title ?? undefined,
     arcPlanningStatus: row.arc_planning_status ?? undefined,
   };
-}
-function workflowFromRow(row: WorkflowRunRow): WorkflowRunRecord {
-  return { id: row.id, workflowType: row.workflow_type, projectId: row.project_id, temporalWorkflowId: row.temporal_workflow_id, status: toWorkflowRunStatus(row.status), payload: row.payload ?? {}, createdAt: iso(row.created_at), updatedAt: iso(row.updated_at) };
 }
 function taskAttemptFromRow(row: TaskAttemptRow): TaskAttemptRecord {
   return { id: row.id, workflowRunId: row.workflow_run_id ?? undefined, taskId: row.task_id, leaseOwner: row.lease_owner ?? undefined, leaseExpiresAt: row.lease_expires_at ? iso(row.lease_expires_at) : undefined, heartbeatAt: row.heartbeat_at ? iso(row.heartbeat_at) : undefined, status: row.status, payload: row.payload ?? {} };
@@ -360,6 +356,8 @@ export function chapterBlueprintFromRow(row: ChapterBlueprintRow): ChapterBluepr
 export class NovelPostgresRepository {
   readonly pool: Pool;
   private readonly connectionConfig: PoolConfig;
+  /** 第一片物理 slice：workflow_runs 的受控读写；公开面仍由仓储委托（消费方零改动）。 */
+  private workflowRunsSlice?: WorkflowRunSlice;
 
   constructor(config: PoolConfig | string = process.env.DATABASE_URL ?? "postgresql://ymcp:ymcp@127.0.0.1:5432/ymcp") {
     this.connectionConfig = typeof config === "string" ? { connectionString: config } : { ...config };
@@ -380,6 +378,15 @@ export class NovelPostgresRepository {
          AND c.status<>'final'`,
       [projectId, documentId],
     );
+  }
+
+  /**
+   * 懒建而非构造期注入：本仓的 SQL 形状测试用 `Object.create(prototype)` + 覆写 `pool`
+   * 造桩（不起真连接池），构造期捕获 `this.pool` 会让那条路数静默失效。每个实例的
+   * `pool` 只在构造函数里赋值一次、`forSchema` 另建新实例，故缓存切片是安全的。
+   */
+  private get workflowRuns(): WorkflowRunSlice {
+    return (this.workflowRunsSlice ??= new WorkflowRunSlice({ pool: this.pool, appendOutbox: (aggregateType, aggregateId, eventType, payload) => this.appendOutbox(aggregateType, aggregateId, eventType, payload) }));
   }
 
   forSchema(schemaName: string): NovelPostgresRepository {
@@ -2712,72 +2719,18 @@ export class NovelPostgresRepository {
     return result.rows[0]?.payload as NovelIntent;
   }
 
+  // ---- workflow_runs 生命周期：实现住在 repository/workflow-run-slice.ts，本层只委托。
+  // 拆片的可验证性正在于此：公开面与 SQL 行为逐字不变，slice 可独立测、独立推演。
   async putWorkflowRun(input: { id: string; workflowType: string; projectId: string; temporalWorkflowId: string; status: string; payload?: Record<string, unknown> }) {
-    const result = await this.pool.query<WorkflowRunRow>(`INSERT INTO workflow_runs(id,workflow_type,project_id,temporal_workflow_id,status,payload)
-      VALUES($1,$2,$3,$4,$5,$6)
-      ON CONFLICT(temporal_workflow_id) DO UPDATE SET status=EXCLUDED.status,payload=workflow_runs.payload || EXCLUDED.payload,updated_at=now()
-      RETURNING id,workflow_type,project_id,temporal_workflow_id,status,payload,created_at,updated_at`, [input.id, input.workflowType, input.projectId, input.temporalWorkflowId, input.status, withTerminalOutcome(input.status, input.payload ?? {})]);
-    await this.appendOutbox("workflow-run", input.temporalWorkflowId, `workflow.${input.status}`, { projectId: input.projectId, workflowId: input.temporalWorkflowId, runId: input.id });
-    return workflowFromRow(result.rows[0]);
+    return this.workflowRuns.put(input);
   }
 
   async updateWorkflowRunStatus(temporalWorkflowId: string, status: WorkflowRunStatus, payload: Record<string, unknown> = {}) {
-    const result = await this.pool.query<WorkflowRunRow>(`UPDATE workflow_runs SET status=$2,payload=payload || $3,updated_at=now()
-      WHERE temporal_workflow_id=$1 ${terminalOverwriteGuardSql("$2")}
-      RETURNING id,workflow_type,project_id,temporal_workflow_id,status,payload,created_at,updated_at`, [temporalWorkflowId, status, withTerminalOutcome(status, payload)]);
-    if (!result.rowCount) return this.diagnoseRefusedStatusUpdate(temporalWorkflowId, status);
-    return this.announceWorkflowRunStatus(result.rows[0], status, payload);
+    return this.workflowRuns.updateStatus(temporalWorkflowId, status, payload);
   }
 
-  /**
-   * 零行更新的原因区分（守卫不得静默）。
-   *
-   * 行不存在是正常竞态（run 尚未落库或已随项目删除）；被终态守卫挡下则必须留痕，
-   * 否则装了守卫反而比没有更糟——原来至少看得见覆写结果，现在只剩一次 no-op。
-   * 判据本身已经在 UPDATE 的 WHERE 里原子生效，这里只做事后归因（多读一次当前行，
-   * 取值可能已更新，故只用于留痕不用于二次决策）。
-   */
-  private async diagnoseRefusedStatusUpdate(temporalWorkflowId: string, status: WorkflowRunStatus) {
-    const current = await this.pool.query<{ status: string }>("SELECT status FROM workflow_runs WHERE temporal_workflow_id=$1", [temporalWorkflowId]);
-    const from = current.rows[0]?.status;
-    if (from && isForbiddenTerminalOverwrite(from, status)) {
-      await this.appendOutbox("workflow-run", temporalWorkflowId, "workflow.transition-refused", { from, to: status, rule: "terminal-absorbing-except-redrive" });
-    }
-    return undefined;
-  }
-
-  /**
-   * 人工门 → running 的**守卫式**回写（供提交人工裁决的消费面使用）。
-   *
-   * 为什么要守卫：裁决链路是 claimApprovalEvidence → signal(humanSignal) → 回写状态。
-   * 信号一送达，工作流就恢复自驱——reject/abandon 这类短路径可能在回写落地前已经写完
-   * 终态。无守卫的回写会把 `completed`/`failed` 覆回 `running`，而工作流此后不再写自己
-   * 的终态，该 run 就只能等对账把"僵尸 running"收编成 `failed`：一次成功的裁决最终以
-   * 失败收场。守卫放进 UPDATE 的 WHERE 里（不是先读后判），所以判据与写入同一原子内，
-   * 不存在竞态窗口；未命中即返回 undefined，交由工作流这一个写入者继续负责状态。
-   */
   async resumeWorkflowRunFromHumanGate(temporalWorkflowId: string, payload: Record<string, unknown> = {}) {
-    const status = HUMAN_GATE_RESUME_WORKFLOW_RUN_STATUS;
-    const result = await this.pool.query<WorkflowRunRow>(`UPDATE workflow_runs SET status=$2,payload=payload || $3,updated_at=now()
-      WHERE temporal_workflow_id=$1 AND status IN (${HUMAN_GATE_WORKFLOW_RUN_STATUSES_SQL})
-      RETURNING id,workflow_type,project_id,temporal_workflow_id,status,payload,created_at,updated_at`, [temporalWorkflowId, status, withTerminalOutcome(status, payload)]);
-    if (!result.rowCount) return undefined;
-    return this.announceWorkflowRunStatus(result.rows[0], status, payload);
-  }
-
-  /** 状态写入后的事件面：run 状态变更与有语义 progress 事件双写（两条写入路径共用，避免口径分叉）。 */
-  private async announceWorkflowRunStatus(row: WorkflowRunRow, status: WorkflowRunStatus, payload: Record<string, unknown>) {
-    const record = workflowFromRow(row);
-    await this.appendOutbox("workflow-run", record.temporalWorkflowId, `workflow.${status}`, { projectId: record.projectId, workflowId: record.temporalWorkflowId, runId: record.id, ...payload });
-    // OR-C1（product-audit-20260910 E4）：有语义 progress 事件双写持久事件表。
-    // run payload 的 stage 键是"后写覆盖"的当前态展示位，守卫决策（revision-decision/
-    // revision-reverted/manual-review-required…）若无追加式留痕则事后无法回答
-    // "阈值挡下过什么"。规则泛化：凡带 stage 的写入即按 `workflow.progress.<stage>`
-    // 落一条事件，不设阶段白名单——新阶段零登记自动可审计。
-    if (typeof payload.stage === "string" && payload.stage.trim()) {
-      await this.appendOutbox("workflow-run", record.temporalWorkflowId, `workflow.progress.${payload.stage.trim()}`, { projectId: record.projectId, workflowId: record.temporalWorkflowId, runId: record.id, ...payload });
-    }
-    return record;
+    return this.workflowRuns.resumeFromHumanGate(temporalWorkflowId, payload);
   }
 
   async claimApprovalEvidence(input: { workflowId: string; artifactId: string; decision: ApprovalEvidence["decision"]; actorSource: ApprovalEvidence["actorSource"]; actorId: string; feedback?: string; revisionBase?: "current" | "previous" }) {
@@ -2965,17 +2918,11 @@ export class NovelPostgresRepository {
   }
 
   async getWorkflowRunByTemporalId(temporalWorkflowId: string) {
-    const result = await this.pool.query<WorkflowRunRow>("SELECT id,workflow_type,project_id,temporal_workflow_id,status,payload,created_at,updated_at FROM workflow_runs WHERE temporal_workflow_id=$1", [temporalWorkflowId]);
-    return result.rows[0] ? workflowFromRow(result.rows[0]) : undefined;
+    return this.workflowRuns.getByTemporalId(temporalWorkflowId);
   }
 
   async listProjectRuns(projectId: string, limit = 20, workflowType?: string): Promise<WorkflowRunRecord[]> {
-    const sql = workflowType
-      ? "SELECT id,workflow_type,project_id,temporal_workflow_id,status,payload,created_at,updated_at FROM workflow_runs WHERE project_id=$1 AND workflow_type=$2 ORDER BY updated_at DESC LIMIT $3"
-      : "SELECT id,workflow_type,project_id,temporal_workflow_id,status,payload,created_at,updated_at FROM workflow_runs WHERE project_id=$1 ORDER BY updated_at DESC LIMIT $2";
-    const params = workflowType ? [projectId, workflowType, limit] : [projectId, limit];
-    const result = await this.pool.query<WorkflowRunRow>(sql, params);
-    return result.rows.map(workflowFromRow);
+    return this.workflowRuns.listProjectRuns(projectId, limit, workflowType);
   }
 
   async findBootstrapRunId(projectId: string, idempotencyKey: string): Promise<string | undefined> {
