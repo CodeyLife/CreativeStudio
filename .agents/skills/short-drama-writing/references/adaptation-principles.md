@@ -20,11 +20,11 @@ A clutching-head or trembling shot may accompany the information but never repla
 
 ## 3. Segment budget and rhythm
 
-- One segment = 5-10 seconds = one complete action, reaction, or dialogue exchange.
-- Working budget: ~350 CJK characters of prose per segment; derive the floor, never pad.
+- One segment = 10-15 seconds = one complete action, reaction, or dialogue exchange. Spectacle and combat beats take the upper edge so camera moves, environment detail, and physical feedback have room to land; dialogue exchanges still fill at least 10 seconds with performance detail, never with filler.
+- Working budget: derive the segment floor from prose length and information density — never pad to fill a segment and never compress a beat out of existence.
 - Rhythm per segment: an establishing beat (space + subject), a build (the action escalates or the exchange turns), a peak (impact, reveal, line lands), and a brake (held close-up, readable line, settle) before the exit.
 - Adjacent segments chain: each exit state is the next entry state; a hook (deadline, unresolved question) may be spoken in the last segment to pull forward.
-- Exit states are hooks, not closures: the strongest exits cut on the impact instant (see `dramaturgy.md` §3); one emotion node — clash, reveal, or decision — lands every 2-4 segments.
+- Exit states are hooks, not closures: the strongest exits cut on the impact instant (see `dramaturgy.md` §3); one emotion node — clash, reveal, or decision — lands every 2-4 segments, and each node works the suppression → release loop with its pressure and release types varied across segments — all scaled by regime and mode per `dramaturgy.md` §0 (short chapters collapse to one main release; spectacle-mode pieces are exempt).
 
 ## 4. Signature moments
 
@@ -37,7 +37,8 @@ If a preset library exists (defined by the author before generation), its subjec
 ## 6. Dialogue discipline
 
 - Preserve the original language inside `<d>` tags and the fact/causal semantics of the prose.
-- Compression is allowed (prose sentences become speakable lines); rewriting facts, merging unrelated speakers, or inventing lines is not.
+- Compression is allowed (prose sentences become speakable lines); rewriting facts, merging unrelated speakers, or inventing lines is not. Lines stay colloquial and speakable — short sentences, plain wording; the peak line of an exchange lands against the shot that shows it, not across the cut after it.
+- On-screen text (signs, screens, letters) carries information verbatim from the prose, in its original language — it doubles as the silent-viewing channel for key beats.
 - Inner monologue becomes either a flashback (visible past) or a spoken/voiceover line (stated information) — never a framed "thinking" shot with no content.
 - Dense-dialogue segments prioritize the complete spoken timeline over descriptive word counts.
 

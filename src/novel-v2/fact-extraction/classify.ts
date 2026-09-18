@@ -49,7 +49,37 @@ export interface ClassifyFactCandidatesInput {
   existingClaimIndex?: Map<string, string[]>;
 }
 
-const CONTINUITY_PREDICATE_PATTERN = /身份|姓名|年龄|生死|死亡|存活|状态|位置|所在地|持有|拥有|失去|获得|知道|得知|隐瞒|关系|亲属|敌友|承诺|约定|时间|日期|先后|能力|限制|伤势|阵营|职位/u;
+const CONTINUITY_PREDICATE_PATTERN = /身份|姓名|年龄|生死|死亡|存活|状态|位置|所在地|持有|拥有|失去|获得|知道|得知|隐瞒|关系|亲属|敌友|承诺|约定|时间|日期|先后|能力|限制|伤势|阵营|职位|修为/u;
+
+/**
+ * 值槽谓词（单一当前值的排他性状态槽）：更新语义 = 旧值被取代，允许整槽清扫
+ * supersedes。事件累积型谓词（状态变化/知晓/承诺/给予…）在同一主体+谓词槽位里
+ * 每行记录的是**不同事件**，单条 update 无权退役整槽——product-audit-20260910
+ * A1/FM-1 的直接根因之一：ch21「旁路当前状态」候选仅与 ch19「缴清灵石欠项」同落
+ * `char|状态变化` 槽就把后者整体退役，资产账本凭空断线。
+ * 分类基于叙事功能（状态槽 vs 事件账）而非题材词表；边界：关系类（师徒/敌对）由
+ * relations 表承载不在此列；未列入的谓词一律按事件累积处理（安全偏置——宁可少退役，
+ * 由事实梳理/审批通道兜底），需要扩展时在此处按同一"单当前值"判据评估。
+ */
+const VALUE_SLOT_CANONICAL_PREDICATES = new Set([
+  "持有",
+  "位于",
+  "隶属",
+  "所属组织",
+  "修为",
+  "境界",
+  "身份",
+  "职位",
+  "阵营",
+  "年龄",
+  "所在地",
+  "所在地为",
+  "生死",
+]);
+
+export function isValueSlotPredicate(predicate: string): boolean {
+  return VALUE_SLOT_CANONICAL_PREDICATES.has(canonicalizeFactPredicate(predicate));
+}
 
 /** Facts that can alter later causal/state decisions need stronger evidence. */
 export function isContinuitySensitiveFact(fact: FactExtractionOutput["facts"][number]): boolean {
@@ -105,9 +135,12 @@ export function classifyFactRisk(params: {
     ? "derived"
     : "candidate";
 
-  // P0-A1: novelty=update 时按 subject.id+predicate 查 existingClaimIndex 填充 supersedes
+  // P0-A1: novelty=update 时按 subject.id+predicate 查 existingClaimIndex 填充 supersedes。
+  // FM-1 收紧（product-audit-20260910 A1）：仅值槽谓词（单一当前值）允许整槽退役；
+  // 事件累积型谓词的多行同属不同事件，单条 update 不得清扫整槽，否则会把未提及的
+  // 既有派生事实连带逐出检索面（实测资产账本断线根因）。
   let supersedes: string[] = [];
-  if (fact.novelty === "update" && params.existingClaimIndex) {
+  if (fact.novelty === "update" && params.existingClaimIndex && isValueSlotPredicate(fact.predicate)) {
     const key = `${normalizeFactToken(fact.subject.id)}|${canonicalizeFactPredicate(fact.predicate)}`;
     supersedes = params.existingClaimIndex.get(key) ?? [];
   }

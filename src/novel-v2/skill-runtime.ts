@@ -28,6 +28,9 @@ export const SKILL_EXECUTION_POLICIES: Record<SkillExecutionPoint, SkillStagePol
   "arc.review": { taskClasses: ["review"], requiredCapabilities: ["review"] },
   "arc.revision": { taskClasses: ["revision"], requiredCapabilities: ["revision"] },
   "chapter.blueprint": { taskClasses: ["planning"], requiredCapabilities: ["planning"] },
+  // 章节标题命名（SK-5/C5）：轻量文案任务，只挂显式声明 chapter.title 的 skill，
+  // 刻意不进 TASK_CLASS_POINTS——蓝图契约（2.5KB 场景执行材料指引）不得再被挂上标题任务。
+  "chapter.title": { taskClasses: ["drafting"], requiredCapabilities: ["draft"] },
   "chapter.drafting": { taskClasses: ["drafting"], requiredCapabilities: ["draft"] },
   "chapter.review.structure": { taskClasses: ["review"], requiredCapabilities: ["review"] },
   "chapter.review.character": { taskClasses: ["review"], requiredCapabilities: ["review"] },
@@ -59,6 +62,7 @@ const COARSE_STAGE: Record<SkillExecutionPoint, NovelStage> = {
   "arc.review": "review",
   "arc.revision": "revision",
   "chapter.blueprint": "planning",
+  "chapter.title": "planning",
   "chapter.drafting": "drafting",
   "chapter.review.structure": "review",
   "chapter.review.character": "review",
@@ -74,6 +78,27 @@ const COARSE_STAGE: Record<SkillExecutionPoint, NovelStage> = {
 
 function asStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string" && item.trim().length > 0).map((item) => item.trim()) : [];
+}
+
+/**
+ * SK-2 单一真源支撑（product-audit-20260910 C1）：skill 版本的 semver 式数值段比较，
+ * 非数值段退回字典序（对任意 "a.b.c" 记法稳健）。sync 用它拒绝"seed 覆盖更新的学习闭环
+ * 晋升"（promote 后 sync 即回滚的双真源竞态根因），check 用它把"DB 超前"分类为
+ * promotion-ahead（预期状态）而非 drift 报警。
+ */
+export function compareSkillVersions(left: string, right: string): number {
+  const segments = (value: string): Array<number | string> => (value ?? "").split(".").map((part) => (/^\d+$/u.test(part) ? Number(part) : part));
+  const a = segments(left);
+  const b = segments(right);
+  for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
+    const x = a[index];
+    const y = b[index];
+    if (x === undefined) return -1;
+    if (y === undefined) return 1;
+    if (x === y) continue;
+    return typeof x === "number" && typeof y === "number" ? x - y : String(x).localeCompare(String(y));
+  }
+  return 0;
 }
 
 function deriveExecutionPoints(input: { executionPoints?: unknown; applicableTasks?: unknown }): SkillExecutionPoint[] {

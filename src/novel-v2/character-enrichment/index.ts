@@ -6,13 +6,16 @@ import type { ModelRoutingSnapshot } from "../model-routing";
 import { NovelPostgresRepository } from "../postgres-repository";
 import type { ContentObjectStore } from "../object-store";
 import type { MemoryIndex } from "../qdrant-memory";
-import { characterEnrichmentSchema, type CharacterEnrichmentOutput } from "../prompts/schemas";
+import { characterEnrichmentSchema, RELATION_PREDICATE_WORDS, type CharacterEnrichmentOutput } from "../prompts/schemas";
 import { buildCharacterEnrichmentPrompt } from "./prompt";
 import { compileStageContext } from "../stage-context";
 import { buildSkillContextSections } from "../skill-runtime";
+import { canonicalizeFactPredicate, factIdentityHash, factValueHash } from "../fact-extraction/fingerprint";
 import {
   buildCharacterIdentityIndex,
   characterIdentityPayload,
+  humanMentionNamesFor,
+  isCharacterMentionedIn,
   resolveCharacterIdentity,
   uniqueCharacterIdentities,
   type CharacterIdentityIndex,
@@ -49,9 +52,17 @@ function foundationCharacters(value: unknown): FoundationCharacter[] {
     : [];
 }
 
-async function loadCharacterIdentityRegistry(projectId: string, repository: NovelPostgresRepository): Promise<CharacterIdentityRegistry> {
+/**
+ * 加载项目人物身份注册表（entities + Foundation characters 的别名索引）。
+ *
+ * 设计依据：memory-governance-audit-20260909 §M2——身份解析此前只服务 character-enrichment
+ * 路径，fact-extraction 路径的主体 ID 由模型即兴生成，造成同一人物多种 subject 键形态。
+ * 导出给 extractFacts / chapter-state-rebuild 等提取调用方复用：prompt 注入规范名册 +
+ * 提取结果经同一索引归一，是"身份注册表成为共享写入契约"的最低共享层实现。
+ */
+export async function loadCharacterIdentityRegistry(projectId: string, repository: NovelPostgresRepository): Promise<CharacterIdentityRegistry> {
   const [entities, foundation] = await Promise.all([
-    repository.pool.query<CharacterEntityRow>("SELECT id, name, payload FROM entities WHERE project_id=$1 AND kind='character' ORDER BY name ASC", [projectId]),
+    repository.pool.query<CharacterEntityRow>("SELECT id, name, payload FROM entities WHERE project_id=$1 AND kind='character' AND (payload->>'mergedInto') IS NULL ORDER BY name ASC", [projectId]),
     repository.pool.query<{ characters: unknown }>("SELECT payload->'structuredData'->'characters' AS characters FROM project_plan_sections WHERE project_id=$1 AND task_key='characters'", [projectId]),
   ]);
   return {
@@ -86,6 +97,20 @@ async function loadCharacterIdentityRegistry(projectId: string, repository: Nove
  * - voiceAnchor 四维是题材无关的语言特征，不内置网文套路
  * - 知识边界用 MemoryClaim（knowledgeScope={characterId}）而非 v1 character_knowledge 表（v1 facts 表已废弃）
  */
+
+// PL-4 谓词受控的写入侧兜底：schema 枚举（同一白名单单一真源）在第三方中转不执行
+// json_schema 时可被绕过（AGENTS 已知问题），模型也会把句子塞进谓词（实测 111 行/66 种）。
+// 白名单外短词无损收进"其他:<标签>"逃生通道；句子形态不截断（截断即 garble），
+// 归入通用标签——完整语义本就由 delta 字段承载，此处只收敛检索槽位基数。
+// TODO(magic-value): 8 为"关系词 vs 句子"的形态分界经验位；16 为 schema 标签上限(其他:3字+12)。需语料校准后配置化。
+export function normalizeRelationPredicate(predicate: string): string {
+  const value = predicate.replace(/\s+/gu, "").trim();
+  if (!value) return "其他:关系未命名";
+  if ((RELATION_PREDICATE_WORDS as readonly string[]).includes(value)) return value;
+  if (value.startsWith("其他:")) return value.length <= 16 ? value : "其他:关系变化";
+  if (value.length <= 8) return `其他:${value}`;
+  return "其他:关系变化";
+}
 
 export interface EnrichCharactersInput {
   projectId: string;
@@ -151,7 +176,10 @@ export async function enrichCharactersFromChapter(input: EnrichCharactersInput, 
       const payload = entityById.get(identity.entityId)?.payload ?? {};
       const voice = payload.voiceAnchor ? `声部：${JSON.stringify(payload.voiceAnchor)}` : "";
       const motivation = payload.motivation ? `动机：${payload.motivation}` : "";
-      return `- 规范 ID：${identity.canonicalId}；展示名：${identity.displayName}${voice ? `；${voice}` : ""}${motivation ? `；${motivation}` : ""}`;
+      // PL-4：区分"已出场/未出场"——未在本章正文以可指称名出现的人物显式标注，
+      // 阻断模型把泛指描述（"高瘦的""圆脸弟子"）投射到规划专名（零出场却挂正文来源事实）。
+      const mentioned = isCharacterMentionedIn(input.text, humanMentionNamesFor(characterRegistry.index, identity));
+      return `- 规范 ID：${identity.canonicalId}；展示名：${identity.displayName}${mentioned ? "" : "；【未出场：本章正文未提及此人名，禁止把泛指人物映射到它】"}${voice ? `；${voice}` : ""}${motivation ? `；${motivation}` : ""}`;
     }).join("\n") || undefined;
 
   // 2. LLM 结构化提取
@@ -210,7 +238,7 @@ export function validateCharacterEnrichmentOutput(output: CharacterEnrichmentOut
  *
  * 导出供 materializeExternalEnrichment 复用，避免 external-mcp 双路径下重复实现回写逻辑。
  */
-export async function persistCharacterEnrichment(input: { projectId: string; documentId: string; revisionId: string; narrativeOrder: number; artifact: Artifact }, deps: EnrichCharactersDeps, deltas: CharacterEnrichmentDelta[]): Promise<EnrichCharactersResult> {
+export async function persistCharacterEnrichment(input: { projectId: string; documentId: string; revisionId: string; narrativeOrder: number; artifact: Artifact; text?: string }, deps: EnrichCharactersDeps, deltas: CharacterEnrichmentDelta[]): Promise<EnrichCharactersResult> {
   let entityUpdates = 0;
   let relationRecords = 0;
   const knowledgeClaims: MemoryClaim[] = [];
@@ -224,11 +252,22 @@ export async function persistCharacterEnrichment(input: { projectId: string; doc
     // 设计依据：AGENTS.md「root-cause analysis」——id 不对齐是数据模型层机制错误，
     // 不是单点 bug，会影响所有依赖 relations.subject_id=entities.id 的图遍历逻辑。
     const subjectEntityId = subjectIdentity.entityId;
+    // 实体归并对账（memory-governance-audit-20260909 §5.4.1）：身份索引把同一人物的
+    // 历史别名实体（如早期以显示名建行的 pendingEnrichment 实体）映射到同一规范身份时，
+    // 先把旧行 payload 并入规范行（声部历史拼接、动机兜底），再把旧行标记 mergedInto
+    // 退役——行保留满足 relations 外键与审计，但不再出现在任何身份索引与档案读取中。
+    const legacyRows = characterRegistry.entities.filter((row) =>
+      row.id !== subjectEntityId
+      && !row.payload?.mergedInto
+      && characterRegistry.index.get(row.id)?.entityId === subjectEntityId);
     const existingEntity = await deps.repository.pool.query<{ payload: Record<string, unknown> }>(
       "SELECT payload FROM entities WHERE id=$1",
       [subjectEntityId],
     );
-    const existingPayload = existingEntity.rows[0]?.payload ?? {};
+    let existingPayload = existingEntity.rows[0]?.payload ?? {};
+    for (const legacy of legacyRows) {
+      existingPayload = mergeRetiredEntityPayload(existingPayload, legacy.payload ?? {});
+    }
     const mergedPayload = {
       ...existingPayload,
       ...characterIdentityPayload(subjectIdentity),
@@ -244,10 +283,28 @@ export async function persistCharacterEnrichment(input: { projectId: string; doc
       [subjectEntityId, input.projectId, subjectIdentity.displayName, mergedPayload],
     );
     entityUpdates += 1;
+    for (const legacy of legacyRows) {
+      await deps.repository.pool.query(
+        `UPDATE entities SET payload = payload || jsonb_build_object('mergedInto', $2::text, 'mergedAt', to_char(now(), 'YYYY-MM-DD"T"HH24:MI:SSOF')) WHERE id=$1`,
+        [legacy.id, subjectEntityId],
+      );
+    }
 
     // 3b. 创建 MemoryClaim（角色知识边界）
     for (const knowledge of delta.newKnowledge) {
       const contentHash = createHash("sha256").update(`knowledge:${subjectIdentity.canonicalId}:${knowledge.description}`).digest("hex");
+      // 统一事实指纹契约（memory-governance-audit-20260909 §5.1.2）：知识边界声明此前
+      // 只有字符串 contentHash、无 identityHash，检索层合并键退化为 id 键，与 fact-extraction
+      // 管道对同一章重复提取的"谁知道什么"永远无法对账。改用与 fact-extraction 同构的
+      // identityHash/valueHash（predicate 经 canonicalizeFactPredicate 归一，character-knows
+      // 与"知晓"落在同一槽位），contentHash 保留原算法作为写入层幂等键不变。
+      const knowledgeFact = {
+        subject: { kind: "entity" as const, id: subjectIdentity.canonicalId },
+        predicate: "character-knows",
+        object: { kind: "string" as const, value: knowledge.description },
+        polarity: "affirmed" as const,
+        truthStatus: "objective" as const,
+      };
       const claim: MemoryClaim = {
         id: `claim:knowledge:${input.revisionId}:${contentHash.slice(0, 16)}`,
         projectId: input.projectId,
@@ -262,7 +319,9 @@ export async function persistCharacterEnrichment(input: { projectId: string; doc
         sourceRevisionIds: [input.revisionId],
         contentHash,
         supersedes: [],
-        predicate: "character-knows",
+        predicate: canonicalizeFactPredicate("character-knows"),
+        identityHash: factIdentityHash(knowledgeFact),
+        valueHash: factValueHash(knowledgeFact),
       };
       const recorded = await deps.repository.recordFactExtraction({
         projectId: input.projectId,
@@ -304,9 +363,19 @@ export async function persistCharacterEnrichment(input: { projectId: string; doc
     // voiceAnchor/motivation。本修复题材无关，覆盖所有"关系指向未富化角色"的输入类。
     // 回归风险：无——ON CONFLICT DO NOTHING 对已存在 entity 无副作用；新 stub entity
     // 仅满足 FK + 图遍历可达性，不影响 character-reviewer（它按 subject 富化数据审校）。
+    // PL-4：主体在本章正文的可指认性（displayName/aliases 命中）。调用方未提供正文
+    // （chapter-state-rebuild 重放历史 delta）时门保守放行——无证据不做判定。
+    const subjectMentioned = input.text === undefined || isCharacterMentionedIn(input.text, humanMentionNamesFor(characterRegistry.index, subjectIdentity));
     for (const relation of delta.relationDeltas) {
+      const predicate = normalizeRelationPredicate(relation.predicate);
       const targetIdentity = resolveCharacterIdentity(input.projectId, relation.targetCharacterId, characterRegistry.index);
       const objectEntityId = targetIdentity.entityId;
+      // PL-4 正文可指认门（写入面）：关系两端都以可指称名出现在正文，才允许把 valid_from
+      // 绑到本 revision（成为正文来源事实）；任一端未出场 → 关系仍落库但 valid_from=NULL
+      // （"规划候选"通道，检索面排除、可经 listRelations 人工裁决），杜绝零出场人物挂正文
+      // 来源关系（叶轻眉/玄机子正文 0 命中却有绑定 ch7/ch11/ch20 的"警惕/未知"关系的根因）。
+      const objectMentioned = input.text === undefined || isCharacterMentionedIn(input.text, humanMentionNamesFor(characterRegistry.index, targetIdentity));
+      const mentionBound = subjectMentioned && objectMentioned;
       await deps.repository.pool.query(
         `INSERT INTO entities(id, project_id, kind, name, payload)
          VALUES($1, $2, 'character', $3, $4)
@@ -315,10 +384,10 @@ export async function persistCharacterEnrichment(input: { projectId: string; doc
           objectEntityId,
           input.projectId,
           targetIdentity.displayName,
-          { autoCreated: true, autoCreatedFrom: "relation", sourceRevisionId: input.revisionId, narrativeOrder: input.narrativeOrder, pendingEnrichment: true, ...characterIdentityPayload(targetIdentity) },
+          { autoCreated: true, autoCreatedFrom: "relation", sourceRevisionId: input.revisionId, narrativeOrder: input.narrativeOrder, pendingEnrichment: true, planningCandidate: !objectMentioned, ...characterIdentityPayload(targetIdentity) },
         ],
       );
-      const relationId = `relation:${input.projectId}:${subjectEntityId}:${relation.predicate}:${objectEntityId}:${input.revisionId}`;
+      const relationId = `relation:${input.projectId}:${subjectEntityId}:${predicate}:${objectEntityId}:${input.revisionId}`;
       await deps.repository.pool.query(
         `INSERT INTO relations(id, project_id, subject_id, predicate, object_id, valid_from, source_revision_id)
          VALUES($1, $2, $3, $4, $5, $6, $7)
@@ -327,9 +396,13 @@ export async function persistCharacterEnrichment(input: { projectId: string; doc
           relationId,
           input.projectId,
           subjectEntityId,
-          relation.predicate,
+          predicate,
           objectEntityId,
-          Date.now(),
+          // PL-1 量纲族修复（2026-09-16 上下文供给断裂审核实证）：valid_from 的读侧谓词是
+          // `valid_from<=叙事cutoff`（searchGraphMemory）与 narrativeRange.start（命中投影），
+          // 写入 Date.now()（≈1.7e12）使所有正文来源关系在检索面恒假全灭——关系 facet 召回
+          // 自 PL-4 上线起整项目静默为 0。写侧必须落**叙事序**，与 revision/document 同量纲。
+          mentionBound ? input.narrativeOrder : null,
           input.revisionId,
         ],
       );
@@ -367,6 +440,61 @@ function mergeVoiceAnchor(existing: unknown, delta: CharacterEnrichmentDelta["vo
     return appendHistory(undefined, delta, MAX_HISTORY);
   }
   return appendHistory(existing as Record<string, unknown>, delta, MAX_HISTORY);
+}
+
+/**
+ * 把退役实体行的档案并入规范实体行（memory-governance-audit-20260909 §5.4.1）。
+ *
+ * 合并规则（题材无关的通用机制）：动机取规范行现值、缺失时兜底旧行值；
+ * 声部四维按维度合并历史轨迹（去重保序，规范行 latest 不被旧行覆盖）。
+ * 纯函数，运行时归并（persistCharacterEnrichment）与存量回填脚本共用同一实现，
+ * 避免两处合并语义漂移。
+ */
+export function mergeRetiredEntityPayload(canonical: Record<string, unknown>, legacy: Record<string, unknown>): Record<string, unknown> {
+  const merged: Record<string, unknown> = { ...canonical };
+  if (merged.motivation === undefined && typeof legacy.motivation === "string") merged.motivation = legacy.motivation;
+  const legacyVoice = legacy.voiceAnchor;
+  if (legacyVoice && typeof legacyVoice === "object" && !Array.isArray(legacyVoice)) {
+    const baseVoice = merged.voiceAnchor && typeof merged.voiceAnchor === "object" && !Array.isArray(merged.voiceAnchor)
+      ? merged.voiceAnchor as Record<string, unknown>
+      : undefined;
+    merged.voiceAnchor = mergeVoiceAnchorHistories(baseVoice, legacyVoice as Record<string, unknown>);
+  }
+  return merged;
+}
+
+const VOICE_ANCHOR_DIMENSIONS = ["sentenceLength", "vocabulary", "directness", "avoidance"] as const;
+
+function mergeVoiceAnchorHistories(base: Record<string, unknown> | undefined, extra: Record<string, unknown>): Record<string, unknown> {
+  const result: Record<string, unknown> = { ...(base ?? {}) };
+  for (const dim of VOICE_ANCHOR_DIMENSIONS) {
+    const extraEntry = extra[dim];
+    if (!extraEntry || typeof extraEntry !== "object" || Array.isArray(extraEntry)) continue;
+    const extraRecord = extraEntry as { latest?: unknown; history?: unknown };
+    const incoming = [
+      typeof extraRecord.latest === "string" ? extraRecord.latest : undefined,
+      ...(Array.isArray(extraRecord.history) ? extraRecord.history : []),
+    ].filter((value): value is string => typeof value === "string" && value.trim().length > 0);
+    if (!incoming.length) continue;
+    const baseEntry = result[dim];
+    if (!baseEntry) {
+      result[dim] = extraEntry;
+      continue;
+    }
+    if (typeof baseEntry === "string") {
+      result[dim] = { latest: baseEntry, history: [...new Set([baseEntry, ...incoming])] };
+      continue;
+    }
+    if (typeof baseEntry === "object" && !Array.isArray(baseEntry) && "latest" in baseEntry) {
+      const record = baseEntry as { latest: unknown; history?: unknown };
+      const baseHistory = Array.isArray(record.history) ? record.history : [];
+      result[dim] = {
+        latest: typeof record.latest === "string" ? record.latest : incoming[0],
+        history: [...new Set([typeof record.latest === "string" ? record.latest : "", ...baseHistory, ...incoming].filter(Boolean))],
+      };
+    }
+  }
+  return result;
 }
 
 /**

@@ -28,6 +28,35 @@ describe("story arc review authority boundary", () => {
     expect(start).toHaveBeenCalledWith("storyArcPlanningWorkflow", expect.objectContaining({ args: [expect.objectContaining({ rebase: false })] }));
   });
 
+  it("orphan blueprint artifact from a failed attempt does not force rebase (arc-15 triple-fail regression)", async () => {
+    const putWorkflowRun = vi.fn(async () => undefined);
+    const start = vi.fn(async () => ({ firstExecutionRunId: "run-9" }));
+    const repository = {
+      getStoryArc: vi.fn(async () => ({ id: "arc-9", planningStatus: "failed", blueprintArtifactId: "artifact-orphan", chapters: [] })),
+      markStoryArcGenerating: vi.fn(async () => ({ id: "arc-9", blueprintArtifactId: "artifact-orphan", chapters: [] })),
+      putWorkflowRun,
+      updateWorkflowRunStatus: vi.fn(async () => undefined),
+      recoverStoryArcAfterWorkflowCancellation: vi.fn(async () => undefined),
+      withStoryArcWorkflowLock,
+    } as unknown as NovelPostgresRepository;
+    const temporal = { workflow: { start } } as never;
+
+    await startStoryArcPlanning(repository, temporal, { projectId: "project-1", arcId: "arc-9", mode: "mcp", reviewPolicy: "auto", taskQueue: "creative-studio-v2" });
+
+    expect(putWorkflowRun).toHaveBeenCalledWith(expect.objectContaining({ payload: expect.objectContaining({ rebase: false }) }));
+    // 反方向锁：有已投影章节（documentId）时 rebase 仍为真——谓词收窄不是整体废除。
+    const repo2 = {
+      getStoryArc: vi.fn(async () => ({ id: "arc-9", planningStatus: "failed", blueprintArtifactId: "artifact-x", chapters: [{ documentId: "doc-1", status: "final" }] })),
+      markStoryArcGenerating: vi.fn(async () => ({ id: "arc-9" })),
+      putWorkflowRun: vi.fn(async () => undefined),
+      updateWorkflowRunStatus: vi.fn(async () => undefined),
+      recoverStoryArcAfterWorkflowCancellation: vi.fn(async () => undefined),
+      withStoryArcWorkflowLock,
+    } as unknown as NovelPostgresRepository;
+    await startStoryArcPlanning(repo2, { workflow: { start: vi.fn(async () => ({ firstExecutionRunId: "run-10" })) } } as never, { projectId: "project-1", arcId: "arc-9", mode: "mcp", reviewPolicy: "auto", taskQueue: "creative-studio-v2" });
+    expect(repo2.putWorkflowRun).toHaveBeenCalledWith(expect.objectContaining({ payload: expect.objectContaining({ rebase: true }) }));
+  });
+
   it("recovers the arc and records a failed run when Temporal start fails", async () => {
     const recoverStoryArcAfterWorkflowCancellation = vi.fn(async () => undefined);
     const updateWorkflowRunStatus = vi.fn(async () => undefined);
@@ -82,7 +111,7 @@ describe("story arc review authority boundary", () => {
         planningStatus: "awaiting-review",
         executionStatus: "active",
         blueprintArtifactId: "artifact-1",
-        chapters: [{ documentId: "document-1" }],
+        chapters: [{ documentId: "document-1", status: "final" }],
       })),
       putWorkflowRun,
       listActiveStoryArcWorkflowIds: vi.fn(async () => []),
@@ -199,7 +228,7 @@ describe("story arc review authority boundary", () => {
       planningStatus: "awaiting-review",
       executionStatus: "active",
       blueprintArtifactId: "artifact-1",
-      chapters: [{ documentId: "document-1" }],
+      chapters: [{ documentId: "document-1", status: "final" }],
       batches: [],
     }));
     const repository = {
@@ -208,7 +237,7 @@ describe("story arc review authority boundary", () => {
         planningStatus: "failed",
         executionStatus: "active",
         blueprintArtifactId: "artifact-1",
-        chapters: [{ documentId: "document-1" }],
+        chapters: [{ documentId: "document-1", status: "final" }],
         batches: [],
       })),
       prepareStoryArcRebase: rebase,
@@ -265,7 +294,7 @@ describe("story arc review authority boundary", () => {
       planningStatus: "awaiting-review",
       executionStatus: "active",
       blueprintArtifactId: "artifact-1",
-      chapters: [{ documentId: "document-1" }],
+      chapters: [{ documentId: "document-1", status: "final" }],
       batches: [{ batchIndex: 1, status: "awaiting-review", sourceArtifactId: "stale-artifact" }],
     }));
     const retry = vi.fn(async () => undefined);
@@ -275,7 +304,7 @@ describe("story arc review authority boundary", () => {
         planningStatus: "failed",
         executionStatus: "active",
         blueprintArtifactId: "artifact-1",
-        chapters: [{ documentId: "document-1" }],
+        chapters: [{ documentId: "document-1", status: "final" }],
         batches: [{ batchIndex: 1, status: "awaiting-review", sourceArtifactId: "stale-artifact" }],
       })),
       prepareStoryArcRebase: rebase,
@@ -294,6 +323,41 @@ describe("story arc review authority boundary", () => {
     expect(rebase).toHaveBeenCalledWith("project-1", "arc-1", "web-author");
     expect(retry).not.toHaveBeenCalled();
     expect(putWorkflowRun).toHaveBeenCalledWith(expect.objectContaining({ payload: expect.objectContaining({ existingArtifactId: "artifact-1", rebase: true }) }));
+  });
+
+  it("failed arc with approved batch and projected-planned chapters recovers as ordinary review, not rebase", async () => {
+    // 弧6 批准竞态恢复实证：批次 approved、章节文档已投影但全部 planned（零正文活动）——
+    // 无冻结历史可重基线；若误标 rebase，修订物化撞"保持原批次位置"守卫使恢复环自锁。
+    const putWorkflowRun = vi.fn(async () => undefined);
+    const rebase = vi.fn(async () => ({
+      id: "arc-1",
+      planningStatus: "awaiting-review",
+      executionStatus: "active",
+      blueprintArtifactId: "artifact-1",
+      chapters: [{ documentId: "document-1", status: "planned" }],
+      batches: [{ batchIndex: 1, status: "approved", sourceArtifactId: "artifact-1", complete: true }],
+    }));
+    const repository = {
+      getStoryArc: vi.fn(async () => ({
+        id: "arc-1",
+        planningStatus: "failed",
+        executionStatus: "active",
+        blueprintArtifactId: "artifact-1",
+        chapters: [{ documentId: "document-1", status: "planned" }],
+        batches: [{ batchIndex: 1, status: "approved", sourceArtifactId: "artifact-1", complete: true }],
+      })),
+      prepareStoryArcRebase: rebase,
+      putWorkflowRun,
+      listActiveStoryArcWorkflowIds: vi.fn(async () => []),
+      updateWorkflowRunStatus: vi.fn(async () => undefined),
+      withStoryArcWorkflowLock,
+    } as unknown as NovelPostgresRepository;
+    const temporal = { workflow: { start: vi.fn(async () => ({ firstExecutionRunId: "run-1" })) } } as never;
+
+    await startStoryArcReview(repository, temporal, { projectId: "project-1", arcId: "arc-1", mode: "mcp", reviewPolicy: "auto", taskQueue: "novel-v2" });
+
+    expect(rebase).toHaveBeenCalled(); // 恢复仍走 failed→awaiting-review 准备路径
+    expect(putWorkflowRun).toHaveBeenCalledWith(expect.objectContaining({ payload: expect.objectContaining({ existingArtifactId: "artifact-1", rebase: false }) }));
   });
 
   it("retries a failed batch in its original chapter range", async () => {

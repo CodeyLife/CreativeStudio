@@ -711,7 +711,7 @@ function ChapterRail({ documents, runs, selectedId, onSelect }: { documents: Nov
                 <button type="button" className={`pb-chapter ${selectedId === doc.id ? "is-selected" : ""}`} onClick={() => onSelect(doc.id)}>
                   <span className="pb-chapter-num">{doc.narrativeOrder}</span>
                   <span className="pb-chapter-copy"><span className="pb-chapter-name">{doc.title}</span><small>{doc.wordCount ? `${doc.wordCount.toLocaleString()} 字` : doc.arcTitle ?? "未归属故事弧"}</small></span>
-                  {doc.reviewStale ? <span className="pb-chapter-review is-stale">已修改</span> : typeof doc.reviewScore === "number" ? <span className={`pb-chapter-review is-${doc.reviewVerdict ?? "passed"}`}>{doc.reviewScore.toFixed(1)}</span> : null}
+                  {doc.reviewStale ? <span className="pb-chapter-review is-stale">已修改</span> : typeof doc.reviewScore === "number" ? <span className={`pb-chapter-review is-${doc.reviewVerdict ?? "passed"}`} title={doc.authorDecision === "approve" ? "reviewer 判定保留原判，作者已覆盖批准当前内容" : undefined}>{doc.reviewScore.toFixed(1)}{doc.authorDecision === "approve" ? "✓" : ""}</span> : null}
                   <span className={`pb-chapter-mode is-${meta.tone}`}>{meta.label}</span>
                 </button>
               </li>

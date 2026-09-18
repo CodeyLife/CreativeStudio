@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import Ajv from "ajv";
-import { foundationSchemaForTask, normalizeFoundationModelOutput, validateFoundationTaskContract } from "../application/foundation-contract";
+import { foundationSchemaForTask, normalizeFoundationModelOutput, normalizeFoundationStructuredDataFlat, validateFoundationTaskContract } from "../application/foundation-contract";
+import { foundationContractFingerprint } from "../application/foundation-contract-fingerprint";
 import type { FoundationOutput } from "../prompts/schemas";
 
 const output = (structuredData: Record<string, unknown>): FoundationOutput => ({
@@ -187,5 +188,82 @@ describe("foundation task semantic contracts", () => {
       structuredData: JSON.stringify({ structure: "三卷递进", volumes: [], povStrategy: "限知视角", timeSpan: "两年" }),
     };
     expect(normalizeFoundationModelOutput(flat).structuredData).toEqual({ structure: "三卷递进", volumes: [], povStrategy: "限知视角", timeSpan: "两年" });
+  });
+});
+
+describe("foundation schema 层校验活着（PL-8 死代码守卫，product-audit-20260910 B3）", () => {
+  // 根因：Ajv.compile 后 validator 从未调用，schema 层（required 键/类型/数组成员）
+  // 自落地起短路。以下反例全部**通过 requiredPaths 语义层**、只可能被 schema 层抓住——
+  // 若校验再次失效，这些用例必红。
+  const basePlotDesign = {
+    narrativePromises: ["真相改变关系"],
+    characterDestinations: [{ characterRef: "p1", endingRange: "承担后果" }],
+    endingEnvelope: "开放但不否定代价",
+    nonNegotiables: ["不抹除已付出的代价"],
+  };
+
+  it("子结构类型错误必须被 schema 抓住（requiredPaths 只看顶层非空，抓不到子键类型）", () => {
+    const errors = validateFoundationTaskContract(output({
+      ...basePlotDesign,
+      longHorizonThreads: [{ threadRef: "main", direction: "查明", closureCondition: "公开", doNotConsumeBefore: "后期", responsibleVolumeOrdinals: ["非卷序值"], nextResponsibility: "推进" }],
+      informationBoundaries: { hidden: [], notDesigned: [], open: [] },
+    }), "plot-design");
+    expect(errors.join("\n")).toMatch(/must be integer|must be number/);
+  });
+
+  it("informationBoundaries 成员类型错误必须被 schema 抓住", () => {
+    const errors = validateFoundationTaskContract(output({
+      ...basePlotDesign,
+      longHorizonThreads: [{ threadRef: "main", direction: "查明", closureCondition: "公开", doNotConsumeBefore: "后期", responsibleVolumeOrdinals: [1], nextResponsibility: "推进" }],
+      informationBoundaries: { hidden: "不是数组", notDesigned: [], open: [] },
+    }), "plot-design");
+    expect(errors.join("\n")).toContain("must be array");
+  });
+
+  it("旧键别名迁移：hiddenInformation/notDesignedYet + 裸字符串成员 → 规范 {claim} 对象数组且通过校验", () => {
+    const legacy = {
+      ...basePlotDesign,
+      longHorizonThreads: [{ threadRef: "main", direction: "查明", closureCondition: "公开", doNotConsumeBefore: "后期", responsibleVolumeOrdinals: [1], nextResponsibility: "推进" }],
+      informationBoundaries: {
+        levelOne: { type: "异常现象", content: "可复验的规律" },
+        hiddenInformation: ["底层机制完整答案", "潮汐异常最终来源"],
+        notDesignedYet: ["终局后社会形态"],
+        worldSurfaceFacts: ["宗门与境界常识"],
+      },
+    };
+    const normalized = normalizeFoundationStructuredDataFlat(legacy, "plot-design");
+    const boundaries = normalized.informationBoundaries as Record<string, unknown>;
+    expect(boundaries.hidden).toEqual([{ claim: "底层机制完整答案" }, { claim: "潮汐异常最终来源" }]);
+    expect(boundaries.notDesigned).toEqual([{ claim: "终局后社会形态" }]);
+    expect(boundaries.open).toEqual([]);
+    expect(boundaries.hiddenInformation).toBeUndefined();
+    expect(boundaries.levelOne).toBeDefined(); // 未知键原样保留（前向兼容面）
+    expect(validateFoundationTaskContract(output(legacy), "plot-design")).toEqual([]);
+  });
+
+  it("规范新键存在时别名不得覆盖（双向：迁移只补空缺不改已正）", () => {
+    const mixed = normalizeFoundationStructuredDataFlat({
+      informationBoundaries: { hidden: [{ claim: "已规范" }], hiddenInformation: ["应被忽略的残留"], notDesigned: [], open: [] },
+    }, "plot-design");
+    expect((mixed.informationBoundaries as Record<string, unknown>).hidden).toEqual([{ claim: "已规范" }]);
+  });
+
+  it("卷序记法归一：[\"V1\",\"卷2\",3] 纯记法漂移无损转整数；转不了的保留并如实报错（不掩盖）", () => {
+    const normalized = normalizeFoundationStructuredDataFlat({
+      longHorizonThreads: [
+        { threadRef: "main", responsibleVolumeOrdinals: ["V1", "卷2", 3, "第4卷"] },
+        { threadRef: "side", responsibleVolumeOrdinals: ["后半程"] },
+      ],
+    }, "plot-design");
+    const threads = normalized.longHorizonThreads as Array<Record<string, unknown>>;
+    expect(threads[0].responsibleVolumeOrdinals).toEqual([1, 2, 3, 4]);
+    expect(threads[1].responsibleVolumeOrdinals).toEqual(["后半程"]); // 非记法值不猜，交给校验报告
+  });
+
+  it("契约指纹确定且随任务区分，未注册任务无指纹", () => {    const characters = foundationContractFingerprint("characters");
+    expect(characters).toBeTruthy();
+    expect(foundationContractFingerprint("characters")).toBe(characters);
+    expect(foundationContractFingerprint("worldview")).not.toBe(characters);
+    expect(foundationContractFingerprint("not-a-task")).toBeNull();
   });
 });

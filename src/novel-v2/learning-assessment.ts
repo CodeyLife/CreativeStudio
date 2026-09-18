@@ -120,6 +120,7 @@ export function parseRuntimeLearningAssessmentV2(value: unknown, base: {
       rationale: requiredText(candidate.rationale, "candidate.rationale"),
       afterText,
       applicableGenres,
+      aggregateToCandidateId: typeof candidate.aggregateToCandidateId === "string" && candidate.aggregateToCandidateId.trim() ? candidate.aggregateToCandidateId.trim() : undefined,
     },
     createdAt: base.createdAt ?? Date.now(),
   };
@@ -149,7 +150,7 @@ export const runtimeLearningAssessmentSchema = {
     candidate: {
       type: "object",
       additionalProperties: false,
-      required: ["targetKind", "targetId", "rationale", "afterText", "applicableGenres"],
+      required: ["targetKind", "targetId", "rationale", "afterText", "applicableGenres", "aggregateToCandidateId"],
       properties: {
         targetKind: { enum: ["none", "skill", "system-prompt"] },
         targetId: { type: "string" },
@@ -159,6 +160,12 @@ export const runtimeLearningAssessmentSchema = {
           type: "array",
           items: { type: "string" },
           description: "题材适用性；没有限制时为空数组。",
+        },
+        // SK-3 候选聚合（product-audit-20260910 C3）：同一底层机制已有排队候选时，
+        // 引用其 id 聚合证据而非新建重复候选（17 份重复的根因是队列对 LLM 不可见）。
+        aggregateToCandidateId: {
+          type: ["string", "null"],
+          description: "若本次改进与队列中某既有候选是同一机制，填其 id（证据聚合到该候选，不新建）；否则填 null。",
         },
       },
     },
@@ -175,6 +182,13 @@ export function buildRuntimeLearningPrompt(input: {
    * skill definition 而抛错。注入实际列表从源头消除 ID 不匹配。
    */
   availableSkills?: Array<{ skillId: string; capabilities: string[]; executionPoints?: SkillExecutionPoint[] }>;
+  /**
+   * SK-3 候选聚合（product-audit-20260910 C3）：同一底层机制被反复提出候选
+   * （实测 prose-craft 1.3.1→1.3.2 重复 17 条），根因是既有排队候选对 learning LLM
+   * 不可见 + dedup 仅按 assessmentId。注入未晋升候选摘要，让 LLM 对同机制改进输出
+   * candidate.aggregateToCandidateId 引用既有候选聚合证据，而非新建重复行。
+   */
+  pendingCandidates?: Array<{ id: string; targetKind: string; targetId: string; proposedVersion: string; rationale: string; underlyingMechanism?: string }>;
   /**
    * 跨章序列证据（近 N 章状态跨度/功能密度/主题跨度统计）。
    * 设计依据：AGENTS.md「问题要在机制层解决」——单章审核结构上看不见跨章模式
@@ -204,6 +218,15 @@ export function buildRuntimeLearningPrompt(input: {
   const skillList = input.availableSkills?.length
     ? input.availableSkills.map((s) => `- ${s.skillId} (capabilities: ${s.capabilities.join(", ")}; executionPoints: ${s.executionPoints?.join(", ") || "未声明"})`).join("\n")
     : "- （skill_definitions 表为空，targetKind=skill 时无法创建 candidate，请改用 system-prompt 或返回 no-shared-learning）";
+  // SK-3：把未晋升候选队列投影给 LLM，配合下方聚合规则抑制重复候选。
+  // 机制文本截断为摘要（防超长候选把 prompt 挤爆；也避免候选正文被当作指令展开）。
+  const pendingList = input.pendingCandidates?.length
+    ? input.pendingCandidates.map((c) => {
+        const mechanism = (c.underlyingMechanism || c.rationale || "").replace(/\s+/gu, " ").trim();
+        const digest = mechanism.length > 160 ? `${mechanism.slice(0, 160)}…` : mechanism;
+        return `- id=${c.id}｜target=${c.targetKind}:${c.targetId}｜拟晋升 ${c.proposedVersion}｜机制：${digest}`;
+      }).join("\n")
+    : "- （当前无排队中的候选）";
   return `# V2 Runtime Learning Assessment
 
 你要判断审核发现的问题（含 blocker/major/warning）是否暴露了可迁移到一类输入的共享缺陷。
@@ -219,6 +242,11 @@ targetKind=skill 时，targetId 必须从以下 skill_definitions 中选择（�
 ${skillList}
 
 targetKind=system-prompt 时，targetId 格式为 "<projectId>:<templateId>"，需对应 prompt_templates 表中的记录。
+
+## 排队中的候选（尚未晋升，proposed/evidencing/reviewing）
+${pendingList}
+
+聚合规则（优先于新建）：若你判断的底层机制与上表某个候选**是同一机制**（同一输入类别、同一修复方向，措辞不同也算），必须把 candidate.aggregateToCandidateId 填为该候选 id 并照常完整输出你的候选内容（系统会把本次证据聚合到既有候选，不新建重复行）；确属不同机制或该表为空时填 null。
 
 ## 决策规则
 - blocker/major 优先评估：如果是单次正文执行偏差、项目特有事实、审稿误判，返回 no-shared-learning。
@@ -320,6 +348,8 @@ export async function assessRuntimeLearningWithModel(input: {
   serialContext?: SerialContextSnapshot;
   /** 近 N 章审核 issue 按 rule 聚类（持续模式证据）。 */
   recentIssueClusters?: RecentIssueCluster[];
+  /** SK-3 候选聚合：透传到 buildRuntimeLearningPrompt 的排队候选摘要。 */
+  pendingCandidates?: Array<{ id: string; targetKind: string; targetId: string; proposedVersion: string; rationale: string; underlyingMechanism?: string }>;
   /** 当前章正文（用于标注 issue evidence 是否在正文出现，降权回显误报）。 */
   plainText?: string;
   /** 当前 learning Skill bundle；由 compileStageContext 负责实际注入和 manifest 对账。 */
@@ -358,7 +388,7 @@ export async function assessRuntimeLearningWithModel(input: {
     if (!input.model) throw new Error("模型网关未配置");
     const system = "你是长篇小说 Runtime 的学习闭环审计员，只在能说明底层机制和影响输入类时提出可复用规则改进。";
     const skillSections = input.skillBundle ? buildSkillContextSections(input.skillBundle, "learning.assessment", "学习评估 Skill") : [];
-    const promptPackage = compileStageContext({ projectId: input.projectId, workflowId: input.workflowId, purpose: "learning.assess", stage: "review", system, schema: runtimeLearningAssessmentSchema, maxInputTokens: 128_000, reservedOutputTokens: 4_096, skillManifest: input.skillBundle?.resolution ?? input.skillManifest, sections: [{ id: "learning-evidence", kind: "review", title: "学习评估证据与规则", text: buildRuntimeLearningPrompt({ artifact: input.artifact, reviews: input.reviews, availableSkills: input.availableSkills, serialContext: input.serialContext, recentIssueClusters: input.recentIssueClusters, plainText: input.plainText }), priority: "required", provenanceRefs: [input.artifact.id, ...input.reviews.map((review) => review.id)] }, ...skillSections] });
+    const promptPackage = compileStageContext({ projectId: input.projectId, workflowId: input.workflowId, purpose: "learning.assess", stage: "review", system, schema: runtimeLearningAssessmentSchema, maxInputTokens: 128_000, reservedOutputTokens: 4_096, skillManifest: input.skillBundle?.resolution ?? input.skillManifest, sections: [{ id: "learning-evidence", kind: "review", title: "学习评估证据与规则", text: buildRuntimeLearningPrompt({ artifact: input.artifact, reviews: input.reviews, availableSkills: input.availableSkills, pendingCandidates: input.pendingCandidates, serialContext: input.serialContext, recentIssueClusters: input.recentIssueClusters, plainText: input.plainText }), priority: "required", provenanceRefs: [input.artifact.id, ...input.reviews.map((review) => review.id)] }, ...skillSections] });
     const result = await input.model.generateStructured<Record<string, unknown>>({
       purpose: "learning.assess",
       system,

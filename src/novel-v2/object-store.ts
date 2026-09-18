@@ -3,11 +3,15 @@ import { access, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { CreateBucketCommand, DeleteObjectCommand, GetObjectCommand, HeadBucketCommand, HeadObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 
-export interface ContentObject { hash: string; key: string; bytes: number; }
+export interface ContentObject { hash: string; key: string; bytes: number; mimeType?: string; }
 export interface ObjectStoreIdentity { backend: "file" | "s3"; location: string; fingerprint: string; }
 export interface ObjectStoreAdapter {
   putText(text: string): Promise<ContentObject>;
   getText(key: string): Promise<string>;
+  /** 持久化任意二进制内容（图片素材等），按内容 hash 去重；ContentObject.mimeType 记录媒体类型便于回读。 */
+  putData(bytes: Buffer, mimeType: string): Promise<ContentObject>;
+  /** 按 key 读取二进制内容（配合调用方已知的 mimeType 使用）。 */
+  getData(key: string): Promise<Buffer>;
 }
 export interface RuntimeObjectStoreAdapter extends ObjectStoreAdapter {
   has(key: string): Promise<boolean>;
@@ -42,6 +46,15 @@ export class FileContentObjectStore implements RuntimeObjectStoreAdapter {
   }
 
   async getText(key: string) { return readFile(join(this.root, key), "utf8"); }
+  async putData(bytes: Buffer, mimeType: string): Promise<ContentObject> {
+    const hash = createHash("sha256").update(bytes).digest("hex");
+    const key = join(hash.slice(0, 2), hash.slice(2)).replaceAll("\\", "/");
+    const path = join(this.root, key);
+    await mkdir(dirname(path), { recursive: true });
+    try { await readFile(path); } catch { await writeFile(path, bytes); }
+    return { hash, key, bytes: bytes.byteLength, mimeType };
+  }
+  async getData(key: string): Promise<Buffer> { return readFile(join(this.root, key)); }
   async delete(key: string) { await unlink(join(this.root, key)).catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT") throw error; }); }
   async has(key: string) { try { await access(join(this.root, key)); return true; } catch { return false; } }
   async ensureReady() { await mkdir(this.root, { recursive: true }); }
@@ -79,6 +92,20 @@ export class S3ContentObjectStore implements RuntimeObjectStoreAdapter {
     return response.Body?.transformToString("utf8") ?? "";
   }
 
+  async putData(bytes: Buffer, mimeType: string): Promise<ContentObject> {
+    const hash = createHash("sha256").update(bytes).digest("hex");
+    const key = `${hash.slice(0, 2)}/${hash.slice(2)}`;
+    await this.ensureBucket();
+    await this.client.send(new PutObjectCommand({ Bucket: this.bucket, Key: key, Body: bytes, ContentType: mimeType }));
+    return { hash, key, bytes: bytes.byteLength, mimeType };
+  }
+
+  async getData(key: string): Promise<Buffer> {
+    const response = await this.client.send(new GetObjectCommand({ Bucket: this.bucket, Key: key }));
+    const bytes = await response.Body?.transformToByteArray();
+    return Buffer.from(bytes ?? []);
+  }
+
   async has(key: string) {
     try { await this.client.send(new HeadObjectCommand({ Bucket: this.bucket, Key: key })); return true; }
     catch (error) {
@@ -107,6 +134,8 @@ export class ContentObjectStore implements RuntimeObjectStoreAdapter {
 
   putText(text: string) { return this.adapter.putText(text); }
   getText(key: string) { return this.adapter.getText(key); }
+  putData(bytes: Buffer, mimeType: string) { return this.adapter.putData(bytes, mimeType); }
+  getData(key: string) { return this.adapter.getData(key); }
   has(key: string) { return this.adapter.has(key); }
   delete(key: string) { return this.adapter.delete(key); }
   ensureReady() { return this.adapter.ensureReady(); }

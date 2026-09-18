@@ -2,11 +2,14 @@ import { createServer } from "node:http";
 import { Client, Connection } from "@temporalio/client";
 import { QdrantClient } from "@qdrant/js-client-rest";
 import { createHash, randomUUID } from "node:crypto";
-import { NovelPostgresRepository, type KnowledgeRecordKind, type MutableKnowledgeRecordKind, type StoredShortScript } from "../src/novel-v2/postgres-repository";
+import { NovelPostgresRepository, type KnowledgeRecordKind, type MutableKnowledgeRecordKind } from "../src/novel-v2/postgres-repository";
 import { NOVEL_V2_PROTOCOL_VERSION, type Artifact, type AuthorDecision, type NovelIntent } from "../src/novel-v2/protocol";
 import { CommitService } from "../src/novel-v2/commit-service";
 import { createRuntimeModelGateway } from "../src/novel-v2/model-runtime";
 import type { ModelRoutingConfig, ModelTaskRecord } from "../src/novel-v2/model-routing";
+import { ExternalMcpRequiredError, syncExternalMcpHttpStatus } from "../src/novel-v2/model-routing";
+import { CHAPTER_CHANGE_SCOPES } from "../src/novel-v2/prompts/chapter-review";
+import { locateEvidenceParagraphs } from "../src/novel-v2/evidence-check";
 import { captureProjectSnapshot, computeProjectHead } from "../src/novel-v2/evaluation/project-snapshot";
 import { createExperimentWorkspace, getExperimentWorkspace, listExperimentWorkspaces } from "../src/novel-v2/evaluation/experiment-workspace";
 import { extractCandidateBundle } from "../src/novel-v2/evaluation/candidate-bundle";
@@ -61,6 +64,7 @@ import { parseCreativeBrief } from "../src/novel-v2/application/creative-brief";
 import { createConfiguredSkillProvider } from "../src/novel-v2/skill-runtime";
 import { loadRuntimeEnv } from "./runtime-env.mjs";
 import { publicRuntimeIdentity, resolveNovelRuntimeConfig } from "../src/novel-v2/runtime-config";
+import { codeRevision } from "../src/novel-v2/code-revision";
 
 Object.assign(process.env, loadRuntimeEnv(process.cwd()));
 const runtime = resolveNovelRuntimeConfig(process.env);
@@ -95,42 +99,6 @@ const temporal = new Client({ connection, namespace: runtime.temporalNamespace }
 const port = runtime.apiPort;
 const taskQueue = runtime.taskQueue;
 const ACTIVE_CHAPTER_INTENT_STATUSES = new Set(["accepted", "pending", "running", "waiting-external", "manual-review-required"]);
-
-/** 创意短剧列表项（语义化摘要，不暴露原始 JSON；projectId 缺省=独立短剧）。 */
-function shortScriptSummary(stored: StoredShortScript) {
-  const segments = Array.isArray(stored.payload?.segments) ? stored.payload.segments as unknown[] : [];
-  return {
-    scriptId: stored.id,
-    projectId: stored.projectId,
-    idea: stored.idea,
-    instruction: stored.instruction,
-    targetDurationSeconds: stored.targetDurationSeconds,
-    segmentCount: segments.length,
-    cinematicHintCount: computeCinematicHints(segments as never).length,
-    createdAt: stored.createdAt,
-  };
-}
-
-/** 创意短剧详情（v2 契约：scriptId 主键；cinematicHints 现算，随读取实时反映）。 */
-function shortScriptDetail(stored: StoredShortScript) {
-  const data = stored.payload ?? {};
-  const segments = Array.isArray(data.segments) ? data.segments as unknown[] : [];
-  return {
-    exists: true,
-    scriptId: stored.id,
-    projectId: stored.projectId,
-    createdAt: stored.createdAt,
-    sourceFingerprint: stored.sourceFingerprint,
-    mode: typeof data.mode === "string" ? data.mode : "ref2va",
-    idea: stored.idea,
-    instruction: stored.instruction,
-    targetDurationSeconds: stored.targetDurationSeconds,
-    plotBeats: Array.isArray(data.plotBeats) ? data.plotBeats : [],
-    cinematicHints: computeCinematicHints(segments as never),
-    characters: Array.isArray(data.characters) ? data.characters : [],
-    segments,
-  };
-}
 
 function chapterTargetId(target: unknown): string | undefined {
   const record = asRecord(target);
@@ -172,6 +140,31 @@ async function readJson(request: import("node:http").IncomingMessage) {
 function send(response: import("node:http").ServerResponse, status: number, value: unknown) {
   response.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", "access-control-allow-origin": "*", "access-control-allow-methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS", "access-control-allow-headers": "content-type,authorization", "x-novel-runtime-id": runtime.runtimeId, "x-novel-runtime-profile": runtime.profile, "x-novel-runtime-fingerprint": runtime.runtimeFingerprint });
   response.end(status === 204 ? undefined : JSON.stringify(value));
+}
+
+/**
+ * 从 POST 请求体解析并生成独立短剧脚本（stateless：不落库，产物由前端存浏览器）。
+ * 素材（referenceMaterials/materialRefs）与回避清单（avoidMotifs）由前端直传，后端不再解析创作台。
+ */
+async function generateShortScriptFromBody(body: Record<string, unknown>) {
+  const idea = asString(body.idea);
+  if (!idea) throw new ShortScriptInputError(400, "idea 必填：核心创意须写清谁、何处、什么冲突");
+  const targetDurationRaw = body.targetDurationSeconds;
+  const targetDurationSeconds = typeof targetDurationRaw === "number" && Number.isFinite(targetDurationRaw) ? Math.round(targetDurationRaw) : undefined;
+  const durationModeRaw = body.durationMode;
+  const durationMode = durationModeRaw === "auto" || durationModeRaw === "fixed" ? durationModeRaw : undefined;
+  return generateShortScriptH3(
+    {
+      referenceMaterials: Array.isArray(body.referenceMaterials) ? body.referenceMaterials as Array<{ subjectTag: string; description: string }> : undefined,
+      materialRefs: Array.isArray(body.materialRefs) ? body.materialRefs as Array<{ materialId: string; description: string; subjectTag: string }> : undefined,
+      avoidMotifs: Array.isArray(body.avoidMotifs) ? body.avoidMotifs.filter((v): v is string => typeof v === "string") : undefined,
+      idea,
+      instruction: asString(body.instruction) || undefined,
+      ...(durationMode !== undefined ? { durationMode } : {}),
+      ...(targetDurationSeconds !== undefined ? { targetDurationSeconds } : {}),
+    },
+    { model, skillProvider },
+  );
 }
 
 function asString(value: unknown) { return typeof value === "string" && value.trim() ? value.trim() : undefined; }
@@ -333,7 +326,7 @@ function buildCreativeCommand(input: Record<string, unknown>): CreativeCommand |
 const server = createServer(async (request, response) => {
   try {
     if (request.method === "OPTIONS") return send(response, 204, {});
-    if (request.method === "GET" && request.url === "/live") return send(response, 200, { service: "ymcp-novel-v2", status: "alive", runtime: publicRuntimeIdentity(runtime) });
+    if (request.method === "GET" && request.url === "/live") return send(response, 200, { service: "ymcp-novel-v2", status: "alive", runtime: { ...publicRuntimeIdentity(runtime), codeRevision: codeRevision() } });
     if (request.method === "GET" && (request.url === "/health" || request.url === "/ready")) {
       const dependencies: Record<string, { ok: boolean; detail?: string }> = {};
       try { await repository.health(); dependencies.postgres = { ok: true }; } catch (error) { dependencies.postgres = { ok: false, detail: (error as Error).message }; }
@@ -354,7 +347,7 @@ const server = createServer(async (request, response) => {
       const requiredReady = dependencies.postgres.ok && dependencies.objectStore.ok && dependencies.qdrant.ok && dependencies.temporal.ok;
       const fullyHealthy = requiredReady && dependencies.embedding.ok && dependencies.worker.ok;
       const status = fullyHealthy ? "healthy" : requiredReady ? "degraded" : "unready";
-      return send(response, request.url === "/ready" && !fullyHealthy ? 503 : 200, { service: "ymcp-novel-v2", status, runtime: { ...publicRuntimeIdentity(runtime), protocolVersion: NOVEL_V2_PROTOCOL_VERSION, foundationStageCount: PROJECT_PLAN_STAGES.length }, dependencies });
+      return send(response, request.url === "/ready" && !fullyHealthy ? 503 : 200, { service: "ymcp-novel-v2", status, runtime: { ...publicRuntimeIdentity(runtime), codeRevision: codeRevision(), protocolVersion: NOVEL_V2_PROTOCOL_VERSION, foundationStageCount: PROJECT_PLAN_STAGES.length }, dependencies });
     }
     if (request.method === "GET" && request.url === "/v2/model-config") return send(response, 200, { config: modelConfigStore.getMaskedConfig() });
     if (request.method === "PUT" && request.url === "/v2/model-config") {
@@ -527,6 +520,7 @@ const server = createServer(async (request, response) => {
       const input = await readJson(request);
       if (typeof input.projectId !== "string" || typeof input.objective !== "string" || typeof input.idempotencyKey !== "string") return send(response, 400, { error: "projectId、objective、idempotencyKey 必填" });
       if (input.factApprovalMode !== undefined && input.factApprovalMode !== "auto" && input.factApprovalMode !== "manual") return send(response, 400, { error: "factApprovalMode 必须为 auto 或 manual" });
+      if (input.changeScope !== undefined && !CHAPTER_CHANGE_SCOPES.includes(input.changeScope as (typeof CHAPTER_CHANGE_SCOPES)[number])) return send(response, 400, { error: `changeScope 必须为 ${CHAPTER_CHANGE_SCOPES.join("/")}` });
       const requestedStage = input.requestedStage as NovelIntent["requestedStage"];
       const target = input.target as NovelIntent["target"];
       const targetDocumentId = chapterTargetId(target);
@@ -544,7 +538,7 @@ const server = createServer(async (request, response) => {
           && ((asRecord(run.payload.intent)?.requestedStage as NovelIntent["requestedStage"] | undefined) ?? requestedStage) === requestedStage);
         if (active) return send(response, 200, { intent: asRecord(active.payload.intent), workflowId: active.temporalWorkflowId, status: active.status, reused: true });
       }
-      const intent: NovelIntent = { id: crypto.randomUUID(), projectId: input.projectId, source: input.source === "mcp" ? "mcp" : input.source === "cli" ? "cli" : input.source === "web" ? "web" : "api", objective: input.objective.trim(), target, requestedStage, constraints: Array.isArray(input.constraints) ? input.constraints.filter((value): value is string => typeof value === "string") : undefined, requestedCapabilities: Array.isArray(input.requestedCapabilities) ? input.requestedCapabilities.filter((value): value is string => typeof value === "string") : undefined, factApprovalMode: input.factApprovalMode as NovelIntent["factApprovalMode"], createdAt: Date.now(), idempotencyKey: input.idempotencyKey };
+      const intent: NovelIntent = { id: crypto.randomUUID(), projectId: input.projectId, source: input.source === "mcp" ? "mcp" : input.source === "cli" ? "cli" : input.source === "web" ? "web" : "api", objective: input.objective.trim(), target, requestedStage, constraints: Array.isArray(input.constraints) ? input.constraints.filter((value): value is string => typeof value === "string") : undefined, requestedCapabilities: Array.isArray(input.requestedCapabilities) ? input.requestedCapabilities.filter((value): value is string => typeof value === "string") : undefined, factApprovalMode: input.factApprovalMode as NovelIntent["factApprovalMode"], changeScope: input.changeScope as NovelIntent["changeScope"], createdAt: Date.now(), idempotencyKey: input.idempotencyKey };
       await repository.ensureProject(intent.projectId, typeof input.projectTitle === "string" ? input.projectTitle : intent.projectId);
       const stored = await repository.putIntent(intent);
       const workflowId = `novel-intent-${stored.id}`;
@@ -724,108 +718,13 @@ const server = createServer(async (request, response) => {
         throw error;
       }
     }
-    // 创意短剧脚本（项目无关端点，契约 v2）：核心创意 → 简短分镜提示词。
-    // 独立于小说创作板块：不依赖任何小说项目；projectId 可选（关联作品=衍生短剧）。
-    const independentShortScriptListMatch = request.url?.match(/^\/v2\/short-script-h3\/list(?:\?(.+))?$/);
-    if (request.method === "GET" && independentShortScriptListMatch) {
-      const projectId = new URL(request.url ?? "/", "http://localhost").searchParams.get("projectId")?.trim() || undefined;
-      const scripts = (await repository.listShortScripts({ projectId, limit: SCRIPT_LIST_LIMIT })).map(shortScriptSummary);
-      return send(response, 200, { scripts });
-    }
-    const independentShortScriptDetailMatch = request.url?.match(/^\/v2\/short-script-h3\/([^/?]+)$/);
-    if (request.method === "DELETE" && independentShortScriptDetailMatch) {
-      const scriptId = decodeURIComponent(independentShortScriptDetailMatch[1]);
-      const removed = await repository.deleteShortScript(scriptId);
-      if (!removed) return send(response, 404, { error: "指定的创意短剧产物不存在" });
-      // 同步清理对象存储中的产物文本；失败不回滚行删除（残留对象属孤儿，由审计任务回收）。
-      if (removed.objectKey) await objectStore.delete(removed.objectKey).catch(() => undefined);
-      return send(response, 200, { deleted: true, scriptId });
-    }
-    if (request.method === "GET" && independentShortScriptDetailMatch) {
-      const stored = await repository.getShortScript(decodeURIComponent(independentShortScriptDetailMatch[1]));
-      if (!stored) return send(response, 404, { error: "指定的创意短剧产物不存在" });
-      return send(response, 200, shortScriptDetail(stored));
-    }
+    // 独立短剧生成（stateless，浏览器存储）：POST /v2/short-script-h3 仅生成、不落库（产物由前端存 IndexedDB）。
     const independentShortScriptMatch = request.url?.match(/^\/v2\/short-script-h3(?:\?(.+))?$/);
-    if (independentShortScriptMatch && (request.method === "GET" || request.method === "POST")) {
-      if (request.method === "GET") {
-        // ?scriptId= 读指定产物（与 workflow-map 8.2 契约一致）；无参读最新一条。
-        const scriptId = new URL(request.url ?? "/", "http://localhost").searchParams.get("scriptId")?.trim() || undefined;
-        const stored = scriptId
-          ? await repository.getShortScript(scriptId)
-          : (await repository.listShortScripts({ limit: 1 }))[0];
-        if (scriptId && !stored) return send(response, 404, { error: "指定的创意短剧产物不存在" });
-        return stored ? send(response, 200, shortScriptDetail(stored)) : send(response, 200, { exists: false });
-      }
+    if (independentShortScriptMatch && request.method === "POST") {
       const body = await readJson(request).catch(() => ({}) as Record<string, unknown>);
-      const idea = asString(body.idea);
-      if (!idea) return send(response, 400, { error: "idea 必填：核心创意须写清谁、何处、什么冲突" });
-      const targetDurationRaw = body.targetDurationSeconds;
-      const targetDurationSeconds = typeof targetDurationRaw === "number" && Number.isFinite(targetDurationRaw)
-        ? Math.round(targetDurationRaw)
-        : undefined;
       try {
-        const record = await generateShortScriptH3(
-          {
-            projectId: asString(body.projectId) || undefined,
-            idea,
-            instruction: asString(body.instruction) || undefined,
-            ...(targetDurationSeconds !== undefined ? { targetDurationSeconds } : {}),
-          },
-          { repository, objects: objectStore, model, skillProvider },
-        );
-        return send(response, record.reused ? 200 : 202, { record });
-      } catch (error) {
-        if (error instanceof ShortScriptInputError) return send(response, error.statusCode, { error: error.message });
-        throw error;
-      }
-    }
-    // 创意短剧脚本历史列表（项目级兼容端点：按关联作品过滤，读 short_scripts 表）
-    const shortScriptListMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/short-script-h3\/list$/);
-    if (request.method === "GET" && shortScriptListMatch) {
-      const projectId = decodeURIComponent(shortScriptListMatch[1]);
-      const scripts = (await repository.listShortScripts({ projectId, limit: SCRIPT_LIST_LIMIT })).map(shortScriptSummary);
-      return send(response, 200, { scripts });
-    }
-    // 创意短剧脚本（项目级兼容端点：POST 透传 projectId 关联，GET 按项目读最新/指定产物）
-    const shortScriptMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/short-script-h3(?:\?(.+))?$/);
-    if (shortScriptMatch && (request.method === "GET" || request.method === "POST")) {
-      const projectId = decodeURIComponent(shortScriptMatch[1]);
-      if (request.method === "GET") {
-        // 兼容参数 artifactId（v2 契约为 scriptId）：按产物加载详情并校验项目归属。
-        const scriptId = new URL(request.url ?? "/", "http://localhost").searchParams.get("scriptId")?.trim()
-          ?? (new URL(request.url ?? "/", "http://localhost").searchParams.get("artifactId")?.trim() || undefined);
-        let stored;
-        if (scriptId) {
-          const found = await repository.getShortScript(scriptId);
-          if (!found || found.projectId !== projectId) {
-            return send(response, 404, { error: "指定的创意短剧产物不存在" });
-          }
-          stored = found;
-        } else {
-          stored = (await repository.listShortScripts({ projectId, limit: 1 }))[0];
-        }
-        if (!stored) return send(response, 200, { exists: false });
-        return send(response, 200, shortScriptDetail(stored));
-      }
-      const body = await readJson(request).catch(() => ({}) as Record<string, unknown>);
-      const idea = asString(body.idea);
-      if (!idea) return send(response, 400, { error: "idea 必填：核心创意须写清谁、何处、什么冲突" });
-      const targetDurationRaw = body.targetDurationSeconds;
-      const targetDurationSeconds = typeof targetDurationRaw === "number" && Number.isFinite(targetDurationRaw)
-        ? Math.round(targetDurationRaw)
-        : undefined;
-      try {
-        const record = await generateShortScriptH3(
-          {
-            projectId,
-            idea,
-            instruction: asString(body.instruction) || undefined,
-            ...(targetDurationSeconds !== undefined ? { targetDurationSeconds } : {}),
-          },
-          { repository, objects: objectStore, model, skillProvider },
-        );
-        return send(response, record.reused ? 200 : 202, { record });
+        const record = await generateShortScriptFromBody(body);
+        return send(response, 202, { record });
       } catch (error) {
         if (error instanceof ShortScriptInputError) return send(response, error.statusCode, { error: error.message });
         throw error;
@@ -887,11 +786,33 @@ const server = createServer(async (request, response) => {
       const input = await readJson(request);
       const severity = asString(input.severity);
       const title = asString(input.title);
-      const paragraph = input.paragraph === undefined || input.paragraph === null || input.paragraph === "" ? undefined : Number(input.paragraph);
+      let paragraph = input.paragraph === undefined || input.paragraph === null || input.paragraph === "" ? undefined : Number(input.paragraph);
+      let revisionRanges = Array.isArray(input.revisionRanges) ? input.revisionRanges : undefined;
+      const projectId = decodeURIComponent(reviewIssuesMatch[1]);
+      const documentId = decodeURIComponent(reviewIssuesMatch[2]);
       if (severity !== "blocker" && severity !== "major" && severity !== "warning") return send(response, 400, { error: "severity 必须为 blocker、major 或 warning" });
       if (!title) return send(response, 400, { error: "审核意见标题不能为空" });
       if (paragraph !== undefined && (!Number.isInteger(paragraph) || paragraph < 1)) return send(response, 400, { error: "目标段落必须为正整数" });
-      return send(response, 201, { issue: await repository.addChapterReviewIssue({ projectId: decodeURIComponent(reviewIssuesMatch[1]), documentId: decodeURIComponent(reviewIssuesMatch[2]), severity, title, description: asString(input.description), evidenceQuote: asString(input.evidenceQuote), paragraph, suggestion: asString(input.suggestion) }) });
+      // 段落号自动定位（2026-09-08）：用 evidenceQuote 反查正文中全部命中段落，校正
+      // 编辑器行号/非空行序错位（实证：ch15 定向修订因行号 vs 段落号错位放置到无关段落）。
+      // 定位成功时 paragraph 与 revisionRanges 一律以定位结果为准；无法定位时保留调用方传入值。
+      let locatedNote: string | undefined;
+      try {
+        const content = await repository.getFinalDocumentContentRef(projectId, documentId);
+        const evidenceQuote = asString(input.evidenceQuote) || title;
+        if (content?.objectKey) {
+          const plainText = await objectStore.getText(content.objectKey);
+          const located = locateEvidenceParagraphs(plainText, evidenceQuote);
+          if (located.length) {
+            const before = JSON.stringify({ paragraph, revisionRanges });
+            paragraph = located[0];
+            revisionRanges = located.map((value) => ({ start: value, end: value }));
+            locatedNote = `段落号自动定位：${before} → paragraph=${paragraph}, revisionRanges=${JSON.stringify(revisionRanges)}`;
+          }
+        }
+      } catch { /* 定位失败不阻塞登记，保留调用方传入值 */ }
+      const issue = await repository.addChapterReviewIssue({ projectId, documentId, severity, title, description: asString(input.description), evidenceQuote: asString(input.evidenceQuote), paragraph, revisionRanges, suggestion: asString(input.suggestion) });
+      return send(response, 201, { issue, ...(locatedNote ? { locatedNote } : {}) });
     }
     const chapterVersionMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/documents\/([^/?]+)\/versions\/([^/?]+)(?:\/(restore))?$/);
     if (chapterVersionMatch) {
@@ -1306,6 +1227,14 @@ const server = createServer(async (request, response) => {
       const preview = await repository.previewStoryArcApproval(projectId, arcId);
       if (input.confirm !== true) return send(response, 200, { preview });
       const workflow = await repository.getStoryArcWorkflow(projectId, arcId);
+      // 作者修订指令入门（弧6 实践批）：decision=revise 不审库批准（审核未过被
+      // repository 正当拒绝是设计），只把指令信号送进等待中的门，workflow 走
+      // revise→重审→再入门。无活动门可寻址时显式拒绝，不静默丢失指令。
+      if (input.decision === "revise") {
+        if (!workflow || !["accepted", "running", "manual-review-required"].includes(workflow.status)) return send(response, 409, { error: "当前没有等待作者决策的故事弧工作流，修订指令无处投递" });
+        await temporal.workflow.getHandle(workflow.temporalWorkflowId).signal("storyArcApproved", { decision: "revise", feedback: asString(input.feedback) || "", arcId });
+        return send(response, 202, { accepted: true, workflowId: workflow.temporalWorkflowId, stage: "revision" });
+      }
       const reviewArtifactId = typeof workflow?.payload.reviewArtifactId === "string" ? workflow.payload.reviewArtifactId : undefined;
       if (!reviewArtifactId) return send(response, 409, { error: "故事弧缺少当前蓝图的审核证据，请先完成审核" });
       const result = await repository.approveStoryArc(projectId, arcId, preview.artifactId, reviewArtifactId, "web-author");
@@ -1314,7 +1243,7 @@ const server = createServer(async (request, response) => {
       }
       return send(response, 200, result);
     }
-    const knowledgeMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/knowledge\/(planning|worldview|characters|relations|timeline|facts|skills|foundation|claims|chapter-memories|project-skills)$/);
+    const knowledgeMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/knowledge\/(planning|worldview|characters|relations|timeline|skills|foundation|claims|chapter-memories|project-skills)$/);
     if (knowledgeMatch) {
       const projectId = decodeURIComponent(knowledgeMatch[1]);
       const kind = knowledgeMatch[2] as KnowledgeRecordKind;
@@ -1335,7 +1264,7 @@ const server = createServer(async (request, response) => {
         return send(response, 201, result);
       }
     }
-    const knowledgeItemMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/knowledge\/(planning|worldview|characters|relations|timeline|facts|claims|skills)\/([^/?]+)$/);
+    const knowledgeItemMatch = request.url?.match(/^\/v2\/projects\/([^/?]+)\/knowledge\/(planning|worldview|characters|relations|timeline|claims|skills)\/([^/?]+)$/);
     if (knowledgeItemMatch) {
       const projectId = decodeURIComponent(knowledgeItemMatch[1]);
       const kind = knowledgeItemMatch[2] as MutableKnowledgeRecordKind;
@@ -1916,6 +1845,19 @@ const server = createServer(async (request, response) => {
         const actorId = asString(input.actorId);
         if (!decision || !actorId) return send(response, 400, { error: "decision(approve/reject) 和 actorId 必填" });
         const result = await repository.decideFactCandidate({ projectId, claimId, actorId, decision, reason: asString(input.reason) });
+        // 向量层同步与 MCP novel_fact_candidate_decide 同一契约（FM-2）：
+        // approve 写入新点并按 supersedes 删除被退役点；reject 防御性删除。
+        // 向量层失败不阻断裁决——PostgreSQL memory_claims 是权威真源，reindex 兜底。
+        try {
+          if (result.authority === "approved") {
+            const claim = await repository.getMemoryClaimById(projectId, claimId);
+            if (claim) await qdrantMemory.upsertClaims(projectId, [claim]);
+          } else {
+            await qdrantMemory.deleteClaims?.(projectId, [claimId]);
+          }
+        } catch (indexError) {
+          console.warn("[api] fact-candidate 裁决的向量层同步失败（库内裁决已完成）：", indexError);
+        }
         return send(response, 200, { result });
       } catch (error) {
         return send(response, 409, { error: error instanceof Error ? error.message : String(error) });
@@ -1932,7 +1874,16 @@ const server = createServer(async (request, response) => {
     }
 
     if (request.method === "GET" && request.url === "/v2/usage") return send(response, 200, { usage: await repository.listModelUsage() });
+    // OR-A1（product-audit-20260910 E1）跨 purpose 候选健康度：只读诊断，不改运行时。
+    if (request.method === "GET" && request.url?.startsWith("/v2/routing/candidate-health")) {
+      const url = new URL(request.url, "http://localhost");
+      const sinceDays = Number(url.searchParams.get("sinceDays") ?? "") || undefined;
+      const minSamples = Number(url.searchParams.get("minSamples") ?? "") || undefined;
+      return send(response, 200, { cells: await repository.getRoutingCandidateHealth({ sinceDays, minSamples }) });
+    }
     if (request.method === "POST" && request.url === "/v2/maintenance/chapter-retention") return send(response, 200, { result: await runRetentionCleanup() });
+    // OR-B4 周期对账（product-audit-20260910 E3）：僵尸非终态 run 收编 + 名下外部任务清账。
+    if (request.method === "POST" && request.url === "/v2/maintenance/reconcile-runs") return send(response, 200, { reconciled: await repository.reconcileStaleWorkflowRuns({ nowMs: Date.now() }) });
     const runCancelMatch = request.url?.match(/^\/v2\/runs\/([^/]+)\/cancel$/);
     if (request.method === "POST" && runCancelMatch) {
       const workflowId = decodeURIComponent(runCancelMatch[1]);
@@ -1978,7 +1929,19 @@ const server = createServer(async (request, response) => {
       }
     }
     return send(response, 404, { error: "NOT_FOUND" });
-  } catch (error) { return send(response, 500, { error: error instanceof Error ? error.message : String(error) }); }
+  } catch (error) {
+    // 同步链路的外部 MCP 兜底语义化（契约见 syncExternalMcpHttpStatus）：
+    // 短剧等进程内同步调用没有外部任务物化通道，等待外部接手在这里只能是
+    // 503 + 可行动文案（补 API 候选 / 走 *_submit 双轨），不能停留在裸 500。
+    const mapped = syncExternalMcpHttpStatus(error);
+    if (mapped !== null) {
+      const purpose = error instanceof ExternalMcpRequiredError ? error.purpose : "unknown";
+      return send(response, mapped, {
+        error: `模型任务 ${purpose} 的 API 候选全部失败，同步生成路径不支持等待外部 MCP 接手；请为该用途配置更多 API 模型候选，或由外部编排者通过 *_submit 工具直接提交产物`,
+      });
+    }
+    return send(response, 500, { error: error instanceof Error ? error.message : String(error) });
+  }
 });
 
 const apiHost = runtime.apiHost;

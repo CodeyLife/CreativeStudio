@@ -13,6 +13,7 @@ import type { Artifact, MemoryClaim } from "../protocol";
 import { chapterStateDeltaSchema, type ChapterStateDelta, type FactExtractionOutput } from "../prompts/schemas";
 import { canonicalizeFactPredicate, factIdentityHash, factValueHash } from "../fact-extraction/fingerprint";
 import { buildFactExtractionPrompt } from "../fact-extraction/prompt";
+import { buildCharacterIdentityIndex } from "../character-identity";
 
 const artifact: Artifact = { id: "artifact-1", projectId: "p1", taskId: "task-1", attemptId: "attempt-1", kind: "draft", contentHash: "hash", objectKey: "obj", baseRevision: 7, createdAt: 1, fingerprint: "fp-1" };
 
@@ -194,6 +195,12 @@ describe("fact-extraction classifyFactRisk maps to risk tiers", () => {
     expect(claim.supersedes).toEqual(["claim-old-location"]);
   });
 
+  it("does not let an event-slot update sweep unrelated same-slot claims (FM-1)", () => {
+    // 状态变化/知晓等事件累积谓词的同槽多行记录的是不同事件，单条 update 不得退役整槽。
+    const { claim } = classifyFactRisk({ fact: fact({ predicate: "状态变化", novelty: "update", truthStatus: "objective", humanReadable: "主角当前状态：略宽于初开辟" }), projectId: "p1", artifactId: artifact.id, baseRevision: 1, existingClaimIndex: new Map([["hero|状态变化", ["claim-payoff", "claim-wound"]]]) });
+    expect(claim.supersedes).toEqual([]);
+  });
+
   it("keeps low-confidence continuity-changing facts as candidates", () => {
     const { risk, claim } = classifyFactRisk({ fact: fact({ predicate: "持有", confidence: 0.65 }), projectId: "p1", artifactId: artifact.id, baseRevision: 1 });
     expect(risk).toBe("medium");
@@ -342,5 +349,76 @@ describe("fact-extraction extractFactsWithStats orchestration", () => {
     };
     expect(computeClaimContentHash(claim)).toBe(computeClaimContentHash(claim));
     expect(computeClaimContentHash({ ...claim, subjectRefs: ["mentor"] })).not.toBe(computeClaimContentHash(claim));
+  });
+});
+
+describe("fact-extraction identity normalization (memory-governance-audit-20260909 §5.1.1)", () => {
+  const identityIndex = buildCharacterIdentityIndex(
+    "p1",
+    [],
+    [{ id: "char_hero", name: "主角" }, { id: "char_mentor", name: "师父" }],
+  );
+
+  it("rewrites subject ids that hit the registry alias map before hashing", () => {
+    const output: ChapterStateDelta = {
+      facts: [fact({ subject: { kind: "entity", id: "主角" }, humanReadable: "主角持有古剑承影" })],
+      narrativeElements: { foreshadowings: [], promises: [], payoffs: [] },
+    };
+    const result = projectFactExtractionOutput({ projectId: "p1", artifact, text: "正文略。", identityIndex }, output);
+    expect(result.claims[0].subjectRefs).toEqual(["char_hero"]);
+    // 归一发生在哈希之前：同一事实经规范 ID 提取时 identityHash 必须一致。
+    const canonical = projectFactExtractionOutput(
+      { projectId: "p1", artifact, text: "正文略。" },
+      { facts: [fact({ subject: { kind: "entity", id: "char_hero" }, humanReadable: "主角持有古剑承影" })], narrativeElements: { foreshadowings: [], promises: [], payoffs: [] } },
+    );
+    expect(result.claims[0].identityHash).toBe(canonical.claims[0].identityHash);
+  });
+
+  it("dedupes the same fact extracted with a display name and a canonical id in one batch", () => {
+    const output: ChapterStateDelta = {
+      facts: [
+        fact({ subject: { kind: "entity", id: "主角" }, humanReadable: "主角持有古剑承影" }),
+        fact({ subject: { kind: "entity", id: "char_hero" }, humanReadable: "主角持有古剑承影" }),
+      ],
+      narrativeElements: { foreshadowings: [], promises: [], payoffs: [] },
+    };
+    const result = projectFactExtractionOutput({ projectId: "p1", artifact, text: "正文略。", identityIndex }, output);
+    expect(result.claims).toHaveLength(1);
+    expect(result.stats.discardedDuplicate).toBe(1);
+  });
+
+  it("keeps unknown subject keys untouched instead of inventing a third key form", () => {
+    const output: ChapterStateDelta = {
+      facts: [fact({ subject: { kind: "entity", id: "自造_ID" }, humanReadable: "陌生人物做了某事", evidence: "足够长的一段正文证据文本。" })],
+      narrativeElements: { foreshadowings: [], promises: [], payoffs: [] },
+    };
+    const result = projectFactExtractionOutput({ projectId: "p1", artifact, text: "正文略。", identityIndex }, output);
+    expect(result.claims[0].subjectRefs).toEqual(["自造_ID"]);
+  });
+
+  it("injects the canonical character roster into the prompt when provided", () => {
+    const prompt = buildFactExtractionPrompt({
+      artifact,
+      text: "正文略。",
+      canonicalCharacters: [{ canonicalId: "char_hero", displayName: "主角" }],
+    });
+    expect(prompt).toContain("规范人物名册");
+    expect(prompt).toContain("char_hero｜显示名：主角");
+    expect(prompt).toContain("禁止使用显示名、拼音转写或自造 ID");
+  });
+
+  it("omits the roster section when no canonical characters are provided", () => {
+    const prompt = buildFactExtractionPrompt({ artifact, text: "正文略。" });
+    expect(prompt).not.toContain("规范人物名册");
+  });
+
+  it("aligns character-knows with the 知晓 identity slot across pipelines", () => {
+    expect(canonicalizeFactPredicate("character-knows")).toBe("知晓");
+    const enrichmentFact = {
+      subject: { kind: "entity" as const, id: "char_hero" },
+      predicate: "character-knows",
+    };
+    const extractionFact = fact({ subject: { kind: "entity", id: "char_hero" }, predicate: "知晓" });
+    expect(factIdentityHash(enrichmentFact)).toBe(factIdentityHash(extractionFact));
   });
 });

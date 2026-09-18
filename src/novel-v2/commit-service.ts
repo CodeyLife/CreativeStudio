@@ -54,8 +54,8 @@ export class CommitService {
   ) {}
 
   async commit(input: CommitRequest & { text: string } & CommitDerivedData): Promise<CommitResult & { chapterMemory?: ChapterMemory }> {
-    const gate = evaluateCommitGate(input.reviews, input.artifact.fingerprint, input.structuralReport);
-    if (!gate.passed) throw new Error(`正式提交必须具备当前 artifact 的完整三类 reviewer 通过证据；缺失角色：${gate.missingRoles.join("、") || "无"}`);
+    const gate = evaluateCommitGate(input.reviews, input.artifact.fingerprint, input.structuralReport, input.changeScope);
+    if (!gate.passed) throw new Error(`正式提交必须具备当前 artifact 的完整三类 reviewer 通过证据（changeScope=${input.changeScope ?? "narrative"} 档位）；缺失角色：${gate.missingRoles.join("、") || "无"}`);
     if (!inspectManuscript({ text: input.text }).passed) throw new Error("正式提交正文未通过确定性结构复检");
     return this.persistApprovedRevision(input);
   }

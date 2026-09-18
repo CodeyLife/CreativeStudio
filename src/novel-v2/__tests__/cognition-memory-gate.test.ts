@@ -4,7 +4,7 @@ import type { MemoryBundle, NovelIntent, PreflightPlan, SkillBundle } from "../p
 
 const intent: NovelIntent = { id: "intent-gate", projectId: "p1", source: "web", objective: "修订第十章", requestedStage: "revision", createdAt: 1, idempotencyKey: "gate" };
 const plan: PreflightPlan = {
-  id: "preflight-gate", intentId: intent.id, projectId: "p1", taskClass: "revision", stage: "revision", targetDocumentId: "doc-10", narrativeCutoff: 9,
+  id: "preflight-gate", intentId: intent.id, projectId: "p1", taskClass: "revision", stage: "revision", changeScope: "narrative", targetDocumentId: "doc-10", narrativeCutoff: 9,
   facets: ["fact", "entity", "thread", "foreshadowing", "chapter-memory"].map((kind) => ({ kind: kind as "fact" | "entity" | "thread" | "foreshadowing" | "chapter-memory", query: kind, required: kind === "fact" || kind === "chapter-memory" })),
   risk: "high", requiresIndependentReview: true, createdAt: 1, sourceFingerprint: "plan",
 };

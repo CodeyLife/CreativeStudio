@@ -25,6 +25,8 @@ export interface NovelDocumentSummary {
   arcPlanningStatus?: string;
   reviewScore?: number;
   reviewVerdict?: "passed" | "revise" | "blocked";
+  /** 作者对当前内容最近一次审校聚合结果的最终决定（approve=作者已覆盖批准，与 reviewer verdict 并存不冲突） */
+  authorDecision?: "approve" | "revise" | "reject" | "abandon";
   reviewStale?: boolean;
 }
 
@@ -312,35 +314,41 @@ export interface NovelChapterScriptView {
   segments?: NovelChapterScriptSegmentView[];
 }
 
-/** GET /v2/short-script-h3/:id 响应；exists=false 表示尚未生成创意短剧（契约 v2：scriptId 主键，projectId 缺省=独立短剧） */
+/** 剧情选入素材的快照（对应后端 materialRefs）：受选素材的 <Subject N> 参考帧。 */
+export interface NovelShortScriptMaterialRefView {
+  materialId: string;
+  description: string;
+  subjectTag: string;
+}
+
+/**
+ * 创意短剧的**前端视图模型**（契约 v2：scriptId 主键，projectId 缺省=独立短剧）。
+ * 09-17 浏览器化后服务端只提供一个 stateless `POST /v2/short-script-h3`（202 返回
+ * `{ record }`，不落库）；本类型由 ScriptStudioPanel 从 IndexedDB 记录经
+ * scriptRecordToView() 合成，`exists` 是前端"已有选中产物"的标志，不由服务端回填。
+ */
 export interface NovelShortScriptView {
   exists: boolean;
   scriptId?: string;
   /** 关联作品（衍生短剧）；缺省=独立短剧，不依赖任何小说项目 */
   projectId?: string;
+  /** 归属短剧创作台（创作台内多剧情容器）；缺省=独立剧情 */
+  workspaceId?: string;
+  /** 该剧情选入的公用素材快照 */
+  materialRefs?: NovelShortScriptMaterialRefView[];
   createdAt?: number;
   sourceFingerprint?: string | null;
   mode?: string;
   /** 本次产物的创意来源（历史列表语义展示依据） */
   idea?: string;
   instruction?: string;
+  /** 时长模式：fixed=固定目标时长；auto=不限时长（targetDurationSeconds 记产物实际总时长） */
+  durationMode?: "fixed" | "auto";
   targetDurationSeconds?: number;
   plotBeats?: NovelPlotBeatView[];
   cinematicHints?: string[];
   characters?: NovelChapterScriptCharacterView[];
   segments?: NovelChapterScriptSegmentView[];
-}
-
-/** GET /v2/short-script-h3/list 响应项：创意短剧历史摘要（语义化，不暴露原始 JSON/UUID） */
-export interface NovelShortScriptSummaryView {
-  scriptId: string;
-  projectId?: string;
-  idea: string;
-  instruction?: string;
-  targetDurationSeconds?: number;
-  segmentCount: number;
-  cinematicHintCount: number;
-  createdAt: number;
 }
 
 export function fetchNovelChapterScriptSubjectPreset(projectId: string): Promise<{ definitionText: string }> {
@@ -824,36 +832,32 @@ export function generateNovelChapterScript(projectId: string, documentId: string
   });
 }
 
-/** 创意短剧（契约 v2，项目无关端点）：按 scriptId 读详情；scriptId 缺省返回全部中最新一条 */
-export function fetchShortScript(scriptId?: string): Promise<NovelShortScriptView> {
-  return scriptId ? novelFetch(`/v2/short-script-h3/${enc(scriptId)}`) : novelFetch("/v2/short-script-h3");
-}
-
-/** 历史短剧列表：projectId 提供时按关联作品过滤，缺省返回全部（独立的 + 关联的） */
-export function fetchShortScriptList(projectId?: string): Promise<{ scripts: NovelShortScriptSummaryView[] }> {
-  const query = projectId ? `?projectId=${enc(projectId)}` : "";
-  return novelFetch(`/v2/short-script-h3/list${query}`);
-}
-
-/** 生成创意短剧：projectId 可选（关联作品=衍生短剧），缺省为独立短剧 */
-export function generateShortScript(
-  input: { idea: string; instruction?: string; targetDurationSeconds?: number; projectId?: string },
-): Promise<{ record: NovelShortScriptView & { reused?: boolean; scriptId: string } }> {
+/**
+ * 独立短剧生成（stateless，浏览器存储）：POST /v2/short-script-h3 仅生成、不落库。
+ * 产物由前端存入 IndexedDB（见 src/lib/shortDramaStore.ts）。素材/回避清单由前端直传。
+ */
+export function generateShortScriptStateless(input: {
+  idea: string;
+  instruction?: string;
+  durationMode?: "fixed" | "auto";
+  targetDurationSeconds?: number;
+  referenceMaterials?: Array<{ subjectTag: string; description: string }>;
+  materialRefs?: Array<{ materialId: string; description: string; subjectTag: string }>;
+  avoidMotifs?: string[];
+}): Promise<{ record: NovelShortScriptView & { scriptId: string } }> {
   return novelFetch("/v2/short-script-h3", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       idea: input.idea,
       instruction: input.instruction?.trim() || undefined,
-      targetDurationSeconds: input.targetDurationSeconds,
-      projectId: input.projectId?.trim() || undefined,
+      durationMode: input.durationMode,
+      targetDurationSeconds: input.durationMode === "auto" ? undefined : input.targetDurationSeconds,
+      referenceMaterials: input.referenceMaterials?.length ? input.referenceMaterials : undefined,
+      materialRefs: input.materialRefs?.length ? input.materialRefs : undefined,
+      avoidMotifs: input.avoidMotifs?.length ? input.avoidMotifs : undefined,
     }),
   });
-}
-
-/** 删除指定创意短剧产物（行 + 对象存储文本一并清理） */
-export function deleteShortScript(scriptId: string): Promise<{ deleted: boolean; scriptId: string }> {
-  return novelFetch(`/v2/short-script-h3/${enc(scriptId)}`, { method: "DELETE" });
 }
 
 // ---------- 写 ----------

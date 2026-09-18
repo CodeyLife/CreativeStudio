@@ -3,7 +3,7 @@
 状态：**可行，已打通全链路**。dsh（DeepSeek Harness）可作为自主编排运行时，通过 MCP 桥接驱动 novel-v2 创作工作流。
 
 日期：2026-09-04
-配置资产：[orchestrator/dsh/cordis.patch.yml](../../orchestrator/dsh/cordis.patch.yml)、[orchestrator/dsh/stream-bridge.mjs](../../orchestrator/dsh/stream-bridge.mjs)、[orchestrator/dsh/settings/llm.example.yaml](../../orchestrator/dsh/settings/llm.example.yaml)
+配置资产：[orchestrator/dsh/cordis.patch.yml](../../orchestrator/dsh/cordis.patch.yml)（基础设施层：provider 声明 + MCP 桥接，不钉默认模型）、[orchestrator/dsh/patches/](../../orchestrator/dsh/patches/)（模型选择层：model-gpt-relay / model-glm-relay，`--patch` 叠加后者覆盖）、[orchestrator/dsh/run-task.ps1](../../orchestrator/dsh/run-task.ps1)（任务启动器：预检/后台运行/日志）、[orchestrator/dsh/stream-bridge.mjs](../../orchestrator/dsh/stream-bridge.mjs)、[orchestrator/dsh/settings/llm.example.yaml](../../orchestrator/dsh/settings/llm.example.yaml)
 
 ## 目标架构
 
@@ -29,8 +29,8 @@ CreativeStudio 产物（规划/正文/审校/修订/短剧脚本）
 | 项 | 结论 | 说明 |
 |---|---|---|
 | dsh 安装 | ✅ | `npm install -g @deepseek-ai/dsh --registry=https://registry.npmmirror.com`（官方源慢，走国内镜像） |
-| novel-v2 MCP HTTP 模式 | ✅ | `npm run novel:mcp:v2:http`，端口 7654，40 工具加载，initialize 握手正常 |
-| dsh 插件桥接 | ✅ | `@deepseek-ai/dsh-mcp-client` 装入 headless profile，40 工具以 `mcp__novel__<name>` 注册 |
+| novel-v2 MCP HTTP 模式 | ✅ | `npm run novel:mcp:v2:http`，端口 7654，41 工具加载，initialize 握手正常 |
+| dsh 插件桥接 | ✅ | `@deepseek-ai/dsh-mcp-client` 装入 headless profile，41 工具以 `mcp__novel__<name>` 注册 |
 | MCP 工具调用 | ✅ | 实测 `novel_skill_get`（返回 h3-video-prompt@1.6.9 技能内容）、`novel_project_list`（返回项目真实数据）均正确 |
 | 编排模型路由 | ✅ | hand-declared `glm-relay` 路由（OpenAI completions 兼容），经 stream-bridge |
 | skill 发现 | ✅ | dsh-skill-filesystem 默认扫描 `.agents/skills`，项目内 SKILL.md 兼容（会话 catalog 可见 novel-mcp-orchestration 等 20 个技能） |
@@ -92,7 +92,7 @@ dsh --profile headless --patch orchestrator/dsh/cordis.patch.yml "<任务描述>
 2. **dsh 版 short-drama-orchestration skill**：短剧创作编排（novel_short_script_h3 / novel_chapter_script_h3 / submit 工具链）。
 3. **运行手册** `docs/orchestrator/dsh-runbook.md`：启动顺序、常见故障（含本页关键发现速查）、会话恢复。
 
-## Phase 1 验收结论（2026-09-04）
+## Phase 1 验收结论（2026-09-04，2026-09-07 修订）
 
 交付物：
 - `.agents/skills/novel-autopilot/SKILL.md`——小说自主推进协议（感知-决策-执行循环、
@@ -107,13 +107,22 @@ dsh --profile headless --patch orchestrator/dsh/cordis.patch.yml "<任务描述>
   **可靠**：直接工具调用 `novel_short_script_h3` 一次成功，产出 28s 双片段脚本，
   御剑双足踏剑意象保真、单长镜头多段运镜、<Subject N> 跨镜头引用、REST 读回
   全部达标。
-- **已知限制**：glm-5.2 编排模型在多步自主任务（加载 skill → 分析 → 选择路径 →
-  调用 → 读回 → 自检 → 汇报的完整链）中可靠性不足——两次实测均在工具调用前
-  中断为纯文本输出；单步指令任务 100% 成功。编排协议内容本身被正确加载遵循
-  （类型判定、硬约束应用均准确）。
-- **缓解措施**（按优先级）：① 任务拆解为单步指令序列下发（runbook 已指导）；
-  ② 编排模型升级（DeepSeek 官方充值后切换，或 glm-5.3 流式缺陷修复后回归）；
-  ③ 评估 dsh goal/ralph 循环对中断回合的重试覆盖。
+
+### 编排模型可靠性结论（2026-09-07 修订）
+
+- glm-5.2 多步任务失败的**精确根因**：工具使用纪律差——幻觉调用不存在的
+  工具（`open_url`，实际可用 `web_fetch`/`pwsh`）、收到错误后不恢复、编造
+  放弃理由（虚构"轮数 3/3 上限"，dsh 无此限制）。四步任务在第二步即翻车，
+  "任务拆解"缓解措施无效（每步粒度须细到单工具调用才有意义）。
+- **goal-round-driver 已在 headless profile 内置**（profile cordis.yml 的
+  goal/goal-round-driver/command-goal/tool-goal bundle），零安装成本；其作用是
+  回合结束后目标未完成时自动续推，作为中断保险机制存在。
+- **解法：编排模型切换 gpt-5.6-sol**（sub2api 中转，`prof-f74824e9 我的中转站`
+  路由）。流式 tool calling 实测 3/3 稳定（直连，无需 stream-bridge）；同款
+  多步自主任务（skill 协议遵循 + goal 生命周期 + 生成 + REST 读回自检 + 汇报）
+  **一次全通**，协议硬约束逐项达标（时长容差、双足踏剑、一镜到底、无对抗事件）。
+- 模型路由现状：主路由 `gpt-relay`（gpt-5.6-sol 直连）；备用路由 `glm-relay`
+  （glm-5.2 经 stream-bridge，其所在中交流式缺陷未修复前不可直连）。
 
 ## Phase 2+ 待办
 

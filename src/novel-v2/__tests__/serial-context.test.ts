@@ -24,6 +24,13 @@ function makeSerial(overrides: Partial<SerialContextSnapshot> = {}): SerialConte
     subjectSpans: [
       { subject: "金属残片", narrativeOrders: [7, 8, 10, 12], latestExcerpt: "陈渊把金属残片塞进输运段石槽下藏好。" },
     ],
+    assetSpans: [
+      { subject: "灵石", entries: [{ narrativeOrder: 1, quantity: "两块", value: 2 }, { narrativeOrder: 5, quantity: "三块", value: 3 }] },
+    ],
+    openPromises: [
+      { statement: "三天内凑齐三块下品灵石，否则取消月俸并罚守夜", establishedAtOrder: 11 },
+      { statement: "来源不明的承诺（孤儿修订）", establishedAtOrder: null },
+    ],
     fingerprint: "serial-fp",
     ...overrides,
   };
@@ -50,6 +57,15 @@ describe("serial-context render", () => {
     expect(text).toContain("金属残片");
   });
 
+  it("renders open promises with their establishing chapter for cross-chapter deadline checks", () => {
+    const text = renderSerialContext(makeSerial());
+    expect(text).toContain("未兑现承诺/期限");
+    expect(text).toContain("建立于第11章");
+    expect(text).toContain("建立章未知");
+    // 对照检查指令：引用不得早于建立章、时限不得矛盾。
+    expect(text).toContain("不得早于其建立章");
+  });
+
   it("does not turn repeated signals into hard requirements (no 必须/禁止 phrasing)", () => {
     const text = renderSerialContext(makeSerial());
     expect(text).not.toContain("必须改变");
@@ -68,7 +84,7 @@ describe("serial-context render", () => {
   });
 
   it("handles empty chapters without crashing", () => {
-    const text = renderSerialContext({ window: 6, chapters: [], characterSpans: [], functionRuns: [], subjectSpans: [], fingerprint: "f" });
+    const text = renderSerialContext({ window: 6, chapters: [], characterSpans: [], functionRuns: [], subjectSpans: [], openPromises: [], assetSpans: [], fingerprint: "f" });
     expect(text).toContain("没有可用的跨章序列证据");
   });
 });
@@ -140,3 +156,4 @@ describe("learning cross-chapter aggregation prompt (L3)", () => {
     expect(prompt).toContain("返回 no-shared-learning");
   });
 });
+

@@ -31,6 +31,7 @@ import type {
   CreativeRunPolicy,
   CreativeWorkKind,
   NovelIntent,
+  MemoryClaim,
   SkillExecutionPoint,
 } from "../protocol";
 import { startNovelBootstrap } from "../application/bootstrap";
@@ -40,8 +41,11 @@ import { DEFAULT_ARTIFACT_LIST_LIMIT, DEFAULT_WORKFLOW_LIST_LIMIT } from "./tool
 import { startStoryArcBatchPlanning, startStoryArcOrchestratedPlanning, startStoryArcPlanning, startStoryArcReview } from "../application/story-arc-workflow";
 import { parseCreativeBrief } from "../application/creative-brief";
 import { generateChapterScriptH3, submitExternalChapterScriptH3 } from "../application/chapter-script-h3";
-import { generateShortScriptH3, submitExternalShortScriptH3, brainstormShortScriptWonders } from "../application/short-script-h3";
 import { ContentObjectStore } from "../object-store";
+import { locateEvidenceParagraphs } from "../evidence-check";
+import { CHAPTER_CHANGE_SCOPES } from "../prompts/chapter-review";
+import { buildMemoryGroomingReport } from "../memory-grooming";
+import type { ModelPurpose } from "../model-purposes";
 import { createConfiguredSkillProvider, resolveStageSkillBundle, renderSkillInstruction, SKILL_EXECUTION_POLICIES } from "../skill-runtime";
 import {
   createCreativeRun,
@@ -64,6 +68,7 @@ import {
   rollbackCraftRuleCandidate,
   type CraftRuleScopeAnalysis,
 } from "../craft-rule";
+import { describePromptPatchFormatWarning } from "../craft-rule/prompt-patch";
 
 // ===== 辅助：类型断言 =====
 
@@ -146,9 +151,10 @@ async function signalReviewSubmitted(ctx: ToolContext, workItemId: string): Prom
     // 信号名 "reviewSubmitted" 与 workflows.ts reviewSubmittedSignal 定义对齐;
     // payload 为单个 workItemId 字符串(defineSignal<[string]>)。
     await handle.signal("reviewSubmitted", workItemId);
-  } catch {
+  } catch (error) {
     // workflow 已结束/不可达,或 work item 不存在——review 落库已成功,信号失败不阻塞。
-    // TODO P2: 结构化日志记录 signal 失败,便于排查 manual-gate 死锁。
+    // OR-E1（product-audit-20260910 E6）禁裸吞：降级须可从日志追溯（manual-gate 死锁排查面）。
+    console.warn(`[novel-v2.mcp] reviewSubmitted-signal degraded: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
@@ -523,7 +529,10 @@ const novel_rule_candidate_create: ToolHandler = async (args, ctx) => {
   const candidate = await createCraftRuleCandidate(ctx.repository, {
     projectId, targetKind, targetId, afterText, rationale, scope,
   });
-  return { candidate };
+  // afterText 格式兼容性告警（2026-09-11 实证）：多执行点 skill 快照 + 纯文本
+  // afterText 会在 promote 时整体覆盖 drafting 段——创建时即提示，避免僵尸候选。
+  const formatWarning = describePromptPatchFormatWarning(candidate.beforeText, afterText);
+  return { candidate, ...(formatWarning ? { formatWarning } : {}) };
 };
 
 const novel_rule_candidate_get: ToolHandler = async (args, ctx) => {
@@ -722,7 +731,8 @@ const novel_story_arc_start: ToolHandler = async (args, ctx) => {
   const projectId = asString(args.projectId);
   if (!projectId) throw new Error("projectId 必填");
   if (!ctx.temporal) throw new Error("novel_story_arc_start 需要 Temporal");
-  return startStoryArcPlanning(ctx.repository, ctx.temporal, { projectId, mode: "mcp", authorIntent: asString(args.authorIntent) || undefined, taskQueue: ctx.taskQueue });
+  // arcId 传入时重生成既有弧（底层自动 rebase 判定），缺省创建下一顺序弧。
+  return startStoryArcPlanning(ctx.repository, ctx.temporal, { projectId, arcId: asString(args.arcId) || undefined, mode: "mcp", authorIntent: asString(args.authorIntent) || undefined, taskQueue: ctx.taskQueue });
 };
 
 const novel_story_arc_get: ToolHandler = async (args, ctx) => {
@@ -730,6 +740,42 @@ const novel_story_arc_get: ToolHandler = async (args, ctx) => {
   const arcId = asString(args.arcId);
   if (!projectId) throw new Error("projectId 必填");
   return arcId ? { arc: await ctx.repository.getStoryArc(projectId, arcId) } : { arcs: await ctx.repository.listStoryArcs(projectId) };
+};
+
+/**
+ * 伏笔账本分流（弧6 收口实践抓出的工具缺口）：health 的 foreshadowing-overdue 告警
+ * 一直指示作者"兑现/改写窗口/放弃"三选一，但兑现走正文账、后两者全系统无通道，
+ * 告警在指挥作者做不存在的操作。list 给分流决策所需的三态视图（含 overdue 同源判定），
+ * triage 只写终局决定：abandon（open 消费面出局）与 rewrite-window（只动窗口不动埋设账），
+ * 两者都必须带 reason（审计），逐条幂等 skip 不炸整批。
+ */
+const novel_foreshadowing_list: ToolHandler = async (args, ctx) => {
+  const projectId = asString(args.projectId);
+  if (!projectId) throw new Error("projectId 必填且非空");
+  const status = asString(args.status) || "open";
+  if (!["open", "fulfilled", "abandoned", "all"].includes(status)) throw new Error("status 必须是 open/fulfilled/abandoned/all");
+  const limit = args.limit === undefined ? undefined : Number(args.limit);
+  if (limit !== undefined && (!Number.isInteger(limit) || limit < 1 || limit > 400)) throw new Error("limit 必须是 1..400 的整数");
+  const rows = await ctx.repository.listForeshadowingForTriage(projectId, { status: status as "open", ...(limit ? { limit } : {}) });
+  return { projectId, status, count: rows.length, foreshadowings: rows };
+};
+
+const novel_foreshadowing_triage: ToolHandler = async (args, ctx) => {
+  const projectId = asString(args.projectId);
+  const actorId = asString(args.actorId);
+  if (!projectId || !actorId) throw new Error("projectId/actorId 必填且非空");
+  if (!Array.isArray(args.entries) || !args.entries.length) throw new Error("entries 必须是非空数组");
+  const entries: Array<{ id: string; action: "abandon" | "rewrite-window"; reason: string; windowFrom?: number; windowTo?: number }> = [];
+  for (const raw of args.entries as unknown[]) {
+    if (!raw || typeof raw !== "object") throw new Error("entries 每项必须是对象");
+    const e = raw as Record<string, unknown>;
+    const id = asString(e.id); const action = asString(e.action); const reason = asString(e.reason);
+    if (!id) throw new Error("entries 每项必须含 id");
+    if (action !== "abandon" && action !== "rewrite-window") throw new Error("action 只能是 abandon/rewrite-window（兑现走正文 payoffs，不经此门）");
+    if (!reason.trim()) throw new Error("分流是作者终局决定，reason 必填");
+    entries.push({ id, action, reason, ...(typeof e.windowFrom === "number" ? { windowFrom: e.windowFrom } : {}), ...(typeof e.windowTo === "number" ? { windowTo: e.windowTo } : {}) });
+  }
+  return ctx.repository.triageForeshadowing({ projectId, actorId, entries });
 };
 
 const novel_story_arc_review: ToolHandler = async (args, ctx) => {
@@ -749,6 +795,45 @@ const novel_story_arc_review: ToolHandler = async (args, ctx) => {
     reviewPolicy: reviewPolicy as "manual" | "auto" | undefined,
     taskQueue: ctx.taskQueue,
   });
+};
+
+/**
+ * 故事弧人工门决策（弧6 实践批补齐与章节门 novel_chapter_review_decision 的平权）：
+ * manual 策略的规划门此前只有 REST 批准通道，审核 verdict=revise 时 approve 被
+ * repository 正当拒绝而外部编排者没有任何可交修订指令的入口（唯一出路=放弃重建，
+ * 销毁已过审核周期的蓝图）。decision=approve 复用 REST 同一落库+信号链路；
+ * decision=revise 把作者指令送进等待中的门（无活动门时显式拒绝，不静默丢失）。
+ */
+const novel_story_arc_decision: ToolHandler = async (args, ctx) => {
+  const projectId = asString(args.projectId);
+  const arcId = asString(args.arcId);
+  const decision = asString(args.decision);
+  if (!projectId || !arcId) throw new Error("projectId/arcId 必填且非空");
+  if (decision !== "approve" && decision !== "revise") throw new Error("decision 必须是 approve 或 revise");
+  if (!ctx.temporal) throw new Error("novel_story_arc_decision 需要 Temporal");
+  const workflow = await ctx.repository.getStoryArcWorkflow(projectId, arcId);
+  const gateActive = Boolean(workflow && ["accepted", "running", "manual-review-required"].includes(workflow.status));
+  const feedback = asString(args.feedback);
+  if (decision === "revise") {
+    if (!feedback.trim()) throw new Error("revise 必须携带 feedback 修订指令");
+    if (!gateActive) throw new Error("当前没有等待作者决策的故事弧工作流，修订指令无处投递");
+    await ctx.temporal.workflow.getHandle(workflow!.temporalWorkflowId).signal("storyArcApproved", { decision: "revise", feedback, arcId });
+    return { accepted: true, decision, workflowId: workflow!.temporalWorkflowId, stage: "revision" };
+  }
+  const preview = await ctx.repository.previewStoryArcApproval(projectId, arcId);
+  // 信号优先：storyArcPlanningWorkflow 的 manual 分支在 condition(() => approved)
+  // 解除后自己调用 approveStoryArcAutomatically 落库——REST 入口（web 路径）正是
+  // 这个顺序。若先就地落库，工作流醒来的第二次 approve 必撞"当前状态不可批准"
+  // （2026-09-12 弧6 实践批：MCP 首用即 failed，修订环作者批准被误报成工作流失败）。
+  // 活动门在，交由工作流落库；无活动门（工作流崩溃/放弃后补批）才直接落库兜底。
+  if (gateActive) {
+    await ctx.temporal.workflow.getHandle(workflow!.temporalWorkflowId).signal("storyArcApproved", { arcId, artifactId: preview.artifactId });
+    return { accepted: true, decision, arcId, workflowId: workflow!.temporalWorkflowId, approvedBy: "story-arc-workflow" };
+  }
+  const reviewArtifactId = typeof workflow?.payload.reviewArtifactId === "string" ? workflow.payload.reviewArtifactId : undefined;
+  if (!reviewArtifactId) throw new Error("故事弧缺少当前蓝图的审核证据，请先完成审核");
+  const approval = await ctx.repository.approveStoryArc(projectId, arcId, preview.artifactId, reviewArtifactId, asString(args.actorId) || "mcp-author");
+  return { accepted: true, decision, arcId, planningStatus: approval.arc?.planningStatus, executionStatus: approval.arc?.executionStatus };
 };
 
 const novel_story_arc_batch_start: ToolHandler = async (args, ctx) => {
@@ -823,13 +908,19 @@ const novel_chapter_generate: ToolHandler = async (args, ctx) => {
     const document = await ctx.repository.findNextPlannedArcDocument(projectId);
     if (!document) throw new Error("没有已批准故事弧中的待创作章节，请先完成故事弧规划和审核");
     targetDocumentId = document.id;
-  } else {
+  } else if (args.reprocess !== true) {
     // 生成与重审是互斥生命周期；仓储层同时按 status/current revision 防御陈旧蓝图投影。
+    // reprocess=true 为定稿整章重出通道（ch51 双通道证伪后定案）：绕过 planned-only 闸门，
+    // 但下游 draft→三审→门→commit 全链与幂等/基线守卫一律不变，旧正式稿批准前不动。
     await ctx.repository.assertChapterGenerationAllowed(projectId, targetDocumentId);
   }
   await ctx.repository.getChapterPlanningContext(projectId, targetDocumentId);
 
   // 3. 创建 NovelIntent:target.kind="chapter" 触发 classify 返回 drafting
+  const changeScope = asString(args.changeScope) || undefined;
+  if (changeScope && !CHAPTER_CHANGE_SCOPES.includes(changeScope as (typeof CHAPTER_CHANGE_SCOPES)[number])) {
+    throw new Error(`changeScope 必须为 ${CHAPTER_CHANGE_SCOPES.join("/")}`);
+  }
   const intent: NovelIntent = {
     id: randomUUID(),
     projectId,
@@ -837,6 +928,8 @@ const novel_chapter_generate: ToolHandler = async (args, ctx) => {
     objective: instruction || `生成章节正文(${targetDocumentId})`,
     target: { kind: "chapter", id: targetDocumentId },
     constraints: instruction ? [instruction] : undefined,
+    reprocess: args.reprocess === true || undefined,
+    changeScope: changeScope as NovelIntent["changeScope"],
     createdAt: Date.now(),
     idempotencyKey,
   };
@@ -855,7 +948,7 @@ const novel_chapter_generate: ToolHandler = async (args, ctx) => {
   });
   const handle = await ctx.temporal.workflow.start("novelIntentWorkflow", {
     args: [stored, workflowId],
-    taskQueue: ctx.taskQueue ?? "novel-v2",
+    taskQueue: ctx.taskQueue ?? "creative-studio-novel-v2",
     workflowId,
   });
 
@@ -904,7 +997,7 @@ const novel_chapter_review: ToolHandler = async (args, ctx) => {
   await ctx.repository.putWorkflowRun({ id: workflowId, workflowType: "chapter-review", projectId, temporalWorkflowId: workflowId, status: "accepted", payload: { documentId, instruction, idempotencyKey, mode, targetIssueIds: mode === "targeted" ? targetIssueIds : [] } });
   let handle;
   try {
-    handle = await ctx.temporal.workflow.start("chapterReviewWorkflow", { args: [params], taskQueue: ctx.taskQueue ?? "novel-v2", workflowId });
+    handle = await ctx.temporal.workflow.start("chapterReviewWorkflow", { args: [params], taskQueue: ctx.taskQueue ?? "creative-studio-novel-v2", workflowId });
   } catch (error) {
     // accepted 记录会被单文档与项目级审校查询视为活跃；若 start 失败而记录
     // 悬挂，该章节乃至整个项目的审校启动都会被永久阻塞（工作流从未运行，
@@ -922,10 +1015,10 @@ const novel_chapter_review_issue_add: ToolHandler = async (args, ctx) => {
   const title = asString(args.title);
   if (!projectId || !documentId || !severity || !title) throw new Error("projectId/documentId/severity/title 必填且非空");
   if (severity !== "blocker" && severity !== "major" && severity !== "warning") throw new Error("severity 必须是 blocker/major/warning");
-  const paragraph = asNumber(args.paragraph);
+  let paragraph = asNumber(args.paragraph);
   if (paragraph !== undefined && (!Number.isInteger(paragraph) || paragraph < 1)) throw new Error("paragraph 必须是正整数");
   const rawRanges = args.revisionRanges;
-  const revisionRanges = Array.isArray(rawRanges)
+  let revisionRanges = Array.isArray(rawRanges)
     ? rawRanges.map((range) => {
         if (!range || typeof range !== "object" || Array.isArray(range)) throw new Error("revisionRanges 每项必须是 {start,end} 对象");
         const start = asNumber((range as Record<string, unknown>).start);
@@ -935,6 +1028,29 @@ const novel_chapter_review_issue_add: ToolHandler = async (args, ctx) => {
       })
     : undefined;
   if (revisionRanges?.length && paragraph !== undefined) throw new Error("paragraph 与 revisionRanges 不能同时提供，使用 revisionRanges 表达多段落范围");
+  // 段落号自动定位（2026-09-08）：用 evidenceQuote 反查正文中全部命中段落，校正
+  // 编辑器行号/非空行序错位（实证：ch15 定向修订因行号 vs 段落号错位放置到无关段落）。
+  // 定位成功时 paragraph 与 revisionRanges 一律以定位结果为准；无法定位时保留调用方传入值。
+  let locatedNote: string | undefined;
+  try {
+    {
+      const content = await ctx.repository.getFinalDocumentContentRef(projectId, documentId);
+      const evidenceQuote = asString(args.evidenceQuote) || title;
+      if (content?.objectKey && ctx.objects) {
+        const plainText = await ctx.objects.getText(content.objectKey);
+        const located = locateEvidenceParagraphs(plainText, evidenceQuote);
+        if (located.length) {
+          const before = JSON.stringify({ paragraph, revisionRanges });
+          paragraph = located[0];
+          revisionRanges = located.map((value) => ({ start: value, end: value }));
+          locatedNote = `段落号自动定位：${before} → paragraph=${paragraph}, revisionRanges=${JSON.stringify(revisionRanges)}`;
+        }
+      }
+    }
+  } catch (error) { /* 定位失败不阻塞登记，保留调用方传入值 */
+    // OR-E1 禁裸吞：自动定位降级留痕（审查者需知道传的是手填值而非定位值）。
+    console.warn(`[novel-v2.mcp] issue-paragraph-locator degraded: ${error instanceof Error ? error.message : String(error)}`);
+  }
   const issue = await ctx.repository.addChapterReviewIssue({
     projectId,
     documentId,
@@ -946,7 +1062,131 @@ const novel_chapter_review_issue_add: ToolHandler = async (args, ctx) => {
     revisionRanges,
     suggestion: asString(args.suggestion) || undefined,
   });
-  return { issue };
+  return { issue, ...(locatedNote ? { locatedNote } : {}) };
+};
+
+// ===== 外部 LLM 深度参与：上下文查询与子 agent 调度（5，2026-09-08）=====
+
+const novel_memory_query: ToolHandler = async (args, ctx) => {
+  const projectId = asString(args.projectId);
+  if (!projectId) throw new Error("projectId 必填且非空");
+  const documentId = asString(args.documentId) || undefined;
+  const compact = args.compact === true;
+  const narrativeCutoff = asNumber(args.narrativeCutoff);
+  const targetNarrativeOrder = documentId ? await ctx.repository.getDocumentNarrativeOrder(projectId, documentId) : undefined;
+  const cutoff = narrativeCutoff ?? (targetNarrativeOrder !== undefined && targetNarrativeOrder > 1 ? targetNarrativeOrder - 1 : undefined);
+  const serialContext = cutoff !== undefined && documentId ? await ctx.repository.getSerialContextSnapshot(projectId, documentId, cutoff) : undefined;
+  const memories = await ctx.repository.getChapterMemories({ projectId, narrativeCutoff: cutoff, limit: 8 });
+  const claims = await ctx.repository.getOpenForeshadowingAndPromises(projectId, cutoff);
+  if (compact) {
+    return {
+      narrativeCutoff: cutoff ?? null,
+      chapterMemories: memories.map((m) => ({ id: m.id, summary: m.summary.slice(0, 200), range: m.narrativeRange })),
+      openForeshadowings: claims.foreshadowings.map((f) => ({ id: f.id, description: f.description.slice(0, 100) })),
+      openPromises: claims.promises.map((p) => ({ id: p.id, statement: p.statement.slice(0, 100) })),
+      serialContextSummary: serialContext ? { window: serialContext.window, characterSpanCount: serialContext.characterSpans.length, subjectSpanCount: serialContext.subjectSpans.length, openPromiseCount: serialContext.openPromises?.length ?? 0, assetSpanCount: serialContext.assetSpans?.length ?? 0 } : null,
+    };
+  }
+  return { narrativeCutoff: cutoff ?? null, chapterMemories: memories, openForeshadowings: claims.foreshadowings, openPromises: claims.promises, serialContext: serialContext ?? null };
+};
+
+const novel_memory_grooming_report: ToolHandler = async (args, ctx) => {
+  const projectId = asString(args.projectId);
+  if (!projectId) throw new Error("projectId 必填且非空");
+  // 只读诊断投影（memory-governance-audit-20260909 §5.5）：机械层只做槽位分组与
+  // 近重复候选排序，等价判定与退役执行由外部审核意见 + 作者确认走既有 claim 生命周期。
+  return await buildMemoryGroomingReport(ctx.repository.pool, projectId);
+};
+
+const novel_fact_candidate_queue: ToolHandler = async (args, ctx) => {
+  const projectId = asString(args.projectId);
+  if (!projectId) throw new Error("projectId 必填且非空");
+  // A3/FM-2：候选队列一等公民化——积压面板让编排者看见债务，配合 decide 工具形成闭环。
+  return await ctx.repository.getFactCandidateBacklog(projectId);
+};
+
+const novel_fact_candidate_decide: ToolHandler = async (args, ctx) => {
+  const projectId = asString(args.projectId);
+  const claimIds = Array.isArray(args.claimIds) ? args.claimIds.filter((value): value is string => typeof value === "string" && value.length > 0) : [];
+  const decision = args.decision === "approve" || args.decision === "reject" ? args.decision : undefined;
+  const reason = asString(args.reason);
+  if (!projectId || !claimIds.length || !decision || !reason) throw new Error("projectId/claimIds/decision/reason 必填且非空");
+  const actorId = asString(args.actorId) || "mcp-orchestrator";
+  const results: Array<{ claimId: string; status: "decided" | "skipped" | "failed"; authority?: string; error?: string }> = [];
+  const approvedClaims: MemoryClaim[] = [];
+  for (const claimId of claimIds) {
+    try {
+      const outcome = await ctx.repository.decideFactCandidate({ projectId, claimId, actorId, decision, reason });
+      results.push({ claimId, status: "decided", authority: outcome.authority });
+      if (decision === "approve") {
+        const claim = await ctx.repository.getMemoryClaimById(projectId, claimId);
+        if (claim) approvedClaims.push(claim);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      // 已处理视为幂等跳过（批量重放不报错）；其余失败逐条上报，不中断整批。
+      if (message.includes("已处理")) results.push({ claimId, status: "skipped" });
+      else results.push({ claimId, status: "failed", error: message });
+    }
+  }
+  // 向量层同步（与 workflow approveFactClaims 同一契约）：approve 写入新点并按
+  // supersedes 删除被退役点；reject 防御性删除（候选通常不在库中）。
+  let vectorSyncError: string | undefined;
+  if (ctx.memoryIndex) {
+    try {
+      if (approvedClaims.length) await ctx.memoryIndex.upsertClaims(projectId, approvedClaims);
+      const rejectedIds = results.filter((item) => item.status === "decided" && item.authority === "rejected").map((item) => item.claimId);
+      if (rejectedIds.length) await ctx.memoryIndex.deleteClaims?.(projectId, rejectedIds);
+    } catch (error) {
+      vectorSyncError = error instanceof Error ? error.message : String(error);
+    }
+  }
+  return { decision, actorId, indexed: Boolean(ctx.memoryIndex), ...(vectorSyncError ? { vectorSyncError } : {}), results };
+};
+
+const novel_skill_query: ToolHandler = async (args, ctx) => {
+  const projectId = asString(args.projectId);
+  const executionPoint = asString(args.executionPoint);
+  const role = asString(args.role) || undefined;
+  if (!projectId || !executionPoint) throw new Error("projectId/executionPoint 必填且非空");
+  const bundle = await resolveStageSkillBundle({ projectId, executionPoint: executionPoint as SkillExecutionPoint, role, provider: createConfiguredSkillProvider({ source: process.env.NODE_ENV === "production" ? "database" : "workspace", databaseList: (id) => ctx.repository.listSkills(id) }) });
+  return { executionPoint, resolution: bundle.resolution, fingerprint: bundle.fingerprint, skills: bundle.skills.map((skill) => ({ skillId: skill.skillId, version: skill.version, priority: skill.priority, sourceRef: skill.sourceRef, contentFingerprint: skill.contentFingerprint, promptSections: skill.promptSections })) };
+};
+
+const novel_prompt_inspect: ToolHandler = async (args, ctx) => {
+  const workflowId = asString(args.workflowId);
+  const taskId = asString(args.taskId);
+  if (!workflowId || !taskId) throw new Error("workflowId/taskId 必填且非空");
+  const invocations = await ctx.repository.pool.query(
+    `SELECT task_id, purpose, provider_label, model, candidate_index, status, provider_input_tokens, provider_output_tokens, latency_ms, error_category, left(error_message, 300) AS error_message, created_at FROM model_invocations WHERE workflow_run_id=$1 AND task_id=$2 ORDER BY created_at DESC`,
+    [workflowId, taskId],
+  );
+  if (!invocations.rowCount) throw new Error("未找到该 taskId 的模型调用");
+  return { workflowId, taskId, invocations: invocations.rows };
+};
+
+const novel_invocation_list: ToolHandler = async (args, ctx) => {
+  const projectId = asString(args.projectId);
+  const workflowId = asString(args.workflowId) || undefined;
+  const limit = asNumber(args.limit) ?? 20;
+  if (!projectId) throw new Error("projectId 必填且非空");
+  const invocations = await ctx.repository.pool.query(
+    `SELECT mi.task_id, mi.purpose, mi.provider_label, mi.model, mi.candidate_index, mi.status, mi.provider_input_tokens, mi.provider_output_tokens, mi.latency_ms, mi.error_category, left(mi.error_message, 200) AS error_message, mi.created_at FROM model_invocations mi WHERE mi.project_id=$1 ${workflowId ? "AND mi.workflow_run_id=$2" : ""} ORDER BY mi.created_at DESC LIMIT ${Math.min(Math.max(1, limit), 100)}`,
+    workflowId ? [projectId, workflowId] : [projectId],
+  );
+  return { projectId, workflowId: workflowId ?? null, invocations: invocations.rows };
+};
+
+const novel_model_dispatch: ToolHandler = async (args, ctx) => {
+  const purpose = asString(args.purpose);
+  const prompt = asString(args.prompt);
+  const system = asString(args.system) || undefined;
+  const maxTokens = asNumber(args.maxTokens) ?? 32768;
+  if (!purpose || !prompt) throw new Error("purpose/prompt 必填且非空");
+  if (!ctx.model) throw new Error("novel_model_dispatch 需要 ToolContext.model");
+  if (!["writing.draft", "writing.revision"].includes(purpose)) throw new Error("purpose 白名单限制为 writing.draft / writing.revision");
+  const result = await ctx.model.generateText({ purpose: purpose as ModelPurpose, system, prompt, maxTokens, promptContext: { source: "external-dispatch", purpose } as never });
+  return { purpose, text: result.text, modelProvenance: result.provenance ?? null };
 };
 
 // ===== 评估闭环（1，v2 新增）=====
@@ -1005,9 +1245,10 @@ const novel_workflow_get: ToolHandler = async (args, ctx) => {
         status: info.status.name,
         closeTime: info.closeTime?.toISOString(),
       };
-    } catch {
+    } catch (error) {
       // Temporal 不可达或 workflow 不存在——temporal 留空，仅返回 DB 状态。
-      // TODO P2: 结构化日志记录 describe 失败，便于排查 Temporal 连通性。
+      // OR-E1 禁裸吞：降级留痕，Temporal 连通性排查从日志起步。
+      console.warn(`[novel-v2.mcp] workflow-describe degraded: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
@@ -1054,12 +1295,14 @@ const novel_chapter_review_decision: ToolHandler = async (args, ctx) => {
   const revisionBase = args.revisionBase === "previous" ? "previous" : args.revisionBase === "current" ? "current" : undefined;
 
   // 1. 创建 approval evidence 并抢占决策锁（同一 artifact 只能提交一次决策）
+  // actorId 允许编排者署名（审计真实性）；actorSource 保持 interactive-web 语义 =
+  // "作者代理通道"，repository 对 automation 来源的批准限制不受影响。
   const claimed = await ctx.repository.claimApprovalEvidence({
     workflowId,
     artifactId,
     decision,
     actorSource: "interactive-web",
-    actorId: "web-author",
+    actorId: asString(args.actorId) || "web-author",
     feedback,
     revisionBase,
   });
@@ -1122,6 +1365,38 @@ const novel_context_get: ToolHandler = async (args, ctx) => {
     planningFeedback: planning.planningFeedback ?? [],
     plotOutline: planning.plotOutline ?? null,
   };
+  // 外部 LLM 深度参与增强（2026-09-08）：序列证据 + 最近模型调用摘要。
+  // OR-E1（product-audit-20260910 E6）：两块增强独立降级并把失败显式记入 enhancementErrors[]——
+  // 此前合并成单个裸 catch 全吞，坏 SQL（不存在的列）曾借此"恒静默丢字段"长期无人发现。
+  const enhancementErrors: string[] = [];
+  try {
+    const maxOrder = await ctx.repository.pool.query("SELECT max(narrative_order)::int AS max_order FROM manuscript_documents WHERE project_id=$1", [projectId]);
+    const maxO = maxOrder.rows[0]?.max_order;
+    if (maxO !== null && maxO !== undefined && maxO > 1) {
+      const serialContext = await ctx.repository.getSerialContextSnapshot(projectId, "", maxO);
+      if (serialContext) {
+        all.serialContext = {
+          window: serialContext.window,
+          openPromises: serialContext.openPromises ?? [],
+          assetSpans: (serialContext.assetSpans ?? []).slice(0, 8),
+          characterSpans: serialContext.characterSpans.slice(0, 5),
+          subjectSpans: serialContext.subjectSpans.slice(0, 8),
+        };
+      }
+    }
+  } catch (error) {
+    enhancementErrors.push(`serialContext: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  try {
+    const recentInvocations = await ctx.repository.pool.query(
+      `SELECT purpose, model, status, provider_input_tokens, provider_output_tokens, latency_ms, error_category, created_at FROM model_invocations WHERE project_id=$1 ORDER BY created_at DESC LIMIT 5`,
+      [projectId],
+    );
+    all.recentModelInvocations = recentInvocations.rows;
+  } catch (error) {
+    enhancementErrors.push(`recentModelInvocations: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (enhancementErrors.length) all.enhancementErrors = enhancementErrors;
   if (!sections?.length) return all;
 
   const allowed = new Set(["foundation", "recent-chapters", "narrative-state", "open-elements", "planning-feedback"]);
@@ -1222,98 +1497,6 @@ const novel_chapter_script_h3: ToolHandler = async (args, ctx) => {
 };
 
 /**
- * 从核心创意生成简短短剧脚本提示词（MiniMax H3 Ref2VA）。
- *
- * 设计依据：创作支撑层基线 —— 无定稿正文依赖的独立创作派生物，不走 Temporal
- * 工作流，也不进正文质量门；skill 指引经 short.script 执行点解析后注入系统提示；
- * 与章节剧本共用六段式片段契约与结构特征校验。
- */
-const novel_short_script_h3: ToolHandler = async (args, ctx) => {
-  const idea = asString(args.idea);
-  if (!idea) throw new Error("idea 必填且非空");
-  if (!ctx.model) throw new Error("novel_short_script_h3 需要 ToolContext.model（LLM 网关）");
-  const projectId = asString(args.projectId) || undefined;
-
-  const targetDurationSecondsRaw = args.targetDurationSeconds;
-  const targetDurationSeconds = typeof targetDurationSecondsRaw === "number" && Number.isFinite(targetDurationSecondsRaw)
-    ? Math.round(targetDurationSecondsRaw)
-    : undefined;
-  const record = await generateShortScriptH3(
-    {
-      projectId,
-      idea,
-      instruction: asString(args.instruction) || undefined,
-      ...(targetDurationSeconds !== undefined ? { targetDurationSeconds } : {}),
-    },
-    {
-      repository: ctx.repository,
-      objects: new ContentObjectStore(),
-      model: ctx.model,
-      skillProvider: createConfiguredSkillProvider({ databaseList: (pid) => ctx.repository.listSkills(pid) }),
-    },
-  );
-
-  return {
-    projectId: record.projectId,
-    scriptId: record.scriptId,
-    sourceFingerprint: record.sourceFingerprint,
-    reused: record.reused ?? false,
-    mode: "ref2va",
-    targetDurationSeconds: record.targetDurationSeconds,
-    plotBeats: record.plotBeats,
-    cinematicHints: record.cinematicHints,
-    characterBaselines: record.characters,
-    segments: record.segments.map((segment) => ({
-      index: segment.index,
-      title: segment.title,
-      synopsis: segment.synopsis,
-      durationSeconds: segment.durationSeconds,
-      promptText: segment.promptText,
-    })),
-    nextAction: "把各片段 promptText 直接送入 MiniMax H3；短剧产物存储于 short_scripts 独立表（不依赖小说项目），可通过 REST GET /v2/short-script-h3/:scriptId 读取",
-  };
-};
-
-/**
- * 开放创意方向 → N 个截然不同的具体奇观候选（创意发散，不生成脚本、不落库）。
- *
- * 设计依据：开放命题直接喂给 novel_short_script_h3 时模型会塌缩到默认母题
- * （东方仙侠+云上→倒悬巨钟）。本工具在正式生成前先让模型以「创意策划」视角穷举
- * N 个彼此明显不同的可拍奇观，每个候选 wonder 已是可直接喂给 novel_short_script_h3
- * 的 idea 字符串；编排者挑定其一后再生成。属「外部编排者给方向」层的创意发散。
- */
-const novel_short_script_h3_brainstorm: ToolHandler = async (args, ctx) => {
-  const idea = asString(args.idea);
-  if (!idea) throw new Error("idea 必填且非空");
-  if (!ctx.model) throw new Error("novel_short_script_h3_brainstorm 需要 ToolContext.model（LLM 网关）");
-
-  const countRaw = args.count;
-  const count = typeof countRaw === "number" && Number.isFinite(countRaw) ? Math.round(countRaw) : undefined;
-  const targetDurationSecondsRaw = args.targetDurationSeconds;
-  const targetDurationSeconds = typeof targetDurationSecondsRaw === "number" && Number.isFinite(targetDurationSecondsRaw)
-    ? Math.round(targetDurationSecondsRaw)
-    : undefined;
-  const instruction = asString(args.instruction) || undefined;
-
-  const result = await brainstormShortScriptWonders(
-    { idea, count, targetDurationSeconds, instruction },
-    { model: ctx.model },
-  );
-
-  return {
-    idea: result.idea,
-    count: result.count,
-    candidates: result.candidates.map((candidate, index) => ({
-      index: index + 1,
-      wonder: candidate.wonder,
-      why: candidate.why,
-      nextAction: "挑定一个候选后调用 novel_short_script_h3(idea=candidate.wonder, targetDurationSeconds?) 生成完整脚本",
-    })),
-    note: `本工具只做创意发散，不生成脚本、不落库；候选数 = ${result.count}`,
-  };
-};
-
-/**
  * 读取指定执行点的已解析 Skill 指引文本（通用）。
  *
  * 设计依据：支持外部 MCP 接手短剧内容产出——先读 skill 拿到 h3-video-prompt
@@ -1340,8 +1523,9 @@ const novel_skill_get: ToolHandler = async (args, ctx) => {
       version: descriptor.version,
       executionPoints: (descriptor.executionPoints ?? []).map(String),
     }));
-  } catch {
-    // provider 源不可用时忽略发现，仅影响 availableSkills 完整性。
+  } catch (error) {
+    // provider 源不可用时忽略发现，仅影响 availableSkills 完整性。OR-E1 禁裸吞：降级留痕。
+    console.warn(`[novel-v2.mcp] skill-discovery degraded: ${error instanceof Error ? error.message : String(error)}`);
   }
 
   try {
@@ -1363,7 +1547,7 @@ const novel_skill_get: ToolHandler = async (args, ctx) => {
       })),
       resolution: bundle.resolution,
       availableSkills,
-      nextAction: "将 skillText 作为外部 MCP 创作短剧脚本的方法论，按核心创意与时长参数产出模型形态 JSON，再用 novel_short_script_h3_submit / novel_chapter_script_h3_submit 落库",
+      nextAction: "将 skillText 作为外部 MCP 创作章节派生短剧脚本的方法论，按核心创意与时长参数产出模型形态 JSON，再用 novel_chapter_script_h3_submit 落库（独立短剧已改浏览器本地存储，无外部落库工具）",
     };
   } catch (error) {
     return {
@@ -1374,64 +1558,6 @@ const novel_skill_get: ToolHandler = async (args, ctx) => {
       note: `该执行点暂无可用 skill：${(error as Error)?.message ?? String(error)}；可用执行点见 availableSkills[].executionPoints`,
     };
   }
-};
-
-/**
- * 外部 MCP 接手短剧内容产出（核心创意路径）。
- *
- * 设计依据：与 novel_short_script_h3（系统内部生成）互为双轨。外部 MCP 自行产出
- * 模型形态剧本 JSON 后提交，系统复用 normalizeChapterScriptOutput 零阻断组装 +
- * 落库；短剧脚本是正文只读派生，不进正文质量门，故允许外部产出（mcp-orchestrator
- * 外部编排「治理与产出解耦」原则在该派生产物上的放宽为可读）。
- */
-const novel_short_script_h3_submit: ToolHandler = async (args, ctx) => {
-  const idea = asString(args.idea);
-  if (!idea) throw new Error("idea 必填且非空");
-  const payload = asRecord(args.payload);
-  if (!payload) throw new Error("payload 必填（外部 MCP 产出的模型形态剧本 JSON）");
-  if (!Array.isArray(payload.segments) || !payload.segments.length) {
-    throw new Error("payload.segments 必填且非空");
-  }
-  const projectId = asString(args.projectId) || undefined;
-  const targetDurationSecondsRaw = args.targetDurationSeconds;
-  const targetDurationSeconds = typeof targetDurationSecondsRaw === "number" && Number.isFinite(targetDurationSecondsRaw)
-    ? Math.round(targetDurationSecondsRaw)
-    : undefined;
-
-  const record = await submitExternalShortScriptH3(
-    {
-      projectId,
-      idea,
-      instruction: asString(args.instruction) || undefined,
-      ...(targetDurationSeconds !== undefined ? { targetDurationSeconds } : {}),
-      payload: { plotBeats: payload.plotBeats, characters: payload.characters, segments: payload.segments },
-    },
-    {
-      repository: ctx.repository,
-      objects: new ContentObjectStore(),
-    },
-  );
-
-  return {
-    projectId: record.projectId,
-    scriptId: record.scriptId,
-    sourceFingerprint: record.sourceFingerprint,
-    reused: record.reused ?? false,
-    origin: "external",
-    mode: "ref2va",
-    targetDurationSeconds: record.targetDurationSeconds,
-    plotBeats: record.plotBeats,
-    cinematicHints: record.cinematicHints,
-    characterBaselines: record.characters,
-    segments: record.segments.map((segment) => ({
-      index: segment.index,
-      title: segment.title,
-      synopsis: segment.synopsis,
-      durationSeconds: segment.durationSeconds,
-      promptText: segment.promptText,
-    })),
-    nextAction: "把各片段 promptText 直接送入 MiniMax H3；本产物由外部 MCP 产出（origin=external），存储于 short_scripts 独立表",
-  };
 };
 
 /**
@@ -1525,17 +1651,17 @@ export const TOOL_HANDLERS: Record<string, ToolHandler> = {
   novel_chapter_review_issue_add,
   novel_chapter_generate,
   novel_chapter_script_h3,
-  novel_short_script_h3,
-  novel_short_script_h3_brainstorm,
   novel_story_arc_start,
   novel_story_arc_get,
   novel_story_arc_review,
+  novel_story_arc_decision,
+  novel_foreshadowing_list,
+  novel_foreshadowing_triage,
   novel_story_arc_batch_start,
   novel_story_arc_orchestrate,
 
-  // 外部产出与 Skill 读取（3，v2 新增）
+  // 外部产出与 Skill 读取（2，v2 新增）
   novel_skill_get,
-  novel_short_script_h3_submit,
   novel_chapter_script_h3_submit,
 
   // 评估闭环（1）
@@ -1551,4 +1677,14 @@ export const TOOL_HANDLERS: Record<string, ToolHandler> = {
   // 上下文与产物查询（2，新增）
   novel_context_get,
   novel_artifact_list,
+
+  // 外部 LLM 深度参与：上下文查询与子 agent 调度（6，2026-09-08；梳理报告 2026-09-09）
+  novel_memory_query,
+  novel_memory_grooming_report,
+  novel_fact_candidate_queue,
+  novel_fact_candidate_decide,
+  novel_skill_query,
+  novel_prompt_inspect,
+  novel_invocation_list,
+  novel_model_dispatch,
 };

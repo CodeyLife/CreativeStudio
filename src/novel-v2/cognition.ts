@@ -15,6 +15,7 @@ import type {
   BlueprintTask,
 } from "./protocol";
 import type { ChapterPlanningContext } from "./application/story-arc";
+import { CHAPTER_CHANGE_SCOPES } from "./prompts/chapter-review";
 import { canonicalSha256 } from "./canonical-json";
 
 export { createConfiguredSkillProvider, createDatabaseSkillProvider, createWorkspaceSkillProvider, renderSkillInstruction, resolveStageSkillBundle, skillPromptSection } from "./skill-runtime";
@@ -134,11 +135,24 @@ export function createPreflightPlan(intent: NovelIntent, snapshot: PreflightProj
   if (!intent.objective.trim()) throw new Error("创作目标不能为空");
   const taskClass = classify(intent);
   const facets = facetsFor(intent, snapshot, taskClass);
+  // E4 changeScope 归一化：缺省 = narrative（现行为，零回归）；非法值显式拒绝，
+  // 防拼写错误静默落入最宽评审面之外的档位。
+  if (intent.changeScope !== undefined && !CHAPTER_CHANGE_SCOPES.includes(intent.changeScope)) {
+    throw new Error(`changeScope 非法：${intent.changeScope}（可用：${CHAPTER_CHANGE_SCOPES.join("/")}）`);
+  }
+  const changeScope = intent.changeScope ?? "narrative";
+  // E4 语义守卫（最低共享层=纯 plan 函数，REST/MCP/workflow 全部入口经此归一）：
+  // changeScope 只对正文生成/修订（评审面所在链路）有意义；规划、复盘等非正文
+  // taskClass 拒绝"用机械档跑规划"这类无意义组合——收窄评审面对象不存在的层。
+  if (changeScope !== "narrative" && taskClass !== "drafting" && taskClass !== "revision") {
+    throw new Error(`changeScope=${changeScope} 仅适用于 drafting/revision，当前 taskClass=${taskClass}`);
+  }
   return {
     id: `preflight:${intent.id}`,
     intentId: intent.id,
     projectId: intent.projectId,
     taskClass,
+    changeScope,
     stage: intent.requestedStage ?? (taskClass === "review" ? "review" : taskClass === "revision" ? "revision" : taskClass === "drafting" ? "drafting" : "planning"),
     targetDocumentId: intent.target?.id ?? snapshot.targetDocumentId,
     // drafting on an existing final document is an explicit fresh-generation
@@ -189,8 +203,22 @@ export function computeTokenBudget(taskClass: PreflightPlan["taskClass"], totalC
   const HARD_LIMIT = 128_000;
   if (taskClass !== "drafting" && taskClass !== "revision") return DEFAULT_BUDGET;
   if (totalChapters === undefined) return DEFAULT_BUDGET;
+  // 根因修复（2026-09-16 ch125 顶穿实证：必要上下文 118.8K，旧阶梯 50→96K、200→128K
+  // 之间的整数台阶会让"约每 25 章顶穿一次"反复发生，被迫靠 revision 硬下限抬数字续命）。
+  // 改为按章数在 [50,200] 区间对 [96K,128K] 线性插值——预算随记忆面自然增长曲线连续放宽，
+  // 不再制造可预见的天花板。200+ 保持 HARD_LIMIT 封顶（模型窗口实证上限）；50 以下仍 64K
+  // （早期章节记忆面小，保持"早期紧凑"哲学）。边界：插值仅在 50-200 生效，跨题材按章数
+  // 通用，不识别具体书/章/角色。
   if (totalChapters >= 200) return HARD_LIMIT;
-  if (totalChapters >= 50) return 96_000;
+  if (totalChapters >= 50) {
+    const ratio = (totalChapters - 50) / (200 - 50);
+    const interpolated = Math.round((96_000 + ratio * (HARD_LIMIT - 96_000)) / 1000) * 1000;
+    // 钳位（2026-09-16 ch130 三次顶穿实战定案）：draft 包=记忆+技能+规划上下文+指令，
+    // 实测非记忆段 ≈25.4K、窗内可用输入 ≈124.6K → 记忆段真实上限 ≈99K。
+    // 取 98K 留 1K 余量；检索本按相关度降序，被裁的是长尾最弱命中。
+    // TODO: 应升级为按实际渲染段动态测量，而非静态偶数（同 staging 预算配置化）。
+    return Math.min(interpolated, 98_000);
+  }
   return 64_000;
 }
 
@@ -237,12 +265,24 @@ export async function buildMemoryBundle(plan: PreflightPlan, input: { projectId:
   const ordered = [...deduplicated.values()].sort(compareCandidates);
   let spent = 0;
   const selected = new Map<string, { claim: MemoryHit; reason: MemorySelectionReceipt["reason"] }>();
+  // 同 identity 槽位配额（memory-governance-audit-20260909 §5.3.3）：
+  // 每个身份槽位（identityHash 相同的主体+谓词组合）最多入选 MAX_PER_IDENTITY_SLOT 条，
+  // 防止单一槽位（如主角"知晓"账本）以数量垄断 ranked-fill 预算。pinned/required 选择
+  // 先于配额参与占位——硬上下文不受配额阻断，但同槽位后续条目为它们让位。
+  const MAX_PER_IDENTITY_SLOT = 3; // TODO: move into runtime configuration (magic value: per-slot claim quota)
+  const slotCounts = new Map<string, number>();
+  const quotaExcluded = new Set<string>();
+  const countSlot = (claim: MemoryHit): void => {
+    if (!claim.identityHash) return;
+    slotCounts.set(claim.identityHash, (slotCounts.get(claim.identityHash) ?? 0) + 1);
+  };
   const select = (claim: MemoryHit, reason: MemorySelectionReceipt["reason"]): boolean => {
     if (selected.has(claim.id)) return true;
     const cost = estimateTokens(`${claim.title}\n${claim.content}`);
     if (spent + cost > tokenBudget) return false;
     spent += cost;
     selected.set(claim.id, { claim, reason });
+    countSlot(claim);
     return true;
   };
   const pinned = ordered.filter((candidate) => pinnedIds.has(candidate.id));
@@ -265,10 +305,19 @@ export async function buildMemoryBundle(plan: PreflightPlan, input: { projectId:
       throw new Error(`必要记忆 facet ${facet} 超过记忆预算：${candidate.id} 需要约 ${cost} tokens，已使用 ${spent}/${tokenBudget}。请提高预算或压缩必要上下文，不能静默丢弃 required-facet 内容。`);
     }
   }
-  for (const claim of ordered) select(claim, "ranked-fill");
+  for (const claim of ordered) {
+    if (selected.has(claim.id)) continue;
+    if (claim.identityHash && (slotCounts.get(claim.identityHash) ?? 0) >= MAX_PER_IDENTITY_SLOT) {
+      quotaExcluded.add(claim.id);
+      continue;
+    }
+    select(claim, "ranked-fill");
+  }
   const budgeted = [...selected.values()].map(({ claim }) => claim);
   for (const { claim, reason } of selected.values()) receipts.push(selectionReceipt(claim, "included", reason));
-  for (const claim of ordered.filter((candidate) => !selected.has(candidate.id))) receipts.push(selectionReceipt(claim, "excluded", "budget"));
+  for (const claim of ordered.filter((candidate) => !selected.has(candidate.id))) {
+    receipts.push(selectionReceipt(claim, "excluded", quotaExcluded.has(claim.id) ? "identity-slot-quota" : "budget"));
+  }
   const found = new Set(budgeted.flatMap(matchedFacetsOf));
   const missingFacets = [...required].filter((facet) => !found.has(facet));
   const sourceRevisionIds = [...new Set(budgeted.flatMap((claim) => claim.sourceRevisionIds))];
@@ -359,7 +408,7 @@ export async function resolveSkillBundle(plan: PreflightPlan, memory: MemoryBund
   return resolveSkillBundleForTask({ ...input, taskClasses: [plan.taskClass], preflightId: plan.id, memory }, now);
 }
 
-export function compileExecutionBlueprint(intent: NovelIntent, plan: PreflightPlan, memory: MemoryBundle, skills: SkillBundle, snapshot: PreflightProjectSnapshot, context?: ContextManifest, foundationArtifacts?: Artifact[], planningContext?: ChapterPlanningContext, now = Date.now()): ExecutionBlueprint {
+export function compileExecutionBlueprint(intent: NovelIntent, plan: PreflightPlan, memory: MemoryBundle, skills: SkillBundle, snapshot: PreflightProjectSnapshot, context?: ContextManifest, foundationArtifacts?: Artifact[], planningContext?: ChapterPlanningContext, factCandidateBacklog?: { pending: number; oldestPendingDays: number | null }, now = Date.now()): ExecutionBlueprint {
   if (memory.preflightId !== plan.id || skills.preflightId !== plan.id) throw new Error("认知快照不属于当前 Preflight");
   if (context && (context.preflightId !== plan.id || context.memoryBundleId !== memory.id)) throw new Error("上下文清单不属于当前 Preflight");
   const availableFacets = new Set(memory.claims.flatMap(matchedFacetsOf));
@@ -386,6 +435,14 @@ export function compileExecutionBlueprint(intent: NovelIntent, plan: PreflightPl
         ? criticalMissingFacets
         : [];
   if (skills.conflicts.length) throw new Error("Skill 冲突，不能生成执行蓝图");
+  // 候选积压 facet（A3/FM-2，非硬门）：超阈值只标注+告警，供编排者决定是否清队列。
+  const CANDIDATE_BACKLOG_ALERT_THRESHOLD = Number(process.env.NOVEL_V2_CANDIDATE_BACKLOG_ALERT ?? "10"); // TODO: move into runtime configuration (magic value: candidate backlog alert threshold)
+  const candidateBacklog = factCandidateBacklog
+    ? { pending: factCandidateBacklog.pending, oldestPendingDays: factCandidateBacklog.oldestPendingDays, alert: factCandidateBacklog.pending >= CANDIDATE_BACKLOG_ALERT_THRESHOLD }
+    : undefined;
+  if (candidateBacklog?.alert) {
+    console.warn(`[memory-gate] 事实候选积压 ${candidateBacklog.pending} 条（最长 ${candidateBacklog.oldestPendingDays ?? "unknown"} 天）——裁决队列进入 novel_fact_candidate_queue，积压不裁决会让正式事实供给持续悬置。`);
+  }
   const retrieve: BlueprintTask = { id: `${plan.id}:retrieve`, kind: "retrieve", role: "memory-curator", dependsOn: [], readSet: memory.sourceRevisionIds, writeSet: [], queue: "memory", independentReviewRequired: false };
   const draft: BlueprintTask = { id: `${plan.id}:draft`, kind: plan.taskClass === "review" ? "review" : plan.taskClass === "revision" ? "revise" : "draft", role: plan.taskClass === "review" ? "structure-reviewer" : "writer", dependsOn: [retrieve.id], readSet: memory.sourceRevisionIds, writeSet: intent.target?.id ? [intent.target.id] : [], queue: "writer", independentReviewRequired: plan.requiresIndependentReview };
   const review: BlueprintTask = { id: `${plan.id}:review`, kind: "review", role: "quality-editor", dependsOn: [draft.id], readSet: [draft.id, ...memory.sourceRevisionIds], writeSet: [], queue: "reviewer", independentReviewRequired: true };
@@ -397,7 +454,7 @@ export function compileExecutionBlueprint(intent: NovelIntent, plan: PreflightPl
   const foundationArtifactIds = foundationArtifacts?.length ? foundationArtifacts.map((artifact) => artifact.id) : undefined;
   // memory.tokenBudget 约束检索集合；stage-context 会在此基础上为模型输出
   // 和固定 prompt 预留空间，并把 ranked-fill 记忆标成可裁剪上下文。
-  const blueprint: ExecutionBlueprint = { id: `blueprint:${intent.id}`, projectId: intent.projectId, intentId: intent.id, preflightId: plan.id, memoryBundleId: memory.id, skillBundleId: skills.id, contextManifestId: context?.id, baseRevision: snapshot.currentRevision, tasks: [retrieve, draft, review, commit], commitPolicy: plan.requiresIndependentReview ? "dual-gate" : "human-only", factApprovalMode: intent.factApprovalMode ?? "auto", budget: { maxInputTokens: memory.tokenBudget, maxOutputTokens: plan.taskClass === "drafting" || plan.taskClass === "revision" ? 16_000 : 8_000 }, memoryGate: { status: manualReviewFacets.length ? "manual-review" : "passed", missingFacets, manualReviewFacets }, foundationArtifactIds, arcId: planningContext?.arcId, chapterBlueprintId: planningContext?.chapterBlueprintId, planningContextFingerprint: planningContext?.fingerprint, fingerprint: "", createdAt: now };
+  const blueprint: ExecutionBlueprint = { id: `blueprint:${intent.id}`, projectId: intent.projectId, intentId: intent.id, preflightId: plan.id, memoryBundleId: memory.id, skillBundleId: skills.id, contextManifestId: context?.id, baseRevision: snapshot.currentRevision, tasks: [retrieve, draft, review, commit], commitPolicy: plan.requiresIndependentReview ? "dual-gate" : "human-only", factApprovalMode: intent.factApprovalMode ?? "auto", changeScope: plan.changeScope, budget: { maxInputTokens: memory.tokenBudget, maxOutputTokens: plan.taskClass === "drafting" || plan.taskClass === "revision" ? 16_000 : 8_000 }, memoryGate: { status: manualReviewFacets.length ? "manual-review" : "passed", missingFacets, manualReviewFacets, candidateBacklog }, foundationArtifactIds, arcId: planningContext?.arcId, chapterBlueprintId: planningContext?.chapterBlueprintId, planningContextFingerprint: planningContext?.fingerprint, fingerprint: "", createdAt: now };
   blueprint.fingerprint = canonicalSha256({ ...blueprint, fingerprint: undefined, createdAt: undefined });
   return blueprint;
 }

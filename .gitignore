@@ -41,3 +41,6 @@ scripts/tmp-*.mjs
 scripts/tmp-*.mts
 .tmp-novel-v2-*.log*
 .tmp-novel-v2-*.err
+
+# SK-2 路线二：晋升待审 yaml patch 工件（sidecar，审阅应用后自动删除）
+skills/**/*.promoted.yaml

@@ -81,6 +81,11 @@ function buildWritingContract(targetWordCount?: number): string {
     READER_RECONSTRUCTION_CONTRACT,
     "状态可以保持稳定；关系、理解、情绪、资源、知识或处境的细微变化同样可以构成章节完成感。",
     "视角降噪：主角的独特认知（职业思维、专业训练、天赋等）是设定——解释他为何能看出常人看不到的规律，不是叙事语言。认知优势通过观察、判断、行动与结果自然体现（如'他敏锐地发现局势中常人难以察觉的规律'），不以专业思维解说或职业黑话外显代替动作与场景。专业隐喻仅作适度点缀，每次出现须承担新的信息、选择或世界观功能；正文是普通读者可读的叙事，不是技术解说。收束段尤其禁止用专业术语堆叠确认认知收获（如以职业术语宣告任务完成、障碍清除、谜团得解）——应转译为体验层表达（首次达成的行动、走通的路、尚未参透的余韵等抽象层级的完成感）。",
+    // 2026-09-17 补（docs/novel-v2/ai-taint-diagnosis-20260917.md F3）：上一条规则查的是
+    // **词汇**（是否职业黑话/技术标签），而实测的 AI 味载体是**叙述动作**——用世界观内部
+    // 完全合法的语汇，替读者把"为什么非得这样做"论证一整段。词汇表可以全是中文且承担
+    // 世界观信息，仍读成讲解腔。因此判据必须落在动作上，与词汇表无关。
+    "叙述者不替读者论证：人物的选择、规矩或手法，其正当性由行动的过程与后果承担，不由叙述者解释'为什么要这样做'。若一段文字主要在回答'他为什么非得这样'（逐条说明某动作的必要性、某条规矩为何成立、某个数目的最优性、某处失误的机理），而不是'他正在这样做'，就把它改写为该选择被执行的现场——手、眼、物、时间、对方的反应——理由留给读者从后果中推得。判据是删除测试：删掉论证句后，读者对'人物在做什么、他为此付出什么代价'的理解没有减少，那它只是解释，不是叙事。允许制度、行话、术语作为语汇出现并承担世界观信息；本条限制的是叙述者代替人物论证这个**动作**，不是词汇表。",
     `本章目标篇幅约 ${targetWordCount ?? DEFAULT_TARGET_WORD_COUNT} 字（建议性目标：按情节完整自然展开，不因凑字或压字牺牲内容，也不设硬性上限）。`,
     "在体验自然完成的位置收束，保留必要的铺陈、内省和余波，不按固定字数、段落数量、钩子类型或节奏公式停笔。",
   ].join("\n");
@@ -102,7 +107,24 @@ export function buildChapterDraftPromptPackage(input: DraftPromptInput & { workf
     { id: "author-intent", kind: "goal" as const, title: "作者目标", text: renderIntent(input.intent), priority: "required" as const, provenanceRefs: [input.intent.id] },
     ...(input.planningContext ? [{ id: "execution-contract", kind: "planning" as const, title: "章节执行合同", text: renderChapterExecutionContract(input.planningContext), priority: "required" as const, provenanceRefs: [input.planningContext.fingerprint] }] : []),
     { id: "blueprint", kind: "blueprint" as const, title: "工作流蓝图引用", text: buildBlueprintSummary(input.blueprint, input.planningContext), priority: "normal" as const, provenanceRefs: [input.blueprint.id] },
-    ...memory.claims.map((claim) => ({ id: `memory:${claim.id}`, kind: "fact" as const, title: `冻结事实：${claim.title}`, text: renderExecutionMemoryClaim(claim).text, priority: memoryClaimPriority(memory, claim), provenanceRefs: [claim.id, ...claim.sourceRevisionIds] })),
+    ...memory.claims.filter((claim) => !claim.id.startsWith("foundation:")).map((claim) => ({ id: `memory:${claim.id}`, kind: "fact" as const, title: `冻结事实：${claim.title}`, text: renderExecutionMemoryClaim(claim).text, priority: memoryClaimPriority(memory, claim), provenanceRefs: [claim.id, ...claim.sourceRevisionIds] })),
+    // 创作契约与冻结事实分轨（product-audit-20260910 A2）：foundation 段级投影是
+    // 规划边界而非逐字事实清单，混在「冻结事实」名下会诱导把规划摘要当既定事实复述，
+    // 且以体量垄断事实预算（实测 fact token 97:3）。分轨后仍全部注入，仅归名与角色不同。
+    ...(memory.claims.some((claim) => claim.id.startsWith("foundation:")) ? [{
+      id: "creative-contract",
+      kind: "planning" as const,
+      title: "创作契约（已批准规划投影）",
+      text: [
+        "以下是已批准的全局规划投影，作为创作边界与方向承诺，不是逐字事实清单：与「冻结事实」冲突时以冻结事实为准；正文不得以任何方式违反契约中的既定规则、人物边界与终局约束，但揭示时机由章节执行合同决定。",
+        ...memory.claims.filter((claim) => claim.id.startsWith("foundation:")).map((claim) => {
+          const projected = renderExecutionMemoryClaim(claim);
+          return `- ${projected.title}: ${projected.text}`;
+        }),
+      ].join("\n"),
+      priority: "normal" as const,
+      provenanceRefs: memory.claims.filter((claim) => claim.id.startsWith("foundation:")).map((claim) => claim.id),
+    }] : []),
     ...(memory.narrativeRhythm ? [{ id: "narrative-rhythm", kind: "planning" as const, title: "连续章节位置", text: renderNarrativeRhythm(memory.narrativeRhythm), priority: "normal" as const, provenanceRefs: [memory.narrativeRhythm.fingerprint] }] : []),
     ...(memory.serialContext ? [{ id: "serial-context", kind: "planning" as const, title: "跨章序列证据", text: renderSerialContext(memory.serialContext), priority: "normal" as const, provenanceRefs: [memory.serialContext.fingerprint] }] : []),
     ...buildSkillContextSections(input.skills, "chapter.drafting", "写作 Skill"),

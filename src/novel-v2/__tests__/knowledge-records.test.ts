@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { isPostgresUnavailable } from "./test-db";
 import { randomUUID } from "node:crypto";
 import { NovelPostgresRepository } from "../postgres-repository";
 import type { Artifact, MemoryClaim } from "../protocol";
@@ -18,6 +19,7 @@ describe("V2 formal knowledge records", () => {
       await repository.ensureProject(projectId, "Knowledge Test");
       available = true;
     } catch (error) {
+      if (!isPostgresUnavailable(error)) throw error;
       console.warn(`[knowledge-records.test] Postgres 不可用，跳过集成测试: ${(error as Error).message}`);
     }
   }, 30_000);
@@ -29,7 +31,7 @@ describe("V2 formal knowledge records", () => {
     await repository.close();
   });
 
-  it("covers planning, worldview, character, relation, timeline, fact and skill CRUD through one audited boundary", async () => {
+  it("covers planning, worldview, character, relation, timeline and skill CRUD through one audited boundary", async () => {
     if (!available) return;
     const planning = await repository.upsertKnowledgeRecord(projectId, "planning", { name: "第一卷规划", payload: { objective: "建立主冲突" } });
     const worldview = await repository.upsertKnowledgeRecord(projectId, "worldview", { name: "力量规则", payload: { rule: "使用力量需要代价" } });
@@ -37,18 +39,20 @@ describe("V2 formal knowledge records", () => {
     const mentor = await repository.upsertKnowledgeRecord(projectId, "characters", { name: "导师", payload: { role: "mentor" } });
     const relation = await repository.upsertKnowledgeRecord(projectId, "relations", { subjectId: character.id, predicate: "信任", objectId: mentor.id });
     const timeline = await repository.upsertKnowledgeRecord(projectId, "timeline", { narrativeTime: 3, eventType: "discovery", content: { summary: "发现密信" } });
-    const fact = await repository.upsertKnowledgeRecord(projectId, "facts", { subjectId: character.id, predicate: "持有", objectValue: { item: "密信" }, truthStatus: "objective", confidence: 1 });
     await repository.upsertKnowledgeRecord(projectId, "skills", { id: skillId, version: "1.0.0", capabilities: ["drafting"], applicableTasks: ["drafting"], promptSections: { drafting: "保持人物知识边界。" }, enabled: true });
 
     expect((await repository.listKnowledgeRecords(projectId, "planning")).some((row) => row.id === planning.id)).toBe(true);
     expect((await repository.listKnowledgeRecords(projectId, "worldview")).some((row) => row.id === worldview.id)).toBe(true);
     expect((await repository.listKnowledgeRecords(projectId, "relations")).find((row) => row.id === relation.id)).toMatchObject({ subjectId: character.id, objectId: mentor.id });
     expect((await repository.listKnowledgeRecords(projectId, "timeline")).find((row) => row.id === timeline.id)).toMatchObject({ narrativeTime: 3, eventType: "discovery" });
-    expect((await repository.listKnowledgeRecords(projectId, "facts")).find((row) => row.id === fact.id)).toMatchObject({ subjectId: character.id, objectValue: { item: "密信" }, truthStatus: "objective" });
     expect((await repository.listKnowledgeRecords(projectId, "skills")).find((row) => row.id === skillId)).toMatchObject({ applicableTasks: ["drafting"], promptSections: { drafting: "保持人物知识边界。" } });
 
+    // The legacy facts table is a closed second source of truth: no surface may write or read it as a knowledge kind.
+    await expect(repository.upsertKnowledgeRecord(projectId, "facts" as never, { predicate: "持有" })).rejects.toThrow("facts");
+    await expect(repository.listKnowledgeRecords(projectId, "facts" as never)).rejects.toThrow("facts");
+
     const audit = await repository.pool.query("SELECT action FROM audit_records WHERE project_id=$1 AND action='knowledge.upsert'", [projectId]);
-    expect(audit.rowCount).toBeGreaterThanOrEqual(8);
+    expect(audit.rowCount).toBeGreaterThanOrEqual(7);
   });
 
   it("keeps candidate facts out of retrieval until an audited approval", async () => {

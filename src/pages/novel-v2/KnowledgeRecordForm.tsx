@@ -3,7 +3,7 @@
  *
  * 现状：KnowledgeWorkbenchPanel 用一个 TextArea 手编整条 JSON，易错且门槛高。
  * 这里用「按类型的字段 schema 注册表」驱动表单渲染：
- * - 每种知识库（planning/worldview/characters/relations/timeline/facts/skills）
+ * - 每种知识库（planning/worldview/characters/relations/timeline/claims/skills）
  *   声明自己的字段（路径/类型/选项/校验），表单据此渲染对应控件
  * - 复杂子结构（promptSections / objectValue / content）退化为「子字段级 JSON」编辑，
  *   而非整条记录 JSON —— 大幅降低出错面
@@ -17,7 +17,7 @@ import { useEffect, useRef, useState } from "react";
 import { Input, InputNumber, Select, Switch } from "antd";
 import "./knowledge-form.css";
 
-export type KnowledgeFormKind = "planning" | "worldview" | "characters" | "relations" | "timeline" | "facts" | "claims" | "skills";
+export type KnowledgeFormKind = "planning" | "worldview" | "characters" | "relations" | "timeline" | "claims" | "skills";
 
 type FieldType = "text" | "textarea" | "number" | "select" | "switch" | "stringList" | "json" | "object";
 
@@ -101,18 +101,6 @@ export const KNOWLEDGE_FORM_SCHEMA: Record<KnowledgeFormKind, FieldSchema[]> = {
     { path: "narrativeTime", label: "章节序号", type: "number", min: 1, step: 1 },
     { path: "eventType", label: "事件类型", type: "text", placeholder: "如：转折 / 揭示 / 相遇" },
     { path: "content", label: "事件内容", type: "json", span: 2, help: "结构化事件描述（JSON）" },
-  ],
-  facts: [
-    { path: "subjectId", label: "主体", type: "text", placeholder: "如：林晚" },
-    { path: "predicate", label: "谓词", type: "text", placeholder: "如：持有 / 知晓 / 位于" },
-    { path: "objectValue", label: "值", type: "json", span: 2, help: "事实的取值（可为字符串/对象 JSON）" },
-    { path: "truthStatus", label: "真值状态", type: "select", options: [
-      { value: "objective", label: "客观" },
-      { value: "belief", label: "信念" },
-      { value: "lie", label: "谎言" },
-      { value: "candidate", label: "候选" },
-    ] },
-    { path: "confidence", label: "置信度", type: "number", min: 0, max: 1, step: 0.05 },
   ],
   claims: [
     { path: "title", label: "事实标题", type: "text", span: 2, placeholder: "简洁概括这条事实" },

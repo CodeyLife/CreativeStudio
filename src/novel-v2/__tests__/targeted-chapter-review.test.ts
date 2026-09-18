@@ -338,4 +338,71 @@ describe("targeted chapter review issues", () => {
     const otherPreflight = await repository.getChapterReviewPreflight(projectId, documentId);
     expect(otherPreflight?.projectActiveReviewWorkflowId).toBe(otherWorkflowId);
   });
+
+  it("快照聚合按蓝图档位判完整（S1）：窄档两审成快照，无档位三审才算全量", async () => {
+    if (!available) return;
+    // 三件套 fixture：workflow_run → execution_blueprint（changeScope=local-text），
+    // 评审 artifact 挂 temporal_workflow_id；结构+文笔两审（裁掉的正是 character）。
+    const scopeDocId = `scoped-doc-${suffix}`;
+    const scopeWorkflowId = `scoped-review-${suffix}`;
+    const scopeArtifactId = `scoped-artifact-${suffix}`;
+    const scopeIntentId = `scoped-intent-${suffix}`;
+    const scopeFingerprint = `scoped-fp-${suffix}`;
+    const scopeHash = `scoped-hash-${suffix}`;
+    await repository.pool.query("INSERT INTO manuscript_documents(id,project_id,title,narrative_order,status) VALUES($1,$2,'档位快照章',3,'final')", [scopeDocId, projectId]);
+    await repository.pool.query("INSERT INTO content_blobs(content_hash,object_key,byte_length) VALUES($1,$2,10)", [scopeHash, `test/${scopeHash}`]);
+    await repository.pool.query("INSERT INTO artifacts(id,project_id,task_id,attempt_id,kind,content_hash,base_revision,fingerprint,payload,created_at) VALUES($1,$2,'t-scope','a-scope','chapter-draft',$3,0,$4,$5::jsonb,now())", [scopeArtifactId, projectId, scopeHash, scopeFingerprint, JSON.stringify({ workflowId: scopeWorkflowId })]);
+    await repository.putWorkflowRun({
+      id: `run-${scopeWorkflowId}`, workflowType: "chapter-generation", projectId,
+      temporalWorkflowId: scopeWorkflowId, status: "running",
+      payload: { documentId: scopeDocId, blueprintId: `eb-${suffix}`, intent: { id: scopeIntentId } },
+    });
+    // 蓝图 FK 链：intent → preflight → bundles → blueprint（与 blueprint-fallback 同法）。
+    await repository.pool.query("INSERT INTO novel_intents(id,project_id,source,objective,payload,idempotency_key) VALUES($1,$2,'chapter-generate','档位测试',$3::jsonb,$4)", [scopeIntentId, projectId, JSON.stringify({ target: { kind: "chapter", id: scopeDocId } }), `k-scope-${suffix}`]);
+    await repository.pool.query("INSERT INTO preflight_plans(id,intent_id,project_id,payload,fingerprint) VALUES($1,$2,$3,'{}'::jsonb,$4)", [`pf-${suffix}`, scopeIntentId, projectId, `pfp-${suffix}`]);
+    await repository.pool.query("INSERT INTO memory_bundles(id,project_id,preflight_id,payload,fingerprint) VALUES($1,$2,$3,'{}'::jsonb,$4)", [`mb-${suffix}`, projectId, `pf-${suffix}`, `mbf-${suffix}`]);
+    await repository.pool.query("INSERT INTO skill_bundles(id,project_id,preflight_id,payload,fingerprint) VALUES($1,$2,$3,'{}'::jsonb,$4)", [`sb-${suffix}`, projectId, `pf-${suffix}`, `sbf-${suffix}`]);
+    await repository.pool.query(
+      `INSERT INTO execution_blueprints(id,project_id,intent_id,preflight_id,memory_bundle_id,skill_bundle_id,payload,fingerprint,created_at)
+       VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,'fp-eb',now())`,
+      [`eb-${suffix}`, projectId, scopeIntentId, `pf-${suffix}`, `mb-${suffix}`, `sb-${suffix}`, JSON.stringify({ changeScope: "local-text" })],
+    );
+    for (const [role, identity] of [["structure-reviewer", "internal"], ["prose-reviewer", "independent"]] as const) {
+      await repository.pool.query(
+        "INSERT INTO reviews(id,project_id,artifact_id,reviewer_id,identity,verdict,issues,score,role,dimension_scores,artifact_fingerprint,created_at) VALUES($1,$2,$3,$4,$5,'passed','[]'::jsonb,4.0,$6,'{}'::jsonb,$7,now())",
+        [`rev-${role}-${suffix}`, projectId, scopeArtifactId, `reviewer-${role}`, identity, role, scopeFingerprint],
+      );
+    }
+    // 正向：窄档两审 → 按 local-text 期望集判完整，快照行落库。
+    expect(await repository.refreshChapterReviewSnapshot(scopeArtifactId, revisionId, "正文")).toBe(true);
+    const scoped = await repository.pool.query<{ complete: boolean; reviewer_roles: string[] }>(
+      "SELECT complete,reviewer_roles FROM chapter_review_snapshots WHERE document_id=$1", [scopeDocId],
+    );
+    expect(scoped.rows[0]).toMatchObject({ complete: true });
+    expect(scoped.rows[0].reviewer_roles).toEqual(expect.arrayContaining(["structure-reviewer", "prose-reviewer"]));
+    expect(scoped.rows[0].reviewer_roles).not.toContain("character-reviewer");
+
+    // 反例：同两审、无蓝图档位 → narrative 全量期望，character 缺席不许成快照。
+    const wideDocId = `wide-doc-${suffix}`;
+    const wideWorkflowId = `wide-review-${suffix}`;
+    const wideArtifactId = `wide-artifact-${suffix}`;
+    const wideFingerprint = `wide-fp-${suffix}`;
+    const wideHash = `wide-hash-${suffix}`;
+    await repository.pool.query("INSERT INTO manuscript_documents(id,project_id,title,narrative_order,status) VALUES($1,$2,'宽档对照章',4,'final')", [wideDocId, projectId]);
+    await repository.pool.query("INSERT INTO content_blobs(content_hash,object_key,byte_length) VALUES($1,$2,10)", [wideHash, `test/${wideHash}`]);
+    await repository.pool.query("INSERT INTO artifacts(id,project_id,task_id,attempt_id,kind,content_hash,base_revision,fingerprint,payload,created_at) VALUES($1,$2,'t-wide','a-wide','chapter-draft',$3,0,$4,$5::jsonb,now())", [wideArtifactId, projectId, wideHash, wideFingerprint, JSON.stringify({ workflowId: wideWorkflowId })]);
+    await repository.putWorkflowRun({
+      id: `run-${wideWorkflowId}`, workflowType: "chapter-generation", projectId,
+      temporalWorkflowId: wideWorkflowId, status: "running", payload: { documentId: wideDocId },
+    });
+    for (const [role, identity] of [["structure-reviewer", "internal"], ["prose-reviewer", "independent"]] as const) {
+      await repository.pool.query(
+        "INSERT INTO reviews(id,project_id,artifact_id,reviewer_id,identity,verdict,issues,score,role,dimension_scores,artifact_fingerprint,created_at) VALUES($1,$2,$3,$4,$5,'passed','[]'::jsonb,4.0,$6,'{}'::jsonb,$7,now())",
+        [`rev-wide-${role}-${suffix}`, projectId, wideArtifactId, `reviewer-${role}`, identity, role, wideFingerprint],
+      );
+    }
+    expect(await repository.refreshChapterReviewSnapshot(wideArtifactId, revisionId, "正文")).toBe(false);
+    const wideSnapshot = await repository.pool.query("SELECT 1 FROM chapter_review_snapshots WHERE document_id=$1", [wideDocId]);
+    expect(wideSnapshot.rowCount).toBe(0);
+  });
 });

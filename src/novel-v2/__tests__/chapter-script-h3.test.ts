@@ -214,6 +214,25 @@ describe("normalizeChapterScriptOutput", () => {
       expect(normalized.hints.some((hint) => /剧情节拍未被任何片段承载.*beat-memory|剧情节拍未被任何片段承载.*beat-deadline/s.test(hint))).toBe(true);
     });
 
+    it("downgrades a dialogue-kind beat carried without any spoken line to a hint (voice got no carrying time)", () => {
+      // "给语音留足时长"的观察面：节拍声明为对话交换，片段却没有任何台词。
+      const beats = [...PLOT_BEATS, { id: "beat-argue", kind: "dialogue" as const, summary: "店主与客人就赊账的来历争执" }];
+      const silentCarrier = {
+        ...courierSegment(),
+        beatIds: ["beat-argue"],
+        detailedDescription: [
+          "Live-action cinematic look.",
+          "[Shot 1] The courier faces the customer across the counter; neither of them speaks; the wall lamp flickers between them.",
+        ].join("\n"),
+      };
+      const normalized = normalizeChapterScriptOutput({ plotBeats: beats, characters: [], segments: [silentCarrier] });
+      expect(normalized.hints.some((hint) => hint.includes("承载对话节拍") && hint.includes("没有任何台词"))).toBe(true);
+      // 有台词承载同一 dialogue 节拍则不提示
+      const voiced = { ...courierSegment(), beatIds: ["beat-argue"] };
+      const voicedNormalized = normalizeChapterScriptOutput({ plotBeats: beats, characters: [], segments: [voiced] });
+      expect(voicedNormalized.hints.some((hint) => hint.includes("承载对话节拍"))).toBe(false);
+    });
+
     it("downgrades unknown beatId references and empty beat lists to hints", () => {
       const ghost = normalizeChapterScriptOutput({ ...validScript(), segments: [{ ...courierSegment(), beatIds: ["beat-ghost"] }, memoryCarrierSegment()] });
       expect(ghost.hints.some((hint) => hint.includes("不存在的节拍 beat-ghost"))).toBe(true);
@@ -417,6 +436,71 @@ describe("影视镜头语言提示（cinematicHints，提示级）", () => {
     };
     expect(computeCinematicHints([{ ...cinematic, index: 1, promptText: "" }])).toEqual([]);
   });
+
+  it("flags spoken dialogue whose estimated speech time exceeds the segment duration (voiceover budget observation)", () => {
+    // 根因（实测）：台词被当作免费标注，10s 片段塞入远超口播上限的台词，生成端只能截断。
+    // 口播时长按中文约 4-5 字/秒折算，超出段时长即物理不可交付，提示级观察不阻断。
+    const overloaded = {
+      ...courierSegment(10),
+      detailedDescription: [
+        "Live-action cinematic look.",
+        "[Shot 1] The courier stands in the alley and reads the label aloud under the flickering lamp.",
+        "<d>[中文] 这一段超载的台词用连续的长句反复陈述信息使得估算口播时长远远超出片段所能承载的极限时间预算需要压缩或者移交相邻片段承载。</d>",
+      ].join("\n"),
+    };
+    const hints = computeCinematicHints([{ ...overloaded, index: 1, promptText: "" }]);
+    expect(hints.some((hint) => /台词口播估算.*超出片段时长 10s/.test(hint))).toBe(true);
+  });
+
+  it("does not flag brief or dialogue-free segments as voiceover overloads (spectacle pieces stay legal)", () => {
+    const brief = {
+      ...courierSegment(10),
+      detailedDescription: [
+        "Live-action cinematic look.",
+        "[Shot 1] The courier stands in the alley and opens his empty satchel in silence.",
+        "<d>[中文] 包裹不见了。</d>",
+      ].join("\n"),
+    };
+    expect(computeCinematicHints([{ ...brief, index: 1, promptText: "" }]).some((hint) => hint.includes("台词口播估算"))).toBe(false);
+    const silent = {
+      ...courierSegment(10),
+      detailedDescription: "[Shot 1] The camera drifts across the rain-glossed alley while water drips off the lamp housing.",
+    };
+    expect(computeCinematicHints([{ ...silent, index: 1, promptText: "" }]).some((hint) => hint.includes("台词口播估算"))).toBe(false);
+  });
+
+  it("flags segments whose per-shot average falls below the camera-time budget (shot-time observation)", () => {
+    // "给镜头留足时长"的观察面：10s 切 4 镜单镜平均 2.5s，动作与运镜没有时间展开。
+    const cramped = {
+      ...courierSegment(10),
+      detailedDescription: [
+        "Live-action cinematic look.",
+        "[Shot 1] The courier steps in from the left and lifts the satchel flap.",
+        "[Shot 2] At 00:02.500, the shot cuts to a close-up of his calloused palms.",
+        "[Shot 3] At 00:05.000, the shot cuts to the empty satchel interior.",
+        "[Shot 4] At 00:07.500, the shot cuts back to his frowning face.",
+      ].join("\n"),
+    };
+    expect(computeCinematicHints([{ ...cramped, index: 1, promptText: "" }]).some((hint) => /单镜平均 2\.5s 低于 3s/.test(hint))).toBe(true);
+  });
+
+  it("keeps single-take and comfortably-paced segments outside the shot-time observation", () => {
+    const singleTake = {
+      ...courierSegment(12),
+      detailedDescription: "[Shot 1] The camera drifts across the rain-glossed alley while the courier checks his satchel in one sustained take.",
+    };
+    expect(computeCinematicHints([{ ...singleTake, index: 1, promptText: "" }]).some((hint) => hint.includes("单镜平均"))).toBe(false);
+    const paced = {
+      ...courierSegment(12),
+      detailedDescription: [
+        "Live-action cinematic look.",
+        "[Shot 1] The courier stands in the alley and lifts the satchel flap.",
+        "[Shot 2] At 00:05.000, the shot cuts to a close-up of his frowning face under the lamp.",
+        "[Shot 3] At 00:09.000, the shot cuts to the empty satchel interior.",
+      ].join("\n"),
+    };
+    expect(computeCinematicHints([{ ...paced, index: 1, promptText: "" }]).some((hint) => hint.includes("单镜平均"))).toBe(false);
+  });
 });
 
 describe("buildChapterScriptCharacterDigests / buildChapterScriptPrompt", () => {
@@ -492,9 +576,20 @@ describe("buildChapterScriptCharacterDigests / buildChapterScriptPrompt", () => 
       "构图设计",
       "色彩设计",
       "反平庸默认态",
+      // v1.8.0 片段时间预算分配契约（节拍层/镜头层/语音层口播守恒）
+      "片段时间预算分配",
+      "口播守恒",
+      // v1.8.1 语音预算按句自检指引 / v1.8.2 分配优先总原则
+      "以句为单位自检最可靠",
+      "分配优先（本契约的总原则）",
+      // v1.9.2 风格句契约：画幅与朝向不进提示词（比例由生成参数决定）
+      "画幅与朝向不进风格句",
     ]) {
       expect(chapter, `skill 契约缺失：${token}`).toContain(token);
     }
+    // v1.9.2 反向守卫：指引层不得再锚定任何比例数字——风格句会被逐字复用到每个片段，
+    // 指引里写进的画幅即全片每段的复读（用户反馈产物段段描述 9:16）。
+    expect(chapter).not.toMatch(/9:16|16:9|2\.39:1/);
   });
 
   it("injects the user-preset shared definitions with reuse rules when present", () => {

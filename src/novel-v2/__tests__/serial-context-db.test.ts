@@ -134,4 +134,21 @@ describe("serial context snapshot (L1)", () => {
     expect(cluster!.chapterCount).toBe(3);
     expect(cluster!.narrativeOrders).toEqual([7, 8, 9]);
   });
+
+  it("projects open promises with establishing chapter order (deadline cross-check context)", async () => {
+    if (!available) return;
+    // 两条开放承诺：一条建立于第 8 章（有章节序），一条 source_revision 指向不存在文档（孤儿，序为 null）。
+    await repository.pool.query(
+      `INSERT INTO promises(id,project_id,statement,source_revision_id,status,payload)
+       VALUES($1,$2,'三天内凑齐三块下品灵石',$3,'open',$4::jsonb),
+             ($5,$2,'孤儿承诺',NULL,'open',$4::jsonb)`,
+      [`promise-serial-${randomUUID().slice(0, 8)}`, projectId, `serial-rev-8`, { promiser: "执事", promisee: "陈渊" }, `promise-orphan-${randomUUID().slice(0, 8)}`],
+    );
+    const serial = await repository.getSerialContextSnapshot(projectId, "serial-doc-12", 12, 6);
+    expect(serial!.openPromises).toHaveLength(2);
+    const deadline = serial!.openPromises.find((item) => item.statement.includes("灵石"));
+    expect(deadline?.establishedAtOrder).toBe(8);
+    const orphan = serial!.openPromises.find((item) => item.statement.includes("孤儿"));
+    expect(orphan?.establishedAtOrder).toBeNull();
+  });
 });

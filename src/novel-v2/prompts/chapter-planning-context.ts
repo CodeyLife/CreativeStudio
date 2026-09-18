@@ -5,6 +5,15 @@ function list(items: string[], empty = "无"): string {
   return items.length ? items.map((item) => `- ${item}`).join("\n") : `- ${empty}`;
 }
 
+/**
+ * SK-11 承接口径统一（product-audit-20260910 C6）：未解清单的唯一权威读法。
+ * 单一声明源挂在 draft/review/revision 三面共用的蓝图解释器（renderChapterExecutionContract）
+ * 里，三面逐字同源；写作侧不产生"每章必须推进"的必填压力，审核侧不把它当从严承接清单，
+ * 安静章/余波章的合法消化路径显式成立。双向测试断言三面 prompt 都含本常量。
+ */
+export const UNRESOLVED_THREADS_READING_CONTRACT =
+  "章末未解清单的读法（写作与审核同一口径）：这是本章留给后续章节的冻结边界，不是逐章必须推进的承接清单。后续章节以什么方式处理——推进、保持、换视角侧写、或以安静章/余波章消化——都是合法的章节功能选择；安静章不触碰未解项不构成违例。可报告的承接问题只有两种：本章蓝图声明了承接责任而正文没有承载；或承接与冻结边界冲突（提前回答、抹平合理未知、改写既定悬置状态）。除此之外，不以“未明确承接”本身作为问题报告。";
+
 export function renderNarrativeRhythm(rhythm: NarrativeRhythmSnapshot | undefined): string {
   if (!rhythm?.chapters.length) return "- 当前没有已定稿的前序章节节奏摘要。";
   return rhythm.chapters.map((chapter) =>
@@ -41,6 +50,12 @@ export function renderSerialContext(serial: SerialContextSnapshot | undefined): 
   }
   if (serial.subjectSpans.length) {
     lines.push(`- 物件/主题跨度：${serial.subjectSpans.map((span) => `${span.subject}（第${span.narrativeOrders.join("、")}章）：${truncate(span.latestExcerpt)}`).join("；")}；同一物件/主题跨章出现是正常的，检查每次出现是否承担新选择/新因果/新信息。`);
+  }
+  if (serial.openPromises?.length) {
+    lines.push(`- 未兑现承诺/期限：${serial.openPromises.map((promise) => `${truncate(promise.statement)}（${promise.establishedAtOrder ? `建立于第${promise.establishedAtOrder}章` : "建立章未知"}）`).join("；")}；对照检查：正文对该承诺/期限的任何引用不得早于其建立章，时限与条件不得与陈述矛盾；已兑现的承诺不应仍以未决语气出现。`);
+  }
+  if (serial.assetSpans?.length) {
+    lines.push(`- 可数资产数量对照：${serial.assetSpans.slice(0, 8).map((span) => `${span.subject}（${span.entries.map((entry) => `第${entry.narrativeOrder}章=${entry.quantity}`).join("、")}）`).join("；")}；对照检查：同一实体的数量在各章间应连续一致（获得/消耗/被夺须有交代），出现无交代的增减时报连续性问题。数量为模糊量（几/些）时不参与精确对照。`);
   }
   return lines.join("\n");
 }
@@ -98,11 +113,12 @@ export function memoryClaimPriority(memory: MemoryBundle, claim: MemoryHit): Sta
  * Editorial labels are intentionally absent; only causal state and observable scene material remains.
  */
 
-/** 单章建议性目标篇幅（字符数）；蓝图可经 targetWordCount 覆盖，正文产出时作为创作指引而非硬性上限。 */
-export const DEFAULT_TARGET_WORD_COUNT = 3500;
+/** 单章建议性目标篇幅（字符数）；蓝图可经 targetWordCount 覆盖，正文产出时作为创作指引而非硬性上限。
+ *  唯一定义在 ../word-count（workflow bundle 安全叶子模块，见该文件注释），此处 re-export 兼容 prompt 侧引用。 */
+export { DEFAULT_TARGET_WORD_COUNT } from "../word-count";
+import { DEFAULT_TARGET_WORD_COUNT } from "../word-count";
 
-export function renderChapterExecutionContract(context: ChapterPlanningContext): string {
-  const chapter = context.chapter;
+export function renderChapterExecutionContract(context: ChapterPlanningContext): string {  const chapter = context.chapter;
   const projection = projectChapterForExecution(chapter);
   const scenes = projection.scenes.map((scene, index) => [
     `### 场景 ${index + 1}：${scene.title}`,
@@ -133,6 +149,10 @@ export function renderChapterExecutionContract(context: ChapterPlanningContext):
     list(projection.continuityConstraints),
     "### 章末未解",
     list(projection.unresolvedAtClose, "无"),
+    // SK-11 承接口径统一（product-audit-20260910 C6）：写作/审核/修订三面对"未解清单"
+    // 此前各读各的——reviewer 对"明确承接"从严、写作侧 skill 不禁必填，安静章易误伤。
+    // 单一权威口径挂在这三 prompt 共用的唯一蓝图解释器里，三面逐字同源，漂移即破坏测试。
+    UNRESOLVED_THREADS_READING_CONTRACT,
     "### 相邻章节位置",
     neighbors,
     "### 读者复原边界",

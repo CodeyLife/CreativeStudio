@@ -1,7 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import { finalizeChapterLifecycle, runChapterLifecycle } from "../application/chapter-lifecycle";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { buildChapterGatePayload, finalizeChapterLifecycle, runChapterLifecycle } from "../application/chapter-lifecycle";
 import { inspectManuscript, structuralReviewFromReport } from "../application/manuscript-structure";
 import type { Artifact, FactApprovalSummary, Review, ReviewIssue } from "../protocol";
+import type { ManuscriptStructuralReport } from "../application/manuscript-structure";
 
 const artifact: Artifact = {
   id: "artifact-1",
@@ -262,5 +265,88 @@ describe("runChapterLifecycle", () => {
     expect(params.review).toHaveBeenCalledTimes(1);
     expect(result.draft.artifact.id).toBe(repaired.id);
     expect(result.structuralReport.passed).toBe(true);
+  });
+});
+
+describe("篇幅欠量门口径锁（raw vs 去白计长，ch151/ch165 贴线放行根因）", () => {
+  // 根因：lifecycle 曾向 commitGate 传 raw `.length`（含空白与换行），而结构门自检与
+  // 人工验收按可见字符计——两口径实测差 10-20%，使 60% 底线被虚高满足（短稿 raw 达标、
+  // 真实字数不足仍过门）。修复=单源 countNovelCharacters（word-count 叶子模块，与
+  // draft 契约/DEFAULT_TARGET_WORD_COUNT 同住，workflow bundle 安全）。
+  // 结构面显式放行：本用例只锁「计长口径」，与段落融合/重复块等结构规则解耦
+  //（重复填充文本会触发 structural-blocker，掩盖 length 分类）。
+  const lengthParams = (text: string, targetWordCount: number) => ({
+    ...baseParams(fivePassedReviews(), []),
+    initialDraft: { artifact, text },
+    inspect: vi.fn(async () => ({
+      report: { passed: true, blockers: [], warnings: [], issues: [] } as unknown as ManuscriptStructuralReport,
+      review: review("structure", "internal", "passed", false, "structure-reviewer"),
+    })),
+    targetWordCount,
+  });
+
+  it("raw 口径达标但可见字数不足者被拦（原缺陷形态）", async () => {
+    // 每段「他走。」= 可见 2 字 + 标点/换行 3 字符：可见 1000 字、raw 2500 字符。
+    const padded = "他走。\n\n".repeat(500);
+    expect(padded.length).toBeGreaterThanOrEqual(1800); // raw 口径本会放行
+    const result = await runChapterLifecycle(lengthParams(padded, 3000));
+    expect(result.commitGate.qualityFailure).toBe("length-under-target");
+    expect(result.commitGate.passed).toBe(false);
+  });
+
+  it("可见字数达标者放行（无标点/空白可借的正文）", async () => {
+    const dense = "他走了四十七步".repeat(300); // 可见 2100 字
+    const result = await runChapterLifecycle(lengthParams(dense, 3000));
+    expect(result.commitGate.qualityFailure).toBeUndefined();
+  });
+
+  it("接线锁：lifecycle 必须用 countNovelCharacters 计长，不得回到 raw .length", () => {
+    const source = readFileSync(fileURLToPath(new URL("../application/chapter-lifecycle.ts", import.meta.url)), "utf8");
+    expect(source).toMatch(/from "\.\.\/word-count"/);
+    // 三个 commitGate 调用点全部改用同一计数源。
+    expect(source.match(/plainTextLength: countNovelCharacters\(draft\.text\)/g)?.length).toBe(3);
+    // 反例面：raw 口径不得残留（否则口径分裂复发）。
+    expect(source).not.toMatch(/plainTextLength: draft\.text\.length/);
+  });
+});
+
+describe("buildChapterGatePayload（门 payload 真值直通，弧5 编排误导根因修复）", () => {
+  const base = {
+    blueprintId: "bp-1",
+    signalCount: 2,
+    iterations: 1,
+    finalScore: 4.83,
+    draftArtifactId: "art-1",
+    commitGate: { reviewIds: ["r1", "r2"], failedReviewIds: [], missingRoles: [] },
+  };
+
+  it("作者驱动修订后的批准门保留 targeted-manuscript-approval，不被改写成质量门未过", () => {
+    const payload = buildChapterGatePayload({ ...base, commitBlocked: { reasonCode: "targeted-manuscript-approval", targetIssueCount: 3 } });
+    expect(payload.reasonCode).toBe("targeted-manuscript-approval");
+    expect(payload.targetIssueCount).toBe(3);
+    // 反例面（历史 bug）：全绿批准稿绝不允许显示为 quality-gate-not-passed。
+    expect(payload.reasonCode).not.toBe("quality-gate-not-passed");
+  });
+
+  it("无 blocked 时回落 quality-gate-not-passed；stage 一律显式覆写为 manuscript-approval", () => {
+    const fallback = buildChapterGatePayload(base);
+    expect(fallback.reasonCode).toBe("quality-gate-not-passed");
+    expect(fallback.stage).toBe("manuscript-approval");
+    // memory-coverage-incomplete 等其它语义码同样直通。
+    const memoryGate = buildChapterGatePayload({ ...base, commitBlocked: { reasonCode: "memory-coverage-incomplete", missingFacets: ["relations"] } });
+    expect(memoryGate.reasonCode).toBe("memory-coverage-incomplete");
+    expect((memoryGate.missingFacets as string[])).toEqual(["relations"]);
+    // 上一 progress 的阶段名被门 payload 覆写，不随 merge 残留误导外部读者。
+    expect(memoryGate.stage).toBe("manuscript-approval");
+  });
+
+  it("commitGate 质量分类直通 reasonCode（无拦截因时），显式拦截因仍最优先", () => {
+    const lengthGate = buildChapterGatePayload({ ...base, commitGate: { ...base.commitGate, qualityFailure: "length-under-target" } });
+    expect(lengthGate.reasonCode).toBe("length-under-target");
+    const structuralGate = buildChapterGatePayload({ ...base, commitGate: { ...base.commitGate, structuralFailure: "structural-blocker" } });
+    expect(structuralGate.reasonCode).toBe("structural-blocker");
+    // 优先级链：commitBlocked（定向/记忆覆盖等显式因）不被质量分类劫持。
+    const both = buildChapterGatePayload({ ...base, commitGate: { ...base.commitGate, qualityFailure: "length-under-target" }, commitBlocked: { reasonCode: "targeted-manuscript-approval" } });
+    expect(both.reasonCode).toBe("targeted-manuscript-approval");
   });
 });

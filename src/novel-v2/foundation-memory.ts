@@ -20,6 +20,16 @@ function compactStructuredData(value: unknown): string {
   return serialized.length <= 12_000 ? serialized : `${serialized.slice(0, 12_000)}…`;
 }
 
+/**
+ * 段级单例 claim id（product-audit-20260910 A2=PL-3+FM-6）：每个 (项目, taskKey)
+ * 在记忆层只有一个 foundation 投影行。历史 per-artifact id
+ * （`foundation:<artifactId>`）由回填行以 supersedes 退役；单例化让 Qdrant 同名
+ * 点 upsert 即物理覆盖，陈旧代际不再有机会出现在任何检索轨。
+ */
+export function foundationClaimId(projectId: string, taskKey: string): string {
+  return `foundation:${projectId}:${taskKey}`;
+}
+
 /** Projects an accepted foundation artifact into durable, derived cognition. */
 export function foundationArtifactToMemoryClaim(
   artifact: Artifact,
@@ -39,7 +49,7 @@ export function foundationArtifactToMemoryClaim(
   const contentHash = createHash("sha256").update(content).digest("hex");
 
   return {
-    id: `foundation:${artifact.id}`,
+    id: foundationClaimId(artifact.projectId, taskKey),
     projectId: artifact.projectId,
     kind: kindByTaskKey[taskKey] ?? "hierarchical",
     title: `[foundation:${taskKey}] ${title}`,

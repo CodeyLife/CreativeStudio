@@ -1,11 +1,12 @@
 import { mkdtemp, rm } from "node:fs/promises";
+import { isPostgresUnavailable } from "./test-db";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { ModelConfigStore, applyRuntimeModelOverrides } from "../model-config-store";
 import { normalizeProviderJsonSchema, RoutedModelGateway } from "../model-gateway";
 import { NovelPostgresRepository } from "../postgres-repository";
-import { ExternalMcpRequiredError, ModelRoutingConfigError, createRoutingSnapshot, resolveRoute, validateModelRoutingConfig, type ModelProviderProfile, type ModelRoutingConfig } from "../model-routing";
+import { ExternalMcpRequiredError, ModelRoutingConfigError, createRoutingSnapshot, resolveRoute, syncExternalMcpHttpStatus, validateModelRoutingConfig, type ModelProviderProfile, type ModelRoutingConfig } from "../model-routing";
 
 function profile(overrides: Partial<ModelProviderProfile> = {}): ModelProviderProfile {
   return {
@@ -31,6 +32,14 @@ const TEST_DB_URL = process.env.TEST_DATABASE_URL ?? "postgresql://ymcp:ymcp@127
 afterEach(() => vi.unstubAllGlobals());
 
 describe("model routing config", () => {
+  it("maps the external-MCP wait to 503 for synchronous paths and leaves other errors untouched", () => {
+    // 同步链路（短剧/章节剧本直出）没有外部任务物化通道：ExternalMcpRequiredError
+    // 映射 503 + 可行动文案，其余错误返回 null 由调用方按原通道处理。
+    expect(syncExternalMcpHttpStatus(new ExternalMcpRequiredError("writing.script", "snapshot-1", 1))).toBe(503);
+    expect(syncExternalMcpHttpStatus(new Error("普通错误"))).toBeNull();
+    expect(syncExternalMcpHttpStatus(undefined)).toBeNull();
+  });
+
   it("overrides only the embedding route profile base URL for the active runtime", () => {
     const next = config([
       profile({ id: "writer", capabilities: ["text"] }),
@@ -46,7 +55,7 @@ describe("model routing config", () => {
   it("supports a different model override for each vector purpose on one provider", async () => {
     const next = config(
       [profile({ id: "vectors", model: "default-model", capabilities: ["embedding", "rerank"] })],
-      [{ executor: "external-mcp" }],
+      [],
     );
     next.routes["memory.embed"] = { candidates: [{ executor: "api", profileId: "vectors", model: "embed-model" }] };
     next.routes["memory.rerank"] = { candidates: [{ executor: "api", profileId: "vectors", model: "rerank-model" }] };
@@ -132,6 +141,43 @@ describe("model routing config", () => {
     }
   });
 
+  it("strips legacy explicit external-mcp candidates when loading a config file", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ymcp-model-config-legacy-external-"));
+    const path = join(dir, "model-providers.local.yaml");
+    try {
+      await (await import("node:fs/promises")).writeFile(path, [
+        "version: 1",
+        "profiles:",
+        "  - id: primary",
+        "    label: Primary",
+        "    protocol: chat-completions",
+        "    baseUrl: https://example.test/v1",
+        "    model: writer-model",
+        "    capabilities: [text, structured, stream, embedding, rerank]",
+        "    enabled: true",
+        "routes:",
+        "  '*':",
+        "    candidates:",
+        "      - executor: api",
+        "        profileId: primary",
+        "      - executor: external-mcp",
+        "  writing.draft:",
+        "    candidates:",
+        "      - executor: external-mcp",
+      ].join("\n"), "utf8");
+      const store = new ModelConfigStore(path);
+      await store.load();
+      const loaded = store.getConfig();
+      // 剥离后 API 候选保留、显式外部候选移除；纯外部路由变为空链（纯兜底）。
+      expect(loaded.routes["*"].candidates).toEqual([{ executor: "api", profileId: "primary" }]);
+      expect(loaded.routes["writing.draft"].candidates).toEqual([]);
+      // 剥离结果必须通过新契约校验（可保存回写）。
+      expect(() => validateModelRoutingConfig(loaded)).not.toThrow();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("rejects task-chain on non-writing purposes", () => {
     const invalid = config([profile({ protocol: "responses", capabilities: ["text", "structured", "responses-continuation", "embedding", "rerank"] })]);
     invalid.routes = { "review.*": { candidates: [{ executor: "api", profileId: "primary" }], conversationPolicy: "task-chain" }, "*": { candidates: [{ executor: "api", profileId: "primary" }] } };
@@ -140,17 +186,30 @@ describe("model routing config", () => {
 
   it("allows Foundation review to use a dedicated structured route", () => {
     const next = config([profile()]);
-    next.routes["review.*"] = { candidates: [{ executor: "external-mcp" }], conversationPolicy: "stateless" };
+    next.routes["review.*"] = { candidates: [], conversationPolicy: "stateless" };
     next.routes["review.foundation"] = { candidates: [{ executor: "api", profileId: "primary" }], conversationPolicy: "stateless" };
     expect(resolveRoute(next, "review.foundation")).toEqual(next.routes["review.foundation"]);
     expect(() => validateModelRoutingConfig(next)).not.toThrow();
+  });
+
+  it("allows an empty candidate chain as the external-MCP fallback form", () => {
+    const next = config([profile()]);
+    next.routes["*"] = { candidates: [], conversationPolicy: "stateless" };
+    expect(() => validateModelRoutingConfig(next)).not.toThrow();
+  });
+
+  it("rejects explicit external-mcp candidates now that the fallback is implicit", () => {
+    const invalid = config([], [{ executor: "external-mcp" }]);
+    expect(() => validateModelRoutingConfig(invalid)).toThrow(/不允许显式 external-mcp/);
+    const chained = config([profile({ id: "a" }), profile({ id: "b" })], [{ executor: "api", profileId: "a" }, { executor: "external-mcp" }, { executor: "api", profileId: "b" }]);
+    expect(() => validateModelRoutingConfig(chained)).toThrow(/不允许显式 external-mcp/);
   });
 
   it("resolves canonical chapter review purposes through the review wildcard", () => {
     const next = config([profile()]);
     next.routes = {
       "review.*": { candidates: [{ executor: "api", profileId: "primary" }], conversationPolicy: "stateless" },
-      "*": { candidates: [{ executor: "external-mcp" }], conversationPolicy: "stateless" },
+      "*": { candidates: [], conversationPolicy: "stateless" },
     };
     expect(resolveRoute(next, "review.structure")).toEqual(next.routes["review.*"]);
     expect(resolveRoute(next, "review.prose")).toEqual(next.routes["review.*"]);
@@ -169,6 +228,7 @@ describe("model routing persistence", () => {
       await repository.migrate();
       postgresAvailable = true;
     } catch (error) {
+      if (!isPostgresUnavailable(error)) throw error;
       console.warn("[model-routing.test] Postgres 不可用，跳过持久化测试: " + (error as Error).message);
     }
   }, 30000);
@@ -177,13 +237,13 @@ describe("model routing persistence", () => {
     if (postgresAvailable && repository) await repository.close();
   });
 
-  it("persists external MCP candidates as JSONB arrays", async () => {
+  it("persists empty candidate chains (implicit external fallback) as JSONB arrays", async () => {
     if (!postgresAvailable) return;
-    const next = config([], [{ executor: "external-mcp" }]);
+    const next = config([], []);
     const snapshot = createRoutingSnapshot(next);
     await repository.projectModelRoutingConfig(next, snapshot);
     const result = await repository.pool.query("SELECT candidates FROM model_routes WHERE task_class = $1", ["*"]);
-    expect(result.rows[0].candidates).toEqual([{ executor: "external-mcp" }]);
+    expect(result.rows[0].candidates).toEqual([]);
   });
 
   it("serializes concurrent API and worker routing refreshes", async () => {
@@ -253,18 +313,20 @@ describe("RoutedModelGateway adapters", () => {
     expect(recorder).toHaveBeenLastCalledWith(expect.objectContaining({ providerInputTokens: 12, providerCachedInputTokens: 8 }));
   });
 
-  it("records the provider label and response body for failed model calls", async () => {
+  it("records the provider label and response body for failed model calls before the external fallback", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response("{\"error\":\"Insufficient Balance\"}", { status: 402 })));
     const recorder = vi.fn(async () => undefined);
     const gateway = new RoutedModelGateway(new ModelConfigStore("unused", config()), recorder);
 
-    await expect(gateway.generateText({ purpose: "review.prose", prompt: "审校正文" })).rejects.toMatchObject({ name: "NonRetryableModelTransportError" });
+    // 402 留痕后走链尾兜底：最终抛出 ExternalMcpRequiredError，且兜底位有 waiting-external 留痕。
+    await expect(gateway.generateText({ purpose: "review.prose", prompt: "审校正文" })).rejects.toBeInstanceOf(ExternalMcpRequiredError);
     expect(recorder).toHaveBeenCalledWith(expect.objectContaining({
       providerLabel: "Primary",
       model: "writer-model",
       errorCategory: "http-402",
       errorMessage: expect.stringContaining("Insufficient Balance"),
     }));
+    expect(recorder).toHaveBeenLastCalledWith(expect.objectContaining({ status: "waiting-external", executor: "external-mcp" }));
   });
 
   it("uses previous_response_id only for a configured Responses writing chain", async () => {
@@ -344,7 +406,6 @@ describe("RoutedModelGateway adapters", () => {
     vi.stubGlobal("fetch", fetchMock);
     const gateway = new RoutedModelGateway(new ModelConfigStore("unused", config(profiles, [
       { executor: "api", profileId: "empty" },
-      { executor: "external-mcp" },
       { executor: "api", profileId: "good" },
     ])));
 
@@ -355,8 +416,41 @@ describe("RoutedModelGateway adapters", () => {
     });
 
     expect(result.value).toEqual({ ok: true });
-    expect(result.provenance).toMatchObject({ candidateIndex: 2, profileId: "good", model: "good-model" });
+    expect(result.provenance).toMatchObject({ candidateIndex: 1, profileId: "good", model: "good-model" });
     expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
+  it("falls back to the implicit external-MCP tail after every API candidate fails", async () => {
+    const profiles = [profile({ id: "bad" })];
+    const fetchMock = vi.fn().mockResolvedValue(new Response("gateway unavailable", { status: 503 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const recorder = vi.fn(async () => undefined);
+    const gateway = new RoutedModelGateway(new ModelConfigStore("unused", config(profiles, [{ executor: "api", profileId: "bad" }])), recorder);
+
+    // API 候选重试耗尽后进入链尾兜底：抛 ExternalMcpRequiredError，候选位为链长（虚拟兜底位）。
+    await expect(gateway.generateText({ purpose: "writing.draft", prompt: "p", workflowRunId: "run-1", taskId: "task-1" }))
+      .rejects.toMatchObject({ name: "ExternalMcpRequiredError", candidateIndex: 1 });
+    expect(recorder).toHaveBeenLastCalledWith(expect.objectContaining({
+      purpose: "writing.draft",
+      candidateIndex: 1,
+      executor: "external-mcp",
+      status: "waiting-external",
+    }));
+  });
+
+  it("uses the implicit external-MCP tail when the candidate chain is empty", async () => {
+    vi.stubGlobal("fetch", vi.fn());
+    const recorder = vi.fn(async () => undefined);
+    const gateway = new RoutedModelGateway(new ModelConfigStore("unused", config([profile()], [])), recorder);
+
+    await expect(gateway.generateText({ purpose: "writing.draft", prompt: "p", workflowRunId: "run-1", taskId: "task-1" }))
+      .rejects.toMatchObject({ name: "ExternalMcpRequiredError", candidateIndex: 0 });
+    expect(recorder).toHaveBeenLastCalledWith(expect.objectContaining({
+      purpose: "writing.draft",
+      candidateIndex: 0,
+      executor: "external-mcp",
+      status: "waiting-external",
+    }));
   });
 
   it("counts the final prompt against the effective context budget and records the failure", async () => {
@@ -431,9 +525,9 @@ describe("RoutedModelGateway adapters", () => {
     expect(repairPrompt.length).toBeLessThan(800);
   });
 
-  it("applies route context budgets before creating an external MCP task", async () => {
-    const next = config([], [{ executor: "external-mcp" }]);
-    next.routes["*"] = { candidates: [{ executor: "external-mcp" }], maxInputTokens: 10 };
+  it("applies route context budgets before the implicit external-MCP tail fallback", async () => {
+    const next = config([], []);
+    next.routes["*"] = { candidates: [], maxInputTokens: 10 };
     const gateway = new RoutedModelGateway(new ModelConfigStore("unused", next));
     await expect(gateway.generateText({ purpose: "writing.draft", prompt: "超长正文".repeat(20) }))
       .rejects.toThrow("context-budget-exceeded");
@@ -503,33 +597,39 @@ describe("RoutedModelGateway adapters", () => {
     })).rejects.toThrow("要求覆盖 2 个文档");
   });
 
-  it("marks an exhausted retryable transport failure as non-retryable for the workflow", async () => {
+  it("marks an exhausted retryable transport failure as non-retryable when no fallback applies", async () => {
+    // memory.rerank 是向量链路：没有外部任务物化路径，兜底不适用，候选耗尽仍快速失败。
     const fetchMock = vi.fn().mockResolvedValue(new Response("gateway unavailable", { status: 503 }));
     vi.stubGlobal("fetch", fetchMock);
     const gateway = new RoutedModelGateway(new ModelConfigStore("unused", config()));
 
-    await expect(gateway.generateText({ purpose: "writing.revision", prompt: "revise" }))
-      .rejects.toMatchObject({ name: "NonRetryableModelTransportError" });
-    expect(fetchMock).toHaveBeenCalledTimes(3);
+    await expect(gateway.rerank({ purpose: "memory.rerank", query: "q", documents: ["文本"] }))
+      .rejects.toMatchObject({ name: "ModelTransportError" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("also terminates structured review calls after their transport retries are exhausted", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(new Response("gateway unavailable", { status: 503 }));
+  it("also falls back to the external-MCP tail after structured validation exhausts the chain", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ choices: [{ message: { content: "{\"wrong\":\"shape\"}" } }] }), { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);
-    const gateway = new RoutedModelGateway(new ModelConfigStore("unused", config()));
+    const recorder = vi.fn(async () => undefined);
+    const gateway = new RoutedModelGateway(new ModelConfigStore("unused", config()), recorder);
 
+    // 修复循环耗尽后 schema 校验失败 → 跳过剩余 API 候选（无）→ 链尾兜底。
     await expect(gateway.generateStructured({
       purpose: "review.prose",
       prompt: "review",
       schema: { type: "object", additionalProperties: false, required: ["verdict"], properties: { verdict: { type: "string" } } },
-    })).rejects.toMatchObject({ name: "NonRetryableModelTransportError" });
-    expect(fetchMock).toHaveBeenCalledTimes(3);
+      maxRepairAttempts: 0,
+      workflowRunId: "run-1",
+      taskId: "task-1",
+    })).rejects.toMatchObject({ name: "ExternalMcpRequiredError", candidateIndex: 1 });
+    expect(recorder).toHaveBeenLastCalledWith(expect.objectContaining({ status: "waiting-external", candidateIndex: 1 }));
   });
 
   it("does not call fetch for an external MCP route", async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
-    const gateway = new RoutedModelGateway(new ModelConfigStore("unused", config([], [{ executor: "external-mcp" }])));
+    const gateway = new RoutedModelGateway(new ModelConfigStore("unused", config([], [])));
     await expect(gateway.generateText({ purpose: "writing.draft", prompt: "p" })).rejects.toBeInstanceOf(ExternalMcpRequiredError);
     expect(fetchMock).not.toHaveBeenCalled();
   });

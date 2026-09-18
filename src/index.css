@@ -39,44 +39,250 @@ body {
 }
 
 /* ===== 设置页 =====
- * 设置包含表单和高密度路由表：表单使用可伸缩分栏，表格只在自身边界内横向滚动。
+ * 布局契约：顶部横向 Tab 分板块切换；核心设置单一 Form（forceRender 保证跨 pane 字段注册），
+ * 每个板块底部自带保存操作行；高密度路由表沿用独立保存，只在自身边界内横向滚动。
  */
 .settings-page {
-  width: min(1400px, 100%);
+  width: min(1200px, 100%);
   margin: 0 auto;
-  padding: 24px 28px 48px;
+  padding: 24px 28px 72px;
   box-sizing: border-box;
 }
 
-.settings-core-card {
-  width: 100%;
+.settings-form-flow {
+  display: flex;
+  flex-direction: column;
 }
 
+/* —— 顶部横向 Tab + 状态摘要行 —— */
+.settings-topbar {
+  display: flex;
+  align-items: flex-end;
+  gap: 18px;
+}
+
+.settings-topbar > .ant-tabs {
+  flex: 1;
+  min-width: 0;
+}
+
+.settings-tabs .ant-tabs-nav {
+  margin-bottom: 0;
+}
+
+.settings-tabs .ant-tabs-nav::before {
+  border-bottom-color: rgba(39, 39, 42, 0.9) !important;
+}
+
+.settings-tabs .ant-tabs-tab {
+  margin: 0 30px 0 0;
+  padding: 10px 2px;
+}
+
+.settings-tabs .ant-tabs-tab:last-child {
+  margin-right: 0;
+}
+
+.settings-tabs .ant-tabs-tab-btn {
+  color: #a1a1aa !important;
+  font-size: 14px;
+  font-weight: 550;
+  transition: color 0.18s ease;
+}
+
+.settings-tabs .ant-tabs-tab:hover .ant-tabs-tab-btn {
+  color: #d4d4d8 !important;
+}
+
+.settings-tabs .ant-tabs-tab-active .ant-tabs-tab-btn {
+  color: #34d399 !important;
+  font-weight: 650;
+}
+
+.settings-tabs .ant-tabs-ink-bar {
+  background: linear-gradient(90deg, #6ee7b7, #10b981);
+  box-shadow: 0 0 10px rgba(16, 185, 129, 0.5);
+}
+
+.settings-tabs .ant-tabs-tabpane {
+  padding-top: 16px;
+}
+
+.settings-tab-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.settings-tab-icon {
+  color: #71717a;
+  font-size: 15px;
+  transition: color 0.18s ease;
+}
+
+.settings-tabs .ant-tabs-tab:hover .settings-tab-icon {
+  color: #a1a1aa;
+}
+
+.settings-tabs .ant-tabs-tab-active .settings-tab-icon {
+  color: #34d399;
+}
+
+/* —— 分区面板 —— */
+.settings-panel {
+  position: relative;
+  padding: 20px 22px;
+  border: 1px solid rgba(39, 39, 42, 0.9);
+  border-radius: 12px;
+  background:
+    radial-gradient(120% 80% at 50% 0%, rgba(52, 211, 153, 0.045), transparent 46%),
+    linear-gradient(180deg, rgba(24, 24, 27, 0.88), rgba(14, 14, 17, 0.94));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+
+.settings-panel .ant-form-item {
+  margin-bottom: 16px;
+}
+
+.settings-panel > .ant-form-item:last-child,
+.settings-panel > :last-child .ant-form-item:last-child {
+  margin-bottom: 4px;
+}
+
+.settings-alert {
+  margin-bottom: 16px;
+  border-radius: 10px;
+}
+
+/* —— 分区头 —— */
+.settings-section-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.settings-section-icon {
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  flex-shrink: 0;
+  border-radius: 10px;
+  color: #34d399;
+  font-size: 17px;
+  background: rgba(16, 185, 129, 0.1);
+  border: 1px solid rgba(52, 211, 153, 0.22);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+}
+
+.settings-section-copy {
+  flex: 1;
+  min-width: 0;
+}
+
+.settings-section-copy h2 {
+  margin: 0;
+  color: #f4f4f5;
+  font-size: 16px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  line-height: 1.3;
+}
+
+.settings-section-copy p {
+  margin: 3px 0 0;
+  color: #71717a;
+  font-size: 12.5px;
+  line-height: 1.55;
+  max-width: 65ch;
+}
+
+/* —— 表单 —— */
 .settings-form-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  column-gap: 20px;
+  column-gap: 18px;
 }
 
 .settings-form-grid > .ant-form-item {
   min-width: 0;
 }
 
-.settings-form-grid-compact {
-  grid-template-columns: minmax(0, 360px);
+.settings-field-narrow {
+  max-width: 300px;
 }
 
+.settings-label-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.settings-label-action {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #34d399;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.4;
+  cursor: pointer;
+  opacity: 0.85;
+  transition: opacity 0.15s ease, color 0.15s ease;
+}
+
+.settings-label-action:hover {
+  opacity: 1;
+  color: #6ee7b7;
+}
+
+.settings-label-action:active {
+  transform: translateY(1px);
+}
+
+/* —— 板块内保存操作行 —— */
 .settings-form-actions {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 12px;
+  gap: 8px 12px;
+  margin-top: 4px;
+  padding-top: 14px;
+  border-top: 1px solid rgba(39, 39, 42, 0.9);
 }
 
+.settings-form-actions-buttons {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+/* dirty 状态占位：常驻渲染避免出现/消失时行高跳动 */
+.settings-dirty-note {
+  color: transparent;
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.4;
+  user-select: none;
+}
+
+.settings-dirty-note.is-dirty {
+  color: #fbbf24;
+  user-select: text;
+}
+
+/* —— 小说模型路由区：与分区面板同视觉语言 —— */
 .settings-routing-section {
-  margin-top: 32px;
-  padding-top: 24px;
-  border-top: 1px solid #27272a;
+  position: relative;
+  padding: 20px 22px;
+  border: 1px solid rgba(39, 39, 42, 0.9);
+  border-radius: 12px;
+  background:
+    radial-gradient(120% 80% at 50% 0%, rgba(52, 211, 153, 0.045), transparent 46%),
+    linear-gradient(180deg, rgba(24, 24, 27, 0.88), rgba(14, 14, 17, 0.94));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
 }
 
 .settings-routing-header {
@@ -95,7 +301,7 @@ body {
 }
 
 .settings-routing-table-group {
-  margin-top: 24px;
+  margin-top: 22px;
 }
 
 .settings-candidate-chain-scroll {
@@ -161,21 +367,59 @@ body {
 
 @media (max-width: 767px) {
   .settings-page {
-    padding: 20px 16px 36px;
+    padding: 20px 16px 48px;
   }
 
-  .settings-core-card .ant-card-body {
+  /* 窄屏：Tab 收进可横滑的滚动区，隐藏伸缩箭头（全部 tab 可见、无需下拉） */
+  .settings-tabs .ant-tabs-nav {
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .settings-tabs .ant-tabs-nav::-webkit-scrollbar {
+    display: none;
+  }
+
+  .settings-tabs .ant-tabs-nav-operations {
+    display: none !important;
+  }
+
+  .settings-tabs .ant-tabs-tab {
+    margin-right: 18px;
+    padding: 9px 2px;
+    white-space: nowrap;
+  }
+
+  .settings-panel,
+  .settings-routing-section {
     padding: 16px;
   }
 
-  .settings-form-grid,
-  .settings-form-grid-compact {
+  .settings-form-grid {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .settings-routing-section {
-    margin-top: 24px;
-    padding-top: 20px;
+  .settings-form-grid .ant-form-item:last-child {
+    margin-bottom: 4px;
+  }
+
+  .settings-form-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .settings-form-actions-buttons {
+    margin-left: 0;
+    width: 100%;
+  }
+
+  .settings-form-actions-buttons .ant-btn {
+    flex: 1 1 0;
+    min-width: 0;
+  }
+
+  .settings-dirty-note {
+    display: none;
   }
 
   .settings-routing-header {
@@ -625,92 +869,20 @@ body {
   border: 1px solid #3f3f46;
 }
 
-.sidebar-status-card {
-  position: relative;
-  margin: 0 12px;
-  padding: 12px 14px;
-  border-radius: 10px;
-  background:
-    linear-gradient(135deg, rgba(16, 185, 129, 0.08) 0%, rgba(255, 255, 255, 0.02) 60%),
-    rgba(15, 15, 18, 0.55);
-  backdrop-filter: blur(8px) saturate(140%);
-  -webkit-backdrop-filter: blur(8px) saturate(140%);
-  border: 1px solid rgba(39, 39, 42, 0.8);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.05),
-    0 4px 12px rgba(0, 0, 0, 0.22);
-  overflow: hidden;
-}
-.sidebar-status-card::before {
-  content: "";
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  height: 1px;
-  background: linear-gradient(90deg, transparent, rgba(52, 211, 153, 0.45), transparent);
-}
-/* 右下角细微 emerald 光晕：与"本地就绪"语义呼应 */
-.sidebar-status-card::after {
-  content: "";
-  position: absolute;
-  right: -24px;
-  bottom: -24px;
-  width: 88px;
-  height: 88px;
-  border-radius: 50%;
-  background: radial-gradient(circle, rgba(16, 185, 129, 0.14), transparent 65%);
-  filter: blur(6px);
-  pointer-events: none;
-}
-
-/* 扫描线：从左到右循环扫过，模拟"系统在监控" */
-.sidebar-status-scan {
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  left: 0;
-  width: 50%;
-  background: linear-gradient(90deg,
-    transparent 0%,
-    rgba(52, 211, 153, 0.06) 30%,
-    rgba(110, 231, 183, 0.14) 50%,
-    rgba(52, 211, 153, 0.06) 70%,
-    transparent 100%);
-  animation: status-scan 3.6s cubic-bezier(0.45, 0, 0.55, 1) infinite;
-  pointer-events: none;
-  mix-blend-mode: screen;
-}
-@keyframes status-scan {
-  0% { transform: translateX(-100%); }
-  100% { transform: translateX(200%); }
-}
-
-/* 底部底座：顶部 hairline 分隔 + 微背景，让底部"压得住" */
-.sidebar-footer {
-  flex-shrink: 0;
-  padding: 0 0 14px;
-  border-top: 1px solid rgba(39, 39, 42, 0.6);
-  background:
-    linear-gradient(180deg, rgba(16, 185, 129, 0.02) 0%, transparent 40%);
-  margin-top: 8px;
-}
-
-/* 折叠按钮：展开态为横向胶囊（图标+文字），折叠态为小圆按钮 */
+/* 折叠按钮：标题栏最右侧的纯图标方按钮（展开/折叠两态同尺寸，不显示文字） */
 .sidebar-collapse-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 6px;
-  height: 30px;
-  padding: 0 14px;
-  border-radius: 999px;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  flex-shrink: 0;
+  border-radius: 8px;
   background: linear-gradient(180deg, #1c1c1f 0%, #141416 100%);
   border: 1px solid rgba(63, 63, 70, 0.5);
   color: #71717a;
   cursor: pointer;
-  font-size: 12px;
-  font-weight: 500;
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.05),
     0 1px 3px rgba(0, 0, 0, 0.35);
@@ -742,20 +914,6 @@ body {
   flex-shrink: 0;
 }
 
-/* 折叠态：按钮变回小圆，隐藏文字 */
-.sidebar-collapsed .sidebar-collapse-btn {
-  width: 26px;
-  height: 26px;
-  padding: 0;
-}
-.sidebar-collapse-label {
-  display: inline;
-  line-height: 1;
-}
-.sidebar-collapsed .sidebar-collapse-label {
-  display: none;
-}
-
 /* 折叠态：仅显示图标，居中 */
 .sidebar-collapsed .sidebar-item {
   justify-content: center;
@@ -764,7 +922,6 @@ body {
 }
 .sidebar-collapsed .sidebar-group-label,
 .sidebar-collapsed .sidebar-item-label,
-.sidebar-collapsed .sidebar-status-card,
 .sidebar-collapsed .sidebar-brand-text {
   display: none;
 }
@@ -2642,7 +2799,6 @@ a.image-preview-img2img-button {
   .sidebar-logo-aura,
   .sidebar-item-active .sidebar-item-icon,
   .sidebar-item-sheen::before,
-  .sidebar-status-scan,
   .sidebar-active-indicator::before,
   .sidebar-active-indicator::after,
   .file-upload-trigger-paste-active {
@@ -2659,7 +2815,6 @@ a.image-preview-img2img-button {
 
   /* —— 关闭 backdrop-filter（改为实色/半透明背景，保留层次感与可读性） —— */
   .sidebar-shell,
-  .sidebar-status-card,
   .qq-group-chip,
   .result-actions,
   .image-gen-action-bar,

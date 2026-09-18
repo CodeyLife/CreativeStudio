@@ -19,6 +19,8 @@ metadata:
 
 # 小说创作 MCP 编排流程（外部大模型作为治理者）
 
+> 当前工具面：49（= 代码 `TOOL_COUNT`，由 `src/novel-v2/__tests__/mcp-tool-face-single-source.test.ts` 校验本文件与 spec 的声明）。本文出现的一切工具名都必须真实存在于注册表——外部编排者按本文行动，写到不存在的工具会直接造成调用失败与重试死循环。
+
 ## 你是谁：外部编排者
 
 系统内部模型负责**产出**（规划、蓝图、正文、审核、修订）。你负责**治理**：
@@ -34,7 +36,7 @@ metadata:
 | 推进 | novel_action_execute(work.accept/retry/recover/run.pause/resume/cancel)、novel_chapter_review_decision(approve)、novel_story_arc_batch_start |
 | 编辑 | novel_chapter_review_issue_add、novel_chapter_review(mode=targeted)、novel_chapter_review_decision(revise+feedback)、novel_action_execute(work.revise)、novel_story_arc_orchestrate |
 | 迭代优化 | novel_closed_loop_run、novel_rule_candidate_create/get、novel_rule_evidence_submit、novel_rule_foundation_evaluate、novel_rule_review_submit、novel_rule_promote、novel_rule_rollback |
-| 派生产物 | novel_chapter_script_h3（定稿章节 → MiniMax H3 Ref2VA 短剧剧本提示词）、novel_short_script_h3（核心创意 → 短剧脚本提示词，projectId 可选、可完全独立于小说项目）、novel_short_script_h3_brainstorm（开放创意方向 → N 个截然不同的具体奇观候选，创意发散不生成脚本不落库） |
+| 派生产物 | novel_chapter_script_h3（定稿章节 → MiniMax H3 Ref2VA 短剧剧本提示词）。核心创意 → 短剧脚本已不走 MCP（见阶段 2.5 的 09-17 浏览器化说明），跨引擎候选发散由编排者自行完成后逐个调 REST |
 | 查询 | novel_catalog_get、novel_context_get、novel_artifact_list、novel_story_arc_get、novel_workflow_get/list |
 
 ## 全流程各阶段
@@ -101,6 +103,12 @@ manual reviewGate 下，bootstrap 的 5 个 foundation 阶段每阶段都要走"
   状态竞态。缺作者确认不会导致 failed——workflow 会持久等待 approve（或暂停/
   取消时退出等待）。处理：模型服务恢复后 `novel_bootstrap_run` 重启
   （同项目幂等），已批准产物会被新 run 重新生成覆盖。
+- **弧批准"引用无法解析"分诊**（弧14/16 两型实证）：先查被引哈希在账真身——
+  ①存在但代际/装饰错形（`:anchor:` 双代际、`_ref_unused` 拖挂）：resolver 已有容错，
+  直接 `novel_story_arc_review` 重试即过；②账上零存在（planner 幻觉哈希）：**review
+  重试无用**（原 bundle 重审撞同一引用门禁），走 `novel_story_arc_start(arcId)` 重生
+  成新 bundle，authorIntent 明写"引用一律逐字复制台账现有 id、禁自造哈希"；
+  无 documentId 投影章节时谓词已保证走普通重生不误入 rebase。
 - **learning 记录**：review 落库后按 AGENTS.md 汇总 issue 模式；可复用机制
   沉淀走 novel_rule_candidate_create（scope 四件套）。
 
@@ -133,7 +141,8 @@ manual reviewGate 下，bootstrap 的 5 个 foundation 阶段每阶段都要走"
 **模式 A 系统自规划**：`novel_story_arc_start(projectId, authorIntent?)`
 → `novel_story_arc_get` 查看蓝图 → 审核/推进：
 - `novel_story_arc_review(projectId, arcId, reviewPolicy=manual|auto)` 恢复/重审
-- `novel_story_arc_batch_start(projectId, arcId, retryFailed?)` 推进下一批章节
+- `novel_story_arc_decision(projectId, arcId, decision, feedback?)` 人工门放行（reviewPolicy=manual 且工作流停在 manual-review-required 时）：`approve` 批准当前蓝图——**审核 verdict=revise 时会被门禁正当拒绝，不要硬批**；`revise` + feedback 把作者修订指令送进等待中的门，系统合并审核意见走定向修订→重审→再入门（feedback 写"改什么、怎么改、不许动什么"三件套，点名蓝图字段与不许消费的边界）
+- `novel_story_arc_batch_start(projectId, arcId, retryFailed?)` 推进下一批章节。**批次窗口由系统分配**：单批章数 = 弧内剩余未规划章数（上限 16），prompt 注入、内部/外部提交守卫与修订面同契约，外部编排方提交 chapters bundle 时章数必须恰等于该窗口——多与少都会被拒绝进审核，不要按"少出几章更稳"自行缩窗
 
 **模式 B 外部编排（你提供剧情编排，系统完善）**：
 
@@ -167,6 +176,24 @@ novel_chapter_review_decision(workflowId, artifactId, decision, feedback?, revis
 ```
 
 作为编辑者的正确做法：
+0. `novel_chapter_generate` 不带 documentId 时自动选弧内最早 planned 章——**instruction 必须
+   与该章匹配**：先确认选章结果（返回体 documentId 与章号）或显式传 documentId，再把指令投出
+   （2026-09-12 实证：编排者把 ch39 观测章指令投给自动选中的 ch38 服丹章，候选稿撞蓝图被审校
+   拦进门，reject→重出一次收敛——错在自己时 reject 通道同样有效，作废理由写进 feedback 留审计）。
+   0b. **生成指令标准四件**（弧12 实证：七章全零门直通，指令质量=门停靠率的唯一变量）：
+    0c. **串行时序两戒**（弧16 两踩实证）：①approve/带痕批准后必须轮询到该章 final 再投下一章——提交是异步链（事实提取→enrich），固定 sleep 会撞'正式稿基线已变化'竞态整 run 报废；②显式 documentId 不豁免①：前章未落定时投新 run 同样吃基线锁——节奏=批准→轮询 final→再发。
+   ①每拍字数配额（"三大拍各≥650字"优于整章带宽——骨架稿只在无逐拍配额时出现）。
+     ①b **配额必须不等量**（2026-09-17 全量复扫确诊，docs/novel-v2/ai-taint-diagnosis-20260917.md F1）：
+     等量配额（"六段各≥550字""每段 220-280 字"）的最省力满足方式，是把每段写到配额线附近——
+     于是全章段长趋同、无长段造压也无短段落刀，读起来像工序表逐格填满（实测：141-168 的段长
+     变异系数降到全书最低 0.62，ch167 仅 0.07）。配额要写成**带重量差**的形态：给最重的一拍
+     一个显著更大的配额（如"题眼拍≥900字，其余三拍各 300-450 字"），并显式留出**独立短段**
+     （"至少两处让一句话单独成段，收刀用"）。判据是"段长有重量差"，不是"段段达标"。
+   ②outcome 可蕴含锁（凡涉他人心理/系统意图的结论，当场写明"只记行为不记心意"级
+   的合法落点，越界措辞列为禁区并给替代表述）；③机制论断视角化（世界观机制的解释
+   禁止以叙述者断言出现，给"旧规矩里有过这种改法"一类的角色内视角示例）；
+   ④动作-结论间补一拍身体过渡（推定/确认/被看见类结论前必须有落眼、停息、扫视等
+   物理证据动作——弧规划门 28 条微修的绝大多数即此型，前置一句省一轮门）。
 1. 读候选稿与三份审核：`novel_workflow_get(workflowId)` 拿 artifactId →
    `novel_artifact_get(artifactId)` 读正文与审校 issue。
 2. 追加你的意见：`novel_chapter_review_issue_add(projectId, documentId,
@@ -175,6 +202,22 @@ novel_chapter_review_decision(workflowId, artifactId, decision, feedback?, revis
 3. 定向修订：`novel_chapter_review(projectId, documentId, mode=targeted,
    targetIssueIds=[...])` 走正式修订闭环（仍是完整审核 → 事实提取 → commit）。
 4. 或者在工作流等待处 `novel_chapter_review_decision(revise, feedback, revisionBase=current|previous)`。
+   修订残留（收束区/个别措辞反复改不净是修订模型的稳定弱点，弧5 ch32/弧7 ch49/弧8 ch51
+   三实证）时，升级为**令牌级指令**：逐字引用原句 + 给出替换句全文 + 声明"其余零改动"；
+   一轮即净。分层判据（ch58 实证）：**词级/句级替换**令牌法一轮可救；**场景插入**
+   （合同要求的整拍缺失）令牌法一轮不中即别再耗——直接 reject 重出，重出指令把
+   硬指标置顶编号（A 篇幅带 B 必含场景及其在章内位置），缺失场景写"实时在场，
+   不是回忆不是暗示"。结构性漂移（分数递减+同区三轮不修）同样 reject 重出，
+   冻结账本逐日写死。令牌法两条铁律（ch64 实证）：引用原文必须**逐字**（意会式引文
+   会让修订模型静默不执行而回 accepted）；每轮结果以**目标短语在现稿中的存续计数**
+   验证，不看 accepted——修订环还有"回滚保留原候选"路径，accepted+文未变=没救到，
+   连续两轮未救到即转 approve 权衡或 reject 重出。修订动词分界（ch58/65/74/94 五例实证收口）：定向修订对**替换/删除**类指令可靠（词级句级一轮即净），对**添加/插入**类系统性不可靠（分段加料与逐字锚点插针均不落地，且易自造尾部议论引入新伤被正当回退）——需要加厚/插拍时跳过定向环，直接 reject 重出并在重出指令里逐拍配额。
+    ④b 定向环单发纪律（2026-09-16 ch102 四轮全灭实证补刀）：删除/替换类虽属可靠族，但**一个候选内多处并发**时模型只改首处并连带把目标所在整句删坏（两段双删指令、全段替换令、纯誊写令三种表述均复现同一路径依赖失败）。纪律：一处 issue 只锁一个段落一个目标；多处即拆多轮单发（每轮候选差异段=1、保留句在位双验证再批）；同章同型失败两轮即 abandon 入带痕池等重出窗口，不烧轮。
+    ⑤跨时段结构防缩骨（ch115 三稿实证：缩骨七例复盘）：指令若让模型写'三天/连续多日'的编年结构，首稿必压成目录——对策不是加字数令，是重构为**单日主场特写+其余降为晨昏短拍**（每拍给逐刻动作清单）；重出两次仍薄即改结构，第三次再 reject 是浪费。
+    ⑥反 tic 预算（2026-09-16 全语料扫描入册，防生成端再染）：每章指令默认带——对比句'不是A是B'≤2、'X息'计时词≤2、禁'这层/一层'类层语进正文（编排术语不出现在散文）、场景收梢隔章限一次格言位、明喻预算放宽为一处+允许暗喻替代（旧'比喻限两处'压枯了健康比喻——预算令要留生长空间）；身体讯族（后颈/手心/耳壳/喉结/指腹）同族每章≤2 且跨章轮换部位。
+    ⑦对手戏配额（2026-09-16 结构扫描确诊：对白密度弧8-10 崩至 1.68/千字、四章零对白——逐拍内心节目单式编排的根因）：每弧蓝图≥1/3 章必须有'非主角意志驱动的事件'进场（他人有欲望有代价地行动，不是道具）；每章指令默认含'≥2 段活对白且对白改变处境'（寒暄/复述型对白不计）；静是合法章功能但每弧至多一章纯静，写静章前先答'这章的静在跟谁说话'。
+    ⑦b 最小场景合同（ch121 实证：对白指令在缩骨稿中被整体蒸发——对白是最先被砍的'可选'形态）：凡要求对白，必须把对话写成在场锁四件套——'[对白合同] 谁（带欲望的具名差称）/为何在场（他不出现本章有损失）/≥N 轮且每轮改变处境/说完各自去哪'，并列入'缺失即拒'清单与拍配额同级；只写'加一段对话'无效。
+    ⑦c 重出无上稿（ch122 双踩实证）：reject→generate 是**从蓝图+指令全新起草**，不存在承接的上稿——'其余与上稿全保/只改X'类增量指令对重出无效（对白与角色会再蒸发）；要承接旧稿优点必须把旧稿的可保内容整段转写进新指令（自足化），或改走 gate 内 revise（有 previous draft 在场）。同一章重出两次仍薄，第三次一律走'自足全量指令'。
 5. approve 前检查：有 blocker/major 而你要 approve，必须给 feedback 理由。
 
 ### 阶段 2.5 短剧剧本提示词（章节派生与核心创意两条路径，只读派生）
@@ -182,22 +225,30 @@ novel_chapter_review_decision(workflowId, artifactId, decision, feedback?, revis
 ```
 novel_chapter_script_h3(projectId, documentId, instruction?)
   → artifacts(kind=chapter-script)，返回各片段 promptText
-novel_short_script_h3(idea, instruction?, targetDurationSeconds?, projectId?)
-  → short_scripts 独立表（projectId 缺省=独立短剧，不依赖任何小说项目）
-novel_short_script_h3_brainstorm(idea, count?, targetDurationSeconds?, instruction?)
-  → 开放创意方向穷举 N 个截然不同的具体奇观候选（创意发散，不生成脚本不落库）
+
+# 核心创意 → 短剧脚本：2026-09-17 起不在 MCP 工具面内（`novel_short_script_h3`、
+# `_brainstorm`、`_submit` 三个工具随"独立短剧改浏览器本地存储"一并移除，见
+# docs/novel-v2/workflow-map.md §8.2 末 09-17 更正条目）。现行入口是后端单个
+# stateless 端点，不走 MCP：
+#   POST /v2/short-script-h3
+#     body: idea, instruction?, durationMode?(fixed|auto), targetDurationSeconds?,
+#           projectId?, materialRefs?, avoidMotifs?
+#     → 生成即返回、不落库、不复读服务端幂等；产物与历史存浏览器 IndexedDB
+#       （src/lib/shortDramaStore.ts，按 localKey 去重）
+#     → 返回含 creativeStrategy（主引擎承诺：hookType awe/humor/conflict + subversion + signatureMoment）
 ```
 
-**候选奇观发散（novel_short_script_h3_brainstorm）**：
-- 用途：开放命题（如「设计一个云上奇观」）直接喂给 `novel_short_script_h3` 会因
-  缺主语塌缩到该题材默认母题（东方仙侠+云上→倒悬巨钟），每次同款。本工具在
-  正式生成前先让模型以「创意策划」视角穷举 N（2-6，默认 3）个彼此明显不同的
-  可拍奇观，规避该塌缩。
-- 只调模型做创意发散，**不生成脚本、不落库**；返回的每候选 `wonder` 已是可直接
-  喂给 `novel_short_script_h3` 的 `idea` 字符串，`why` 说明其相对其它候选的差异点。
-- 标准用法：先 `novel_short_script_h3_brainstorm(idea, count)` 拿候选 → 挑定其一
-  → `novel_short_script_h3(idea=candidate.wonder, targetDurationSeconds?)` 生成完整脚本。
-- 可选 `instruction` 作为穷举时的额外约束（如「避免钟类母题」）。
+**候选奇观发散（原 brainstorm 工具已移除，由编排者自行完成）**：
+- 为什么仍要做：开放命题直接喂给生成会因缺具体承诺而塌缩到该题材的默认母题
+  （同类创意每次同款、且与自己的历史作品换皮重复）。
+- 现行做法：编排者自己以「创意策划」视角穷举 N（2-6，建议 3）个彼此明显不同的
+  可拍候选，count≥3 时保证至少两候选分属不同主引擎（震撼 / 搞笑 / 剧情），每个候选
+  写清 wonder（可直接作 `idea` 的具体奇观）、主引擎标签、相对其它候选的差异点；
+  挑定后逐个调用上面的 stateless 端点。
+- 反同质：把近期已产出短剧的核心创意清单作为 `avoidMotifs` 数组随请求传入
+  （前端面 `listShortDramaRecentIdeas` 提供同一份清单）——这是差异化要求，不是内容禁用。
+- 需要精细控制节拍/结构时，编排者自行产出模型形态 JSON 后按端点契约提交；
+  原 `*_submit` 双轨不再有 MCP 工具承载。
 
 **路径 A（章节派生）**：
 - 仅适用于已有正式 revision 的 final 章节；是正文的只读派生，不走工作流、
@@ -208,16 +259,24 @@ novel_short_script_h3_brainstorm(idea, count?, targetDurationSeconds?, instructi
 - 同一定稿内容幂等复用既有产物；要重新生成先让正文重新修订产生新 revision。
 
 **路径 B（核心创意，独立于小说项目）**：
-- `idea` 写清谁/何处/什么（人物冲突或场景奇观均可，≥10 字符——创意意图
-  忠实性契约按创意文本判定类型：剧情型走冲突导向剧作模式；展示型（只描述
-  场景/世界观/氛围/视觉奇观）走视觉展示模式——空间巡游/规模递进/光影氛围
-  为节拍，禁止自行注入追击、战斗等对抗事件）；`targetDurationSeconds`
-  10-180s（默认 30s，各片段 10-15s）；`projectId` 可选——缺省为独立短剧
+- `idea` 写清谁/何处/什么（人物冲突或场景奇观均可，≥10 字符）。两层承诺并存：
+  **吸引力设计契约**（契约 v10）：产物顶层 `creativeStrategy` 承诺主引擎
+  （awe 震撼奇观 / humor 搞笑反差 / conflict 剧情冲突）+ 一处预期→反转 + 唯一
+  记忆镜头，节拍非铺垫即引爆、末段切在记忆镜头上；生成时自动注入近期产物的
+  核心创意作跨作品反同质回避清单。**创意意图忠实性契约**按创意文本判定类型：
+  剧情型走冲突导向剧作模式；展示型（只描述场景/世界观/氛围/视觉奇观或荒诞反差）
+  走视觉展示/喜剧错位模式——禁止自行注入追击、战斗等对抗事件，搞笑靠错位不靠
+  威胁）。时长两档：`durationMode` 缺省
+  `fixed` 时按 `targetDurationSeconds` 10-180s（默认 30s，各片段 10-15s）固定
+  目标时长；`durationMode="auto"` 时不限时长——总时长与片段数由模型依据创意
+  自行编排（节拍完整优先，段数硬顶 36、每段仍 10-15s），产物 `targetDurationSeconds`
+  回填实际总时长；`projectId` 可选——缺省为独立短剧
   （完全不需要小说项目），填写时产物关联该作品作衍生短剧。
 - 产物存 `short_scripts` 独立表（契约 v2），经 REST `GET /v2/short-script-h3/:scriptId`
-  读取；同作用域同创意输入幂等复用。
+  读取（详情含 creativeStrategy 回显）；同作用域同创意输入幂等复用。
 - 两条路径共享六段式结构与结构特征校验；创意模式专属指引：节拍为设计而非
-  穷举、末段切在钩子上（开场即冲突等冲突导向规则仅对剧情型创意生效）。
+  穷举、末段切在钩子/记忆镜头上（开场即冲突等冲突导向规则仅对主引擎 conflict
+  生效）。
 - 写作方法论见 h3-prompt-writing skill（SKILL.md + references/base-en.txt +
   references/ref-en.txt）；系统生成时已自动注入对应运行时 Skill 指引。
 
@@ -232,6 +291,14 @@ novel_artifact_list(projectId, kind?, workflowId?, limit?)
 
 - 编排剧情前读 narrative-state + open-elements（开放线索/伏笔/承诺）+ recent-chapters。
 - 定位审校对象时用 novel_artifact_list 拿 artifactId。
+- **弧收口伏笔对账（必做）**：`novel_foreshadowing_list(projectId, status=open, limit=400)`
+  取全量开放伏笔与 overdue 判定，逐条三选一：本弧 digest（把 id 写进编排的
+  foreshadowingRefs/phase 目标）、改窗续期（`novel_foreshadowing_triage` action=rewrite-window，
+  弧尾章之后新窗口）、放弃（action=abandon）——放弃是作者终局决定，reason 必须写"为什么
+  正文不会再承接"，不许用 rewrite-window 无限展期逃避对账（展期两次以上就该兑现或放弃）。
+  兑现不经此门：正文写出来由事实提取的 payoffs 账自动翻 fulfilled。
+  **id 必须逐字用 list 返回的全值**（存在 `:anchor:` 三段形态，截尾哈希会整批静默
+  skip）；"正文已兑现但 payoffs 漏联"的行按 abandon 出账并在 reason 里注明漏联。
 
 ### 阶段 4 学习闭环与经验沉淀
 
@@ -265,6 +332,16 @@ novel_rule_promote(candidateId) / novel_rule_rollback(candidateId)
    审核它的人按"是否覆盖失败类 + 是否误伤异构场景"判断。
 8. **编排只给方向**：不在 plotOutline 里伪造事实、替人物宣布感情结论、
    或要求提前兑现伏笔——那是审校会挡回的内容。
+9. **LLM 编排者直接参与编辑**：外部编排模型既是审核者也是编辑者，不是纯守门人。
+   对**证据明确、修法无争议**的问题（错字/标点混用、账本可查证的跨章时序矛盾、
+   与冻结契约直接冲突的违例段落），直接走完整编辑闭环：
+   `novel_chapter_review_issue_add` → `novel_chapter_review(mode=targeted)` →
+   核对候选稿实际改动 → `novel_chapter_review_decision(approve, feedback=证据链)`，
+   不必逐条请示作者；**修法涉及取舍**（剧情走向、人物命运、弧级 resolution、
+   风格偏好）时不擅自决定，登记意见并给作者选项。批准 feedback 必须写清：
+   目标达成证据、范围外遗留登记、命名漂移警告的核实结论
+   （删除引语/复述段导致的短语频次下降是常见假阳性，≠实体漂移）。
+   命名漂移警告必须人工核对后再批准或打回。
 
 ## 与创作方法论的分工
 
@@ -284,8 +361,8 @@ novel_rule_promote(candidateId) / novel_rule_rollback(candidateId)
 | 常规推进故事弧 | novel_story_arc_start → novel_story_arc_get → novel_story_arc_batch_start |
 | 生成下一章 | novel_chapter_generate |
 | 定稿章节转短剧剧本（H3 视频提示词） | novel_chapter_script_h3 → 产物 kind=chapter-script；方法论见 h3-prompt-writing skill |
-| 从核心创意直接写短剧（无需小说项目） | novel_short_script_h3 → short_scripts 独立表（projectId 可选关联作品）；REST /v2/short-script-h3 读取 |
-| 开放创意方向要多个非默认母题候选 | novel_short_script_h3_brainstorm(idea, count=3) → 穷举 N 个截然不同的具体奇观；挑定后 novel_short_script_h3(idea=candidate.wonder) 生成 |
+| 从核心创意直接写短剧（无需小说项目） | 无 MCP 工具（09-17 浏览器化移除）：`POST /v2/short-script-h3` stateless 生成，产物存浏览器 IndexedDB |
+| 开放创意方向要多个非默认母题候选 | 编排者自行穷举跨主引擎候选（见阶段 2.5「候选奇观发散」）→ 逐个带 avoidMotifs 调同一端点 |
 | 追进度 | novel_workflow_get(workflowId) |
 | 人工定稿/修订 | novel_chapter_review_decision(approve/revise/feedback) |
 | 追加编辑意见 | novel_chapter_review_issue_add → novel_chapter_review(mode=targeted) |

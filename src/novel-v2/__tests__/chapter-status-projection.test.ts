@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { NovelPostgresRepository } from "../postgres-repository";
+import { isPostgresUnavailable } from "./test-db";
 
 const TEST_DB_URL = process.env.TEST_DATABASE_URL ?? "postgresql://ymcp:ymcp@127.0.0.1:5432/ymcp_test";
 
@@ -23,6 +24,7 @@ describe("chapter status projection", () => {
       );
       available = true;
     } catch (error) {
+      if (!isPostgresUnavailable(error)) throw error; // 审核 S4：吞 schema/seed 错误=整块假绿
       console.warn(`[chapter-status-projection.test] Postgres unavailable: ${(error as Error).message}`);
     }
   }, 30_000);

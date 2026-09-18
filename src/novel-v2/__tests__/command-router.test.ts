@@ -12,6 +12,7 @@
  * - 测试跨场景 counterexample：blueprint 存在 vs 缺失，验证 prompt 路径切换
  */
 import { describe, expect, it, beforeAll, afterAll, beforeEach } from "vitest";
+import { isPostgresUnavailable } from "./test-db";
 import { randomUUID } from "node:crypto";
 import { NovelPostgresRepository } from "../postgres-repository";
 import { InMemoryModelGateway } from "../model-gateway";
@@ -57,6 +58,7 @@ describe("defaultReviewer integration", () => {
       await repository.migrate();
       postgresAvailable = true;
     } catch (error) {
+      if (!isPostgresUnavailable(error)) throw error;
       console.warn(`[command-router.test] Postgres 不可用，跳过集成测试: ${(error as Error).message}`);
     }
   }, 30000);
@@ -324,11 +326,26 @@ describe("defaultReviewer integration", () => {
        VALUES($1, $2, $3, 'generation', 'project-positioning', 'running', 'test', '{"bootstrap":true}'::jsonb, ARRAY[$4])`,
       [workItemId, runId, projectId, artifactId],
     );
-    // project_plan_sections 初始记录（status=awaiting-confirmation）
+    // project_plan_sections 初始记录（status=awaiting-confirmation）。payload 必须满足
+    // project-positioning 契约（PL-8 起批准路径强制校验，空壳 payload 会被拒绝）。
     await repository.pool.query(
       `INSERT INTO project_plan_sections(project_id, task_key, work_item_id, source_artifact_id, status, payload, edit_revision)
-       VALUES($1, 'project-positioning', $2, $3, 'awaiting-confirmation', '{}'::jsonb, 0)`,
-      [projectId, workItemId, artifactId],
+       VALUES($1, 'project-positioning', $2, $3, 'awaiting-confirmation', $4::jsonb, 0)`,
+      [projectId, workItemId, artifactId, JSON.stringify({
+        structuredData: {
+          taskKey: "project-positioning",
+          bookTitle: "计划批准测试",
+          sellingPoints: ["身份反差", "规则解谜"],
+          targetReader: "喜欢体系流与人物成长的成年读者",
+          coreConflict: "在依赖旧秩序的生存与改写规则之间选择",
+          activePressureSource: "宗门考核与资源垄断",
+          corePromise: "每阶段揭示都改变主角的处境与选择",
+          protagonistNeed: "承认自己真正想要什么",
+          centralOpposition: "维护旧秩序的既得利益者",
+          emotionalContract: { notApplicable: true, rationale: "本作情感线让位于成长主线" },
+          themeQuestion: { notApplicable: true, rationale: "主题随故事弧展开" },
+        },
+      })],
     );
 
     const result = await executeCreativeCommand(repository, {

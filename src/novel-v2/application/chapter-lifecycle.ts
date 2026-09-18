@@ -1,4 +1,5 @@
-import type { Artifact, CommitResult, FactApprovalSummary, Review, ReviewIssue, RuntimeLearningAssessmentV2 } from "../protocol";
+import type { Artifact, ChapterChangeScope, CommitResult, FactApprovalSummary, Review, ReviewIssue, RuntimeLearningAssessmentV2 } from "../protocol";
+import { countNovelCharacters } from "../word-count";
 import type { ManuscriptStructuralReport } from "./manuscript-structure";
 import { candidateQualityKey, DEFAULT_MAX_AUTO_REVISIONS, decideRevision, evaluateCommitGate, isCandidateQualityBetter } from "../temporal/revision-policy";
 
@@ -89,6 +90,10 @@ export async function runChapterLifecycle(params: {
   preserveDirectedRevisionCandidate?: boolean;
   /** P0 #1：为 true 时，若 approveFacts 返回 pending>0，则在 commit 前返回 factApprovalBlocked 交由工作流走人工审批。 */
   requireManualFactApproval?: boolean;
+  /** E4：评审面档位（commit gate 期望角色与评审执行同源收窄；缺省 = narrative 全量）。 */
+  changeScope?: ChapterChangeScope;
+  /** 蓝图声明的目标字数（系统推导的篇幅欠量下限输入；缺省=不检查）。 */
+  targetWordCount?: number;
 }): Promise<ChapterLifecycleResult> {
   let draft = params.initialDraft;
   let previousScore: number | undefined;
@@ -128,7 +133,7 @@ export async function runChapterLifecycle(params: {
         iteration: 1,
         finalScore: finalDecision.currentScore,
         structuralReport: evaluated.structuralReport,
-        commitGate: evaluateCommitGate(reviews, draft.artifact.fingerprint, evaluated.structuralReport),
+        commitGate: evaluateCommitGate(reviews, draft.artifact.fingerprint, evaluated.structuralReport, params.changeScope, { plainTextLength: countNovelCharacters(draft.text), targetWordCount: params.targetWordCount }),
         commitBlocked: { reasonCode: "targeted-manuscript-approval", targetIssueCount: params.directedRevision.issues.length },
       };
     }
@@ -169,7 +174,7 @@ export async function runChapterLifecycle(params: {
       iteration,
       finalScore: finalDecision.currentScore,
       structuralReport: evaluated.structuralReport,
-      commitGate: evaluateCommitGate(reviews, draft.artifact.fingerprint, evaluated.structuralReport),
+      commitGate: evaluateCommitGate(reviews, draft.artifact.fingerprint, evaluated.structuralReport, params.changeScope, { plainTextLength: countNovelCharacters(draft.text), targetWordCount: params.targetWordCount }),
       commitBlocked: {
         reasonCode: "targeted-manuscript-approval",
         targetIssueCount: params.directedRevision.issues.length,
@@ -225,7 +230,7 @@ export async function runChapterLifecycle(params: {
   }
 
   const finalDecision = decideRevision({ reviews, iteration, maxIterations: DEFAULT_MAX_AUTO_REVISIONS, previousScore });
-  const commitGate = evaluateCommitGate(reviews, draft.artifact.fingerprint, structuralReport);
+  const commitGate = evaluateCommitGate(reviews, draft.artifact.fingerprint, structuralReport, params.changeScope, { plainTextLength: countNovelCharacters(draft.text), targetWordCount: params.targetWordCount });
   if (params.commitBlocked) {
     // A blocked attempt is still useful learning evidence, but successful
     // chapters must only learn from the committed artifact below.
@@ -258,4 +263,41 @@ export async function runChapterLifecycle(params: {
     assessPostCommitLearning: true,
   });
   return { draft, reviews, iteration, finalScore: finalDecision.currentScore, structuralReport, commitGate, commitResult, enrichmentError };
+}
+
+/**
+ * 人工稿审批门 payload 的唯一构造点（工作流侧曾就地拼装并把
+ * targeted-manuscript-approval 改写成 quality-gate-not-passed 以"统一"看板口径，
+ * 实际是主动篡改门因：四维全过 4.83 的批准稿被读成质量门未过，弧5 编排实证
+ * 误导一次——看板过滤消费 lifecycle 层语义码，覆写两头都失真）。两条不变量：
+ * ① reasonCode 直通 lifecycle 真值，只在缺失时回落 quality-gate-not-passed；
+ * ② stage 显式覆写为 manuscript-approval——updateWorkflowStatus 的 payload 是
+ * merge 语义，不声明就会残留上一 progress 阶段名，让外部读者把批准门误读成
+ * 修订决策门。提取为纯函数的第二目的：workflow 文件在 vitest 不可驱动，
+ * 门 payload 是编排者的决策输入面，必须有双向回归。
+ */
+export function buildChapterGatePayload(input: {
+  blueprintId: string;
+  signalCount: number;
+  iterations: number;
+  finalScore: number;
+  draftArtifactId: string;
+  commitGate: { reviewIds: string[]; failedReviewIds: string[]; missingRoles: string[]; qualityFailure?: string; structuralFailure?: string };
+  commitBlocked?: { reasonCode?: string } & Record<string, unknown>;
+}): Record<string, unknown> {
+  return {
+    blueprintId: input.blueprintId,
+    signalCount: input.signalCount,
+    iterations: input.iterations,
+    finalScore: input.finalScore,
+    artifactId: input.draftArtifactId,
+    reviewIds: input.commitGate.reviewIds,
+    failedReviewIds: input.commitGate.failedReviewIds,
+    missingReviewerRoles: input.commitGate.missingRoles,
+    ...input.commitBlocked,
+    stage: "manuscript-approval",
+    // lifecycle 真值优先链：显式拦截因 > 质量门失败分类（blocking-issue/
+    // reviewer-score/overall-score/length-under-target/structural-blocker）> 泛化回落。
+    reasonCode: input.commitBlocked?.reasonCode ?? input.commitGate.qualityFailure ?? input.commitGate.structuralFailure ?? "quality-gate-not-passed",
+  };
 }

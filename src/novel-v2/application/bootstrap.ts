@@ -147,7 +147,7 @@ export async function startNovelBootstrap(
   });
   const handle = await temporal.workflow.start("creativeRunWorkflow", {
     args: [run.id],
-    taskQueue: input.taskQueue ?? "novel-v2",
+    taskQueue: input.taskQueue ?? "creative-studio-novel-v2",
     workflowId,
   });
 

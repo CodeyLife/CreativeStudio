@@ -265,6 +265,8 @@ const serialSnapshot: SerialContextSnapshot = {
   subjectSpans: [
     { subject: "金属残片", narrativeOrders: [1, 3], latestExcerpt: "陈渊握着金属残片。" },
   ],
+  openPromises: [],
+  assetSpans: [],
   fingerprint: "serial-fp",
 };
 
@@ -353,5 +355,68 @@ describe("assessLearning activity serial-context wiring", () => {
     expect(call.prompt).toContain("角色状态跨度");
     expect(call.prompt).toContain("陈渊");
     expect(call.prompt).toContain("连续同类功能");
+  });
+});
+
+// ===== SK-3 候选聚合（product-audit-20260910 C3） =====
+
+describe("SK-3 候选聚合通道", () => {
+  it("prompt 双向：有队列时投影候选摘要，空队列时聚合规则仍在场但不虚构条目", () => {
+    const withQueue = buildRuntimeLearningPrompt({
+      artifact, reviews: [blockingReview],
+      pendingCandidates: [{ id: "crc-existing", targetKind: "skill", targetId: "prose-craft", proposedVersion: "1.3.2", rationale: "技术黑话入表层", underlyingMechanism: "drafting 未把技术认知转化为可经历现场" }],
+    });
+    expect(withQueue).toContain("排队中的候选");
+    expect(withQueue).toContain("id=crc-existing");
+    expect(withQueue).toContain("prose-craft");
+    expect(withQueue).toContain("aggregateToCandidateId");
+    const emptyQueue = buildRuntimeLearningPrompt({ artifact, reviews: [blockingReview], pendingCandidates: [] });
+    expect(emptyQueue).toContain("当前无排队中的候选");
+    // 聚合规则句恒在场（通道解释不随队列空消失），但不得出现条目行。
+    expect(emptyQueue).toContain("aggregateToCandidateId");
+    expect(emptyQueue).not.toContain("id=crc-");
+  });
+
+  it("parse 双向：aggregateToCandidateId 字符串透传、null/空白归无", () => {
+    const baseValue = {
+      conclusion: "propose-improvement", symptom: "s", failingLayer: "drafting", underlyingMechanism: "m", affectedInputClass: "c", boundaries: "b", regressionRisks: ["r"],
+      candidate: { targetKind: "skill", targetId: "prose-craft", rationale: "r", afterText: "通用规则文本。".repeat(30) },
+    };
+    const aggregated = parseRuntimeLearningAssessmentV2({ ...baseValue, candidate: { ...baseValue.candidate, aggregateToCandidateId: "crc-target" } }, { projectId: "p1", source: { workflowId: "wf", reviewIds: [], fingerprint: "fp" } });
+    expect(aggregated.candidate?.aggregateToCandidateId).toBe("crc-target");
+    for (const absent of [undefined, null, "   "]) {
+      const parsed = parseRuntimeLearningAssessmentV2({ ...baseValue, candidate: { ...baseValue.candidate, aggregateToCandidateId: absent } }, { projectId: "p1", source: { workflowId: "wf", reviewIds: [], fingerprint: "fp" } });
+      expect(parsed.candidate?.aggregateToCandidateId).toBeUndefined();
+    }
+  });
+
+  it("recordLearning 双向：聚合命中既有候选则不新建；幻觉 id 被守卫拒绝后回退新建", async () => {
+    const proposeValue = {
+      conclusion: "propose-improvement", symptom: "s", failingLayer: "drafting", underlyingMechanism: "技术认知未被转化为现场", affectedInputClass: "c", boundaries: "b", regressionRisks: ["r"],
+      // target 必须是 availableSkills 里的 skill（learning-audit）且 patch 键在其执行点内，
+      // 否则 validateSkillCandidatePatch 拒绝 → fallback no-shared-learning，聚合通道不会被触达。
+      candidate: { targetKind: "skill", targetId: "learning-audit", rationale: "r", afterText: JSON.stringify({ "learning.assessment": "通用评估规则文本，必须达到一百字以上的完整规则要求才能通过候选长度校验。".repeat(4) }), aggregateToCandidateId: "crc-existing" },
+    };
+    const aggregate = vi.fn(async (_input: { projectId: string; candidateId: string; assessmentId: string }) => true);
+    const listPending = vi.fn(async () => [{ id: "crc-existing", targetKind: "skill", targetId: "learning-audit", proposedVersion: "1.3.2", rationale: "r", underlyingMechanism: "m" }]);
+    const recordLearningAssessment = vi.fn(async (assessment: RuntimeLearningAssessmentV2) => assessment);
+    const generateStructured = vi.fn<ModelGateway["generateStructured"]>(async <T,>() => ({ value: proposeValue as T, usage, provenance: mockProvenance }));
+    const activities = learningActivities({ recordLearningAssessment, aggregateCraftRuleCandidateLearning: aggregate, listPendingCraftRuleCandidates: listPending, pool: { query: async () => { throw new Error("不应到达新建路径"); } } } as never, generateStructured as unknown as ModelGateway["generateStructured"]);
+
+    const result = await activities.assessLearning({ projectId: "p1", workflowId: "wf-1", assessmentKey: "1", artifact, reviews: [blockingReview], routingSnapshot: mockRoutingSnapshot });
+    expect(result.kind).toBe("completed");
+    // 队列投影进了 prompt（含既有候选 id）。
+    expect(generateStructured.mock.calls[0]![0].prompt).toContain("id=crc-existing");
+    // 聚合命中：不触碰 create 路径（pool 抛错哨兵未触发即证）。
+    expect(aggregate).toHaveBeenCalledOnce();
+    expect(aggregate.mock.calls[0]![0]).toMatchObject({ projectId: "p1", candidateId: "crc-existing" });
+
+    // 反方向：聚合守卫拒绝（假 id）→ 回退新建，进入 createCraftRuleCandidate 的 skill 查询路径。
+    const aggregateMiss = vi.fn(async (_input: { projectId: string; candidateId: string; assessmentId: string }) => false);
+    const poolQuery = vi.fn(async () => ({ rowCount: 0, rows: [] }));
+    const activities2 = learningActivities({ recordLearningAssessment, aggregateCraftRuleCandidateLearning: aggregateMiss, listPendingCraftRuleCandidates: listPending, pool: { query: poolQuery } } as never, generateStructured as unknown as ModelGateway["generateStructured"]);
+    await expect(activities2.assessLearning({ projectId: "p1", workflowId: "wf-1", assessmentKey: "1", artifact, reviews: [blockingReview], routingSnapshot: mockRoutingSnapshot })).rejects.toThrow();
+    expect(aggregateMiss).toHaveBeenCalledOnce();
+    expect(poolQuery).toHaveBeenCalled(); // 走到了新建候选的 skill_definitions 查询
   });
 });

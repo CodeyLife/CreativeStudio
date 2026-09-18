@@ -124,7 +124,7 @@ export default function StyleContractPanel({ projectId }: { projectId: string })
           <Form.Item name="note" label="适用范围说明">
             <Input.TextArea rows={2} placeholder="说明该版本适用于哪些分卷/阶段、哪些内容不适用" />
           </Form.Item>
-          <div className="nwc-kicker">十维滑杆（只填有把握的维度，缺失维度按未指定处理）</div>
+          <div className="nwc-kicker">十二维滑杆（只填有把握的维度，缺失维度按未指定处理）</div>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0 16px" }}>
             {DIMENSION_KEYS.map((key) => (
               <Form.Item key={key} name={key} label={DIMENSION_LABELS[key]}>

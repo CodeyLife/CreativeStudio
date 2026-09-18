@@ -34,6 +34,11 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { NovelPostgresRepository } from "../src/novel-v2/postgres-repository.ts";
 import { createRuntimeModelGateway } from "../src/novel-v2/model-runtime.ts";
+import { ContentObjectStore } from "../src/novel-v2/object-store.ts";
+import { QdrantMemoryProvider } from "../src/novel-v2/qdrant-memory.ts";
+import { QdrantClient } from "@qdrant/js-client-rest";
+import { resolveNovelRuntimeConfig } from "../src/novel-v2/runtime-config.ts";
+import { codeRevision } from "../src/novel-v2/code-revision.ts";
 import { TOOL_DEFINITIONS, executeTool } from "../src/novel-v2/mcp/index.ts";
 import { loadRuntimeEnv } from "./runtime-env.mjs";
 
@@ -47,11 +52,27 @@ Object.assign(process.env, loadRuntimeEnv(resolve(import.meta.dirname, "..")));
 // 构造 RoutedModelGateway 并接好 ModelConfigStore + audit recorder。
 const repository = new NovelPostgresRepository();
 await repository.migrate();
-const { gateway: model } = await createRuntimeModelGateway(repository);
+const objects = new ContentObjectStore();
+// 与 novel-v2-api/worker 完全一致：传 objectStore，E5 上下文清单采样留痕才在
+// MCP 编排进程生效（不传=该进程调用留痕无 sampling hook，三消费面接线漂移）。
+const { gateway: model } = await createRuntimeModelGateway(repository, objects);
 const temporalConnection = await Connection.connect({ address: process.env.TEMPORAL_ADDRESS ?? "127.0.0.1:7233" });
 const temporal = new Client({ connection: temporalConnection, namespace: process.env.TEMPORAL_NAMESPACE ?? "default" });
-const taskQueue = process.env.TEMPORAL_TASK_QUEUE ?? "novel-v2";
-const ctx = { repository, model, temporal, taskQueue };
+const taskQueue = process.env.TEMPORAL_TASK_QUEUE ?? "creative-studio-novel-v2";
+// 运行时配置与 API/Worker 同一解析路径：指纹供健康端点上报，dev-v2.mjs 复用检测据此
+// 拒绝身份不明或过期的旧实例（与 x-novel-runtime-fingerprint 契约一致）。
+const runtimeConfig = resolveNovelRuntimeConfig(process.env);
+// 向量索引面（FM-2 裁决闭环）：Qdrant 可达时人工/编排裁决同步向量层；
+// 不可达则降级为仅库内裁决（PostgreSQL memory_claims 是权威真源，reindex 兜底）。
+let memoryIndex;
+try {
+  const qdrant = new QdrantClient({ url: runtimeConfig.qdrantUrl });
+  await qdrant.getCollections();
+  memoryIndex = new QdrantMemoryProvider(qdrant, model, runtimeConfig.qdrantCollection, runtimeConfig.embeddingDimension);
+} catch (error) {
+  console.warn(`[mcp] 向量索引不可用，候选裁决降级为仅库内：${error?.message ?? error}`);
+}
+const ctx = { repository, model, temporal, taskQueue, objects, memoryIndex };
 
 // ===== 工具回调（stdio 与 HTTP 共用） =====
 
@@ -130,9 +151,13 @@ if (httpMode) {
   const httpServer = createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "127.0.0.1"}`);
     if (req.method === "GET") {
-      // health check / readiness
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: true, service: "novel-v2-mcp", tools: TOOL_DEFINITIONS.length }));
+      // health check / readiness（指纹头/字段与 API/Worker 同契约，供 pnpm dev 复用检测）
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "x-novel-runtime-fingerprint": runtimeConfig.runtimeFingerprint,
+        "x-novel-code-revision": codeRevision(),
+      });
+      res.end(JSON.stringify({ ok: true, service: "novel-v2-mcp", tools: TOOL_DEFINITIONS.length, runtime: { fingerprint: runtimeConfig.runtimeFingerprint, codeRevision: codeRevision() } }));
       return;
     }
     if (req.method !== "POST" || url.pathname !== "/mcp") {

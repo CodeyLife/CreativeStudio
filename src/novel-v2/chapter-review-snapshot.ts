@@ -1,7 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
-import type { ReaderReconstructionEvidence, Review, ReviewIssue } from "./protocol";
+import type { ChapterChangeScope, ReaderReconstructionEvidence, Review, ReviewIssue } from "./protocol";
+import { isEvidencePresentInText } from "./evidence-check";
+export { isEvidencePresentInText };
 import { mergeReaderReconstructionEvidence } from "./reader-reconstruction";
-import { REQUIRED_CHAPTER_REVIEWERS } from "./temporal/revision-policy";
+import { reviewExecutionsForScope } from "./application/review-concurrency";
 
 export type ChapterReviewVerdict = "passed" | "revise" | "blocked";
 export type ChapterReviewIssueStatus = "pending" | "ignored" | "resolved";
@@ -58,34 +60,9 @@ export function reviewIssueFingerprint(issue: ReviewIssue): string {
 }
 
 /**
- * 校验 issue 的 evidenceQuote 是否出现在给定正文中。
- *
- * 规则（保守）：把 evidence 与正文都做空白归一化；evidence 去除常见省略符
- * （……/…/...）后若长度 ≥ 6 且正文不包含其任意 24 字窗口，判定为未命中。
- * 省略号两侧内容不连续时，取省略号后的最长连续片段做窗口匹配。
- * 短 evidence（< 6 字）不做判定（可能是通用指代，误报率高）。
- * 设计依据：evidence 不是逐字引文（pipeline-audit §2.5），因此只做包含性软校验，
- * 不要求逐字匹配；命中与否都保留 issue，只附机器可读标记。
+ * evidence 未在正文中命中时对快照 issue 附软标记（见 evidence-check 模块与
+ * EVIDENCE_UNVERIFIED_MARKER 注释）。作者来源 issue 不做该校验。
  */
-export function isEvidencePresentInText(evidence: string | undefined, plainText: string | undefined): boolean | undefined {
-  if (!evidence || !plainText) return undefined;
-  const compactText = plainText.replace(/\s+/gu, "");
-  if (!compactText) return undefined;
-  const segments = evidence
-    .replace(/\s+/gu, "")
-    // 省略符形态覆盖 U+2026（…、……、………）与 ASCII 点号（...、......）。
-    .split(/…+|\.{3,}/u)
-    .map((segment) => segment.replace(/[。，、；：？！]/gu, ""))
-    .filter((segment) => segment.length > 0)
-    .sort((left, right) => right.length - left.length);
-  const best = segments[0];
-  if (!best || best.length < 6) return undefined;
-  if (compactText.includes(best)) return true;
-  const window = best.slice(0, 24);
-  if (window.length >= 6 && compactText.includes(window)) return true;
-  return false;
-}
-
 export function markEvidenceUnverified(issue: ChapterReviewSnapshotIssue, plainText: string | undefined): ChapterReviewSnapshotIssue {
   if (issue.sourceRoles.includes("author")) return issue;
   const present = isEvidencePresentInText(issue.evidenceQuote, plainText);
@@ -102,13 +79,16 @@ function aggregateVerdict(reviews: Review[]): ChapterReviewVerdict {
 export function aggregateChapterReviews(
   reviews: Review[],
   priorStatuses: ReadonlyMap<string, ChapterReviewIssueStatus> = new Map(),
+  changeScope?: ChapterChangeScope,
 ): ChapterReviewSnapshotData {
   const latestByRole = new Map<string, Review>();
   for (const review of [...reviews].sort((left, right) => left.createdAt - right.createdAt)) {
     if (review.role) latestByRole.set(review.role, review);
   }
-  const required = REQUIRED_CHAPTER_REVIEWERS.map(({ role }) => latestByRole.get(role)).filter((review): review is Review => Boolean(review));
-  const complete = required.length === REQUIRED_CHAPTER_REVIEWERS.length;
+  // E4：完整性判定与评审面同源——机械/局部档位下被合法裁掉的角色不计缺失。
+  const expectedRoles = reviewExecutionsForScope(changeScope).map(({ role }) => role);
+  const required = expectedRoles.map((role) => latestByRole.get(role)).filter((review): review is Review => Boolean(review));
+  const complete = required.length === expectedRoles.length;
   const scores = required.map((review) => review.score).filter((score): score is number => typeof score === "number" && Number.isFinite(score));
   const overallScore = complete && scores.length === required.length
     ? scores.reduce((sum, score) => sum + Math.max(0, Math.min(5, score)), 0) / scores.length

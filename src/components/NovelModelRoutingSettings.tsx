@@ -51,11 +51,30 @@ function resolveRouteWithSource(config: Config | undefined, purpose: Purpose): {
   const wildcard = `${purpose.split(".")[0]}.*`;
   if (routes?.[wildcard]) return { route: routes[wildcard], source: wildcard };
   if (routes?.["*"]) return { route: routes["*"], source: "*" };
-  return { route: { candidates: [{ executor: "external-mcp" }] }, source: "默认" };
+  // 未配置路由的 purpose 走外部 MCP 隐式链尾兜底（机制契约 2026-09-07），
+  // 候选链为空即「未配置 API 模型，全部由外部 MCP 执行」。
+  return { route: { candidates: [] }, source: "默认" };
 }
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   return requestJson<T>(url, { ...init, headers: { "content-type": "application/json", ...(init?.headers ?? {}) } });
+}
+
+/**
+ * 机制契约 2026-09-07：外部 MCP 是所有调用链的隐式链尾兜底，不再是候选配置项。
+ * 载入与保存时剥离历史配置中的显式 external-mcp 候选——剥离后空链即「纯兜底」，
+ * 与服务端校验（拒绝显式外部候选）保持一致，避免旧配置卡死保存。
+ */
+function stripLegacyExternalCandidates(config: Config): Config {
+  return {
+    ...config,
+    routes: Object.fromEntries(
+      Object.entries(config.routes ?? {}).map(([purpose, route]) => [
+        purpose,
+        { ...route, candidates: route.candidates.filter((candidate) => candidate.executor !== "external-mcp") },
+      ]),
+    ),
+  };
 }
 
 export function NovelModelRoutingSettings() {
@@ -68,13 +87,19 @@ export function NovelModelRoutingSettings() {
   const [probing, setProbing] = useState<string>();
   const [modelOptions, setModelOptions] = useState<{ value: string; label: string; ownedBy?: string }[]>([]);
   const [fetchingModels, setFetchingModels] = useState(false);
+  // OR-A1：候选健康度诊断（只读，加载失败静默降级，不阻断配置编辑）。
+  const [deadRoutes, setDeadRoutes] = useState<{ purpose: string; candidateIndex: number; model: string; providerLabel: string | null; calls: number; failures: number; failedWallClockMs: number }[]>([]);
   const [form] = Form.useForm();
 
   const load = async () => {
     setLoading(true);
     try {
       const result = await request<{ config: Config }>("/v2/model-config");
-      setConfig(result.config);
+      setConfig(stripLegacyExternalCandidates(result.config));
+      try {
+        const health = await request<{ cells: { purpose: string; candidateIndex: number; model: string; providerLabel: string | null; calls: number; failures: number; neverSucceeded: boolean; failedWallClockMs: number }[] }>("/v2/routing/candidate-health");
+        setDeadRoutes(health.cells.filter((cell) => cell.neverSucceeded).map((cell) => ({ purpose: cell.purpose, candidateIndex: cell.candidateIndex, model: cell.model, providerLabel: cell.providerLabel, calls: cell.calls, failures: cell.failures, failedWallClockMs: cell.failedWallClockMs })));
+      } catch { /* 健康度诊断可选，失败不影响配置编辑 */ }
     } catch (error) { message.error(error instanceof Error ? error.message : "读取模型配置失败"); }
     finally { setLoading(false); }
   };
@@ -128,7 +153,7 @@ export function NovelModelRoutingSettings() {
       const clean: Config = {
         version: 1,
         profiles: config.profiles.map(({ hasSecret: _hasSecret, secretSource: _secretSource, secretHint: _secretHint, ...profile }) => profile),
-        routes: config.routes,
+        routes: stripLegacyExternalCandidates(config).routes,
       };
       const result = await request<{ config: Config }>("/v2/model-config", { method: "PUT", body: JSON.stringify({ config: clean }) });
       setConfig(result.config);
@@ -178,14 +203,24 @@ export function NovelModelRoutingSettings() {
     <section className="settings-routing-section">
       <Space className="settings-routing-header" style={{ width: "100%", justifyContent: "space-between", marginBottom: 16 }} align="start" wrap>
         <div>
-          <Title level={3} style={{ margin: 0, fontSize: 20 }}>小说模型路由</Title>
-          <Text type="secondary">V2 Runtime 全局 provider、purpose 路由与外部 MCP 执行策略</Text>
+          <Title level={3} style={{ margin: 0, fontSize: 16, letterSpacing: "-0.01em" }}>小说模型路由</Title>
+          <Text type="secondary">V2 Runtime 全局 provider 与 purpose 调用位置；外部 MCP 为所有调用链的隐式兜底（API 候选耗尽后自动执行）</Text>
         </div>
         <Space>
           <Button icon={<PlusOutlined />} onClick={() => openProfile()}>添加接口</Button>
           <Button type="primary" icon={<SaveOutlined />} loading={saving} onClick={() => void persist()}>保存路由</Button>
         </Space>
       </Space>
+
+      {deadRoutes.length > 0 && (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 12 }}
+          message={`${deadRoutes.length} 个候选组合在观测窗口内从未成功，建议摘除或降权（烧掉的失败等待墙钟约 ${Math.round(deadRoutes.reduce((sum, route) => sum + route.failedWallClockMs, 0) / 60000)} 分钟）`}
+          description={<ul style={{ margin: 0, paddingLeft: 18 }}>{deadRoutes.map((route) => <li key={`${route.purpose}:${route.candidateIndex}:${route.model}`}><Text code>{route.purpose}</Text> 候选 #{route.candidateIndex} · {route.providerLabel ?? "unknown"} / {route.model}：{route.calls} 次调用 {route.failures} 次失败</li>)}</ul>}
+        />
+      )}
 
       <div className="settings-table-scroll">
         <Table<Profile>
@@ -228,13 +263,12 @@ export function NovelModelRoutingSettings() {
             { title: "有序候选链", render: (purpose: Purpose) => {
               const { route } = resolveRouteWithSource(config, purpose);
               const requiredCap = PURPOSE_CAPABILITY[purpose];
-              const options = [
-                ...(config?.profiles.filter((profile) => profile.enabled).map((profile) => {
-                  const compatible = profile.capabilities.includes(requiredCap);
-                  return { label: compatible ? profile.label : `${profile.label} (缺 ${requiredCap})`, value: `api:${profile.id}`, disabled: !compatible };
-                }) ?? []),
-                { label: "外部 MCP", value: "external-mcp" },
-              ];
+              const options = config?.profiles.filter((profile) => profile.enabled).map((profile) => {
+                const compatible = profile.capabilities.includes(requiredCap);
+                return { label: compatible ? profile.label : `${profile.label} (缺 ${requiredCap})`, value: `api:${profile.id}`, disabled: !compatible };
+              }) ?? [];
+              // 外部 MCP 不是可选项：它是所有调用链的隐式链尾兜底（API 候选全部
+              // 失败或链为空时自动执行），故不再出现在候选下拉里。
               const incompatibleIds = route.candidates
                 .filter((c) => c.executor === "api")
                 .map((c) => c.profileId)
@@ -256,6 +290,9 @@ export function NovelModelRoutingSettings() {
           ]}
           />
         </div>
+        <Text type="secondary" style={{ fontSize: 12, display: "block", marginTop: 8 }}>
+          外部 MCP 不是候选选项：每条调用链在所有 API 候选失败（或链为空）后自动进入外部 MCP 兜底等待，由外部编排者认领执行；历史配置中的显式外部候选保存时会被移除。memory.embed / memory.rerank 向量链路无外部执行路径，兜底不适用。
+        </Text>
       </div>
 
       <Modal title={editing ? "编辑模型接口" : "添加模型接口"} open={modalOpen} onCancel={() => setModalOpen(false)} onOk={() => void saveProfile()} forceRender>

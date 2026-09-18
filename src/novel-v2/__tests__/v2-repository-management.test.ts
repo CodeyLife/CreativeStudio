@@ -88,7 +88,22 @@ describe("V2 repository management APIs", () => {
       work_item_id: "work-1",
       source_artifact_id: "artifact-2",
       status: "awaiting-confirmation",
-      payload: { structuredData: { positioning: { bookTitle: "《确认后的正式书名》" } } },
+      payload: {
+        structuredData: {
+          positioning: {
+            bookTitle: "《确认后的正式书名》",
+            sellingPoints: ["身份反差", "规则解谜"],
+            targetReader: "喜欢体系流与人物成长的成年读者",
+            coreConflict: "在依赖旧秩序的生存与改写规则之间选择",
+            activePressureSource: "宗门考核与资源垄断",
+            corePromise: "每阶段揭示都改变主角的处境与选择",
+            protagonistNeed: "承认自己真正想要什么",
+            centralOpposition: "维护旧秩序的既得利益者",
+            emotionalContract: { notApplicable: true, rationale: "本作情感线让位于成长主线" },
+            themeQuestion: { notApplicable: true, rationale: "主题随故事弧展开" },
+          },
+        },
+      },
       edit_revision: 1,
       approved_at: null,
       created_at: new Date(0),

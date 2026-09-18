@@ -48,6 +48,19 @@ export interface NovelIntent {
   requestedCapabilities?: string[];
   /** Whether candidate facts must be approved before the chapter commit. */
   factApprovalMode?: "auto" | "manual";
+  /**
+   * 定稿整章重出（novel_chapter_generate reprocess=true 时置位）：
+   * 跳过 planned-only 生成闸门，从已批准蓝图+自足指令全新生成正文。
+   * 修订通道实证会把重写令执行成加法（ch51 双证伪），整章替换必须走生成链。
+   */
+  reprocess?: boolean;
+  /**
+   * 变更意图范围（product-audit-20260910 E4）：机械微修（黑话降噪/引号错别字/dedupe）
+   * 此前也走全量三审+学习评估（≈8-10 次模型调用），4.77 轮/章的均值被人工噪声主导。
+   * 该字段把"不改变语义"契约化并据此收窄评审面（见 ChapterChangeScope）。
+   * 非后门契约：任何一档都保留机器结构校验与 commit gate 全部门禁。
+   */
+  changeScope?: ChapterChangeScope;
   createdAt: number;
   idempotencyKey: string;
 }
@@ -60,12 +73,16 @@ export interface RetrievalFacet {
   knowledgeCharacterId?: string;
 }
 
+export type ChapterChangeScope = "mechanical-format" | "local-text" | "narrative";
+
 export interface PreflightPlan {
   id: string;
   intentId: string;
   projectId: string;
   taskClass: "foundation" | "planning" | "drafting" | "review" | "revision" | "memory-maintenance";
   stage: NovelStage;
+  /** E4：意图变更范围（createPreflightPlan 归一化，intent 缺省 = "narrative"）。 */
+  changeScope: ChapterChangeScope;
   targetDocumentId?: string;
   /** Existing committed revision being replaced by a fresh draft. */
   replacementRevisionId?: string;
@@ -128,7 +145,8 @@ export type MemorySelectionReason =
   | "future-cutoff"
   | "budget"
   | "duplicate"
-  | "merged-source";
+  | "merged-source"
+  | "identity-slot-quota";
 
 export interface MemorySelectionReceipt {
   claimId: string;
@@ -194,7 +212,32 @@ export interface SerialContextSnapshot {
   characterSpans: SerialCharacterStateSpan[];
   functionRuns: SerialFunctionRun[];
   subjectSpans: SerialSubjectSpan[];
+  /**
+   * 项目开放承诺/期限账本（status=open，按建立章排序）。机制根因：期限/承诺类事实
+   * 在其建立章之前出现（如第 1 章提及第 11 章才建立的灵石期限）是章节级审核的
+   * 结构盲区——单章三审看不到跨章承诺账本。把开放承诺连同建立章序号投影进
+   * 序列证据，供 draft/review/revision 对照「引用不早于建立章、时限与陈述一致」。
+   */
+  openPromises: SerialOpenPromise[];
+  /**
+   * 可数资产的数量提及跨度（确定性扫描，见 asset-ledger.ts）：同一实体在 ≥2 章
+   * 被提及数量时的逐章登记。机制根因：可数资产的数量在各章间漂移（如 ch1 结尾
+   * 两块、ch2 开头单数）是读者能直接追踪的账本断裂——投影后供对照「同实体数量
+   * 是否连续一致、获得/消耗是否有交代」。
+   */
+  assetSpans: AssetEntitySpan[];
   fingerprint: string;
+}
+
+export interface AssetEntitySpan {
+  subject: string;
+  entries: Array<{ narrativeOrder: number; quantity: string; value: number | null }>;
+}
+
+export interface SerialOpenPromise {
+  statement: string;
+  /** 承诺建立章的叙事序（source revision 所在章节）；unknown 时为 null。 */
+  establishedAtOrder: number | null;
 }
 
 /**
@@ -406,6 +449,7 @@ export type SkillExecutionPoint =
   | "arc.review"
   | "arc.revision"
   | "chapter.blueprint"
+  | "chapter.title"
   | "chapter.drafting"
   | "chapter.review.structure"
   | "chapter.review.character"
@@ -549,11 +593,19 @@ export interface ExecutionBlueprint {
    *       不参与审批门判定，避免与 authority 语义混淆。
    */
   factApprovalMode?: "auto" | "manual";
+  /** 评审面宽度（E4 changeScope 投影到蓝图；缺省 narrative=全量三审）。 */
+  changeScope?: "mechanical-format" | "local-text" | "narrative";
   budget: { maxInputTokens: number; maxOutputTokens: number; maxCostUsd?: number };
   memoryGate?: {
     status: "passed" | "manual-review";
     missingFacets: RetrievalFacet["kind"][];
     manualReviewFacets: RetrievalFacet["kind"][];
+    /**
+     * 候选积压咨询信号（product-audit-20260910 A3/FM-2）：待裁决 candidate 数量与
+     * 最长账龄。可配置阈值，非硬门——只影响编排者可见性与 memory-gate facet 标注，
+     * 不阻断生成（未裁决候选已被可见性口径隔离，不会盲杀既有事实）。
+     */
+    candidateBacklog?: { pending: number; oldestPendingDays: number | null; alert: boolean };
   };
   /**
    * 章节生成消费的全书规划 artifact 引用。
@@ -657,6 +709,8 @@ export interface CommitRequest {
   reviews: Review[];
   baseRevision: number;
   idempotencyKey: string;
+  /** E4：评审面档位（commit gate 与评审执行同源；缺省 = narrative 全量三类）。 */
+  changeScope?: ChapterChangeScope;
 }
 
 export interface CommitResult {
@@ -713,6 +767,14 @@ export interface ManuscriptDocumentSummary {
   blockingIssueCount?: number;
   reviewScore?: number;
   reviewVerdict?: "passed" | "revise" | "blocked";
+  /**
+   * 作者对当前内容最近一次审校聚合结果的最终决定（approval_evidence 中按
+   * reviewed_content_hash=当前内容哈希对齐的最新行）：approve=作者已覆盖批准
+   * （reviewer verdict 保留原判，两者并存不冲突）；undefined=作者尚未表态。
+   * 根因：文档级 reviewVerdict 是三审聚合的 reviewer 判定，定向修订作者批准后
+   * verdict 可能仍为 revise，消费方曾把"reviewer 判 revise"误读为"仍有未解决问题"。
+   */
+  authorDecision?: "approve" | "revise" | "reject" | "abandon";
   reviewStale?: boolean;
   arcId?: string;
   arcTitle?: string;
@@ -790,6 +852,12 @@ export interface RuntimeLearningAssessmentV2 {
      * recordLearning 透传给 createCraftRuleCandidate，promote 写入 skill_definitions.applicable_genres。
      */
     applicableGenres?: string[];
+    /**
+     * SK-3 候选聚合（product-audit-20260910 C3）：LLM 判定本次改进与队列中某既有
+     * 候选属同一底层机制时引用其 id——recordLearning 走聚合通道（证据并入既有候选）
+     * 而非新建重复候选。指向不存在/已出队 id 时保守回退为新建（聚合失败不当丢证据）。
+     */
+    aggregateToCandidateId?: string;
   };
   createdAt: number;
 }

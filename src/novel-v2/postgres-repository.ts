@@ -3,8 +3,10 @@ import { Pool, type PoolClient, type PoolConfig } from "pg";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { foundationArtifactToMemoryClaim } from "./foundation-memory";
-import { normalizeFoundationStructuredDataFlat } from "./application/foundation-contract";
+import { foundationArtifactToMemoryClaim, foundationClaimId } from "./foundation-memory";
+import { CLAIM_PROJECTION_SET_SQL, retrievalVisibleClaimsSql, retiredByVisibleKillerSql } from "./memory-visibility";
+import { normalizeFoundationStructuredDataFlat, validateFoundationTaskContract } from "./application/foundation-contract";
+import { foundationContractFingerprint } from "./application/foundation-contract-fingerprint";
 import { assertCompleteChapterReviewEvidence } from "./application/chapter-approval";
 import { ChapterStateRebuildConflictError } from "./application/chapter-state-rebuild-conflict";
 import {
@@ -18,7 +20,7 @@ import {
   type ProjectPlanStatus,
   type ProjectPlanTaskKey,
 } from "./application/project-plan";
-import type { FactExtractionOutput } from "./prompts/schemas";
+import type { FactExtractionOutput, FoundationOutput } from "./prompts/schemas";
 import { normalizeStyleContractPayload, styleContractFingerprint, type StyleContract, type StyleContractPayload } from "./style-contract";
 import type {
   Artifact,
@@ -39,6 +41,7 @@ import type {
   NovelIntent,
   NovelProjectDetail,
   PreflightPlan,
+  PromptContextManifest,
   ProjectSnapshotBundle,
   PromotionReceipt,
   RecentIssueCluster,
@@ -49,6 +52,7 @@ import type {
   SerialCharacterStateSpan,
   SerialContextSnapshot,
   SerialFunctionRun,
+  SerialOpenPromise,
   SerialSubjectSpan,
   SkillBundle,
   SkillDescriptor,
@@ -56,16 +60,18 @@ import type {
   WorkflowRunRecord,
 } from "./protocol";
 import type { ModelInvocationAudit, ModelPromptExecution } from "./model-gateway";
+import { embeddingFingerprint } from "./model-gateway";
+import { withTerminalOutcome } from "./terminal-outcome";
 import type { ModelRoutingConfig, ModelRoutingSnapshot, ModelTaskRecord, ModelWorkPackage } from "./model-routing";
 import type { ObjectStoreAdapter } from "./object-store";
 import { countNovelCharacters } from "./word-count";
 import type { ObjectStoreIdentity } from "./object-store";
 import { normalizeManuscriptStructuralReview } from "./application/manuscript-structure";
-import { auditNamedReferences, auditStoryArcBatchRanges, canonicalReferenceId, normalizeThreadResponsibilityReferences, resolveNamedReference, type NamedReferenceCandidate, type StoryArcIntegrityIssue } from "./application/story-arc-integrity";
+import { arcCompletionPredicateSql, auditNamedReferences, auditStoryArcBatchRanges, canonicalReferenceId, findEmbeddedInternalIdentifiers, normalizeThreadResponsibilityReferences, parseExplicitNewReference, resolveNamedReference, sanitizeReferenceToken, type NamedReferenceCandidate, type StoryArcIntegrityIssue } from "./application/story-arc-integrity";
 import { auditFullBookArchitecture } from "./application/full-book-architecture";
-import { CHAPTER_NARRATIVE_FUNCTIONS, canGenerateNextStoryArcBatch, normalizeChapterPlanningContext, parseStoryArcBundle, parseStoryArcPlan, planningContextFingerprint, validateStoryArcPlanContracts, type ArcPlanningStatus, type ChapterBlueprint, type ChapterBlueprintRecord, type ChapterPlanningContext, type ChapterSceneBlueprint, type NarrativeArcPlan, type StoryArcBatchRecord, type StoryArcBundle, type StoryArcContextReceipt, type StoryArcPlotOutline, type StoryArcRebaseTarget, type StoryArcRecord } from "./application/story-arc";
+import { CHAPTER_NARRATIVE_FUNCTIONS, canGenerateNextStoryArcBatch, inspectStoryArcEnsemble, MAX_STORY_ARC_BATCH_WINDOW, normalizeChapterPlanningContext, parseStoryArcBundle, parseStoryArcPlan, planningContextFingerprint, resolveArcPhase, validateStoryArcPlanContracts, type ArcPlanningStatus, type ChapterBlueprint, type ChapterBlueprintRecord, type ChapterPlanningContext, type ChapterSceneBlueprint, type NarrativeArcPlan, type StoryArcBatchRecord, type StoryArcBundle, type StoryArcContextReceipt, type StoryArcPlotOutline, type StoryArcRebaseTarget, type StoryArcRecord } from "./application/story-arc";
 import type { StoryArcReviewOutput } from "./prompts/story-arc";
-import { aggregateChapterReviews, markEvidenceUnverified, reviewIssueFingerprint, type ChapterReviewIssueStatus } from "./chapter-review-snapshot";
+import { aggregateChapterReviews, isEvidencePresentInText, markEvidenceUnverified, reviewIssueFingerprint, type ChapterReviewIssueStatus } from "./chapter-review-snapshot";
 import {
   bookSynopsisSourceFingerprint,
   bookTitleSourceFingerprint,
@@ -75,8 +81,13 @@ import {
 } from "./application/book-synopsis";
 import { chapterTitleSourceFingerprint, type ChapterTitleSource } from "./application/chapter-title";
 import { canonicalSha256 } from "./canonical-json";
+import { compareSkillVersions, createWorkspaceSkillProvider, listCurrentSkillDescriptors } from "./skill-runtime";
+import { contextManifestSamplingHit, samplingRatioFromEnv } from "./context-manifest-sampling";
 import { canonicalizeFactPredicate, normalizeFactToken } from "./fact-extraction/fingerprint";
 import { scopeClaimsToChapter } from "./fact-extraction/narrative-scope";
+import { dedupeByNarrativeText, foreshadowingLedgerId, formatPayoffWindow, mergeForeshadowingLedgerPayload, narrativeTextKey, parsePayoffWindow, promiseContentKey, type ForeshadowingLedgerPayload, type PayoffWindowRaw } from "./narrative-elements";
+import { buildCharacterRefIndex, type CharacterRefForms } from "./character-ref";
+import { textBigramDice } from "./memory-grooming";
 import { buildCharacterIdentityIndex, resolveCharacterIdentity, type FoundationCharacter } from "./character-identity";
 import { auditMigrations as auditMigrationFiles, formatMigrationAudit, readMigrationFiles, readMigrationManifest, type MigrationAudit } from "./migrations";
 
@@ -134,7 +145,7 @@ export interface NovelProjectSnapshot {
   premise?: string;
 }
 
-export type MutableKnowledgeRecordKind = "planning" | "worldview" | "characters" | "relations" | "timeline" | "facts" | "claims" | "skills";
+export type MutableKnowledgeRecordKind = "planning" | "worldview" | "characters" | "relations" | "timeline" | "claims" | "skills";
 export type KnowledgeRecordKind = MutableKnowledgeRecordKind | "foundation" | "claims" | "chapter-memories" | "project-skills";
 
 export interface LearningAssessmentView {
@@ -144,11 +155,11 @@ export interface LearningAssessmentView {
 }
 
 type ProjectRow = { id: string; title: string; current_revision: string | number; metadata: Record<string, unknown>; created_at: Date | string; updated_at: Date | string };
-type DocumentRow = { id: string; project_id: string; title: string; narrative_order: string | number; pov_character_id: string | null; current_revision_id: string | null; status: string; created_at: Date | string; updated_at: Date | string; word_count?: string | number | null; latest_revision?: string | number | null; chapter_goal?: string | null; blocking_issue_count?: string | number | null; review_score?: string | number | null; review_verdict?: "passed" | "revise" | "blocked" | null; review_stale?: boolean | null; arc_id?: string | null; arc_title?: string | null; arc_planning_status?: string | null };
+type DocumentRow = { id: string; project_id: string; title: string; narrative_order: string | number; pov_character_id: string | null; current_revision_id: string | null; status: string; created_at: Date | string; updated_at: Date | string; word_count?: string | number | null; latest_revision?: string | number | null; chapter_goal?: string | null; blocking_issue_count?: string | number | null; review_score?: string | number | null; review_verdict?: "passed" | "revise" | "blocked" | null; author_decision?: "approve" | "revise" | "reject" | "abandon" | null; review_stale?: boolean | null; arc_id?: string | null; arc_title?: string | null; arc_planning_status?: string | null };
 type WorkflowRunRow = { id: string; workflow_type: string; project_id: string; temporal_workflow_id: string; status: string; payload: Record<string, unknown>; created_at: Date | string; updated_at: Date | string };
 type ArtifactRow = { id: string; project_id: string; task_id: string; attempt_id: string; kind: Artifact["kind"]; content_hash: string; object_key: string | null; base_revision: string | number; fingerprint: string; payload: Record<string, unknown>; created_at: Date | string };
 type TaskAttemptRow = { id: string; workflow_run_id: string | null; task_id: string; lease_owner: string | null; lease_expires_at: Date | string | null; heartbeat_at: Date | string | null; status: TaskAttemptRecord["status"]; payload: Record<string, unknown> };
-type ModelTaskRow = { id: string; workflow_run_id: string; task_id: string; purpose: ModelTaskRecord["purpose"]; config_revision: string; candidate_index: number; status: ModelTaskRecord["status"]; work_package: ModelWorkPackage; result: ModelTaskRecord["result"] | null; idempotency_key: string; created_at: Date | string; updated_at: Date | string };
+type ModelTaskRow = { id: string; workflow_run_id: string; task_id: string; purpose: ModelTaskRecord["purpose"]; config_revision: string; candidate_index: number; status: ModelTaskRecord["status"]; work_package: ModelWorkPackage; result: ModelTaskRecord["result"] | null; idempotency_key: string; project_id: string | null; created_at: Date | string; updated_at: Date | string };
 type ProjectPlanSectionRow = { project_id: string; task_key: string; work_item_id: string | null; source_artifact_id: string | null; status: ProjectPlanStatus; payload: Record<string, unknown>; edit_revision: string | number; approved_at: Date | string | null; created_at: Date | string; updated_at: Date | string };
 type ArcRow = { id: string; volume_id: string; project_id: string; title: string; ordinal: string | number; planning_status: StoryArcRecord["planningStatus"]; execution_status: StoryArcRecord["executionStatus"]; payload: NarrativeArcPlan; source_artifact_id: string | null; blueprint_artifact_id: string | null; context_fingerprint: string | null; review_artifact_id: string | null; review_fingerprint: string | null; edit_revision: string | number; approved_at: Date | string | null; completed_at: Date | string | null; abandoned_at: Date | string | null; updated_at: Date | string };
 type ChapterBlueprintRow = {
@@ -203,6 +214,7 @@ function documentFromRow(row: DocumentRow): ManuscriptDocumentSummary {
     blockingIssueCount: row.blocking_issue_count === undefined || row.blocking_issue_count === null ? undefined : Number(row.blocking_issue_count),
     reviewScore: row.review_score === undefined || row.review_score === null ? undefined : Number(row.review_score),
     reviewVerdict: row.review_verdict ?? undefined,
+    authorDecision: row.author_decision ?? undefined,
     reviewStale: row.review_stale ?? undefined,
     arcId: row.arc_id ?? undefined,
     arcTitle: row.arc_title ?? undefined,
@@ -219,55 +231,6 @@ function artifactFromRow(row: ArtifactRow): Artifact {
   return { id: row.id, projectId: row.project_id, taskId: row.task_id, attemptId: row.attempt_id, kind: row.kind, contentHash: row.content_hash, objectKey: row.object_key ?? undefined, baseRevision: Number(row.base_revision), fingerprint: row.fingerprint, structuredData: row.payload ?? {}, createdAt: new Date(row.created_at).getTime() };
 }
 
-/** 创意短剧独立存储行（short_scripts 表，迁移 050）：project_id 可空=独立短剧。 */
-export interface StoredShortScript {
-  id: string;
-  projectId?: string;
-  idea: string;
-  instruction?: string;
-  targetDurationSeconds: number;
-  sourceFingerprint: string;
-  contractVersion: string;
-  objectKey?: string;
-  contentHash: string;
-  workflowId: string;
-  payload: Record<string, unknown>;
-  createdAt: number;
-}
-
-interface ShortScriptRow {
-  id: string;
-  project_id: string | null;
-  idea: string;
-  instruction: string | null;
-  target_duration_seconds: number;
-  source_fingerprint: string;
-  contract_version: string;
-  object_key: string | null;
-  content_hash: string;
-  workflow_id: string;
-  payload: Record<string, unknown> | null;
-  created_at: Date | string;
-}
-
-const SHORT_SCRIPT_SELECT_SQL = "SELECT id,project_id,idea,instruction,target_duration_seconds,source_fingerprint,contract_version,object_key,content_hash,workflow_id,payload,created_at FROM short_scripts";
-
-function shortScriptFromRow(row: ShortScriptRow): StoredShortScript {
-  return {
-    id: row.id,
-    projectId: row.project_id ?? undefined,
-    idea: row.idea,
-    instruction: row.instruction ?? undefined,
-    targetDurationSeconds: Number(row.target_duration_seconds),
-    sourceFingerprint: row.source_fingerprint,
-    contractVersion: row.contract_version,
-    objectKey: row.object_key ?? undefined,
-    contentHash: row.content_hash,
-    workflowId: row.workflow_id,
-    payload: row.payload ?? {},
-    createdAt: new Date(row.created_at).getTime(),
-  };
-}
 function memoryClaimFromRow(row: any): MemoryClaim {
   return {
     id: row.id,
@@ -321,7 +284,7 @@ function narrativeClaimRecord(claim: MemoryClaim, source: "fact-extraction" | "m
   };
 }
 function modelTaskFromRow(row: ModelTaskRow): ModelTaskRecord {
-  return { id: row.id, workflowRunId: row.workflow_run_id, taskId: row.task_id, purpose: row.purpose, configRevision: row.config_revision, candidateIndex: row.candidate_index, status: row.status, workPackage: row.work_package, result: row.result ?? undefined, idempotencyKey: row.idempotency_key, createdAt: iso(row.created_at), updatedAt: iso(row.updated_at) };
+  return { id: row.id, workflowRunId: row.workflow_run_id, taskId: row.task_id, purpose: row.purpose, configRevision: row.config_revision, candidateIndex: row.candidate_index, status: row.status, workPackage: row.work_package, result: row.result ?? undefined, idempotencyKey: row.idempotency_key, projectId: row.project_id ?? undefined, createdAt: iso(row.created_at), updatedAt: iso(row.updated_at) };
 }
 function projectPlanSectionFromRow(row: ProjectPlanSectionRow): ProjectPlanSection {
   return {
@@ -365,6 +328,13 @@ export function chapterBlueprintFromRow(row: ChapterBlueprintRow): ChapterBluepr
     },
     narrativeFunction: typeof payload.narrativeFunction === "string" && CHAPTER_NARRATIVE_FUNCTIONS.includes(payload.narrativeFunction as (typeof CHAPTER_NARRATIVE_FUNCTIONS)[number]) ? payload.narrativeFunction as ChapterBlueprintRecord["narrativeFunction"] : undefined,
     povCharacterId: typeof payload.povCharacterId === "string" && payload.povCharacterId.trim() ? payload.povCharacterId : undefined,
+    // 2026-09-17 断链修复（docs/novel-v2/ai-taint-diagnosis-20260917.md F1/§四-3）：
+    // 本映射此前**不读 payload.targetWordCount**，于是补录进 chapters.payload 的目标篇幅
+    // 在这一步被静默丢弃——chapter_planning_contexts 因此 226 行全空，正文写作契约回落到
+    // DEFAULT_TARGET_WORD_COUNT(3500)，与编排者手写的 2600、门执法的 3500×0.6=2100
+    // 构成"同一目标三个数"。这是 F1（等量段配额代偿→节拍器呼吸）的直接上游。
+    // 量纲与 parseStoryArcBundle 同源：正整数才收，非法/缺省一律不注入（回落默认值）。
+    targetWordCount: typeof payload.targetWordCount === "number" && Number.isFinite(payload.targetWordCount) && payload.targetWordCount > 0 ? Math.round(payload.targetWordCount) : undefined,
     scenes: Array.isArray(payload.scenes) ? payload.scenes.flatMap<ChapterSceneBlueprint>((value, index) => {
       if (!value || typeof value !== "object" || Array.isArray(value)) return [];
       const scene = value as Record<string, unknown>;
@@ -500,6 +470,138 @@ export class NovelPostgresRepository {
     await this.repairFinalChapterBlueprintStatuses();
     await this.repairCompletedStoryArcStatuses();
     await this.backfillCurrentChapterReviewSnapshots();
+    await this.repairFoundationClaimSingletons();
+    await this.repairStoryArcReferenceHygiene();
+    await this.repairBookTitleProjections();
+    await this.repairForeshadowingPayoffLedger();
+    await this.repairStoryArcBatchCompleteFlags();
+    await this.repairForeshadowingLedgerDuplicates();
+    await this.seedWorkspaceSkills();
+  }
+
+  /**
+   * 批次 complete 旗回补（与 projectStoryArcBundle 派生口径同源，2026-09-12 弧5
+   * 实践批）：该旗此前是模型自报——弧 1 满覆盖却存 false（下游只能靠 prepareNext
+   * 维度守卫兜底），弧 5 重编排批次系统派生了 true 但存量行仍是生成时的 false。
+   * 只回补每个弧的最后一批（complete 语义=弧内规划覆盖已达成，滚动批次的中间批
+   * 恒为 false 本就正确）；expected 缺失/为 0 的旧弧不动（无声明窗口不发明事实）。
+   * 幂等：派生值与存量一致的行 jsonb_set 值短路（seed 教训同款值比较守卫）。
+   */
+  async repairStoryArcBatchCompleteFlags(): Promise<number> {
+    const result = await this.pool.query(
+      `WITH last_batches AS (
+         SELECT b.id, b.arc_id,
+           (SELECT COUNT(DISTINCT c.ordinal) FROM chapters c WHERE c.arc_id = b.arc_id) AS planned_ordinals,
+           COALESCE((SELECT (a.payload->>'expectedChapterCount')::int FROM arcs a WHERE a.id = b.arc_id), 0) AS expected
+         FROM story_arc_batches b
+         WHERE (b.arc_id, b.batch_index) IN (SELECT arc_id, MAX(batch_index) FROM story_arc_batches GROUP BY arc_id)
+       )
+       UPDATE story_arc_batches b
+       SET payload = jsonb_set(b.payload, '{complete}', to_jsonb(l.planned_ordinals >= l.expected))
+       FROM last_batches l
+       WHERE b.id = l.id AND l.expected > 0 AND (b.payload->>'complete') IS DISTINCT FROM (l.planned_ordinals >= l.expected)::text`,
+    );
+    return result.rowCount ?? 0;
+  }
+
+  /**
+   * 伏笔账本同章重措辞归并（弧6 收口对账实证）：锚点身份（PL-5③）上线前登记的老行退回
+   * 描述内容键，同一叙事装置的每轮重抽取换措辞即新增一行——运行库实测 overdue 101 条
+   * 中约四成为此类变体（"树洞蓝光"六个变体）。归并只吃"同章 + 描述 bigram 相似度达阈"
+   * 的保守面：keeper=最早登记行，变体 status 翻 'merged'（非破坏，open 消费面自然出局），
+   * 描述进 keeper.mergedFrom、keywords/possiblePayoffs 并集、变体 payload.mergedInto 指向
+   * keeper。幂等：变体已标 merged 不再出现于 open 扫描面，keeper 侧重复描述由集合去重吸收。
+   */
+  async repairForeshadowingLedgerDuplicates(): Promise<{ clusters: number; retired: number }> {
+    // 账表无时间戳列；keeper=同章字典序首行（内容派生 id 稳定），并集不丢任何变体信息，
+    // keeper 选择不影响语义。
+    const rows = await this.pool.query<{ id: string; narrative_order: number | null; payload: Record<string, unknown> }>(
+      "SELECT id, narrative_order, payload FROM foreshadowing WHERE status='open' AND narrative_order IS NOT NULL ORDER BY narrative_order, id",
+    );
+    // 阈值 0.24（运行库校准，非猜测）：弧6 收口对全 open 账做逐对扫描，同事件变体
+    // 实测带 0.25-0.41（含人物别名与句式重组；并查集传递闭包把 0.22-0.24 的同族两两
+    // 间接并入"粉末→树洞→蓝光"一个装置族，语义正确），首个真·不同叙事时刻（同一物件
+    // 的不同动作："欲言又止未追问" vs "移除后发现表面干净"）落在 0.21。取 0.24 让
+    // 闭包吃到全部变体、留出边界余量。TODO 可配置意图：重抽取模型措辞漂移率变化时
+    // 用同法（逐对分布带）重校准，不逐例加规则。
+    const THRESHOLD = 0.24;
+    const norm = (s: string) => s.replace(/[^一-鿿]/g, "");
+    const byChapter = new Map<number, typeof rows.rows>();
+    for (const row of rows.rows) {
+      const list = byChapter.get(row.narrative_order!) ?? [];
+      list.push(row);
+      byChapter.set(row.narrative_order!, list);
+    }
+    let clusters = 0;
+    let retired = 0;
+    for (const group of byChapter.values()) {
+      if (group.length < 2) continue;
+      const parent = group.map((_, i) => i);
+      const find = (i: number): number => (parent[i] === i ? i : (parent[i] = find(parent[i])));
+      for (let i = 0; i < group.length; i++) {
+        for (let j = i + 1; j < group.length; j++) {
+          const a = norm(String(group[i].payload?.description ?? ""));
+          const b = norm(String(group[j].payload?.description ?? ""));
+          if (a && b && textBigramDice(a, b) >= THRESHOLD) parent[find(j)] = find(i);
+        }
+      }
+      const buckets = new Map<number, number[]>();
+      group.forEach((_, i) => buckets.set(find(i), [...(buckets.get(find(i)) ?? []), i]));
+      for (const members of buckets.values()) {
+        if (members.length < 2) continue;
+        clusters += 1;
+        const keeper = group[members[0]];
+        const keeperPayload = { ...keeper.payload };
+        const keeperDescription = String(keeperPayload.description ?? "");
+        const mergedFrom = new Set<string>((keeperPayload.mergedFrom as string[]) ?? []);
+        const keywords = new Set<string>((keeperPayload.triggerKeywords as string[]) ?? []);
+        const payoffs = new Set<string>((keeperPayload.possiblePayoffs as string[]) ?? []);
+        for (const idx of members.slice(1)) {
+          const variant = group[idx];
+          const vp = variant.payload ?? {};
+          const text = String(vp.description ?? "");
+          if (text && text !== keeperDescription) mergedFrom.add(text);
+          for (const k of (vp.triggerKeywords as string[]) ?? []) keywords.add(k);
+          for (const p of (vp.possiblePayoffs as string[]) ?? []) payoffs.add(p);
+          await this.pool.query("UPDATE foreshadowing SET status='merged', payload=$2 WHERE id=$1", [variant.id, { ...vp, mergedInto: keeper.id }]);
+          retired += 1;
+        }
+        keeperPayload.triggerKeywords = [...keywords];
+        if (payoffs.size) keeperPayload.possiblePayoffs = [...payoffs];
+        if (mergedFrom.size) keeperPayload.mergedFrom = [...mergedFrom];
+        await this.pool.query("UPDATE foreshadowing SET payload=$2 WHERE id=$1", [keeper.id, keeperPayload]);
+      }
+    }
+    return { clusters, retired };
+  }
+
+  /**
+   * 存量收敛（product-audit-20260910 A2）：foundation 投影切换段级单例 id 后，
+   * 为所有含 foundation artifact 的项目回填/刷新单例行；历史 per-artifact 行由
+   * 单例行 supersedes 退役（查询期可见性，不删数据）。幂等：单例行已指向
+   * 最新 artifact 的槽位直接跳过。
+   */
+  async repairFoundationClaimSingletons(): Promise<void> {
+    const projects = await this.pool.query<{ project_id: string }>(
+      "SELECT DISTINCT project_id FROM artifacts WHERE kind='foundation'");
+    for (const row of projects.rows) {
+      await this.ensureFoundationMemoryClaims(row.project_id);
+    }
+  }
+
+  /**
+   * books.title 收口为 novel_projects.title 的投影（审计 FM-6 派生名单一真源）。
+   * books 是 story_arcs 的 FK 锚且 title 无读消费方，历史上只在项目初建时写了一次
+   * 快照，重批书名后永远滞留旧值。派生写面已同步（approveProjectPlanSection），
+   * 这里幂等收口存量：仅两值确实不同才改写，重复执行为零变更。
+   */
+  async repairBookTitleProjections(): Promise<number> {
+    const result = await this.pool.query(
+      `UPDATE books b SET title = p.title
+       FROM novel_projects p
+       WHERE b.project_id = p.id AND b.title IS DISTINCT FROM p.title`,
+    );
+    return result.rowCount ?? 0;
   }
 
   async auditMigrations(migrationsDir = process.env.NOVEL_V2_MIGRATIONS_DIR ?? join(process.cwd(), "deploy", "postgres")): Promise<MigrationAudit> {
@@ -553,25 +655,7 @@ export class NovelPostgresRepository {
            WHERE c.arc_id=a.id
              AND (d.id IS NULL OR d.status<>'final' OR d.current_revision_id IS NULL)
          )
-         AND EXISTS (
-           SELECT 1
-           FROM story_arc_batches b
-           WHERE b.arc_id=a.id
-             AND b.batch_index=(SELECT MAX(last_approved_batch.batch_index) FROM story_arc_batches last_approved_batch WHERE last_approved_batch.arc_id=a.id AND last_approved_batch.status='approved')
-             AND b.status='approved'
-             AND (
-               COALESCE((b.payload->>'complete')::boolean,false)=true
-               OR (
-                 COALESCE((a.payload->>'expectedChapterCount')::integer,0)>0
-                 AND b.end_chapter_index >= (a.payload->>'expectedChapterCount')::integer
-               )
-             )
-             AND b.end_chapter_index >= CASE
-               WHEN COALESCE((a.payload->>'expectedChapterCount')::integer,0)>0
-                 THEN (a.payload->>'expectedChapterCount')::integer
-               ELSE b.end_chapter_index
-             END
-         )
+         AND ${arcCompletionPredicateSql("a", "b")}
        RETURNING a.id,a.project_id`,
     );
     for (const row of result.rows) {
@@ -726,9 +810,9 @@ export class NovelPostgresRepository {
 
   async recordModelInvocation(input: ModelInvocationAudit): Promise<void> {
     await this.pool.query(
-      `INSERT INTO model_invocations(workflow_run_id,task_id,purpose,config_revision,candidate_index,executor,profile_id,provider_label,protocol,model,status,input_tokens,output_tokens,provider_input_tokens,provider_output_tokens,provider_cached_input_tokens,estimated_input_tokens,estimated_output_tokens,usage_source,latency_ms,prompt_fingerprint,response_id,error_category,error_message)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)`,
-      [input.workflowRunId ?? null, input.taskId ?? null, input.purpose, input.configRevision, input.candidateIndex, input.executor, input.profileId ?? null, input.providerLabel ?? null, input.protocol ?? null, input.model, input.status, input.inputTokens, input.outputTokens, input.providerInputTokens ?? null, input.providerOutputTokens ?? null, input.providerCachedInputTokens ?? null, input.estimatedInputTokens ?? null, input.estimatedOutputTokens ?? null, input.usageSource ?? "provider", input.latencyMs, input.promptFingerprint, input.responseId ?? null, input.errorCategory ?? null, input.errorMessage?.slice(0, 2_000) ?? null],
+      `INSERT INTO model_invocations(workflow_run_id,task_id,purpose,config_revision,candidate_index,executor,profile_id,provider_label,protocol,model,status,input_tokens,output_tokens,provider_input_tokens,provider_output_tokens,provider_cached_input_tokens,estimated_input_tokens,estimated_output_tokens,usage_source,latency_ms,prompt_fingerprint,response_id,error_category,error_message,project_id)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,COALESCE($25::text, (SELECT r.project_id FROM workflow_runs r WHERE r.id=$1 OR r.temporal_workflow_id=$1 LIMIT 1)))`,
+      [input.workflowRunId ?? null, input.taskId ?? null, input.purpose, input.configRevision, input.candidateIndex, input.executor, input.profileId ?? null, input.providerLabel ?? null, input.protocol ?? null, input.model, input.status, input.inputTokens, input.outputTokens, input.providerInputTokens ?? null, input.providerOutputTokens ?? null, input.providerCachedInputTokens ?? null, input.estimatedInputTokens ?? null, input.estimatedOutputTokens ?? null, input.usageSource ?? "provider", input.latencyMs, input.promptFingerprint, input.responseId ?? null, input.errorCategory ?? null, input.errorMessage?.slice(0, 2_000) ?? null, input.projectId ?? null],
     );
   }
 
@@ -741,10 +825,133 @@ export class NovelPostgresRepository {
     return result.rows;
   }
 
+  /**
+   * OR-D3（product-audit-20260910 E5 剩余子项）：估算 vs provider 上报的按 purpose
+   * 只读比值报表。症状：估算与上报差最高 76 倍且只能人工抓样本——tokenizer 漂移
+   * （估算公式对特定模型系统性偏低/偏高）不可见、不可回归。
+   * 机制：仅统计双列都非空的行（provider 未上报的行不参与比值，防把"缺报"读成
+   * "偏差"）；p50/p95 用分位数而非均值——单条超长调用不应拉爆整体判断；
+   * max_ratio 行定位最坏样本。泛化：无 purpose/model 专属分支，任何 provider 接入
+   * 即入报表。sinceDays 窗口对齐遥测保留策略。
+   */
+  async getEstimatedVsProviderRatio(input: { sinceDays?: number } = {}) {
+    const sinceDays = input.sinceDays ?? 30; // TODO P3: 诊断窗口应可配置
+    const result = await this.pool.query<{
+      purpose: string; model: string; comparable_calls: number; artifact_calls: number;
+      p50_ratio: number | null; p95_ratio: number | null; max_ratio: number | null; min_ratio: number | null;
+      manifest_linked_calls: number;
+    }>(
+      // 比率只用"provider 对整份负载的真实上报"：与同一请求的独立估算偏离两个
+      // 数量级以上（provider_input*100 < estimated）判为非测量——占位 1/1、只报
+      // 增量/未展开缓存等协议形态都落在此带内（真实分词器口径差异只在数倍内，
+      // 不误伤真·小调用：est=1 上报 1 仍可比）。伪测量混入会把 p50 拉塌到 1e-4，
+      // 恰摧毁本报表"检测估算器偏差"的目的。被剔行不静默丢账：artifact_calls
+      // 显式计数，占比本身是 provider 上报质量的观测面。
+      `SELECT purpose, model,
+         COUNT(*) FILTER (WHERE NOT (provider_input_tokens * 100 < estimated_input_tokens))::int AS comparable_calls,
+         COUNT(*) FILTER (WHERE provider_input_tokens * 100 < estimated_input_tokens)::int AS artifact_calls,
+         percentile_cont(0.5) WITHIN GROUP (ORDER BY (CASE WHEN provider_input_tokens * 100 < estimated_input_tokens THEN NULL ELSE provider_input_tokens::numeric / estimated_input_tokens END)) AS p50_ratio,
+         percentile_cont(0.95) WITHIN GROUP (ORDER BY (CASE WHEN provider_input_tokens * 100 < estimated_input_tokens THEN NULL ELSE provider_input_tokens::numeric / estimated_input_tokens END)) AS p95_ratio,
+         MAX(provider_input_tokens::numeric / estimated_input_tokens) FILTER (WHERE NOT (provider_input_tokens * 100 < estimated_input_tokens)) AS max_ratio,
+         MIN(provider_input_tokens::numeric / estimated_input_tokens) FILTER (WHERE NOT (provider_input_tokens * 100 < estimated_input_tokens)) AS min_ratio,
+         COUNT(*) FILTER (WHERE EXISTS (
+           SELECT 1 FROM prompt_executions pe
+           WHERE pe.prompt_fingerprint = model_invocations.prompt_fingerprint AND pe.context_manifest_id IS NOT NULL
+         ))::int AS manifest_linked_calls
+       FROM model_invocations
+       WHERE created_at > now() - ($1::int * interval '1 day')
+         AND estimated_input_tokens > 0 AND provider_input_tokens IS NOT NULL
+       GROUP BY purpose, model ORDER BY comparable_calls DESC`,
+      [sinceDays],
+    );
+    return result.rows.map((row) => ({
+      purpose: row.purpose,
+      model: row.model,
+      comparableCalls: row.comparable_calls,
+      artifactCalls: row.artifact_calls,
+      p50Ratio: row.p50_ratio === null ? null : Number(row.p50_ratio),
+      p95Ratio: row.p95_ratio === null ? null : Number(row.p95_ratio),
+      maxRatio: row.max_ratio === null ? null : Number(row.max_ratio),
+      minRatio: row.min_ratio === null ? null : Number(row.min_ratio),
+      manifestLinkedCalls: row.manifest_linked_calls,
+    }));
+  }
+
+  /**
+   * OR-A1（product-audit-20260910 E1）跨 purpose 候选健康度诊断——泛化谓词，不绑定具体
+   * 书名/人物/某条历史坏路由：按 `(purpose,candidate_index,executor,profile_id,provider_label,model)`
+   * 聚合调用，样本数≥阈值且成功数=0 ⇒ 判"从未成功"（建议摘除/降权）；同时把"失败等待墙钟"
+   * （SUM(latency_ms) where status='failed'）提为常规聚合指标，暴露烧在死路由上的时间。
+   * 只读诊断不改运行时行为——运维挪路由与机制诊断分离，防"改完配置又腐烂"。
+   * minSamples 阈值防小样本误判（单次失败 ≠ 死路由）；跨所有 purpose/候选一次性给出。
+   */
+  async getRoutingCandidateHealth(input: { sinceDays?: number; minSamples?: number } = {}) {
+    const sinceDays = input.sinceDays ?? 30; // TODO P3: 窗口应可配置（诊断默认近 30 天）
+    const minSamples = input.minSamples ?? 5; // TODO P3: 死路由判定最小样本，防偶发单点失败误判
+    const result = await this.pool.query<{
+      purpose: string; candidate_index: number; executor: string; profile_id: string | null; provider_label: string | null; model: string;
+      calls: number; failures: number; never_succeeded: boolean;
+      failed_wallclock_ms: string; total_wallclock_ms: string;
+    }>(
+      `SELECT purpose, candidate_index, executor, profile_id, provider_label, model,
+        COUNT(*)::int AS calls,
+        COUNT(*) FILTER (WHERE status='failed')::int AS failures,
+        (COUNT(*) FILTER (WHERE status='completed')=0 AND COUNT(*) >= $1::int) AS never_succeeded,
+        COALESCE(SUM(latency_ms) FILTER (WHERE status='failed'),0)::bigint AS failed_wallclock_ms,
+        COALESCE(SUM(latency_ms),0)::bigint AS total_wallclock_ms
+       FROM model_invocations
+       WHERE created_at >= now() - make_interval(days => $2::int)
+       GROUP BY purpose, candidate_index, executor, profile_id, provider_label, model
+       ORDER BY never_succeeded DESC, failed_wallclock_ms DESC`,
+      [minSamples, sinceDays],
+    );
+    return result.rows.map((row) => ({
+      purpose: row.purpose,
+      candidateIndex: row.candidate_index,
+      executor: row.executor,
+      profileId: row.profile_id,
+      providerLabel: row.provider_label,
+      model: row.model,
+      calls: row.calls,
+      failures: row.failures,
+      neverSucceeded: row.never_succeeded,
+      failedWallClockMs: Number(row.failed_wallclock_ms),
+      totalWallClockMs: Number(row.total_wallclock_ms),
+    }));
+  }
+
+  /**
+   * OR-D2（product-audit-20260910 E5）嵌入幂等短路的持久实现（EmbeddingCachePort）：
+   * 键=embeddingFingerprint(model,text)，同模型同内容全局复用（向量无项目归属，
+   * 项目隔离由 Qdrant payload 承担）。lookup 顺序与入参 texts 一一对应。
+   */
+  async lookupEmbeddings(model: string, texts: string[]): Promise<(number[] | undefined)[]> {
+    if (!texts.length) return [];
+    const fingerprints = texts.map((text) => embeddingFingerprint(model, text));
+    const result = await this.pool.query<{ prompt_fingerprint: string; vector: number[] }>(
+      "SELECT prompt_fingerprint, vector FROM embedding_cache WHERE prompt_fingerprint = ANY($1::text[])",
+      [fingerprints],
+    );
+    const byFingerprint = new Map(result.rows.map((row) => [row.prompt_fingerprint, row.vector]));
+    return fingerprints.map((fingerprint) => byFingerprint.get(fingerprint));
+  }
+
+  async storeEmbeddings(model: string, entries: Array<{ text: string; vector: number[] }>): Promise<void> {
+    if (!entries.length) return;
+    const params: unknown[] = [model];
+    const tuples = entries.map((entry) => {
+      // push 返回值即新元素长度 = 该参数 1-based 占位号。
+      const fingerprintIndex = params.push(embeddingFingerprint(model, entry.text));
+      const vectorIndex = params.push(JSON.stringify(entry.vector));
+      return `($1, $${fingerprintIndex}, $${vectorIndex}::jsonb)`;
+    });
+    await this.pool.query(`INSERT INTO embedding_cache(model,prompt_fingerprint,vector) VALUES ${tuples.join(",")} ON CONFLICT(prompt_fingerprint) DO NOTHING`, params);
+  }
+
   async createModelTask(workPackage: ModelWorkPackage, idempotencyKey: string): Promise<ModelTaskRecord> {
     const result = await this.pool.query<ModelTaskRow>(
-      `INSERT INTO model_tasks(id,workflow_run_id,task_id,purpose,config_revision,candidate_index,status,work_package,idempotency_key)
-       VALUES($1,$2,$3,$4,$5,$6,'pending',$7,$8)
+      `INSERT INTO model_tasks(id,workflow_run_id,task_id,purpose,config_revision,candidate_index,status,work_package,idempotency_key,project_id)
+       VALUES($1,$2,$3,$4,$5,$6,'pending',$7,$8,(SELECT r.project_id FROM workflow_runs r WHERE r.id=$2 OR r.temporal_workflow_id=$2 LIMIT 1))
        ON CONFLICT(idempotency_key) DO UPDATE SET updated_at=model_tasks.updated_at
        RETURNING *`,
       [workPackage.id, workPackage.workflowRunId, workPackage.taskId, workPackage.purpose, workPackage.configRevision, workPackage.candidateIndex, workPackage, idempotencyKey],
@@ -752,9 +959,9 @@ export class NovelPostgresRepository {
     return modelTaskFromRow(result.rows[0]);
   }
 
-  async listModelTasks(status: ModelTaskRecord["status"] = "pending", limit = 50): Promise<ModelTaskRecord[]> {
+  async listModelTasks(status: ModelTaskRecord["status"] = "pending", limit = 50, projectId?: string): Promise<ModelTaskRecord[]> {
     await this.reopenExpiredModelTasks();
-    const result = await this.pool.query<ModelTaskRow>("SELECT * FROM model_tasks WHERE status=$1 ORDER BY created_at ASC LIMIT $2", [status, limit]);
+    const result = await this.pool.query<ModelTaskRow>("SELECT * FROM model_tasks WHERE status=$1 AND ($3::text IS NULL OR project_id=$3) ORDER BY created_at ASC LIMIT $2", [status, limit, projectId ?? null]);
     return result.rows.map(modelTaskFromRow);
   }
 
@@ -775,9 +982,9 @@ export class NovelPostgresRepository {
       await client.query("UPDATE model_tasks SET status='claimed',updated_at=now() WHERE id=$1", [input.taskId]);
       const leaseExpires = new Date(Date.now() + input.leaseMs);
       await client.query(
-        `INSERT INTO task_attempts(id,workflow_run_id,task_id,lease_owner,lease_expires_at,heartbeat_at,status,payload)
-         VALUES($1,$2,$3,$4,$5,now(),'claimed',$6)
-         ON CONFLICT(id) DO UPDATE SET lease_owner=EXCLUDED.lease_owner,lease_expires_at=EXCLUDED.lease_expires_at,heartbeat_at=now(),status='claimed',payload=task_attempts.payload || EXCLUDED.payload`,
+        `INSERT INTO task_attempts(id,workflow_run_id,task_id,model_task_id,lease_owner,lease_expires_at,heartbeat_at,status,payload)
+         VALUES($1,$2,$3,$3,$4,$5,now(),'claimed',$6)
+         ON CONFLICT(id) DO UPDATE SET model_task_id=EXCLUDED.model_task_id,lease_owner=EXCLUDED.lease_owner,lease_expires_at=EXCLUDED.lease_expires_at,heartbeat_at=now(),status='claimed',payload=task_attempts.payload || EXCLUDED.payload`,
         [input.attemptId, task.rows[0].workflow_run_id, input.taskId, input.leaseOwner, leaseExpires, { modelTaskId: input.taskId }],
       );
       await client.query("COMMIT");
@@ -792,7 +999,7 @@ export class NovelPostgresRepository {
     const leaseExpires = new Date(Date.now() + input.leaseMs);
     const result = await this.pool.query(
       `UPDATE task_attempts SET heartbeat_at=now(),lease_expires_at=$4,status='running'
-       WHERE id=$1 AND task_id=$2 AND lease_owner=$3 AND lease_expires_at>now()`,
+       WHERE id=$1 AND model_task_id=$2 AND lease_owner=$3 AND lease_expires_at>now()`,
       [input.attemptId, input.taskId, input.leaseOwner, leaseExpires],
     );
     if (!result.rowCount) throw new Error("任务租约不存在、已过期或不属于当前执行者");
@@ -808,7 +1015,7 @@ export class NovelPostgresRepository {
       const row = task.rows[0];
       if (row.status === "submitted") { await client.query("COMMIT"); return modelTaskFromRow(row); }
       if (row.work_package.inputFingerprint !== input.inputFingerprint) throw new Error("输入指纹不匹配，任务上下文已变化");
-      const lease = await client.query("SELECT 1 FROM task_attempts WHERE id=$1 AND task_id=$2 AND lease_owner=$3 AND lease_expires_at>now()", [input.attemptId, input.taskId, input.leaseOwner]);
+      const lease = await client.query("SELECT 1 FROM task_attempts WHERE id=$1 AND model_task_id=$2 AND lease_owner=$3 AND lease_expires_at>now()", [input.attemptId, input.taskId, input.leaseOwner]);
       if (!lease.rowCount) throw new Error("任务租约不存在、已过期或不属于当前执行者");
       if (typeof input.result?.text !== "string" && input.result?.value === undefined) throw new Error("外部任务结果必须包含 text 或 value");
       const updated = await client.query<ModelTaskRow>("UPDATE model_tasks SET status='submitted',result=$2,updated_at=now() WHERE id=$1 RETURNING *", [input.taskId, input.result]);
@@ -822,7 +1029,7 @@ export class NovelPostgresRepository {
   }
 
   async failModelTask(input: { taskId: string; attemptId: string; leaseOwner: string; reason: string }): Promise<ModelTaskRecord> {
-    const lease = await this.pool.query("SELECT 1 FROM task_attempts WHERE id=$1 AND task_id=$2 AND lease_owner=$3", [input.attemptId, input.taskId, input.leaseOwner]);
+    const lease = await this.pool.query("SELECT 1 FROM task_attempts WHERE id=$1 AND model_task_id=$2 AND lease_owner=$3", [input.attemptId, input.taskId, input.leaseOwner]);
     if (!lease.rowCount) throw new Error("任务 attempt 不属于当前执行者");
     const result = await this.pool.query<ModelTaskRow>("UPDATE model_tasks SET status='failed',result=$2,updated_at=now() WHERE id=$1 RETURNING *", [input.taskId, { text: "", value: { reason: input.reason } }]);
     if (!result.rowCount) throw new Error("外部模型任务不存在");
@@ -834,9 +1041,27 @@ export class NovelPostgresRepository {
     await this.pool.query(
       `UPDATE model_tasks mt SET status='pending',updated_at=now()
        WHERE mt.status IN ('claimed','running') AND NOT EXISTS (
-         SELECT 1 FROM task_attempts ta WHERE ta.task_id=mt.id AND ta.status IN ('claimed','running') AND ta.lease_expires_at>now()
+         SELECT 1 FROM task_attempts ta WHERE ta.model_task_id=mt.id AND ta.status IN ('claimed','running') AND ta.lease_expires_at>now()
        )`,
     );
+  }
+
+  /** 人物引用归一索引（P4）：登记表内把任意漂移形态解析为规范三形态。 */
+  private async characterRefIndex(projectId: string, connection: Pool | PoolClient = this.pool) {
+    const rows = await connection.query<{ id: string; name: string }>("SELECT id,name FROM entities WHERE project_id=$1 AND kind='character'", [projectId]);
+    return buildCharacterRefIndex(rows.rows);
+  }
+
+  private async characterRefForms(projectId: string, value: string): Promise<CharacterRefForms | undefined> {
+    return (await this.characterRefIndex(projectId)).resolve(value);
+  }
+
+  /** 引用 → 显示名解析（POV 残留扫描等"以名找文"消费面用；未登记为 undefined）。 */
+  async resolveCharacterDisplayNames(projectId: string, refs: readonly string[]): Promise<Record<string, string | undefined>> {
+    const index = await this.characterRefIndex(projectId);
+    const resolved: Record<string, string | undefined> = {};
+    for (const ref of refs) resolved[ref] = ref ? index.resolve(ref)?.name : undefined;
+    return resolved;
   }
 
   async searchMemory(input: { projectId: string; facets: RetrievalFacet[]; narrativeCutoff?: number; povCharacterId?: string }): Promise<MemoryHit[]> {
@@ -850,6 +1075,18 @@ export class NovelPostgresRepository {
     // P2-G2: 同时计算 lexicalRank（命中 term 数 / 总 term 数），
     // 让 buildMemoryBundle 能做三轨加权融合（semantic + lexical + graph）。
     const results: MemoryHit[] = [];
+    // POV 作用域过滤的形态归一（P4）：facet.knowledgeCharacterId 来自蓝图（存在
+    // char_chu/chu-heng 等漂移形态），claims.knowledge_scope 存短 id 或显示名——
+    // 字符串相等匹配会静默漏配整章的 POV 记忆。登记表解析成功后按规范 URI 比对，
+    // 未登记形态回退字面相等（不发明人物，也不改变旧数据语义）。
+    const povIndex = input.facets.some((facet) => facet.knowledgeCharacterId) ? await this.characterRefIndex(input.projectId) : undefined;
+    const sameCharacter = (left: string, right: string): boolean => {
+      if (left === right) return true;
+      if (!povIndex) return false;
+      const leftForms = povIndex.resolve(left);
+      const rightForms = povIndex.resolve(right);
+      return Boolean(leftForms && rightForms && leftForms.uri === rightForms.uri);
+    };
     for (const facet of input.facets) {
       const terms = facet.query.split(/\s+/u).filter(Boolean).slice(0, 8);
       if (terms.length === 0) continue;
@@ -877,10 +1114,10 @@ export class NovelPostgresRepository {
         const titleParam = 3 + idx * 2;
         return `(CASE WHEN content ILIKE $${contentParam} OR title ILIKE $${titleParam} THEN 1 ELSE 0 END)`;
       }).join(" + ");
-      const sql = `SELECT *, (${lexicalRankSelect})::REAL / ${terms.length} AS lexical_rank FROM memory_claims WHERE project_id = $1 AND lifecycle_status='active' AND authority IN ('approved','author','derived') AND NOT EXISTS (SELECT 1 FROM memory_claims newer WHERE newer.project_id=memory_claims.project_id AND newer.lifecycle_status='active' AND memory_claims.id=ANY(newer.supersedes)) AND (${orClauses.join(" OR ")}) ${extra} ORDER BY lexical_rank DESC, confidence DESC, created_at DESC LIMIT 32`;
+      const sql = `SELECT *, (${lexicalRankSelect})::REAL / ${terms.length} AS lexical_rank FROM memory_claims WHERE project_id = $1 AND ${retrievalVisibleClaimsSql("memory_claims")} AND (${orClauses.join(" OR ")}) ${extra} ORDER BY lexical_rank DESC, confidence DESC, created_at DESC LIMIT 32`;
       const rows = await this.pool.query<any>(sql, params);
       for (const row of rows.rows) {
-        if (facet.knowledgeCharacterId && row.knowledge_scope?.characterId && row.knowledge_scope.characterId !== facet.knowledgeCharacterId) continue;
+        if (facet.knowledgeCharacterId && row.knowledge_scope?.characterId && !sameCharacter(String(row.knowledge_scope.characterId), facet.knowledgeCharacterId)) continue;
         const lexicalRank = Number(row.lexical_rank ?? 0);
         results.push({
           id: row.id,
@@ -934,14 +1171,23 @@ export class NovelPostgresRepository {
     const graphFacets = input.facets.filter((facet) => facet.kind === "entity" || facet.kind === "relation" || facet.kind === "thread");
     if (!graphFacets.length) return [];
     const params: unknown[] = [input.projectId];
-    let validity = "";
+    // PL-4 正文可指认门（检索面）：来源为章节抽取（source_revision_id 非空）却未绑正文
+    // 位置（valid_from NULL）的关系，是未通过可指认判定的"规划候选"，不得作为正文事实被
+    // 检索——正是"零出场人物挂正文来源关系"的止血点。它们仍可经 listRelations 供人工裁决。
+    // 人工/legacy 关系（source_revision_id 为空）保持原语义不受影响。
+    let validity = " AND NOT (r.source_revision_id IS NOT NULL AND r.valid_from IS NULL)";
     if (input.narrativeCutoff !== undefined) {
       params.push(input.narrativeCutoff);
       validity += ` AND (r.valid_from IS NULL OR r.valid_from<=$${params.length}) AND (r.valid_to IS NULL OR r.valid_to>=$${params.length})`;
     }
     if (input.povCharacterId) {
-      params.push(input.povCharacterId);
-      validity += ` AND (r.subject_id=$${params.length} OR r.object_id=$${params.length})`;
+      // P4：relations.subject_id/object_id 恒为实体 URI，蓝图 POV 是短 id/漂移形态——
+      // 旧的字符串相等使 POV 作用域关系召回恒空。按登记表展开为 URI/短 id/原值集合，
+      // 未登记值保留原样匹配（向后兼容）。
+      const forms = await this.characterRefForms(input.projectId, input.povCharacterId);
+      const scopeIds = [...new Set([forms?.uri ?? input.povCharacterId, forms?.shortId ?? input.povCharacterId, input.povCharacterId])];
+      params.push(scopeIds);
+      validity += ` AND (r.subject_id=ANY($${params.length}::text[]) OR r.object_id=ANY($${params.length}::text[]))`;
     }
     const relations = await this.pool.query<{
       id: string; subject_id: string; predicate: string; object_id: string; valid_from: string | number | null; valid_to: string | number | null; source_revision_id: string | null; subject_name: string | null; object_name: string | null;
@@ -1025,6 +1271,7 @@ export class NovelPostgresRepository {
       LEFT JOIN LATERAL (
         SELECT status FROM workflow_runs r WHERE r.project_id=p.id ORDER BY r.updated_at DESC LIMIT 1
       ) latest ON TRUE
+      WHERE COALESCE(p.metadata->>'systemKind','') = ''
       ORDER BY p.updated_at DESC
     `);
     return result.rows.map((row: ProjectRow & { latest_run_status?: string | null; positioning_payload?: Record<string, unknown> | null }) => ({ id: row.id, title: resolveProjectTitle(row.id, row.title, row.positioning_payload ?? undefined), currentRevision: Number(row.current_revision), current_revision: Number(row.current_revision), metadata: row.metadata ?? {}, createdAt: iso(row.created_at), updatedAt: iso(row.updated_at), updated_at: iso(row.updated_at), latestRunStatus: row.latest_run_status ?? undefined }));
@@ -1040,6 +1287,12 @@ export class NovelPostgresRepository {
         cps.chapter_goal,
         COUNT(crsi.id)::int AS blocking_issue_count,
         crs.overall_score AS review_score,crs.verdict AS review_verdict,
+        -- 作者对当前内容的最终决定：approval_evidence 按 artifact 内容哈希与当前修订内容对齐，
+        -- 区分「reviewer 聚合判 revise」与「作者已覆盖批准」两个独立事实（防误读，见 protocol.authorDecision 注）。
+        (SELECT ae.decision FROM approval_evidence ae
+          JOIN artifacts ra ON ra.id=ae.artifact_id
+          WHERE ae.project_id=d.project_id AND ra.content_hash=mr.content_hash
+          ORDER BY ae.created_at DESC, ae.id DESC LIMIT 1) AS author_decision,
         CASE WHEN crs.id IS NULL THEN NULL ELSE crs.reviewed_content_hash<>mr.content_hash END AS review_stale,
         a.id AS arc_id,a.title AS arc_title,a.planning_status AS arc_planning_status
       FROM manuscript_documents d
@@ -1086,16 +1339,44 @@ export class NovelPostgresRepository {
     return this.getProjectDetail(input.projectId);
   }
 
-  async recordPromptExecution(input: ModelPromptExecution, objects: ObjectStoreAdapter): Promise<void> {
+  async recordPromptExecution(input: ModelPromptExecution & { contextManifestId?: string }, objects: ObjectStoreAdapter): Promise<void> {
     if (!input.workflowRunId || !input.taskId) return;
+    // E5 采样判定落在此留痕本体（最低共享层）：网关回调、外部任务 submit 直连等
+    // 全部消费面自动获得同源采样，不存在"某进程绕过 hook"的接线漂移面。
+    let contextManifestId = input.contextManifestId;
+    if (!contextManifestId && input.contextManifest) {
+      const ratio = samplingRatioFromEnv();
+      if (contextManifestSamplingHit(input.contextManifest, input.promptFingerprint, ratio)) {
+        try {
+          await this.putPromptContextManifest(input.contextManifest);
+          contextManifestId = input.contextManifest.id;
+        } catch (error) {
+          console.warn(`[context-manifest-sampling] 物化失败（不阻塞留痕）：${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+    }
     const promptObject = await objects.putText(JSON.stringify({ system: input.system, prompt: input.prompt }));
     const responseObject = input.response === undefined ? undefined : await objects.putText(input.response);
     const retentionDays = Math.max(1, Number(process.env.NOVEL_PROMPT_RETENTION_DAYS ?? 30));
     const id = `prompt:${randomUUID()}`;
     await this.pool.query(
-      `INSERT INTO prompt_executions(id,workflow_run_id,task_id,purpose,candidate_index,status,prompt_fingerprint,response_fingerprint,prompt_object_key,response_object_key,context_manifest,error_category,expires_at)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,now()+($13::text || ' days')::interval)`,
-      [id, input.workflowRunId, input.taskId, input.purpose, input.candidateIndex, input.status, input.promptFingerprint, responseObject?.hash ?? null, promptObject.key, responseObject?.key ?? null, input.contextManifest ?? null, input.errorCategory ?? null, retentionDays],
+      `INSERT INTO prompt_executions(id,workflow_run_id,task_id,purpose,candidate_index,status,prompt_fingerprint,response_fingerprint,prompt_object_key,response_object_key,context_manifest,context_manifest_id,error_category,expires_at,project_id)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,now()+($14::text || ' days')::interval,(SELECT r.project_id FROM workflow_runs r WHERE r.id=$2 OR r.temporal_workflow_id=$2 LIMIT 1))`,
+      [id, input.workflowRunId, input.taskId, input.purpose, input.candidateIndex, input.status, input.promptFingerprint, responseObject?.hash ?? null, promptObject.key, responseObject?.key ?? null, input.contextManifest ?? null, contextManifestId ?? null, input.errorCategory ?? null, retentionDays],
+    );
+  }
+
+  /**
+   * OR-D3（product-audit-20260910 E5）：把 PromptContextManifest（prompt-package 级
+   * 上下文预算/分段收据）物化进 context_manifests。id 为 workflow+fingerprint 确定值，
+   * 重放天然去重（DO NOTHING）；列映射无损——token 收据进 payload JSONB，
+   * token_budget=usableInputTokens（观测面：真正可用的 section 容量）。
+   */
+  async putPromptContextManifest(manifest: PromptContextManifest): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO context_manifests(id,project_id,retrieval_run_id,source_revision_ids,token_budget,truncation_reason,fingerprint,payload)
+       VALUES($1,$2,NULL,'{}',$3,NULL,$4,$5) ON CONFLICT(id) DO NOTHING`,
+      [manifest.id, manifest.projectId, manifest.usableInputTokens, manifest.fingerprint, manifest],
     );
   }
 
@@ -1332,6 +1613,13 @@ export class NovelPostgresRepository {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
+      // Telemetry and event tables cascade via the project_id FK (migration 083),
+      // but rows written before attribution keep a NULL project_id; delete them by
+      // the owning run reference while the run rows are still present.
+      for (const table of ["model_tasks", "model_invocations", "prompt_executions"]) {
+        await client.query(`DELETE FROM ${table} WHERE project_id=$1 OR workflow_run_id IN (SELECT id FROM workflow_runs WHERE project_id=$1 UNION SELECT temporal_workflow_id FROM workflow_runs WHERE project_id=$1)`, [projectId]);
+      }
+      await client.query("DELETE FROM outbox_events WHERE project_id=$1", [projectId]);
       await client.query("DELETE FROM task_attempts WHERE workflow_run_id IN (SELECT temporal_workflow_id FROM workflow_runs WHERE project_id=$1) OR workflow_run_id IN (SELECT id FROM workflow_runs WHERE project_id=$1)", [projectId]);
       await client.query("DELETE FROM workflow_runs WHERE project_id=$1", [projectId]);
       await client.query("DELETE FROM learning_assessments WHERE project_id=$1", [projectId]);
@@ -1443,11 +1731,16 @@ export class NovelPostgresRepository {
   }
 
   async expireModelTask(taskId: string, reason: string): Promise<void> {
-    await this.pool.query(
-      "UPDATE model_tasks SET status='failed',result=$2,updated_at=now() WHERE id=$1 AND status IN ('pending','claimed','running')",
+    const updated = await this.pool.query<{ project_id: string | null; workflow_run_id: string | null }>(
+      "UPDATE model_tasks SET status='failed',result=$2,updated_at=now() WHERE id=$1 AND status IN ('pending','claimed','running') RETURNING project_id,workflow_run_id",
       [taskId, { value: { reason, expired: true } }],
     );
-    await this.pool.query("UPDATE task_attempts SET status='failed',payload=payload || $2 WHERE task_id=$1 AND status IN ('claimed','running')", [taskId, { reason, expired: true }]);
+    await this.pool.query("UPDATE task_attempts SET status='failed',payload=payload || $2 WHERE model_task_id=$1 AND status IN ('claimed','running')", [taskId, { reason, expired: true }]);
+    // OR-B3（product-audit-20260910 E3）：waiting-external 超时不再静默——outbox 事件
+    // 让编排者感知"任务发了没人领"（观测审计里的 34 次等待、0 claim 0 submit）。
+    for (const row of updated.rows) {
+      await this.appendOutbox("model-task", taskId, "model-task.expired", { projectId: row.project_id, modelTaskId: taskId, workflowRunId: row.workflow_run_id, reason });
+    }
   }
 
   async expireWorkflowModelTasks(workflowRunId: string, reason: string): Promise<number> {
@@ -1458,10 +1751,72 @@ export class NovelPostgresRepository {
     return result.rowCount ?? 0;
   }
 
+  /**
+   * OR-B4（product-audit-20260910 E3）周期对账：僵尸非终态 run 的诚实关闭。
+   * 判据：Temporal retention=24h 无卷——updated_at 超窗的 running 类 run 已无从核对
+   * 引擎真相（代码里曾有的 zombieReaped 机制并不存在），继续挂 running 只会永久阻塞
+   * 同类工作流的活动锁与看板。超窗统一落 failed + 显式 terminalOutcome/reasonCode：
+   *   running/accepted → abandoned-stale-run；waiting-external → external-wait-timed-out。
+   * 边界（刻意不收编）：manual-review-required/paused 是**等待人**的合法停驻态，
+   * 机器无权判定人类何时回来。配套 expireWorkflowModelTasks 清其名下未认领外部任务。
+   * 触发：maintenance 端点/编排者周期调用（无隐式调度器——对账是运维决策频率）。
+   */
+  async reconcileStaleWorkflowRuns(input: { nowMs: number; maxRunningMs?: number; maxWaitingExternalMs?: number }): Promise<Array<{ workflowId: string; previousStatus: string; reasonCode: string }>> {
+    const maxRunningMs = input.maxRunningMs ?? 6 * 60 * 60 * 1000; // TODO P3: running 类上限应可配置（覆盖最长合法生成链 + 余量）
+    const maxWaitingExternalMs = input.maxWaitingExternalMs ?? 24 * 60 * 60 * 1000; // TODO P3: 与 Temporal history retention(24h) 对齐
+    const reconciledAt = new Date(input.nowMs).toISOString();
+    const candidates = await this.pool.query<{ temporal_workflow_id: string; project_id: string; status: string }>(
+      `SELECT temporal_workflow_id, project_id, status FROM workflow_runs
+       WHERE (status IN ('running','accepted') AND updated_at < $1::timestamptz)
+          OR (status='waiting-external' AND updated_at < $2::timestamptz)
+       ORDER BY updated_at LIMIT 200`,
+      [new Date(input.nowMs - maxRunningMs).toISOString(), new Date(input.nowMs - maxWaitingExternalMs).toISOString()],
+    );
+    const reconciled: Array<{ workflowId: string; previousStatus: string; reasonCode: string }> = [];
+    for (const row of candidates.rows) {
+      const waitingExternal = row.status === "waiting-external";
+      const terminalOutcome = waitingExternal ? "external-wait-timed-out" : "abandoned-stale-run";
+      const reasonCode = waitingExternal ? "external-wait-exceeded-retention-window" : "stale-running-beyond-temporal-retention";
+      // 乐观守卫：仅当仍是候选快照里的旧状态才收编——对账期间 run 真的推进/终态
+      // （workflow 自己写了新状态）时放弃本行，绝不用过期判据覆写新鲜事实。
+      const updated = await this.pool.query(
+        `UPDATE workflow_runs SET status='failed', updated_at=now(),
+           payload = payload || jsonb_build_object('terminalOutcome', $3::text, 'reasonCode', $4::text, 'reconciledAt', $5::text)
+         WHERE temporal_workflow_id=$1 AND status=$2 RETURNING id`,
+        [row.temporal_workflow_id, row.status, terminalOutcome, reasonCode, reconciledAt],
+      );
+      if (!updated.rowCount) continue;
+      await this.appendOutbox("workflow-run", row.temporal_workflow_id, "workflow.reconciled-abandoned", { projectId: row.project_id, workflowId: row.temporal_workflow_id, previousStatus: row.status, terminalOutcome, reasonCode });
+      // 僵尸 run 名下未认领/未关闭的外部任务一并清账，防止 pending 队列被幽灵 run 喂脏。
+      await this.expireWorkflowModelTasks(row.temporal_workflow_id, `run-reconciled: ${reasonCode}`);
+      reconciled.push({ workflowId: row.temporal_workflow_id, previousStatus: row.status, reasonCode });
+    }
+    // creative_runs 镜像收编（审计"11 条非终态累积"）：paused 同 manual-review-required
+    // 是等人的合法停驻态，不收编。
+    const creativeCandidates = await this.pool.query<{ id: string; project_id: string; status: string }>(
+      `SELECT id, project_id, status FROM creative_runs
+       WHERE status IN ('pending','running') AND updated_at < $1::timestamptz
+       ORDER BY updated_at LIMIT 200`,
+      [new Date(input.nowMs - maxRunningMs).toISOString()],
+    );
+    for (const row of creativeCandidates.rows) {
+      const updated = await this.pool.query(
+        `UPDATE creative_runs SET status='failed', updated_at=now(),
+           payload = payload || jsonb_build_object('terminalOutcome', 'abandoned-stale-run', 'reasonCode', 'stale-creative-run-beyond-retention', 'reconciledAt', $3::text)
+         WHERE id=$1 AND status=$2 RETURNING id`,
+        [row.id, row.status, reconciledAt],
+      );
+      if (!updated.rowCount) continue;
+      await this.appendOutbox("creative-run", row.id, "creative-run.reconciled-abandoned", { projectId: row.project_id, runId: row.id, previousStatus: row.status, reasonCode: "stale-creative-run-beyond-retention" });
+      reconciled.push({ workflowId: row.id, previousStatus: row.status, reasonCode: "stale-creative-run-beyond-retention" });
+    }
+    return reconciled;
+  }
+
   async listIndexableMemoryClaims(input: { offset?: number; limit?: number; projectId?: string } = {}): Promise<MemoryClaim[]> {
     const result = await this.pool.query<any>(
       `SELECT * FROM memory_claims
-       WHERE lifecycle_status='active' AND authority IN ('approved','author','derived') AND ($3::text IS NULL OR project_id=$3)
+       WHERE ${retrievalVisibleClaimsSql("memory_claims")} AND ($3::text IS NULL OR project_id=$3)
        ORDER BY project_id,created_at,id OFFSET $1 LIMIT $2`,
       [input.offset ?? 0, input.limit ?? 500, input.projectId ?? null],
     );
@@ -1490,7 +1845,11 @@ export class NovelPostgresRepository {
   }
 
   async countIndexableMemoryClaims(): Promise<number> {
-    const claims = await this.pool.query<{ count: string }>("SELECT count(*)::text AS count FROM memory_claims WHERE lifecycle_status='active' AND authority IN ('approved','author','derived')");
+    // 与 listIndexableMemoryClaims 同口径：被 supersedes 退役的行不进入向量索引
+    // （memory-governance-audit-20260909 §5.3.1——可索引集 = 检索可见集）。
+    const claims = await this.pool.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM memory_claims
+       WHERE ${retrievalVisibleClaimsSql("memory_claims")}`);
     const chapters = await this.pool.query<{ count: string }>("SELECT count(*)::text AS count FROM chapter_memories");
     return Number(claims.rows[0]?.count ?? 0) + Number(chapters.rows[0]?.count ?? 0);
   }
@@ -1523,7 +1882,12 @@ export class NovelPostgresRepository {
         mr.revision,mr.content_hash,cb.object_key,cb.byte_length,
         cps.chapter_goal,ch.payload AS chapter_payload,ba.fingerprint AS chapter_blueprint_fingerprint,cps.updated_at AS spec_updated_at,
         crs.id AS review_id,crs.revision_id AS reviewed_revision_id,crs.reviewed_content_hash,crs.artifact_fingerprint,
-        crs.source_workflow_id,crs.verdict,crs.complete,crs.overall_score,crs.dimension_scores,crs.reviewer_roles,crs.reviewed_at
+        crs.source_workflow_id,crs.verdict,crs.complete,crs.overall_score,crs.dimension_scores,crs.reviewer_roles,crs.reviewed_at,
+        -- 作者对当前内容的最终决定（同 getProjectDetail 标量子查询口径）。
+        (SELECT ae.decision FROM approval_evidence ae
+          JOIN artifacts ra ON ra.id=ae.artifact_id
+          WHERE ae.project_id=d.project_id AND ra.content_hash=mr.content_hash
+          ORDER BY ae.created_at DESC, ae.id DESC LIMIT 1) AS author_decision
       FROM manuscript_documents d
       LEFT JOIN manuscript_revisions mr ON mr.id=d.current_revision_id
       LEFT JOIN content_blobs cb ON cb.content_hash=mr.content_hash
@@ -1560,6 +1924,8 @@ export class NovelPostgresRepository {
         artifactFingerprint: row.artifact_fingerprint, sourceWorkflowId: row.source_workflow_id ?? undefined, verdict: row.verdict,
         complete: row.complete, overallScore: row.overall_score === null ? undefined : Number(row.overall_score),
         reviewerRoles: row.reviewer_roles ?? [], reviewedAt: iso(row.reviewed_at), stale: row.reviewed_content_hash !== row.content_hash,
+        /** 作者对当前内容的最终决定（与文档列表 authorDecision 同口径），供工作台区分 reviewer 判定与作者覆盖批准。 */
+        authorDecision: row.author_decision ?? undefined,
         issues: issues.rows.map((issue) => ({ id: issue.id, fingerprint: issue.issue_fingerprint, severity: issue.severity, title: issue.title, description: issue.description ?? undefined, evidenceQuote: issue.evidence_quote, paragraph: issue.paragraph ?? undefined, revisionRanges: issue.revision_ranges ?? [], rule: issue.rule ?? undefined, suggestion: issue.suggestion ?? undefined, readerReconstruction: issue.reader_reconstruction ?? null, sourceRoles: issue.source_roles ?? [], status: issue.status, updatedAt: iso(issue.updated_at) })),
       } : undefined,
       versions: versions.rows.map((version) => ({ id: version.id, revision: Number(version.revision), contentHash: version.content_hash, retentionClass: version.retention_class, label: version.label ?? undefined, expiresAt: version.expires_at ? iso(version.expires_at) : undefined, createdAt: iso(version.created_at), current: version.is_current })),
@@ -1640,7 +2006,7 @@ export class NovelPostgresRepository {
     return { id: row.id, fingerprint: row.issue_fingerprint, dimension: row.dimension ?? undefined, severity: row.severity, title: row.title, description: row.description ?? undefined, evidenceQuote: row.evidence_quote, paragraph: row.paragraph ?? undefined, revisionRanges: row.revision_ranges ?? [], rule: row.rule ?? undefined, suggestion: row.suggestion ?? undefined, sourceRoles: row.source_roles ?? [], status: row.status, updatedAt: iso(row.updated_at) };
   }
 
-  async getTargetedChapterReviewIssues(input: { projectId: string; documentId: string; issueIds: string[] }): Promise<{ snapshotId: string; reviewedContentHash: string; fingerprints: string[]; issues: ReviewIssue[] }> {
+  async getTargetedChapterReviewIssues(input: { projectId: string; documentId: string; issueIds: string[]; plainText?: string }): Promise<{ snapshotId: string; reviewedContentHash: string; fingerprints: string[]; issues: ReviewIssue[] }> {
     const issueIds = [...new Set(input.issueIds.map((id) => id.trim()).filter(Boolean))];
     if (!issueIds.length) throw new Error("至少选择一条待处理审核意见");
     if (issueIds.length !== input.issueIds.length) throw new Error("目标审核意见不能重复");
@@ -1666,18 +2032,27 @@ export class NovelPostgresRepository {
     `, [current.id, issueIds]);
     if (rows.rowCount !== issueIds.length) throw new Error("部分审核意见不属于当前章节快照");
     if (rows.rows.some((row) => row.status !== "pending")) throw new Error("只能修复状态为待处理的审核意见");
-    const issues = rows.rows.map((row): ReviewIssue => ({
-      severity: row.severity,
-      title: row.title,
-      description: row.description ?? undefined,
-      evidence: row.evidence_quote,
-      excerpt: row.evidence_quote,
-      paragraph: row.paragraph ?? undefined,
-      revisionRanges: row.revision_ranges ?? [],
-      rule: row.rule ?? undefined,
-      suggestion: row.suggestion ?? undefined,
-      readerReconstruction: row.reader_reconstruction ?? null,
-    }));
+    const issues = rows.rows.map((row): ReviewIssue => {
+      const issue: ReviewIssue = {
+        severity: row.severity,
+        title: row.title,
+        description: row.description ?? undefined,
+        evidence: row.evidence_quote,
+        excerpt: row.evidence_quote,
+        paragraph: row.paragraph ?? undefined,
+        revisionRanges: row.revision_ranges ?? [],
+        rule: row.rule ?? undefined,
+        suggestion: row.suggestion ?? undefined,
+        readerReconstruction: row.reader_reconstruction ?? null,
+      };
+      // Evidence 闭环校验·消费时（2026-09-08）：证据已不在当前正文 → 陈旧意见。
+      // 实证：ch2 期限条目（采纳将复现已修复的时序矛盾）与 ch6×5（引用已删除文本）。
+      // 只附标记不改状态——是否忽略由编辑者决定，但标记会随窗口进入修订与审批链路。
+      if (input.plainText && isEvidencePresentInText(row.evidence_quote, input.plainText) === false) {
+        issue.description = [issue.description, "[evidence-stale] 证据引文已不在当前正文中：意见可能已过时，采纳前请核对是否仍成立（或应忽略）。"].filter(Boolean).join(" ");
+      }
+      return issue;
+    });
     if (issues.some((issue) => !issue.revisionRanges?.length && !issue.paragraph && !issue.excerpt?.trim())) throw new Error("所选审核意见缺少可定位的正文证据");
     return { snapshotId: current.id, reviewedContentHash: current.reviewed_content_hash, fingerprints: rows.rows.map((row) => row.issue_fingerprint), issues };
   }
@@ -1782,11 +2157,19 @@ export class NovelPostgresRepository {
         const elapsedMs = Math.max(0, new Date(current.updated_at).getTime() - new Date(current.created_at).getTime());
         const finalStage = typeof current.payload.stage === "string" ? current.payload.stage : null;
         const failureSummary = typeof current.payload.error === "string" ? current.payload.error.slice(0, 1000) : null;
+        // document_id 的 FK 语义是"引用有效或为 NULL"（ON DELETE SET NULL 同义）。run 可能引用
+        // 已被删除的章节文档（孤儿 run）：直接 INSERT 会 23503 并让整轮清理中断、积压增长。
+        // 先校验文档仍存在，已删除则置 NULL——摘要（metrics/failure_summary）本身保留。
+        let summaryDocumentId = documentId;
+        if (summaryDocumentId) {
+          const doc = await client.query("SELECT 1 FROM manuscript_documents WHERE id=$1", [summaryDocumentId]);
+          if (!doc.rowCount) summaryDocumentId = null;
+        }
         await client.query(`
           INSERT INTO workflow_run_summaries(workflow_run_id,project_id,document_id,workflow_type,final_status,final_stage,elapsed_ms,failure_summary,metrics,cleaned_at,completed_at)
           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,now(),$10)
           ON CONFLICT(workflow_run_id) DO UPDATE SET cleaned_at=EXCLUDED.cleaned_at,metrics=EXCLUDED.metrics
-        `, [current.id, current.project_id, documentId, current.workflow_type, current.status, finalStage, elapsedMs, failureSummary, {
+        `, [current.id, current.project_id, summaryDocumentId, current.workflow_type, current.status, finalStage, elapsedMs, failureSummary, {
           artifacts: artifactIds.length, reviews: Number(reviewCount.rows[0]?.count ?? 0), events: Number(eventCount.rows[0]?.count ?? 0),
           modelCalls: Number(usage.rows[0]?.calls ?? 0), inputTokens: Number(usage.rows[0]?.input_tokens ?? 0), outputTokens: Number(usage.rows[0]?.output_tokens ?? 0), providerCachedInputTokens: Number(usage.rows[0]?.provider_cached_input_tokens ?? 0),
         }, current.updated_at]);
@@ -1852,12 +2235,16 @@ export class NovelPostgresRepository {
   private async refreshChapterReviewSnapshotTx(client: PoolClient, artifactId: string, revisionId?: string, plainText?: string): Promise<boolean> {
     const subject = await client.query<{
       project_id: string; content_hash: string; fingerprint: string; workflow_id: string | null; document_id: string | null;
+      change_scope: string | null;
     }>(`
       SELECT a.project_id,a.content_hash,a.fingerprint,
         COALESCE(a.payload->>'workflowId',a.payload->>'runId') AS workflow_id,
-        COALESCE(w.payload->>'documentId',w.payload#>>'{intent,target,id}',mr.document_id) AS document_id
+        COALESCE(w.payload->>'documentId',w.payload#>>'{intent,target,id}',mr.document_id) AS document_id,
+        COALESCE(eb_direct.payload->>'changeScope',eb_intent.payload->>'changeScope') AS change_scope
       FROM artifacts a
       LEFT JOIN workflow_runs w ON w.temporal_workflow_id=COALESCE(a.payload->>'workflowId',a.payload->>'runId')
+      LEFT JOIN execution_blueprints eb_direct ON eb_direct.id=w.payload->>'blueprintId'
+      LEFT JOIN execution_blueprints eb_intent ON eb_intent.intent_id=w.payload#>>'{intent,id}'
       LEFT JOIN manuscript_revisions mr ON mr.artifact_id=a.id
       WHERE a.id=$1
     `, [artifactId]);
@@ -1891,7 +2278,10 @@ export class NovelPostgresRepository {
     const prior = existing.rowCount
       ? await client.query<{ issue_fingerprint: string; status: ChapterReviewIssueStatus }>("SELECT issue_fingerprint,status FROM chapter_review_snapshot_issues WHERE snapshot_id=$1", [snapshotId])
       : { rows: [] };
-    const snapshot = aggregateChapterReviews(reviews, new Map(prior.rows.map((row) => [row.issue_fingerprint, row.status])));
+    // E4：完整性判定必须与实际评审执行面同源——蓝图存了窄档就按窄档数期望角色，
+    // 否则机械/局部档章节（两审即完整）永远 complete=false，快照静默滞留旧修订。
+    const changeScope = target.change_scope === "mechanical-format" || target.change_scope === "local-text" ? target.change_scope : undefined;
+    const snapshot = aggregateChapterReviews(reviews, new Map(prior.rows.map((row) => [row.issue_fingerprint, row.status])), changeScope);
     if (!snapshot.complete) return false;
     const reviewedAt = new Date(Math.max(...reviews.map((review) => review.createdAt)));
     await client.query(`
@@ -1974,17 +2364,9 @@ export class NovelPostgresRepository {
         FROM memory_claims claim
         LEFT JOIN artifacts source ON source.id=claim.source_artifact_id
         WHERE claim.project_id=$1
-          AND claim.lifecycle_status='active'
-          AND claim.authority IN ('approved','author','derived')
+          AND ${retrievalVisibleClaimsSql("claim")}
           AND claim.predicate IS NOT NULL
           AND (source.kind='fact-extraction' OR (claim.source_artifact_id IS NULL AND claim.authority='author'))
-          AND NOT EXISTS (
-            SELECT 1 FROM memory_claims newer
-            WHERE newer.project_id=claim.project_id
-              AND newer.lifecycle_status='active'
-              AND newer.authority IN ('approved','author','derived')
-              AND claim.id=ANY(newer.supersedes)
-          )
         ORDER BY claim.narrative_start NULLS LAST,claim.created_at DESC,claim.id
       `, [projectId]);
       return result.rows.map((row) => ({
@@ -2074,7 +2456,8 @@ export class NovelPostgresRepository {
     }
     if (kind === "planning" || kind === "worldview" || kind === "characters") {
       const entityKind = kind === "characters" ? "character" : kind;
-      const result = await this.pool.query<{ id: string; kind: string; name: string; payload: Record<string, unknown> | null }>("SELECT id, kind, name, payload FROM entities WHERE project_id=$1 AND kind=$2 ORDER BY name,id", [projectId, entityKind]);
+      // 已归并退役的实体（payload.mergedInto）对知识工作台不可见，声部数据由规范行承载。
+      const result = await this.pool.query<{ id: string; kind: string; name: string; payload: Record<string, unknown> | null }>("SELECT id, kind, name, payload FROM entities WHERE project_id=$1 AND kind=$2 AND (payload->>'mergedInto') IS NULL ORDER BY name,id", [projectId, entityKind]);
       if (kind !== "characters") return result.rows;
       const foundation = await this.pool.query<{ characters: unknown }>("SELECT payload->'structuredData'->'characters' AS characters FROM project_plan_sections WHERE project_id=$1 AND task_key='characters'", [projectId]);
       const foundationCharacters = Array.isArray(foundation.rows[0]?.characters)
@@ -2103,8 +2486,7 @@ export class NovelPostgresRepository {
       const result = await this.pool.query("SELECT id, narrative_time, event_type, content, source_revision_id FROM timeline_events WHERE project_id=$1 ORDER BY narrative_time,id", [projectId]);
       return result.rows.map((row) => ({ id: row.id, narrativeTime: Number(row.narrative_time), eventType: row.event_type, content: row.content ?? {}, sourceRevisionId: row.source_revision_id }));
     }
-    const result = await this.pool.query("SELECT id, subject_id, predicate, object_value, truth_status, confidence, narrative_start, narrative_end FROM facts WHERE project_id=$1 ORDER BY narrative_start NULLS LAST,id", [projectId]);
-    return result.rows.map((row) => ({ id: row.id, subjectId: row.subject_id, predicate: row.predicate, objectValue: row.object_value ?? {}, truthStatus: row.truth_status, confidence: Number(row.confidence), narrativeStart: row.narrative_start === null ? undefined : Number(row.narrative_start), narrativeEnd: row.narrative_end === null ? undefined : Number(row.narrative_end) }));
+    throw new Error(`不支持的资料类型：${kind}（遗留 facts 表已收口，事实断言请使用 claims）`);
   }
 
   async upsertNarrativeClaim(projectId: string, input: Record<string, unknown>) {
@@ -2243,10 +2625,31 @@ export class NovelPostgresRepository {
     if (kind === "skills") {
       const version = typeof input.version === "string" && input.version.trim() ? input.version.trim() : "1.0.0";
       const promptSections = input.promptSections ?? input.prompt_sections ?? {};
-      await this.pool.query(`INSERT INTO skill_definitions(skill_id,version,capabilities,applicable_tasks,required_memory_kinds,conflicts,quality_gates,prompt_sections,applicable_genres,execution_points,roles,depends_on,priority,content_fingerprint,source_ref,enabled)
+      // 值相同 ⇒ rowCount 0 ⇒ 不翻 updated_at、不写审计/outbox（seedWorkspaceSkills 与
+      // skills sync 每次 migrate/同步都全量重放，无此短路会把 audit_records/outbox 灌满
+      // 无效 churn，并放大依赖 audit 历史的重放面扫描——幂等必须对副作用成立）。
+      const wrote = await this.pool.query(`INSERT INTO skill_definitions(skill_id,version,capabilities,applicable_tasks,required_memory_kinds,conflicts,quality_gates,prompt_sections,applicable_genres,execution_points,roles,depends_on,priority,content_fingerprint,source_ref,enabled)
         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
-        ON CONFLICT(skill_id) DO UPDATE SET version=EXCLUDED.version,capabilities=EXCLUDED.capabilities,applicable_tasks=EXCLUDED.applicable_tasks,required_memory_kinds=EXCLUDED.required_memory_kinds,conflicts=EXCLUDED.conflicts,quality_gates=EXCLUDED.quality_gates,prompt_sections=EXCLUDED.prompt_sections,applicable_genres=EXCLUDED.applicable_genres,execution_points=EXCLUDED.execution_points,roles=EXCLUDED.roles,depends_on=EXCLUDED.depends_on,priority=EXCLUDED.priority,content_fingerprint=EXCLUDED.content_fingerprint,source_ref=EXCLUDED.source_ref,enabled=EXCLUDED.enabled,updated_at=now()`,
+        ON CONFLICT(skill_id) DO UPDATE SET version=EXCLUDED.version,capabilities=EXCLUDED.capabilities,applicable_tasks=EXCLUDED.applicable_tasks,required_memory_kinds=EXCLUDED.required_memory_kinds,conflicts=EXCLUDED.conflicts,quality_gates=EXCLUDED.quality_gates,prompt_sections=EXCLUDED.prompt_sections,applicable_genres=EXCLUDED.applicable_genres,execution_points=EXCLUDED.execution_points,roles=EXCLUDED.roles,depends_on=EXCLUDED.depends_on,priority=EXCLUDED.priority,content_fingerprint=EXCLUDED.content_fingerprint,source_ref=EXCLUDED.source_ref,enabled=EXCLUDED.enabled,updated_at=now()
+        WHERE skill_definitions.version IS DISTINCT FROM EXCLUDED.version
+           OR skill_definitions.capabilities IS DISTINCT FROM EXCLUDED.capabilities
+           OR skill_definitions.applicable_tasks IS DISTINCT FROM EXCLUDED.applicable_tasks
+           OR skill_definitions.required_memory_kinds IS DISTINCT FROM EXCLUDED.required_memory_kinds
+           OR skill_definitions.conflicts IS DISTINCT FROM EXCLUDED.conflicts
+           OR skill_definitions.quality_gates IS DISTINCT FROM EXCLUDED.quality_gates
+           OR skill_definitions.prompt_sections IS DISTINCT FROM EXCLUDED.prompt_sections
+           OR skill_definitions.applicable_genres IS DISTINCT FROM EXCLUDED.applicable_genres
+           OR skill_definitions.execution_points IS DISTINCT FROM EXCLUDED.execution_points
+           OR skill_definitions.roles IS DISTINCT FROM EXCLUDED.roles
+           OR skill_definitions.depends_on IS DISTINCT FROM EXCLUDED.depends_on
+           OR skill_definitions.priority IS DISTINCT FROM EXCLUDED.priority
+           OR skill_definitions.content_fingerprint IS DISTINCT FROM EXCLUDED.content_fingerprint
+           OR skill_definitions.source_ref IS DISTINCT FROM EXCLUDED.source_ref
+           OR skill_definitions.enabled IS DISTINCT FROM EXCLUDED.enabled`,
       [id, version, input.capabilities ?? [], input.applicableTasks ?? input.applicable_tasks ?? [], input.requiredMemoryKinds ?? input.required_memory_kinds ?? [], input.conflicts ?? [], input.qualityGates ?? input.quality_gates ?? [], promptSections, input.applicableGenres ?? input.applicable_genres ?? [], input.executionPoints ?? input.execution_points ?? [], input.roles ?? [], input.dependsOn ?? input.depends_on ?? [], input.priority ?? "normal", input.contentFingerprint ?? canonicalSha256({ id, version, promptSections }), input.sourceRef ?? "knowledge-record", input.enabled !== false]);
+      if (!wrote.rowCount) {
+        return { id, kind, record: (await this.listKnowledgeRecords(projectId, kind)).find((record) => record.id === id) ?? null };
+      }
     } else if (kind === "planning" || kind === "worldview" || kind === "characters") {
       const entityKind = kind === "characters" ? "character" : kind;
       const name = typeof input.name === "string" && input.name.trim() ? input.name.trim() : id;
@@ -2263,9 +2666,10 @@ export class NovelPostgresRepository {
       if (!eventType || !Number.isFinite(narrativeTime)) throw new Error("时间线记录需要 eventType 和 narrativeTime");
       await this.pool.query("INSERT INTO timeline_events(id,project_id,narrative_time,event_type,content,source_revision_id) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(id) DO UPDATE SET narrative_time=EXCLUDED.narrative_time,event_type=EXCLUDED.event_type,content=EXCLUDED.content,source_revision_id=EXCLUDED.source_revision_id", [id, projectId, narrativeTime, eventType, input.content ?? {}, input.sourceRevisionId ?? input.source_revision_id ?? null]);
     } else {
-      const predicate = String(input.predicate ?? "").trim();
-      if (!predicate) throw new Error("事实记录需要 predicate");
-      await this.pool.query("INSERT INTO facts(id,project_id,subject_id,predicate,object_value,truth_status,confidence,narrative_start,narrative_end) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(id) DO UPDATE SET subject_id=EXCLUDED.subject_id,predicate=EXCLUDED.predicate,object_value=EXCLUDED.object_value,truth_status=EXCLUDED.truth_status,confidence=EXCLUDED.confidence,narrative_start=EXCLUDED.narrative_start,narrative_end=EXCLUDED.narrative_end", [id, projectId, input.subjectId ?? input.subject_id ?? null, predicate, input.objectValue ?? input.object_value ?? {}, input.truthStatus ?? input.truth_status ?? "candidate", Number(input.confidence ?? 0), input.narrativeStart ?? input.narrative_start ?? null, input.narrativeEnd ?? input.narrative_end ?? null]);
+      // The legacy `facts` table is a retired second source of truth: chapter-derived
+      // and author facts live in memory_claims (approval-governed). Writing it from
+      // any surface is closed; the commit-rollback path still purges old rows only.
+      throw new Error(`不支持的资料类型：${kind}（事实断言请使用 claims）`);
     }
     await this.recordKnowledgeMutation(projectId, kind, id, "upsert", input);
     return { id, kind, record: (await this.listKnowledgeRecords(projectId, kind)).find((record) => record.id === id) ?? null };
@@ -2273,7 +2677,8 @@ export class NovelPostgresRepository {
 
   async deleteKnowledgeRecord(projectId: string, kind: MutableKnowledgeRecordKind, id: string) {
     if (kind === "claims") return this.deleteNarrativeClaim(projectId, id);
-    const table = kind === "skills" ? "skill_definitions" : kind === "planning" || kind === "worldview" || kind === "characters" ? "entities" : kind === "relations" ? "relations" : kind === "timeline" ? "timeline_events" : "facts";
+    const table = kind === "skills" ? "skill_definitions" : kind === "planning" || kind === "worldview" || kind === "characters" ? "entities" : kind === "relations" ? "relations" : kind === "timeline" ? "timeline_events" : null;
+    if (!table) throw new Error(`不支持删除的资料类型：${kind}（事实断言请使用 claims）`);
     const idColumn = kind === "skills" ? "skill_id" : "id";
     const projectClause = kind === "skills" ? "" : " AND project_id=$2";
     const params = kind === "skills" ? [id] : [id, projectId];
@@ -2310,16 +2715,24 @@ export class NovelPostgresRepository {
     const result = await this.pool.query<WorkflowRunRow>(`INSERT INTO workflow_runs(id,workflow_type,project_id,temporal_workflow_id,status,payload)
       VALUES($1,$2,$3,$4,$5,$6)
       ON CONFLICT(temporal_workflow_id) DO UPDATE SET status=EXCLUDED.status,payload=workflow_runs.payload || EXCLUDED.payload,updated_at=now()
-      RETURNING id,workflow_type,project_id,temporal_workflow_id,status,payload,created_at,updated_at`, [input.id, input.workflowType, input.projectId, input.temporalWorkflowId, input.status, input.payload ?? {}]);
+      RETURNING id,workflow_type,project_id,temporal_workflow_id,status,payload,created_at,updated_at`, [input.id, input.workflowType, input.projectId, input.temporalWorkflowId, input.status, withTerminalOutcome(input.status, input.payload ?? {})]);
     await this.appendOutbox("workflow-run", input.temporalWorkflowId, `workflow.${input.status}`, { projectId: input.projectId, workflowId: input.temporalWorkflowId, runId: input.id });
     return workflowFromRow(result.rows[0]);
   }
 
   async updateWorkflowRunStatus(temporalWorkflowId: string, status: string, payload: Record<string, unknown> = {}) {
-    const result = await this.pool.query<WorkflowRunRow>("UPDATE workflow_runs SET status=$2,payload=payload || $3,updated_at=now() WHERE temporal_workflow_id=$1 RETURNING id,workflow_type,project_id,temporal_workflow_id,status,payload,created_at,updated_at", [temporalWorkflowId, status, payload]);
+    const result = await this.pool.query<WorkflowRunRow>("UPDATE workflow_runs SET status=$2,payload=payload || $3,updated_at=now() WHERE temporal_workflow_id=$1 RETURNING id,workflow_type,project_id,temporal_workflow_id,status,payload,created_at,updated_at", [temporalWorkflowId, status, withTerminalOutcome(status, payload)]);
     if (!result.rowCount) return undefined;
     const row = workflowFromRow(result.rows[0]);
     await this.appendOutbox("workflow-run", row.temporalWorkflowId, `workflow.${status}`, { projectId: row.projectId, workflowId: row.temporalWorkflowId, runId: row.id, ...payload });
+    // OR-C1（product-audit-20260910 E4）：有语义 progress 事件双写持久事件表。
+    // run payload 的 stage 键是"后写覆盖"的当前态展示位，守卫决策（revision-decision/
+    // revision-reverted/manual-review-required…）若无追加式留痕则事后无法回答
+    // "阈值挡下过什么"。规则泛化：凡带 stage 的写入即按 `workflow.progress.<stage>`
+    // 落一条事件，不设阶段白名单——新阶段零登记自动可审计。
+    if (typeof payload.stage === "string" && payload.stage.trim()) {
+      await this.appendOutbox("workflow-run", row.temporalWorkflowId, `workflow.progress.${payload.stage.trim()}`, { projectId: row.projectId, workflowId: row.temporalWorkflowId, runId: row.id, ...payload });
+    }
     return row;
   }
 
@@ -2719,14 +3132,23 @@ export class NovelPostgresRepository {
       );
       if (!current.rowCount) throw new Error(`规划阶段不存在：${taskKey}`);
       if (current.rows[0].source_artifact_id !== artifactId) throw new Error("规划内容已变化，请刷新后重新确认");
+      // PL-8（product-audit-20260910 B3）：批准曾只做状态翻转，exact-keys 契约只在生成
+      // 重试循环跑——非生成入口（人工编辑、旧快照回放）带入的键名/类型漂移可绕过校验直接
+      // 批准。批准是"承诺此段结构可信"的语义点，契约必须在**此处**强制，与来源无关。
+      const payload = current.rows[0].payload;
+      const contractErrors = validateFoundationTaskContract(payload as unknown as FoundationOutput, taskKey);
+      if (contractErrors.length) throw new Error(`规划阶段 ${taskKey} 契约校验未通过，不能批准：${contractErrors.slice(0, 6).join("；")}${contractErrors.length > 6 ? ` 等 ${contractErrors.length} 项` : ""}`);
       await client.query(
-        "UPDATE project_plan_sections SET status='approved',approved_at=now(),updated_at=now() WHERE project_id=$1 AND task_key=$2",
-        [projectId, taskKey],
+        "UPDATE project_plan_sections SET status='approved',approved_at=now(),updated_at=now(),payload=$3 WHERE project_id=$1 AND task_key=$2",
+        [projectId, taskKey, { ...payload, contractVersion: foundationContractFingerprint(taskKey) }],
       );
       if (taskKey === "project-positioning") {
         const bookTitle = approvedProjectBookTitle(current.rows[0].payload);
         if (bookTitle) {
           await client.query("UPDATE novel_projects SET title=$2,updated_at=now() WHERE id=$1", [projectId, bookTitle]);
+          // books.title 与项目名同源（books 是 story_arcs 的 FK 锚；派生名单一写面，
+          // 否则锚表永远滞留初建快照——审计实测 books.title=旧书名）。
+          await client.query("UPDATE books SET title=$2 WHERE project_id=$1", [projectId, bookTitle]);
           await client.query(
             "INSERT INTO audit_records(project_id,actor,action,aggregate_type,aggregate_id,payload) VALUES($1,$2,'project.title.adopted','novel-project',$1,$3)",
             [projectId, actor, { title: bookTitle, sourceArtifactId: artifactId, taskKey }],
@@ -2848,6 +3270,9 @@ export class NovelPostgresRepository {
       await client.query("BEGIN");
       const current = await client.query<ArcRow>("SELECT * FROM arcs WHERE id=$1 AND project_id=$2 FOR UPDATE", [input.arcId, input.projectId]);
       if (!current.rowCount) throw new Error("故事弧不存在");
+      // POV 写侧归一（P4 安全网）：模型幻觉/MCP 手改带入的漂移形态在进 chapters
+      // payload 一刻按登记表收敛为短 id，防污染面扩大；未登记形态原样通过。
+      const povWriteIndex = buildCharacterRefIndex((await client.query<{ id: string; name: string }>("SELECT id,name FROM entities WHERE project_id=$1 AND kind='character'", [input.projectId])).rows);
       if (current.rows[0].execution_status === "abandoned" || (current.rows[0].execution_status === "completed" && !input.edited)) throw new Error("已结束故事弧不可改写");
       const existing = await client.query<ChapterBlueprintRow>("SELECT id,arc_id,project_id,document_id,title,ordinal,status,payload,source_artifact_id,blueprint_revision FROM chapters WHERE arc_id=$1 ORDER BY ordinal", [input.arcId]);
       const existingBatch = await client.query<StoryArcBatchRow>("SELECT * FROM story_arc_batches WHERE arc_id=$1 AND project_id=$2 AND batch_index=$3 FOR UPDATE", [input.arcId, input.projectId, input.bundle.batch.batchIndex]);
@@ -2875,7 +3300,16 @@ export class NovelPostgresRepository {
       const batchStartChapterIndex = input.bundle.batch.batchIndex === 1 ? baseOrder : input.bundle.batch.startChapterIndex;
       const previousBatchStart = existingBatch.rows[0] ? Number(existingBatch.rows[0].start_chapter_index) : batchStartChapterIndex;
       const previousBatchEnd = existingBatch.rows[0] ? Number(existingBatch.rows[0].end_chapter_index) : batchStartChapterIndex + input.bundle.chapters.length - 1;
-      const batchPayload = { ...input.bundle.batch, startChapterIndex: batchStartChapterIndex };
+      // 与 startChapterIndex 同理：complete 是"弧内期望是否已被规划覆盖"的系统事实，
+      // 不是模型自报旗（窗口契约同族教训——模型自报值既漏标（弧1 满覆盖却报 false）
+      // 又可能谎报，下游 prepareNext/审计/面板全按它分支）。派生口径：投影后弧内
+      // 不同章序数 ≥ expectedChapterCount。expected 缺失（旧弧 0）才保留模型自报值。
+      const expectedForComplete = Number((current.rows[0].payload as NarrativeArcPlan).expectedChapterCount ?? 0);
+      const projectedOrdinals = new Set<number>([
+        ...existing.rows.map((row) => Number(row.ordinal)),
+        ...input.bundle.chapters.map((_, i) => batchStartChapterIndex + i),
+      ]);
+      const batchPayload = { ...input.bundle.batch, startChapterIndex: batchStartChapterIndex, ...(expectedForComplete ? { complete: projectedOrdinals.size >= expectedForComplete } : {}) };
       const batchId = `batch:${input.arcId}:${input.bundle.batch.batchIndex}`;
       const isInitialBatch = input.bundle.batch.batchIndex === 1;
       const batchRows = await client.query<StoryArcBatchRow>("SELECT * FROM story_arc_batches WHERE arc_id=$1 AND project_id=$2", [input.arcId, input.projectId]);
@@ -2910,6 +3344,8 @@ export class NovelPostgresRepository {
         const isProtected = Boolean(linkedDocument && (linkedDocument.status !== "planned" || linkedDocument.current_revision_id));
         const chapterId = previous?.id ?? chapter.id ?? randomUUID();
         const globalOrder = previous ? Number(previous.ordinal) : baseOrder + chapter.index - 1;
+        const normalizedPov = chapter.povCharacterId ? povWriteIndex.resolve(chapter.povCharacterId) : undefined;
+        const chapterPayload = { ...chapter, id: chapterId, index: globalIndex, ...(normalizedPov ? { povCharacterId: normalizedPov.shortId } : {}) };
         keptIds.push(chapterId);
         // Generated rebases cannot rewrite the plan behind committed prose. An explicit
         // author edit may update that plan so the formal chapter-review workflow can
@@ -2920,7 +3356,7 @@ export class NovelPostgresRepository {
            VALUES($1,$2,$3,$4,$5,$6,'planned',$7,$8,$9,$10,$11,now())
            ON CONFLICT(id) DO UPDATE SET title=EXCLUDED.title,payload=EXCLUDED.payload,source_artifact_id=EXCLUDED.source_artifact_id,
              blueprint_revision=chapters.blueprint_revision+1,batch_id=EXCLUDED.batch_id,batch_index=EXCLUDED.batch_index,updated_at=now()`,
-          [chapterId, input.arcId, input.projectId, previous?.document_id ?? null, chapter.title, globalOrder, { ...chapter, id: chapterId, index: globalIndex }, input.artifact.id, previous ? Number(previous.blueprint_revision) + 1 : 0, batchId, input.bundle.batch.batchIndex],
+          [chapterId, input.arcId, input.projectId, previous?.document_id ?? null, chapter.title, globalOrder, chapterPayload, input.artifact.id, previous ? Number(previous.blueprint_revision) + 1 : 0, batchId, input.bundle.batch.batchIndex],
         );
         if (!isProtected) {
           await client.query("DELETE FROM scenes WHERE chapter_id=$1", [chapterId]);
@@ -2983,10 +3419,10 @@ export class NovelPostgresRepository {
    * imposing literary requirements on chapters or changing persisted data.
    */
   async getArchitectureHealth(projectId: string) {
-    const [project, sections, arcs, batches, chapters, threads, foreshadowing] = await Promise.all([
+    const [project, sections, arcs, batches, chapters, threads, foreshadowing, arcPlanningRuns] = await Promise.all([
       this.pool.query<{ id: string; title: string; current_revision: string | number }>("SELECT id,title,current_revision FROM novel_projects WHERE id=$1", [projectId]),
       this.pool.query<{ task_key: string; status: ProjectPlanStatus; payload: Record<string, unknown> }>("SELECT task_key,status,payload FROM project_plan_sections WHERE project_id=$1 ORDER BY task_key", [projectId]),
-      this.pool.query<{ id: string; ordinal: string | number; planning_status: StoryArcRecord["planningStatus"]; execution_status: StoryArcRecord["executionStatus"]; payload: NarrativeArcPlan }>("SELECT id,ordinal,planning_status,execution_status,payload FROM arcs WHERE project_id=$1 ORDER BY ordinal", [projectId]),
+      this.pool.query<{ id: string; ordinal: string | number; planning_status: StoryArcRecord["planningStatus"]; execution_status: StoryArcRecord["executionStatus"]; payload: NarrativeArcPlan; approved_at: Date | null; completed_at: Date | null }>("SELECT id,ordinal,planning_status,execution_status,payload,approved_at,completed_at FROM arcs WHERE project_id=$1 ORDER BY ordinal", [projectId]),
       this.pool.query<StoryArcBatchRow>("SELECT * FROM story_arc_batches WHERE project_id=$1 ORDER BY arc_id,batch_index", [projectId]),
       this.pool.query<{ arc_id: string | null; ordinal: string | number; batch_id: string | null; batch_index: string | number | null; document_id: string | null; document_status: string | null; current_revision_id: string | null }>(
         `SELECT c.arc_id,c.ordinal,c.batch_id,c.batch_index,c.document_id,d.status AS document_status,d.current_revision_id
@@ -2996,6 +3432,8 @@ export class NovelPostgresRepository {
       ),
       this.pool.query<{ id: string; title: string; payload: Record<string, unknown> }>("SELECT id,title,payload FROM plot_threads WHERE project_id=$1 ORDER BY id", [projectId]),
       this.pool.query<{ id: string; payload: Record<string, unknown> }>("SELECT id,payload FROM foreshadowing WHERE project_id=$1 ORDER BY id", [projectId]),
+      // PL-6 连载健康度：弧规划工作流的终态分布（失败重试数是规划稳定性指标）。
+      this.pool.query<{ status: string; count: string }>("SELECT status, count(*)::text AS count FROM workflow_runs WHERE project_id=$1 AND workflow_type='story-arc-planning' GROUP BY status", [projectId]),
     ]);
     if (!project.rowCount) throw new Error("项目不存在");
 
@@ -3006,6 +3444,26 @@ export class NovelPostgresRepository {
     };
     const threadCandidates: NamedReferenceCandidate[] = threads.rows.map((row) => ({ id: row.id, labels: [row.title, ...labels(row.payload)] }));
     const foreshadowingCandidates: NamedReferenceCandidate[] = foreshadowing.rows.map((row) => ({ id: row.id, labels: labels(row.payload) }));
+    // PL-2 修复④：引用解析区分 resolved-existing 与 resolved-newly-created——引用完整性
+    // 不能对"弧审批时新造的对象"永久失明（影子线自我审批的根因）。
+    const referenceCreatedIds = new Set<string>([
+      ...threads.rows.filter((row) => row.payload?.source === "story-arc-reference").map((row) => row.id),
+      ...foreshadowing.rows.filter((row) => row.payload?.source === "story-arc-reference").map((row) => row.id),
+    ]);
+    const titleHygieneRows: Array<{ id: string; title: string }> = [
+      ...threads.rows.map((row) => ({ id: row.id, title: row.title })),
+      ...arcs.rows.flatMap((arc) => {
+        const p = arc.payload as unknown as Record<string, unknown> | undefined;
+        const keys = ["title", "objective", "entryState", "centralConflict", "resolution", "exitState"] as const;
+        return keys.flatMap((key) => typeof p?.[key] === "string" ? [{ id: `${arc.id}#${key}`, title: String(p[key]) }] : []);
+      }),
+    ];
+    const hygieneIssues: StoryArcIntegrityIssue[] = titleHygieneRows.flatMap((row) => {
+      const embedded = findEmbeddedInternalIdentifiers(row.title);
+      return embedded.length
+        ? [{ code: "embedded-identifier" as const, severity: "blocking" as const, reference: row.id, candidateIds: embedded, message: `“${row.id}”的文本内嵌内部标识符（${embedded.slice(0, 3).join("、")}）：机器记号泄漏进创作文本会随快照复制自我放大，需作者决定改写或登记` }]
+        : [];
+    });
     const referenceReports = arcs.rows.map((arc) => {
       const plotThreadAudit = auditNamedReferences(
         Array.isArray(arc.payload?.threadResponsibilities)
@@ -3014,17 +3472,143 @@ export class NovelPostgresRepository {
         threadCandidates,
       );
       const foreshadowingAudit = auditNamedReferences(Array.isArray(arc.payload?.foreshadowingRefs) ? arc.payload.foreshadowingRefs.filter((value): value is string => typeof value === "string") : [], foreshadowingCandidates);
+      const classify = (audit: { resolutions: Array<{ status: string; canonicalId?: string }> }) => {
+        const resolved = audit.resolutions.filter((resolution) => resolution.status === "resolved" && resolution.canonicalId);
+        return {
+          resolvedExisting: resolved.filter((resolution) => !referenceCreatedIds.has(resolution.canonicalId!)).length,
+          resolvedNewlyCreated: resolved.filter((resolution) => referenceCreatedIds.has(resolution.canonicalId!)).length,
+        };
+      };
       return {
         arcId: arc.id,
-        plotThreads: plotThreadAudit,
-        foreshadowing: foreshadowingAudit,
+        plotThreads: { ...plotThreadAudit, ...classify(plotThreadAudit) },
+        foreshadowing: { ...foreshadowingAudit, ...classify(foreshadowingAudit) },
       };
     });
     const batchReports = arcs.rows.map((arc) => {
       const ranges = batches.rows.filter((batch) => batch.arc_id === arc.id).map((batch) => ({ batchIndex: Number(batch.batch_index), startChapterIndex: Number(batch.start_chapter_index), endChapterIndex: Number(batch.end_chapter_index), status: batch.status }));
       return { arcId: arc.id, ranges, issues: auditStoryArcBatchRanges(ranges) };
     });
+    // PL-1 诊断面（B1）：completed 弧的期望章数与弧内实际落籍章数不一致 → blocking，
+    // 强制 rebase/abandon 或作者修正期望后回写——弧 2 式"缺 7 章静默收口"必须可见。
+    const completionIssues: StoryArcIntegrityIssue[] = arcs.rows.filter((arc) => arc.execution_status === "completed").flatMap((arc) => {
+      const expected = Number((arc.payload as unknown as Record<string, unknown> | undefined)?.expectedChapterCount ?? 0);
+      const localCount = chapters.rows.filter((chapter) => chapter.arc_id === arc.id).length;
+      return expected > 0 && localCount !== expected
+        ? [{ code: "completion-count-mismatch" as const, severity: "blocking" as const, reference: arc.id, message: `弧 ${arc.id} 已 completed 但期望 ${expected} 章、弧内实际落籍 ${localCount} 章：需要 rebase/abandon，或作者确认弧以 ${localCount} 章收口后修正 expectedChapterCount 回写` }]
+        : [];
+    });
+    // PL-5 修复⑤：伏笔账本五类计数（B2——账面失真让"哪些伏笔必须兑现"不可用作决策依据）。
+    // 只读诊断不改数据；每类聚合成一条 issue，计数供总览面板。
+    const [foreshadowingLedgerRows, payoffLedgerRows, currentOrderRow] = await Promise.all([
+      this.pool.query<{ id: string; thread_id: string | null; status: string; narrative_order: number | null; payload: Record<string, unknown> }>(
+        "SELECT id,thread_id,status,narrative_order,payload FROM foreshadowing WHERE project_id=$1", [projectId]),
+      this.pool.query<{ foreshadowing_id: string }>("SELECT DISTINCT p.foreshadowing_id FROM payoffs p JOIN foreshadowing f ON f.id=p.foreshadowing_id WHERE f.project_id=$1", [projectId]),
+      this.pool.query<{ max: number | null }>("SELECT MAX(narrative_order)::int AS max FROM manuscript_documents WHERE project_id=$1 AND status='final'", [projectId]),
+    ]);
+    const paidOffForeshadowingIds = new Set(payoffLedgerRows.rows.map((row) => row.foreshadowing_id));
+    const liveArcIds = new Set(arcs.rows.map((arc) => arc.id));
+    const currentNarrativeOrder = currentOrderRow.rows[0]?.max ?? null;
+    const ledgerFlows = foreshadowingLedgerRows.rows;
+    // overdue 语义（2026-09-18 P1 修正）：`horizonOrder` 是窗口**上界**，不是死线。
+    // 实测 244 条"窗口上界已过"中 238 条仍在活跃推进（关键词被后续 20+ 章提及），
+    // 只有 6 条真沉睡——对连载而言"上界已过而线索仍在跑"是正常形态，不是债务。
+    // 故本字段改称中性事实 `windowElapsed`（窗口上界已过），不再声称超期；
+    // 真正需要行动的"曾活跃→静默终止"由 narrative-dormancy 通道单独给出
+    // （依赖全章正文，只在有对象存储的活动中计算，见 activities.loadNarrativeDormancy）。
+    // 依据：docs/novel-v2/p1-foreshadowing-survey-20260918.md
+    const windowElapsed = ledgerFlows.filter((row) => {
+      if (row.status !== "open") return false;
+      const window = parsePayoffWindow(row.payload?.expectedPayoffWindow, row.narrative_order);
+      return window.kind === "chapter" && window.horizonOrder !== null && currentNarrativeOrder !== null && currentNarrativeOrder > window.horizonOrder;
+    });
+    const unboundOpen = ledgerFlows.filter((row) => row.status === "open" && !row.thread_id);
+    const fulfilledWithoutPayoff = ledgerFlows.filter((row) => row.status === "fulfilled" && !paidOffForeshadowingIds.has(row.id));
+    const arcOrphans = ledgerFlows.filter((row) => typeof row.payload?.sourceArcId === "string" && !liveArcIds.has(String(row.payload.sourceArcId)));
+    // 重复簇=规范化描述字符二元组 Dice 近同文聚簇（精确 key 匹配抓不住"每轮换措辞"的
+    // 真实重复形态）。阈值刻意保守在高位——只聚近同文，语义等价判定仍归 grooming 报告。
+    // TODO(magic-value): 0.85 为经验保守位，需按跨题材语料校准后配置化。
+    const descKeys = ledgerFlows.map((row) => narrativeTextKey(String(row.payload?.description ?? "")));
+    const clusterParent = descKeys.map((_, index) => index);
+    const findCluster = (index: number): number => (clusterParent[index] === index ? index : (clusterParent[index] = findCluster(clusterParent[index]!)));
+    for (let i = 0; i < descKeys.length; i += 1) {
+      for (let j = i + 1; j < descKeys.length; j += 1) {
+        const left = descKeys[i]!;
+        const right = descKeys[j]!;
+        if (!left || !right) continue;
+        if (left === right || textBigramDice(left, right) >= 0.85) clusterParent[findCluster(i)] = findCluster(j);
+      }
+    }
+    const clusterSizes = new Map<number, number>();
+    for (let i = 0; i < descKeys.length; i += 1) {
+      if (!descKeys[i]) continue;
+      const root = findCluster(i);
+      clusterSizes.set(root, (clusterSizes.get(root) ?? 0) + 1);
+    }
+    const duplicateClusters = [...clusterSizes.values()].filter((size) => size > 1).length;
+    const foreshadowingLedger = {
+      total: ledgerFlows.length,
+      open: ledgerFlows.filter((row) => row.status === "open").length,
+      fulfilled: ledgerFlows.filter((row) => row.status === "fulfilled").length,
+      overdue: windowElapsed.length,
+      unbound: unboundOpen.length,
+      fulfilledWithoutPayoff: fulfilledWithoutPayoff.length,
+      arcOrphan: arcOrphans.length,
+      duplicateClusters,
+    };
+    const ledgerIssues: StoryArcIntegrityIssue[] = [];
+    if (foreshadowingLedger.fulfilledWithoutPayoff > 0) ledgerIssues.push({ code: "ledger-inconsistency", severity: "blocking", message: `${foreshadowingLedger.fulfilledWithoutPayoff} 条伏笔标记已兑现但兑现账（payoffs）无行：兑现入口失控，需按单入口重建或补登证据` });
+    // 窗口上界已过是**中性事实**，不报为问题（2026-09-18 P1 修正）：
+    // 对连载而言，长线伏笔的上界过期而线索仍在推进是常态（实测 238/244）。
+    // 旧行为把它报成 warning 并指示"兑现/改写/放弃"，指挥作者处理 238 条不存在的问题。
+    // 需要行动的信号是"曾活跃→静默终止"，由 narrative-dormancy 通道给出。
+    if (duplicateClusters > 0) ledgerIssues.push({ code: "foreshadowing-duplicate", severity: "warning", message: `${duplicateClusters} 簇伏笔描述跨来源重复（每轮重抽取换措辞即多行）：需按锚点归并` });
+    if (arcOrphans.length > 0) ledgerIssues.push({ code: "foreshadowing-arc-orphan", severity: "warning", message: `${arcOrphans.length} 条伏笔的引用弧已不存在/被弃：需作者决定重挂或关闭` });
+    // PL-8：approved-but-stale-contract——以"当前契约实时校验"为真相判定：approved 段在
+    // 今天不再满足契约（键名漂移、类型不符、内容缺陷）即须重审。批准时落的 contractVersion
+    // 指纹提供演进痕迹；旧段无版本时以实时校验兜底（通过=与当前契约兼容，不制造噪声）。
+    const staleContracts: string[] = [];
+    for (const section of sections.rows) {
+      if (section.status !== "approved") continue;
+      if (!foundationContractFingerprint(section.task_key)) continue;
+      if (String(section.payload?.contractVersion ?? "") === foundationContractFingerprint(section.task_key)) continue;
+      if (validateFoundationTaskContract(section.payload as unknown as FoundationOutput, section.task_key).length) staleContracts.push(section.task_key);
+    }
+    const contractIssues: StoryArcIntegrityIssue[] = staleContracts.length
+      ? [{ code: "stale-foundation-contract", severity: "warning", message: `${staleContracts.length} 个 approved 段（${staleContracts.join("、")}）批准时的契约版本与当前不一致：需重审后重新批准以刷新 contractVersion` }]
+      : [];
+    // PL-6 连载健康度（B5）：跨弧空窗天数 = 前一 completed 弧收口 → 下一弧批准的间隔；
+    // 规划失败数 = story-arc-planning 工作流 failed 终态计数。两者都是**可见性指标**，
+    // 不限制单批章数——批量生成是合法模式，失控的是"无人知道断更与反复失败"，不是批量本身。
+    const serializationGaps: Array<{ fromArcId: string; toArcId: string; gapDays: number }> = [];
+    for (let index = 1; index < arcs.rows.length; index += 1) {
+      const previous = arcs.rows[index - 1]!;
+      const current = arcs.rows[index]!;
+      if (!previous.completed_at || !current.approved_at) continue;
+      const gapDays = Math.round((new Date(current.approved_at).getTime() - new Date(previous.completed_at).getTime()) / 86_400_000);
+      if (Number.isFinite(gapDays)) serializationGaps.push({ fromArcId: previous.id, toArcId: current.id, gapDays });
+    }
+    // TODO(magic-value): 7 天=周更连载基线，超过即断更风险；应按项目连载节奏配置化。
+    const serializationIssues: StoryArcIntegrityIssue[] = serializationGaps.filter((gap) => gap.gapDays > 7)
+      .map((gap) => ({ code: "serialization-gap" as const, severity: "warning" as const, reference: gap.toArcId, message: `弧 ${gap.fromArcId} 收口后 ${gap.gapDays} 天才批准弧 ${gap.toArcId}：跨弧空窗超过周更基线，连载断更风险` }));
+    const planningRunStatuses = Object.fromEntries(arcPlanningRuns.rows.map((row) => [row.status, Number(row.count)]));
+    const planningFailures = planningRunStatuses.failed ?? 0;
+    if (planningFailures > 0) serializationIssues.push({ code: "arc-planning-failures", severity: "warning", message: `story-arc-planning 工作流累计 ${planningFailures} 次 failed（总 ${arcPlanningRuns.rows.reduce((sum, row) => sum + Number(row.count), 0)} 次）：规划失败重试是稳定性信号，需回看失败原因是否已消除` });
+    // PL-6 阶段绑定覆盖率：有阶段的弧若章节无 chapterOrdinals 绑定，阶段归属不可用
+    //（旧等分推算已删除——宁缺毋伪），提示补绑而非静默失真。
+    const phaseBindingIssues: StoryArcIntegrityIssue[] = arcs.rows.filter((arc) => {
+      const phases = Array.isArray(arc.payload?.phases) ? arc.payload.phases : [];
+      if (!phases.length) return false;
+      const bound = new Set(phases.flatMap((phase: { chapterOrdinals?: number[] }) => phase.chapterOrdinals ?? []));
+      return bound.size === 0;
+    }).map((arc) => ({ code: "phase-binding-missing" as const, severity: "warning" as const, reference: arc.id, message: `弧 ${arc.id} 有 ${Array.isArray(arc.payload?.phases) ? arc.payload.phases.length : 0} 个阶段但均未绑定 chapterOrdinals：章节所属阶段不可判定（等分推算已删除），需 rebase 或作者回写绑定` }));
     const issues: StoryArcIntegrityIssue[] = [
+      ...hygieneIssues,
+      ...completionIssues,
+      ...ledgerIssues,
+      ...contractIssues,
+      ...serializationIssues,
+      ...phaseBindingIssues,
       ...batchReports.flatMap((report) => report.issues.map((issue) => ({ ...issue, message: `${report.arcId}: ${issue.message}` }))),
       ...referenceReports.flatMap((report) => [
         ...report.plotThreads.issues.map((issue) => ({ ...issue, message: `${report.arcId}: 剧情线${issue.message}` })),
@@ -3048,7 +3632,7 @@ export class NovelPostgresRepository {
       projectId,
       projectTitle: project.rows[0].title,
       runtime: { protocolVersion: "2.0", foundationStageCount: PROJECT_PLAN_STAGES.length },
-      foundation: { required, missing: required.filter((item) => !item.approved).map((item) => item.taskKey) },
+      foundation: { required, missing: required.filter((item) => !item.approved).map((item) => item.taskKey), staleContract: staleContracts },
       arcs: arcs.rows.map((arc) => ({ id: arc.id, ordinal: Number(arc.ordinal), planningStatus: arc.planning_status, executionStatus: arc.execution_status })),
       chapters: (() => {
         const arcPlanningStatus = new Map(arcs.rows.map((arc) => [arc.id, arc.planning_status]));
@@ -3062,6 +3646,8 @@ export class NovelPostgresRepository {
       })(),
       batches: batchReports,
       references: referenceReports,
+      foreshadowingLedger,
+      serialization: { gaps: serializationGaps, planningRunStatuses },
       fullBookArchitecture,
       issues,
     };
@@ -3086,38 +3672,51 @@ export class NovelPostgresRepository {
         return [payload.name, payload.title, payload.description, payload.label, payload.aliases, payload.names].flatMap((value) => Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : typeof value === "string" ? [value] : []);
       };
       const created: string[] = [];
+      const unresolved: Array<{ kind: "thread" | "foreshadowing"; input: string }> = [];
       const mappings: Array<{ kind: "thread" | "foreshadowing"; input: string; canonicalId: string; created: boolean }> = [];
       const normalize = async (kind: "thread" | "foreshadowing", values: unknown[], candidates: NamedReferenceCandidate[]): Promise<string[]> => {
         const result: string[] = [];
         for (const value of values) {
           if (typeof value !== "string" || !value.trim()) continue;
-          const resolution = resolveNamedReference(value, candidates);
-          if (resolution.status === "ambiguous") throw new Error(`引用“${value}”匹配多个${kind === "thread" ? "剧情线" : "伏笔"}：${resolution.candidateIds.join("、")}`);
-          if (resolution.status === "resolved" && resolution.canonicalId) {
+          // PL-2（product-audit-20260910 A4）：取消未知名静默 auto-create——引用字符串
+          // 自我放大成影子对象（title=输入原样）的根因。新对象只能经**显式新建通道**
+          // （`new:<名称>` 前缀）表达；其余未解析引用收集为 blocking 回流 planner。
+          // 复合串自愈与序号前缀剥离由 resolveNamedReference/sanitizeReferenceToken 共享层完成。
+          const explicitNew = parseExplicitNewReference(value);
+          const resolution = explicitNew ? undefined : resolveNamedReference(sanitizeReferenceToken(value), candidates);
+          if (resolution?.status === "ambiguous") throw new Error(`引用“${value}”匹配多个${kind === "thread" ? "剧情线" : "伏笔"}：${resolution.candidateIds.join("、")}`);
+          if (resolution?.status === "resolved" && resolution.canonicalId) {
             result.push(resolution.canonicalId);
             mappings.push({ kind, input: value, canonicalId: resolution.canonicalId, created: false });
             continue;
           }
-          const id = canonicalReferenceId(kind, projectId, value);
+          const label = sanitizeReferenceToken(explicitNew ? explicitNew.name : value);
+          if (!explicitNew || !label) {
+            unresolved.push({ kind, input: value });
+            continue;
+          }
+          const id = canonicalReferenceId(kind, projectId, label);
           if (kind === "thread") {
             await client.query(
               `INSERT INTO plot_threads(id,project_id,title,status,payload)
                VALUES($1,$2,$3,'open',$4)
                ON CONFLICT(id) DO UPDATE SET title=EXCLUDED.title,payload=plot_threads.payload || EXCLUDED.payload`,
-              [id, projectId, value.trim(), { aliases: [value.trim()], source: "story-arc-reference", sourceArcId: arcId }],
+              [id, projectId, label, { aliases: [label], source: "story-arc-reference", sourceArcId: arcId, explicitNew: true }],
             );
           } else {
             await client.query(
               `INSERT INTO foreshadowing(id,project_id,status,payload)
                VALUES($1,$2,'open',$3)
                ON CONFLICT(id) DO UPDATE SET payload=foreshadowing.payload || EXCLUDED.payload`,
-              [id, projectId, { description: value.trim(), aliases: [value.trim()], source: "story-arc-reference", sourceArcId: arcId }],
+              [id, projectId, { description: label, aliases: [label], source: "story-arc-reference", sourceArcId: arcId, explicitNew: true }],
             );
           }
           created.push(id);
           result.push(id);
           mappings.push({ kind, input: value, canonicalId: id, created: true });
-          candidates.push({ id, labels: [value.trim()] });
+          // 显式新建的原始表达（含 new: 前缀）登记为别名：responsibilities 的二次解析
+          // 与后续弧对该名称的引用都能直接命中这个规范对象。
+          candidates.push({ id, labels: [label, value.trim()] });
         }
         return [...new Set(result)];
       };
@@ -3147,9 +3746,27 @@ export class NovelPostgresRepository {
         }
       });
       const foreshadowingRefs = await normalize("foreshadowing", Array.isArray(payload.foreshadowingRefs) ? payload.foreshadowingRefs : [], foreshadowing.rows.map((row) => ({ id: row.id, labels: labels(row.payload) })));
+      if (unresolved.length) {
+        // blocking 回流（PL-2 修复②）：错误文本即可执行审核意见，planner 重新生成时
+        // 要么改用现有对象 id，要么显式 new: 新建——不再有静默影子对象。
+        throw new Error(`故事弧引用无法解析（${unresolved.length} 处）：${unresolved.map((item) => `${item.kind === "thread" ? "剧情线" : "伏笔"}“${item.input}”`).join("、")}。引用既有对象请使用其 id 或登记名原文；确需新建对象请显式输出“new:<名称>”前缀。`);
+      }
       const normalizedPayload = { ...rawPayload, threadResponsibilities, foreshadowingRefs };
       validateStoryArcPlanContracts(parseStoryArcPlan(normalizedPayload));
       await client.query("UPDATE arcs SET payload=$3,updated_at=now() WHERE id=$1 AND project_id=$2", [arcId, projectId, normalizedPayload]);
+      // PL-5 修复④：伏笔 thread_id 关联此前从未写入（实测 0/138），与剧情线完全脱钩。
+      // 泛化回填——本弧归一后的 canonical 伏笔引用与线程责任在此唯一同时可得。仅当本弧
+      // **恰好一条**线程责任时，才把本弧引用且尚未归属的开放伏笔绑到该线；多线弧无法从
+      // 共现推断具体归属（foreshadowingRefs 不与特定 thread 配对），保守留空交人工/弧审核，
+      // 避免伪造关联。planted_revision 归属的弧不在此处理（无弧引用即无证据）。
+      const arcThreadRefs = [...new Set(threadResponsibilities.map((responsibility) => responsibility.threadRef).filter(Boolean))];
+      if (arcThreadRefs.length === 1 && foreshadowingRefs.length) {
+        await client.query(
+          `UPDATE foreshadowing SET thread_id=$2
+           WHERE project_id=$1 AND id=ANY($3::text[]) AND thread_id IS NULL AND status='open'`,
+          [projectId, arcThreadRefs[0], foreshadowingRefs],
+        );
+      }
       await client.query(
         "INSERT INTO audit_records(project_id,actor,action,aggregate_type,aggregate_id,payload) VALUES($1,$2,'story-arc.references-normalized','story-arc',$3,$4)",
         [projectId, actor, arcId, { mappings, created: [...new Set(created)] }],
@@ -3355,27 +3972,7 @@ export class NovelPostgresRepository {
         if (affectedClaimIds.length) {
           await client.query(
             `UPDATE memory_claims claim SET
-               lifecycle_status=CASE WHEN EXISTS (
-                 SELECT 1 FROM memory_claim_sources source
-                 WHERE source.claim_id=claim.id AND source.lifecycle_status='active'
-               ) THEN 'active' ELSE 'staged' END,
-               source_revision_ids=COALESCE((
-                 SELECT array_agg(DISTINCT source.revision_id) FILTER (WHERE source.revision_id IS NOT NULL)
-                 FROM memory_claim_sources source
-                 WHERE source.claim_id=claim.id AND source.lifecycle_status='active'
-               ),'{}'::text[]),
-               narrative_start=(
-                 SELECT MIN(document.narrative_order)
-                 FROM memory_claim_sources source
-                 JOIN manuscript_documents document ON document.id=source.document_id
-                 WHERE source.claim_id=claim.id AND source.lifecycle_status='active'
-               ),
-               narrative_end=(
-                 SELECT MAX(document.narrative_order)
-                 FROM memory_claim_sources source
-                 JOIN manuscript_documents document ON document.id=source.document_id
-                 WHERE source.claim_id=claim.id AND source.lifecycle_status='active'
-               ),
+               ${CLAIM_PROJECTION_SET_SQL},
                source_document_id=(
                  SELECT source.document_id FROM memory_claim_sources source
                  WHERE source.claim_id=claim.id AND source.lifecycle_status='active' AND source.document_id IS NOT NULL
@@ -3468,7 +4065,13 @@ export class NovelPostgresRepository {
       const batches = await client.query<StoryArcBatchRow>("SELECT * FROM story_arc_batches WHERE arc_id=$1 ORDER BY batch_index FOR UPDATE", [arcId]);
       const last = batches.rows.at(-1);
       if (!last || last.status !== "approved" || last.payload?.complete === true) throw new Error("上一批次未批准或故事弧已完成");
-      if (Number(last.end_chapter_index) >= Number((arc.rows[0].payload as NarrativeArcPlan).expectedChapterCount ?? Number.POSITIVE_INFINITY)) throw new Error("故事弧已达到预计章节数，请先完成或调整弧计划");
+      // 量纲修正（弧5实证 bug）：end_chapter_index 是全局章序，expectedChapterCount
+      // 是弧内章数——两者直接比较即 PL-1"全局序对照弧内期望"同型错配（弧1 全局
+      // 1..7 恰好重合蒙混过关，此后每个多章弧都误报"已达到预计章节数"）。
+      // 正确谓词：弧内已规划章数 ≥ 弧内期望章数。
+      const plannedInArc = await client.query<{ count: number }>("SELECT count(*)::int AS count FROM chapters WHERE arc_id=$1", [arcId]);
+      const expectedTotal = (arc.rows[0].payload as NarrativeArcPlan).expectedChapterCount;
+      if (expectedTotal && Number(plannedInArc.rows[0]?.count ?? 0) >= expectedTotal) throw new Error("故事弧已达到预计章节数，请先完成或调整弧计划");
       if (batches.rows.some((batch) => batch.status === "generating" || batch.status === "awaiting-review")) throw new Error("已有批次正在生成或等待审核");
       const progress = await client.query<{ planned: string; finalized: string }>(
         `SELECT count(*)::text AS planned,count(*) FILTER (WHERE d.status='final')::text AS finalized
@@ -3584,6 +4187,22 @@ export class NovelPostgresRepository {
     ].filter((issue) => issue.severity === "blocking");
     if (blockingReferenceIssues.length) throw new Error(`故事弧存在未解决的结构引用：${blockingReferenceIssues.map((issue) => issue.message).join("；")}`);
     if (review.verdict !== "passed") throw new Error("故事弧审核尚未通过，不能批准");
+    // PL-1 审批入口声明一致性（product-audit-20260910 B1 + §六闭环）：末个待审批次
+    // complete=true 却 expectedChapterCount≠已落籍章数时拒绝批准——弧 2 的形态
+    // （期望 15 实际规划 8、靠全局章序算术被静默截断）不再可能通过审批。
+    // 人工 complete=true 的优先权保留给运行期完成转移，不豁免审批入口的一致性声明。
+    const approvalSnapshot = await this.getStoryArc(projectId, arcId);
+    if (!approvalSnapshot) throw new Error("故事弧不存在，无法批准");
+    const closingBatch = approvalSnapshot.batches
+      .filter((batch) => batch.status === "awaiting-review" && batch.complete)
+      .sort((left, right) => right.batchIndex - left.batchIndex)[0];
+    if (closingBatch) {
+      const expectedChapters = Number(approvalSnapshot.arc.expectedChapterCount ?? 0);
+      const plannedChapters = approvalSnapshot.chapters.length;
+      if (expectedChapters > 0 && plannedChapters < expectedChapters) {
+        throw new Error(`批次 ${closingBatch.batchIndex} 声明收口本弧（complete=true），但 expectedChapterCount=${expectedChapters} 与已落籍章节数 ${plannedChapters} 不符：请把本批次规划补足到 ${expectedChapters} 章，或按实际规划修正期望章数后再批准`);
+      }
+    }
     const macro = await this.listCurrentFoundationArtifacts(projectId);
     const contextFingerprint = createHash("sha256").update(JSON.stringify({ macro: macro.map((item) => [foundationTaskKey(item), item.id, item.fingerprint]), artifactId })).digest("hex");
     const client = await this.pool.connect();
@@ -3767,7 +4386,7 @@ export class NovelPostgresRepository {
   }
 
   async getStoryArcPlanningInput(projectId: string, arcId?: string) {
-    const [project, macro, memories, threads, narrativeState, openElements, learning] = await Promise.all([
+    const [project, macro, memories, threads, narrativeState, openElements, learning, cast, foreshadowingLedger] = await Promise.all([
       this.pool.query<{ title: string }>("SELECT title FROM novel_projects WHERE id=$1", [projectId]),
       this.listCurrentFoundationArtifacts(projectId),
       this.getChapterMemories({ projectId, limit: 6 }),
@@ -3775,6 +4394,16 @@ export class NovelPostgresRepository {
       this.getLatestNarrativeStateSnapshot(projectId),
       this.getOpenForeshadowingAndPromises(projectId),
       this.listLearningAssessments(projectId, 24),
+      // 人物登记表：povCharacterId 漂移（chu-heng/char_chu/char_hu_cheng 四形态并存）的
+      // 根因是规划模型从未见过合法 id 名册，只能幻觉（2026-09-16 全书扫描确诊）。
+      // id 取实体 URI 末段（与正文流水线消费的短 id 形态一致），不发明新形态。
+      this.pool.query<{ id: string; name: string }>("SELECT id,name FROM entities WHERE project_id=$1 AND kind='character' ORDER BY id", [projectId]),
+      // 到期账数据面（P1）：全量 open 行自带窗口与埋设章序，与 health 共用同一谓词
+      // （parsePayoffWindow），不再依赖 openForeshadowings 的展示投影。
+      this.pool.query<{ id: string; narrative_order: number | null; payload: Record<string, unknown> }>(
+        "SELECT id,narrative_order,payload FROM foreshadowing WHERE project_id=$1 AND status='open' ORDER BY narrative_order ASC NULLS LAST, id",
+        [projectId],
+      ),
     ]);
     if (!project.rowCount) throw new Error("项目不存在");
     // 跨章序列信号前移到规划：查询最近 N 章的 narrativeFunction，计算连续同类功能游程。
@@ -3787,8 +4416,8 @@ export class NovelPostgresRepository {
     const SERIAL_FUNCTION_RUN_MIN = 3;
     const narrativeCutoffForSerial = (narrativeState?.narrativeOrder ?? memories.reduce((max, memory) => Math.max(max, memory.narrativeRange.end), 0)) || 0;
     const serialRows = narrativeCutoffForSerial > 0
-      ? await this.pool.query<{ narrative_order: string | number; narrative_function: string | null }>(
-        `SELECT d.narrative_order, c.payload->>'narrativeFunction' AS narrative_function
+      ? await this.pool.query<{ narrative_order: string | number; narrative_function: string | null; scenes: unknown }>(
+        `SELECT d.narrative_order, c.payload->>'narrativeFunction' AS narrative_function, c.payload->'scenes' AS scenes
          FROM chapters c
          JOIN manuscript_documents d ON d.id=c.document_id AND d.project_id=c.project_id
          WHERE c.project_id=$1 AND d.status='final' AND d.current_revision_id IS NOT NULL
@@ -3802,6 +4431,80 @@ export class NovelPostgresRepository {
       .map((row) => ({ narrativeOrder: Number(row.narrative_order), narrativeFunction: row.narrative_function ?? undefined }))
       .filter((chapter): chapter is { narrativeOrder: number; narrativeFunction: string } => typeof chapter.narrativeFunction === "string" && chapter.narrativeFunction.length > 0)
       .sort((a, b) => a.narrativeOrder - b.narrativeOrder);
+    // 群像游程信号（2026-09-16 全书审校的机制端）：近窗口内"全部场景参与者≤1"的章
+    // 与最长独处游程。与 serialFunctionRuns 同型——只呈现描述性统计，配额判断归
+    // 规划指引与弧审核面；不做词表/题材黑名单。
+    //
+    // 注：2026-09-17 曾试图同时投影 opposition 以检测"第二意志缺口"，两版正则
+    // 判据均被实测推翻（见 application/story-arc.ts 的负结果记录）——该判断是
+    // 语义判断，不做机器判据，改为生成面契约。故此处仍只投影 participants。
+    const ensembleWindow = serialRows.rows.map((row) => ({
+      index: Number(row.narrative_order),
+      scenes: (Array.isArray(row.scenes) ? row.scenes : []).flatMap((scene) => {
+        if (!scene || typeof scene !== "object" || Array.isArray(scene)) return [];
+        const item = scene as Record<string, unknown>;
+        return [{ participants: Array.isArray(item.participants) ? item.participants.filter((name): name is string => typeof name === "string") : [] }];
+      }),
+    }));
+    const ensembleSignal = ensembleWindow.length >= 3 ? inspectStoryArcEnsemble(ensembleWindow) : undefined;
+    // 窗口上界已过的账（P1，2026-09-16 起，2026-09-18 修正语义）：
+    // 规划者需要看见"哪些线索的兑现窗口上界已经过去"，但**不把它叫超期债务**——
+    // 实测 244 条上界已过中 238 条仍在活跃推进，对连载而言这是常态而非欠账。
+    // 故字段改称中性的 windowElapsedCount，行动建议交给静默判据
+    // （narrative-dormancy 通道，需全章正文，在 activities.loadNarrativeDormancy 计算）。
+    // 可判定纪律：只列 parsePayoffWindow 给出 chapter horizon 且上界已过的条目；
+    // 窗口不可判定但埋设超过 40 章的归入账龄计数，不发明 deadline（宁缺勿伪）。
+    // TODO(magic-value): 40=账龄位、12=注入预算条数，应进连载健康度配置。
+    const dueItems: Array<{ id: string; description: string; horizonOrder: number; plantedOrder: number | null }> = [];
+    let agedOpenCount = 0;
+    for (const row of foreshadowingLedger.rows) {
+      const window = parsePayoffWindow(row.payload?.expectedPayoffWindow, row.narrative_order);
+      if (window.kind === "chapter" && window.horizonOrder !== null && narrativeCutoffForSerial > window.horizonOrder) {
+        dueItems.push({
+          id: row.id,
+          description: String(row.payload?.description ?? "").slice(0, 80),
+          horizonOrder: window.horizonOrder,
+          plantedOrder: row.narrative_order ?? null,
+        });
+      } else if (window.horizonOrder === null && row.narrative_order != null && narrativeCutoffForSerial - row.narrative_order >= 40) {
+        agedOpenCount += 1;
+      }
+    }
+    dueItems.sort((left, right) => left.horizonOrder - right.horizonOrder || (left.plantedOrder ?? 0) - (right.plantedOrder ?? 0));
+    const dueLedger = dueItems.length || agedOpenCount
+      ? { currentOrder: narrativeCutoffForSerial, windowElapsedCount: dueItems.length, agedOpenCount, items: dueItems.slice(0, 12) }
+      : undefined;
+    // 跨弧回报节奏信号（P5，2026-09-16 审核确诊"061-091 共 31 章结清 0 笔"的可见性
+    // 落点）：逐弧"定稿章数 vs 兑付笔数"——兑付密度是题材判断不设硬门，但连续数弧
+    // 零兑付必须成为规划者看得见的数字（读者契约在弧尺度上被静默透支的机制端）。
+    const rhythmRows = await this.pool.query<{ arc_ordinal: string | number | null; payoff_count: string | number }>(
+      `SELECT a.ordinal AS arc_ordinal, COUNT(DISTINCT p.id)::int AS payoff_count
+       FROM payoffs p
+       LEFT JOIN foreshadowing f ON f.id=p.foreshadowing_id
+       LEFT JOIN promises pr ON pr.id=p.promise_id
+       JOIN manuscript_revisions mr ON mr.id=p.revision_id
+       JOIN manuscript_documents d ON d.id=mr.document_id
+       LEFT JOIN chapters c ON c.document_id=d.id
+       LEFT JOIN arcs a ON a.id=c.arc_id
+       WHERE (f.project_id=$1 OR pr.project_id=$1)
+       GROUP BY a.id, a.ordinal`,
+      [projectId],
+    );
+    const arcChapterCounts = await this.pool.query<{ arc_ordinal: string | number | null; arc_title: string | null; final_count: string | number }>(
+      `SELECT a.ordinal AS arc_ordinal, a.title AS arc_title, COUNT(*)::int AS final_count
+       FROM chapters c
+       JOIN arcs a ON a.id=c.arc_id
+       JOIN manuscript_documents d ON d.id=c.document_id AND d.project_id=c.project_id
+       WHERE c.project_id=$1 AND d.status='final' AND d.current_revision_id IS NOT NULL
+       GROUP BY a.id, a.ordinal, a.title`,
+      [projectId],
+    );
+    const payoffByArc = new Map(rhythmRows.rows.map((row) => [String(row.arc_ordinal ?? "unassigned"), Number(row.payoff_count)]));
+    const payoffRhythm = arcChapterCounts.rows
+      .filter((row) => Number(row.final_count) > 0)
+      .sort((left, right) => Number(left.arc_ordinal) - Number(right.arc_ordinal))
+      .slice(-4)
+      .map((row) => ({ arcOrdinal: Number(row.arc_ordinal), title: row.arc_title ?? null, finalChapters: Number(row.final_count), payoffCount: payoffByArc.get(String(row.arc_ordinal)) ?? 0 }));
     const serialFunctionRuns: Array<{ narrativeFunction: string; narrativeOrders: number[] }> = [];
     let runStart = 0;
     for (let index = 1; index <= serialChapters.length; index += 1) {
@@ -3837,10 +4540,15 @@ export class NovelPostgresRepository {
       openThreads: Array<{ id: string; title: string; payload: Record<string, unknown> }>;
       openForeshadowings: Array<{ id: string; description: string; triggerKeywords: string[]; expectedPayoffWindow: string; readerQuestion?: string; possiblePayoffs?: string[]; meaningDelta?: string; cost?: string; plantedRevisionId: string }>;
       openPromises: Array<{ id: string; promiser: string; promisee: string; statement: string; sourceRevisionId: string }>;
+      undisclosedSecrets?: Array<{ claim: string; revealWindow?: string; carrier?: string }>;
       planningFeedback: Array<{ sourceChapterOrder?: number; targetId: string; underlyingMechanism: string; affectedInputClass: string; boundaries?: string; sourceArtifactId?: string }>;
       narrativeState: NarrativeStateSnapshot | undefined;
       plotOutline?: StoryArcPlotOutline;
       serialFunctionRuns?: Array<{ narrativeFunction: string; narrativeOrders: number[] }>;
+      cast?: Array<{ id: string; name: string }>;
+      ensembleSignal?: { soloOnlyOrders: number[]; longestSoloRun: number; windowSize: number };
+      dueLedger?: { currentOrder: number; windowElapsedCount: number; agedOpenCount: number; items: Array<{ id: string; description: string; horizonOrder: number; plantedOrder: number | null }> };
+      payoffRhythm?: Array<{ arcOrdinal: number; title: string | null; finalChapters: number; payoffCount: number }>;
     } = {
       projectTitle: project.rows[0].title,
       macro: macro.map((artifact) => ({ taskKey: foundationTaskKey(artifact) ?? "unknown", title: typeof artifact.structuredData?.title === "string" ? artifact.structuredData.title : "", summary: typeof artifact.structuredData?.summary === "string" ? artifact.structuredData.summary : "" })),
@@ -3851,7 +4559,37 @@ export class NovelPostgresRepository {
       planningFeedback,
       narrativeState,
       ...(serialFunctionRuns.length ? { serialFunctionRuns } : {}),
+      // 登记表只投影短 id（实体 URI 末段）与显示名，上限 80 行防止超长群像项目挤爆预算。
+      cast: cast.rows.slice(0, 80).map((row) => ({ id: row.id.slice(row.id.lastIndexOf(":") + 1), name: row.name })),
+      ...(ensembleSignal ? { ensembleSignal: { soloOnlyOrders: ensembleSignal.soloOnlyChapterIndexes, longestSoloRun: ensembleSignal.longestSoloRun, windowSize: ensembleWindow.length } } : {}),
+      ...(dueLedger ? { dueLedger } : {}),
+      ...(payoffRhythm.length ? { payoffRhythm } : {}),
     };
+    // PL-8③：未揭示秘密清单投影（plot-design informationBoundaries.hidden）。别名迁移
+    // 在 flat 归一层内完成（散文时代成员升为 {claim}）；plot-design 缺失或形态非法时返回
+    // 空——不发明内容，宁缺毋造。
+    {
+      const plotDesign = macro.find((artifact) => foundationTaskKey(artifact) === "plot-design");
+      const envelopeData = plotDesign?.structuredData?.structuredData;
+      const designRoot = (typeof envelopeData === "string"
+        ? (() => { try { return JSON.parse(envelopeData) as unknown; } catch { return undefined; } })()
+        : envelopeData) as Record<string, unknown> | undefined;
+      if (designRoot && typeof designRoot === "object" && !Array.isArray(designRoot)) {
+        const flatDesign = normalizeFoundationStructuredDataFlat(designRoot, "plot-design");
+        const hiddenMembers = (flatDesign.informationBoundaries as Record<string, unknown> | undefined)?.hidden;
+        const undisclosedSecrets = (Array.isArray(hiddenMembers) ? hiddenMembers : []).flatMap((member) => {
+          if (typeof member === "string") return member.trim() ? [{ claim: member.trim() }] : [];
+          if (!member || typeof member !== "object" || Array.isArray(member)) return [];
+          const record = member as Record<string, unknown>;
+          const claim = typeof record.claim === "string" ? record.claim.trim() : "";
+          if (!claim) return [];
+          const revealWindow = [record.revealWindow, record.window, record.doNotConsumeBefore].find((value): value is string => typeof value === "string" && Boolean(value.trim()));
+          const carrier = typeof record.carrier === "string" && record.carrier.trim() ? record.carrier.trim() : undefined;
+          return [{ claim, ...(revealWindow ? { revealWindow: revealWindow.trim() } : {}), ...(carrier ? { carrier } : {}) }];
+        });
+        if (undisclosedSecrets.length) contextData.undisclosedSecrets = undisclosedSecrets;
+      }
+    }
     // 外部剧情编排（模式 B）从对应故事弧的规划 workflow run 读取：arcs.payload
     // 在项目蓝图投影时会被 bundle.arc 覆盖，不能作为编排输入的持久化位置；
     // workflow_runs.payload 是审计性持久层，经 startStoryArcOrchestratedPlanning
@@ -3894,7 +4632,10 @@ export class NovelPostgresRepository {
       recent: canonicalSha256(contextData.recentChapters),
       "open-elements": canonicalSha256({ openThreads: contextData.openThreads, openForeshadowings: contextData.openForeshadowings, openPromises: contextData.openPromises }),
       "feedback-state": canonicalSha256({ planningFeedback: contextData.planningFeedback, narrativeState: contextData.narrativeState }),
-      ...(contextData.serialFunctionRuns ? { "serial-signals": canonicalSha256(contextData.serialFunctionRuns) } : {}),
+      ...(contextData.serialFunctionRuns ? { "serial-signals": canonicalSha256({ runs: contextData.serialFunctionRuns, ensembleSignal: contextData.ensembleSignal }) } : {}),
+      ...(contextData.payoffRhythm ? { "payoff-rhythm": canonicalSha256(contextData.payoffRhythm) } : {}),
+      ...(contextData.cast ? { cast: canonicalSha256(contextData.cast) } : {}),
+      ...(contextData.dueLedger ? { "due-ledger": canonicalSha256(contextData.dueLedger) } : {}),
     };
     const receiptBase: Omit<StoryArcContextReceipt, "fingerprint"> = { narrativeCutoff, sourceArtifactIds, sourceRevisionIds, sectionFingerprints, legacy: false };
     const contextReceipt: StoryArcContextReceipt = { ...receiptBase, fingerprint: canonicalSha256(receiptBase) };
@@ -3921,7 +4662,7 @@ export class NovelPostgresRepository {
       [projectId, arcId],
     );
     if (!rows.rowCount) throw new Error("故事弧没有可重基线的已关联章节");
-    if (rows.rows.length > 16) throw new Error("单次重基线最多处理 16 个已关联章节；更长故事弧需要按批次重基线");
+    if (rows.rows.length > MAX_STORY_ARC_BATCH_WINDOW) throw new Error(`单次重基线最多处理 ${MAX_STORY_ARC_BATCH_WINDOW} 个已关联章节；更长故事弧需要按批次重基线`);
 
     const approvals = await this.pool.query<{ artifact_id: string | null }>(
       `SELECT payload->>'artifactId' AS artifact_id
@@ -4049,12 +4790,10 @@ export class NovelPostgresRepository {
     );
     const phases = planning?.arc.phases ?? [];
     const position = arcPosition.rows[0];
-    const localIndex = position && planning?.arc.expectedChapterCount
-      ? Math.max(0, Math.min(planning.arc.expectedChapterCount - 1, Number(position.current_order) - Number(position.first_order)))
-      : 0;
-    const phaseIndex = phases.length && planning?.arc.expectedChapterCount
-      ? Math.min(phases.length - 1, Math.floor((localIndex / planning.arc.expectedChapterCount) * phases.length))
-      : -1;
+    const arcLocalOrdinal = position ? Math.max(1, Number(position.current_order) - Number(position.first_order) + 1) : 0;
+    // PL-6：阶段归属只认 phases[].chapterOrdinals 数据绑定；未绑定不猜（旧
+    // floor(localIndex/expected*phases) 等分推算在"期望≠实际"弧上静默失真）。
+    const boundPhase = resolveArcPhase(phases, arcLocalOrdinal);
     const payloadWithoutFingerprint = {
       id: `narrative-state:${input.revisionId}`,
       projectId: input.projectId,
@@ -4063,7 +4802,7 @@ export class NovelPostgresRepository {
       narrativeOrder: input.narrativeOrder,
       arcId: planning?.arcId,
       chapterBlueprintId: planning?.chapterBlueprintId,
-      arcPhase: phaseIndex >= 0 ? phases[phaseIndex]?.title : undefined,
+      arcPhase: boundPhase?.title,
       openThreads: [...new Set([
         ...input.chapterMemory.unresolvedThreads,
         ...threads.rows.map((thread) => `${thread.id} ${thread.title}`),
@@ -4092,8 +4831,8 @@ export class NovelPostgresRepository {
       [snapshot.id, snapshot.projectId, snapshot.documentId, snapshot.revisionId, snapshot.narrativeOrder, snapshot, snapshot.fingerprint, new Date(snapshot.createdAt)],
     );
     await connection.query(
-      "INSERT INTO outbox_events(aggregate_type,aggregate_id,event_type,payload) VALUES('narrative-state',$1,'narrative-state.upserted',$2)",
-      [snapshot.id, { projectId: snapshot.projectId, documentId: snapshot.documentId, revisionId: snapshot.revisionId, narrativeOrder: snapshot.narrativeOrder, fingerprint: snapshot.fingerprint }],
+      "INSERT INTO outbox_events(aggregate_type,aggregate_id,event_type,payload,project_id) VALUES('narrative-state',$1,'narrative-state.upserted',$2,$3)",
+      [snapshot.id, { projectId: snapshot.projectId, documentId: snapshot.documentId, revisionId: snapshot.revisionId, narrativeOrder: snapshot.narrativeOrder, fingerprint: snapshot.fingerprint }, snapshot.projectId],
     );
     return snapshot;
   }
@@ -4135,9 +4874,13 @@ export class NovelPostgresRepository {
       ].join("\n");
       const subjectRefs = latestMemory?.characterStates.map((item) => item.characterId) ?? [];
       push({ id: snapshot.id, projectId: input.projectId, kind: "hierarchical", title: `第${snapshot.narrativeOrder}章叙事状态账本`, content, subjectRefs, narrativeRange: { start: snapshot.narrativeOrder, end: snapshot.narrativeOrder }, knowledgeScope: "author", authority: "derived", confidence: 1, sourceRevisionIds: [snapshot.revisionId], contentHash: snapshot.fingerprint, supersedes: [], matchedFacet: "thread", matchedFacets: ["thread", "entity"] });
-      const povState = latestMemory?.characterStates.find((item) => item.characterId === input.povCharacterId);
-      if (povState && input.povCharacterId) {
-        push({ id: `${snapshot.id}:pov:${input.povCharacterId}`, projectId: input.projectId, kind: "working", title: `POV角色章末状态：${input.povCharacterId}`, content: povState.stateSnapshot, subjectRefs: [input.povCharacterId], narrativeRange: { start: snapshot.narrativeOrder, end: snapshot.narrativeOrder }, knowledgeScope: { characterId: input.povCharacterId }, authority: "derived", confidence: 1, sourceRevisionIds: [snapshot.revisionId], contentHash: createHash("sha256").update(`${snapshot.fingerprint}:${input.povCharacterId}:${povState.stateSnapshot}`).digest("hex"), supersedes: [], matchedFacet: "entity" });
+      const povForms = input.povCharacterId ? await this.characterRefForms(input.projectId, input.povCharacterId) : undefined;
+      const povMatches = (characterId: string) => characterId === input.povCharacterId
+        || Boolean(povForms && (characterId === povForms.shortId || characterId === povForms.name || characterId === povForms.uri));
+      const povState = latestMemory?.characterStates.find((item) => povMatches(item.characterId));
+      const povCanonical = povForms?.shortId ?? input.povCharacterId;
+      if (povState && povCanonical) {
+        push({ id: `${snapshot.id}:pov:${povCanonical}`, projectId: input.projectId, kind: "working", title: `POV角色章末状态：${povForms?.name ?? povCanonical}`, content: povState.stateSnapshot, subjectRefs: [povCanonical], narrativeRange: { start: snapshot.narrativeOrder, end: snapshot.narrativeOrder }, knowledgeScope: { characterId: povCanonical }, authority: "derived", confidence: 1, sourceRevisionIds: [snapshot.revisionId], contentHash: createHash("sha256").update(`${snapshot.fingerprint}:${povCanonical}:${povState.stateSnapshot}`).digest("hex"), supersedes: [], matchedFacet: "entity" });
       }
     }
     for (const memory of memories) {
@@ -4297,13 +5040,35 @@ export class NovelPostgresRepository {
       latestExcerpt: row.latest_title ?? "",
     }));
 
+    // openPromises：项目开放承诺账本（不随窗口截断——期限类事实的建立章可能远早于
+    // 窗口起点，且引用它之前必须知道它的建立位置；按建立章排序供「不早于建立章」核对）。
+    // 孤儿 source_revision（文档已删）仍投影，established_order 为 NULL 由渲染层如实标注。
+    const promiseRows = await this.pool.query<{ statement: string; established_order: number | null }>(
+      `SELECT p.statement, d.narrative_order AS established_order
+       FROM promises p
+       LEFT JOIN manuscript_revisions mr ON mr.id = p.source_revision_id
+       LEFT JOIN manuscript_documents d ON d.id = mr.document_id
+       WHERE p.project_id=$1 AND p.status='open'
+       ORDER BY d.narrative_order ASC NULLS LAST, p.id
+       LIMIT 40`,
+      [projectId],
+    );
+    // 拿不到章节序的承诺仍投影（establishedAtOrder=null，如孤儿修订），渲染层如实标注。
+    const openPromises: SerialOpenPromise[] = promiseRows.rows.map((row) => ({
+      statement: row.statement,
+      establishedAtOrder: row.established_order === null ? null : Number(row.established_order),
+    }));
+
     return {
       window,
       chapters: windowChapters,
       characterSpans,
       functionRuns,
       subjectSpans,
-      fingerprint: canonicalSha256({ window, chapters: windowChapters, characterSpans, functionRuns, subjectSpans }),
+      openPromises,
+      // assetSpans 由 activities 层按窗口正文做确定性扫描后回填（repository 无 object store 访问权）。
+      assetSpans: [],
+      fingerprint: canonicalSha256({ window, chapters: windowChapters, characterSpans, functionRuns, subjectSpans, openPromises, assetSpans: [] }),
     };
   }
 
@@ -4501,14 +5266,19 @@ export class NovelPostgresRepository {
   }
 
   async listReferencedObjectKeys(): Promise<Array<{ objectKey: string; contentHash: string; reference: string }>> {
+    // 空/NULL object_key 的行（如 restore/占位类 artifact，仅有元数据无存储对象）不是
+    // 可验证的对象引用：objects.has('') 会让 S3 SDK 因空 Key 抛序列化异常，导致启动
+    // 失败。完整性检查只针对真实持有存储键的引用；空键行的可读性无从校验，排除之。
     const result = await this.pool.query<{ object_key: string; content_hash: string; reference: string }>(`
       SELECT cb.object_key,cb.content_hash,'content-blob'::text AS reference
       FROM content_blobs cb
-      WHERE EXISTS (SELECT 1 FROM manuscript_revisions mr WHERE mr.content_hash=cb.content_hash)
-         OR EXISTS (SELECT 1 FROM manuscript_blocks mb WHERE mb.content_hash=cb.content_hash)
-         OR EXISTS (SELECT 1 FROM artifacts a WHERE a.content_hash=cb.content_hash)
+      WHERE COALESCE(cb.object_key,'')<>''
+        AND (EXISTS (SELECT 1 FROM manuscript_revisions mr WHERE mr.content_hash=cb.content_hash)
+          OR EXISTS (SELECT 1 FROM manuscript_blocks mb WHERE mb.content_hash=cb.content_hash)
+          OR EXISTS (SELECT 1 FROM artifacts a WHERE a.content_hash=cb.content_hash))
       UNION
       SELECT a.object_key,a.content_hash,'artifact'::text AS reference FROM artifacts a
+      WHERE COALESCE(a.object_key,'')<>''
       ORDER BY object_key
     `);
     return result.rows.map((row) => ({ objectKey: row.object_key, contentHash: row.content_hash, reference: row.reference }));
@@ -4685,55 +5455,6 @@ export class NovelPostgresRepository {
     return result.rows[0] ? artifactFromRow(result.rows[0]) : undefined;
   }
 
-  async recordShortScript(script: StoredShortScript): Promise<void> {
-    // 冲突目标指向 source_fingerprint 唯一索引（ux_short_scripts_fingerprint）而非 id：
-    // id 为 randomUUID 永不冲突；并发同创意提交时第二个插入在指纹索引上冲突，
-    // 静默跳过后调用方经 findShortScriptByFingerprint 读到既有产物（幂等语义）。
-    await this.pool.query(
-      `INSERT INTO short_scripts(id,project_id,idea,instruction,target_duration_seconds,source_fingerprint,contract_version,object_key,content_hash,workflow_id,payload,created_at)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-       ON CONFLICT(source_fingerprint) DO NOTHING`,
-      [script.id, script.projectId ?? null, script.idea, script.instruction ?? null, script.targetDurationSeconds, script.sourceFingerprint, script.contractVersion, script.objectKey ?? null, script.contentHash, script.workflowId, script.payload ?? {}, new Date(script.createdAt)],
-    );
-  }
-
-  async getShortScript(id: string): Promise<StoredShortScript | undefined> {
-    const result = await this.pool.query<ShortScriptRow>(SHORT_SCRIPT_SELECT_SQL + " WHERE id=$1", [id]);
-    return result.rows[0] ? shortScriptFromRow(result.rows[0]) : undefined;
-  }
-
-  /**
-   * 删除创意短剧产物行并返回被删记录（含 objectKey），供调用方清理对象存储；
-   * 不存在时返回 undefined（删除语义幂等，由 REST 层映射 404）。
-   */
-  async deleteShortScript(id: string): Promise<StoredShortScript | undefined> {
-    const stored = await this.getShortScript(id);
-    if (!stored) return undefined;
-    await this.pool.query("DELETE FROM short_scripts WHERE id=$1", [id]);
-    return stored;
-  }
-
-  async findShortScriptByFingerprint(fingerprint: string): Promise<StoredShortScript | undefined> {
-    const result = await this.pool.query<ShortScriptRow>(SHORT_SCRIPT_SELECT_SQL + " WHERE source_fingerprint=$1 ORDER BY created_at DESC LIMIT 1", [fingerprint]);
-    return result.rows[0] ? shortScriptFromRow(result.rows[0]) : undefined;
-  }
-
-  async listShortScripts(options: { projectId?: string; limit?: number } = {}): Promise<StoredShortScript[]> {
-    const limit = Math.min(Math.max(options.limit ?? 50, 1), 100);
-    const params: unknown[] = [];
-    let filterSql = "";
-    if (options.projectId !== undefined) {
-      params.push(options.projectId);
-      filterSql = ` WHERE project_id=$${params.length}`;
-    }
-    params.push(limit);
-    const result = await this.pool.query<ShortScriptRow>(
-      SHORT_SCRIPT_SELECT_SQL + filterSql + ` ORDER BY created_at DESC,id DESC LIMIT $${params.length}`,
-      params,
-    );
-    return result.rows.map(shortScriptFromRow);
-  }
-
   async createNextDocument(projectId: string, title?: string): Promise<ManuscriptDocumentSummary> {
     const narrativeOrder = await this.nextDocumentOrder(projectId);
     return this.ensureDocument({ projectId, title: title?.trim() || `第 ${narrativeOrder} 章`, narrativeOrder, status: "planned" });
@@ -4826,6 +5547,7 @@ export class NovelPostgresRepository {
   }
 
   async findHistoricalBlueprintForDocument(projectId: string, documentId: string): Promise<{ blueprint: ExecutionBlueprint; artifactId: string } | undefined> {
+    // 首选：novel-intent 链路的 draft artifact 反查 execution_blueprints（review-stage 不重新编译蓝图）。
     const result = await this.pool.query<{ payload: ExecutionBlueprint; artifact_id: string }>(
       `SELECT eb.payload,a.id AS artifact_id
        FROM artifacts a
@@ -4837,7 +5559,24 @@ export class NovelPostgresRepository {
        ORDER BY a.created_at DESC LIMIT 1`,
       [projectId, documentId],
     );
-    return result.rows[0] ? { blueprint: result.rows[0].payload, artifactId: result.rows[0].artifact_id } : undefined;
+    if (result.rows[0]) return { blueprint: result.rows[0].payload, artifactId: result.rows[0].artifact_id };
+    // 回退：产物保留策略可能清理 intent 链路的历史 :draft artifact，但章节的
+    // execution_blueprints 行（payload 即 ExecutionBlueprint，含 id/preflightId/budget）
+    // 是审校链路真正的加载源（reviewByRefs/reviseByRefs 按 blueprintId 读本表），
+    // 仍被 memory_bundles/skill_bundles/章节工作区快照引用，不会随产物清理消失。
+    // 按 intent 反查最近一条章节蓝图，artifactId 以最近的 review-draft 兜底
+    // （仅供审计溯源；工作流自身会用当前正文新建 review-draft artifact）。
+    const fallback = await this.pool.query<{ payload: ExecutionBlueprint; review_draft_id: string | null }>(
+      `SELECT eb.payload AS payload,
+              (SELECT a.id FROM artifacts a WHERE a.task_id=eb.id || ':review-draft' AND a.kind='draft' ORDER BY a.created_at DESC LIMIT 1) AS review_draft_id
+       FROM novel_intents ni
+       JOIN execution_blueprints eb ON eb.intent_id=ni.id
+       WHERE ni.project_id=$1 AND ni.payload->'target'->>'kind'='chapter' AND ni.payload->'target'->>'id'=$2
+       ORDER BY eb.created_at DESC LIMIT 1`,
+      [projectId, documentId],
+    );
+    if (fallback.rows[0]?.payload) return { blueprint: fallback.rows[0].payload, artifactId: fallback.rows[0].review_draft_id ?? fallback.rows[0].payload.id };
+    return undefined;
   }
 
   async getFinalDocumentContentRef(projectId: string, documentId: string): Promise<{ title: string; status: string; narrativeOrder: number; revision: number; sourceRevisionId?: string; artifactId?: string; contentHash: string; objectKey: string } | undefined> {
@@ -4852,6 +5591,38 @@ export class NovelPostgresRepository {
     const row = result.rows[0];
     if (!row || row.revision === null || !row.revision_id || !row.content_hash || !row.object_key) return row ? { title: row.title, status: row.status, narrativeOrder: Number(row.narrative_order), revision: 0, contentHash: "", objectKey: "" } : undefined;
     return { title: row.title, status: row.status, narrativeOrder: Number(row.narrative_order), revision: Number(row.revision), sourceRevisionId: row.revision_id, artifactId: row.artifact_id ?? undefined, contentHash: row.content_hash, objectKey: row.object_key };
+  }
+
+  /**
+   * 取本章之前最近 N 章的结尾末段正文（跨章语境，供 manuscript.ending-ritual 判据使用）。
+   *
+   * 设计依据：AGENTS.md「在拥有错误行为的最低共享层修复」——章末仪式化（"清点/吹灯/
+   * 格账留白"在 50+ 章近 verbatim 复现）在单章内与"留白"这一本书优点**形态相同**，
+   * 任何单章判据都会把优点一起打掉。故通道必须跨章，而跨章语境只有编排方能提供。
+   *
+   * 返回对象存储的 object_key 列表（非纯文本）：正文住在 MinIO，仓储层只持有引用，
+   * 取文本与裁末段由 activities.loadPriorChapterEndings 完成（objects.getText +
+   * extractChapterEnding）。这样分段口径（extractChapterEnding）只有一处定义，
+   * 仓储层不重复实现文本切分。
+   * 只取 status='final' 且 current_revision_id 非空的行，保证比较对象是已定稿正文。
+   * 返回按章序**升序**（最早的在前），与 narrativeOrder 自然序一致。
+   */
+  async getPriorChapterEndings(input: { projectId: string; narrativeOrder: number; count: number }): Promise<string[]> {
+    if (input.count <= 0) return [];
+    const result = await this.pool.query<{ narrative_order: string | number; content_hash: string; object_key: string }>(
+      `SELECT d.narrative_order, mr.content_hash, cb.object_key
+       FROM manuscript_documents d
+       JOIN manuscript_revisions mr ON mr.id=d.current_revision_id
+       JOIN content_blobs cb ON cb.content_hash=mr.content_hash
+       WHERE d.project_id=$1 AND d.status='final' AND d.current_revision_id IS NOT NULL
+         AND d.narrative_order < $2
+       ORDER BY d.narrative_order DESC, d.id DESC
+       LIMIT $3`,
+      [input.projectId, input.narrativeOrder, input.count],
+    );
+    return result.rows
+      .sort((a, b) => Number(a.narrative_order) - Number(b.narrative_order))
+      .map((row) => row.object_key);
   }
 
   private async findLaterFinalDocument(projectId: string, narrativeOrder: number, connection: Pool | PoolClient = this.pool): Promise<{ id: string; narrativeOrder: number } | undefined> {
@@ -4940,19 +5711,68 @@ export class NovelPostgresRepository {
     return result.rows[0]?.payload;
   }
 
+  /**
+   * Foundation 投影落库（段级单例 + 代际收敛）。
+   *
+   * 设计依据：memory-governance-audit-20260909 §M4/§5.3.1 与 product-audit-20260910 A2——
+   * 早期实现每次生成追加一条整段投影（supersedes 硬编码为空），历史代际常驻 active；
+   * 9/9 的"最新代 supersede 其余代"修复仍让每代各保一行，检索轨任何一处退役口径漂移
+   * 都会把陈旧投影放回 bundle（实测 draft preflight 混入 20-29 条陈旧 foundation 行）。
+   * 段级单例（id = foundation:<projectId>:<taskKey>）从 id 层根除：
+   * - 每槽位只有一行，重新生成即覆盖写（replaceExistingById），Qdrant 同名点物理覆盖；
+   * - 非最新 artifact 的投影不再落行，历史原文只存 artifacts 表（source_artifact_id 溯源）；
+   * - 存量 per-artifact 行由单例行的 supersedes 一次性退役（配合 memory-visibility 统一口径）。
+   */
+  async recordFoundationClaim(input: { projectId: string; claim: MemoryClaim; sourceArtifactId: string }): Promise<MemoryClaim[]> {
+    const taskKeyRef = input.claim.subjectRefs.find((ref) => ref.startsWith("foundation:"));
+    const taskKey = taskKeyRef ? taskKeyRef.slice("foundation:".length) : undefined;
+    if (!taskKey || !taskKeyRef) {
+      return this.recordMemoryClaims({ projectId: input.projectId, claims: [input.claim], sourceArtifactId: input.sourceArtifactId });
+    }
+    const latest = await this.pool.query<{ id: string }>(
+      `SELECT id FROM artifacts
+       WHERE project_id=$1 AND kind='foundation' AND payload->>'taskKey'=$2
+       ORDER BY created_at DESC, id DESC LIMIT 1`,
+      [input.projectId, taskKey],
+    );
+    if (latest.rows[0]?.id !== input.sourceArtifactId) {
+      // 段级单例下陈旧代际不再落投影行：槽位内容由最新代的单例行承载，
+      // 历史原文永久保存在 artifacts 表（审计溯源走 source_artifact_id，不靠记忆层留档）。
+      return [];
+    }
+    const prior = await this.pool.query<{ id: string }>(
+      `SELECT id FROM memory_claims
+       WHERE project_id=$1 AND lifecycle_status='active' AND subject_refs && $2::text[] AND id <> $3`,
+      [input.projectId, [taskKeyRef], input.claim.id],
+    );
+    const supersedes = [...new Set([...prior.rows.map((row) => row.id), ...input.claim.supersedes])];
+    // 段级单例覆盖写：同 (project,taskKey) 重新生成时刷新内容并指向最新 artifact；
+    // prior 里同槽位的其余 active 行（历史 per-artifact 代际）以 supersedes 退役。
+    return this.recordMemoryClaims({ projectId: input.projectId, claims: [{ ...input.claim, supersedes }], sourceArtifactId: input.sourceArtifactId, replaceExistingById: true });
+  }
+
   async ensureFoundationMemoryClaims(projectId: string): Promise<MemoryClaim[]> {
     const artifacts = await this.listFoundationArtifacts(projectId);
     if (!artifacts.length) return [];
-    const claimIds = artifacts.map((artifact) => `foundation:${artifact.id}`);
-    const existing = await this.pool.query<{ id: string }>(
-      "SELECT id FROM memory_claims WHERE project_id=$1 AND id = ANY($2::text[])",
+    // 段级单例回填：只处理每个 taskKey 的最新 artifact；单例行已指向该 artifact 则跳过。
+    const latestByTask = new Map<string, Artifact>();
+    for (const artifact of artifacts) {
+      const taskKey = typeof artifact.structuredData?.taskKey === "string" ? artifact.structuredData.taskKey : "foundation";
+      const current = latestByTask.get(taskKey);
+      if (!current || artifact.createdAt > current.createdAt || (artifact.createdAt === current.createdAt && artifact.id > current.id)) {
+        latestByTask.set(taskKey, artifact);
+      }
+    }
+    const claimIds = [...latestByTask.keys()].map((taskKey) => foundationClaimId(projectId, taskKey));
+    const existing = await this.pool.query<{ id: string; source_artifact_id: string | null }>(
+      "SELECT id,source_artifact_id FROM memory_claims WHERE project_id=$1 AND id = ANY($2::text[])",
       [projectId, claimIds],
     );
-    const existingIds = new Set(existing.rows.map((row) => row.id));
-    const missing = artifacts.filter((artifact) => !existingIds.has(`foundation:${artifact.id}`));
+    const pointedArtifact = new Map(existing.rows.map((row) => [row.id, row.source_artifact_id]));
+    const missing = [...latestByTask.entries()].filter(([taskKey, artifact]) => pointedArtifact.get(foundationClaimId(projectId, taskKey)) !== artifact.id);
     if (!missing.length) return [];
 
-    const runIds = [...new Set(missing.map((artifact) => artifact.structuredData?.runId).filter((value): value is string => typeof value === "string"))];
+    const runIds = [...new Set(missing.map(([, artifact]) => artifact.structuredData?.runId).filter((value): value is string => typeof value === "string"))];
     const objectives = new Map<string, string>();
     if (runIds.length) {
       const runs = await this.pool.query<{ id: string; objective: string | null }>(
@@ -4963,10 +5783,11 @@ export class NovelPostgresRepository {
     }
 
     const recorded: MemoryClaim[] = [];
-    for (const artifact of missing) {
+    for (const [, artifact] of missing) {
       const runId = typeof artifact.structuredData?.runId === "string" ? artifact.structuredData.runId : undefined;
       const claim = foundationArtifactToMemoryClaim(artifact, { objective: runId ? objectives.get(runId) : undefined });
-      recorded.push(...await this.recordMemoryClaims({ projectId, claims: [claim], sourceArtifactId: artifact.id }));
+      // 单例覆盖写 + 存量 per-artifact 行退役在 recordFoundationClaim 内完成。
+      recorded.push(...await this.recordFoundationClaim({ projectId, claim, sourceArtifactId: artifact.id }));
     }
     return recorded;
   }
@@ -5054,10 +5875,28 @@ export class NovelPostgresRepository {
         "SELECT claim_id FROM memory_claim_sources WHERE project_id=$1 AND document_id=$2 AND lifecycle_status='active'",
         [input.projectId, input.documentId],
       );
-      await client.query(
-        "UPDATE memory_claim_sources SET lifecycle_status='staged' WHERE project_id=$1 AND document_id=$2",
-        [input.projectId, input.documentId],
+      // 幸存 revision 的富化声明不参与 staging：character-enrichment 的知识/声部声明挂在
+      // commit artifact（当前 revision）上，状态重建只替换事实提取产物（fact artifact），
+      // 不重跑富化——若把当前 revision 的富化 source 一并 staged，该章的角色知识边界会
+      // 在重建后从检索中消失（方案 A 后知识单一来源，此缺口会被放大）。
+      // memory-governance-audit-20260909 §8.1 复审发现并修复；边界：旧 revision 的富化
+      // source 仍按原语义 staged（其声明随 revision 退役）。
+      const survivingRevisionArtifact = await client.query<{ artifact_id: string | null }>(
+        "SELECT artifact_id FROM manuscript_revisions WHERE id=$1 AND project_id=$2",
+        [input.revisionId, input.projectId],
       );
+      const survivingArtifactId = survivingRevisionArtifact.rows[0]?.artifact_id ?? null;
+      if (survivingArtifactId) {
+        await client.query(
+          "UPDATE memory_claim_sources SET lifecycle_status='staged' WHERE project_id=$1 AND document_id=$2 AND artifact_id IS DISTINCT FROM $3",
+          [input.projectId, input.documentId, survivingArtifactId],
+        );
+      } else {
+        await client.query(
+          "UPDATE memory_claim_sources SET lifecycle_status='staged' WHERE project_id=$1 AND document_id=$2",
+          [input.projectId, input.documentId],
+        );
+      }
       const activated = await client.query<{ claim_id: string }>(
         `UPDATE memory_claim_sources SET document_id=$3,revision_id=$4,lifecycle_status='active'
          WHERE project_id=$1 AND artifact_id=$2 RETURNING claim_id`,
@@ -5067,10 +5906,7 @@ export class NovelPostgresRepository {
       if (affectedIds.length) {
         await client.query(
           `UPDATE memory_claims claim SET
-             lifecycle_status=CASE WHEN EXISTS (SELECT 1 FROM memory_claim_sources source WHERE source.claim_id=claim.id AND source.lifecycle_status='active') THEN 'active' ELSE 'staged' END,
-             source_revision_ids=COALESCE((SELECT array_agg(DISTINCT source.revision_id) FILTER (WHERE source.revision_id IS NOT NULL) FROM memory_claim_sources source WHERE source.claim_id=claim.id AND source.lifecycle_status='active'),'{}'),
-             narrative_start=(SELECT MIN(document.narrative_order) FROM memory_claim_sources source JOIN manuscript_documents document ON document.id=source.document_id WHERE source.claim_id=claim.id AND source.lifecycle_status='active'),
-             narrative_end=(SELECT MIN(document.narrative_order) FROM memory_claim_sources source JOIN manuscript_documents document ON document.id=source.document_id WHERE source.claim_id=claim.id AND source.lifecycle_status='active')
+             ${CLAIM_PROJECTION_SET_SQL}
            WHERE claim.id=ANY($1::text[])`,
           [affectedIds],
         );
@@ -5303,22 +6139,32 @@ export class NovelPostgresRepository {
     let payoffCount = 0;
 
     // 1. 写入 foreshadowings
+    // PL-5③ 锚点身份：登记键 =（文档, 规范化锚点）——同一伏笔多轮重抽取的措辞改写
+    // 不再漂移成新行；锚点缺失/形态不合退回描述内容键（保守不猜）。同键归并在应用层：
+    // 最早埋设信息保留，keywords/possiblePayoffs 有序并集，被吸收描述进 mergedFrom。
     for (const f of narrativeElements.foreshadowings ?? []) {
-      const id = `foreshadowing:${projectId}:${createHash("sha256").update(`${artifact.id}:${f.description}`).digest("hex").slice(0, 12)}`;
-      await connection.query(
-        "INSERT INTO foreshadowing(id, project_id, planted_revision_id, status, payload, narrative_order) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(id) DO UPDATE SET payload=EXCLUDED.payload, narrative_order=EXCLUDED.narrative_order",
-        [id, projectId, revisionId, "open", { description: f.description, triggerKeywords: f.triggerKeywords, expectedPayoffWindow: f.expectedPayoffWindow, readerQuestion: f.readerQuestion ?? "", possiblePayoffs: f.possiblePayoffs ?? [], meaningDelta: f.meaningDelta ?? "", cost: f.cost ?? "", evidence: f.evidence, artifactId: artifact.id }, narrativeOrder ?? null],
+      const id = foreshadowingLedgerId(projectId, documentId, f);
+      const payload: ForeshadowingLedgerPayload = { description: f.description, anchor: f.anchor ?? "", triggerKeywords: f.triggerKeywords ?? [], expectedPayoffWindow: f.expectedPayoffWindow, readerQuestion: f.readerQuestion ?? "", possiblePayoffs: f.possiblePayoffs ?? [], meaningDelta: f.meaningDelta ?? "", cost: f.cost ?? "", evidence: f.evidence, artifactId: artifact.id };
+      const inserted = await connection.query(
+        "INSERT INTO foreshadowing(id, project_id, planted_revision_id, status, payload, narrative_order) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(id) DO NOTHING RETURNING id",
+        [id, projectId, revisionId, "open", payload, narrativeOrder ?? null],
       );
+      if (!inserted.rowCount) {
+        const current = await connection.query<{ payload: ForeshadowingLedgerPayload }>("SELECT payload FROM foreshadowing WHERE id=$1", [id]);
+        const merged = mergeForeshadowingLedgerPayload(current.rows[0]?.payload ?? payload, payload);
+        await connection.query("UPDATE foreshadowing SET payload=$2 WHERE id=$1", [id, merged]);
+      }
       foreshadowingCount += 1;
     }
 
     // 2. 写入 promises
+    // 同上：内容派生键 + COALESCE 保留首次登记的叙事顺序。
     for (const p of narrativeElements.promises ?? []) {
-      const id = `promise:${projectId}:${createHash("sha256").update(`${artifact.id}:${p.promiser}:${p.statement}`).digest("hex").slice(0, 12)}`;
+      const id = `promise:${projectId}:${promiseContentKey(p.promiser, p.promisee, p.statement)}`;
       await connection.query(
         `INSERT INTO promises(id, project_id, statement, source_revision_id, status, payload, narrative_order)
          VALUES($1,$2,$3,$4,$5,$6,$7)
-         ON CONFLICT(id) DO UPDATE SET statement=EXCLUDED.statement,payload=EXCLUDED.payload,narrative_order=EXCLUDED.narrative_order`,
+         ON CONFLICT(id) DO UPDATE SET statement=EXCLUDED.statement,payload=EXCLUDED.payload,narrative_order=COALESCE(promises.narrative_order, EXCLUDED.narrative_order)`,
         [id, projectId, p.statement, revisionId, "open", { promiser: p.promiser, promisee: p.promisee, evidence: p.evidence, artifactId: artifact.id }, narrativeOrder ?? null],
       );
       promiseCount += 1;
@@ -5388,6 +6234,14 @@ export class NovelPostgresRepository {
           if (candidates.length === 1) matchedForeshadowingIds = [candidates[0].id];
         }
         for (const foreshadowingId of matchedForeshadowingIds) {
+          // PL-5 修复②：fulfilled 只能由兑现账行驱动（与 promise 同一入口、同一事务）——
+          // 历史上只翻 status 不落账，兑现账本对伏笔失明。
+          await connection.query(
+            `INSERT INTO payoffs(id, promise_id, foreshadowing_id, revision_id, evidence)
+             VALUES($1,NULL,$2,$3,$4)
+             ON CONFLICT(id) DO UPDATE SET revision_id=EXCLUDED.revision_id, evidence=EXCLUDED.evidence`,
+            [`foreshadowing-payoff:${foreshadowingId}`, foreshadowingId, revisionId, { description: payoff.description, payoffType: "foreshadowing", matchedTriggerKeywords: payoff.matchedTriggerKeywords ?? [], matchedForeshadowingIds: [foreshadowingId], intensity: payoff.intensity ?? null, artifactId: artifact.id }],
+          );
           await connection.query("UPDATE foreshadowing SET status='fulfilled', payoff_revision_id=$2 WHERE id=$1", [foreshadowingId, revisionId]);
         }
       }
@@ -5396,6 +6250,82 @@ export class NovelPostgresRepository {
     }
 
     return { foreshadowings: foreshadowingCount, promises: promiseCount, payoffs: payoffCount };
+  }
+
+  /**
+   * 伏笔账本作者分流面（弧6 收口实践抓出的工具缺口）：overdue 告警一直指示
+   * "兑现/改写窗口/放弃"三选一，但系统从未提供后两者的通道，健康告警在指挥作者
+   * 做不存在的操作。放弃=abandoned 终态（open 消费面全部按 status='open' 过滤，
+   * 出局即不再注入规划/审校/账本）；改写窗口只动 payload 的窗口字段，不动描述与
+   * 埋设账。兑现不走此门（由 payoffs 账行驱动，见 projectNarrativeElements）。
+   */
+  async listForeshadowingForTriage(projectId: string, opts: { status?: "open" | "fulfilled" | "abandoned" | "all"; overdueBeyondOrder?: number; limit?: number } = {}): Promise<Array<{ id: string; status: string; plantedOrder: number | null; anchor: string; description: string; window: string; overdue: boolean; readerQuestion?: string }>> {
+    const status = opts.status ?? "open";
+    const rows = await this.pool.query<{ id: string; status: string; narrative_order: number | null; payload: Record<string, unknown> }>(
+      status === "all"
+        ? "SELECT id,status,narrative_order,payload FROM foreshadowing WHERE project_id=$1 ORDER BY narrative_order ASC NULLS LAST, id LIMIT $2"
+        : "SELECT id,status,narrative_order,payload FROM foreshadowing WHERE project_id=$1 AND status=$2 ORDER BY narrative_order ASC NULLS LAST, id LIMIT $3",
+      status === "all" ? [projectId, opts.limit ?? 200] : [projectId, status, opts.limit ?? 200],
+    );
+    const currentOrder = opts.overdueBeyondOrder ?? (await this.pool.query<{ max: number | null }>("SELECT MAX(narrative_order)::int AS max FROM manuscript_documents WHERE project_id=$1 AND status='final'", [projectId])).rows[0]?.max ?? null;
+    return rows.rows.map((row) => {
+      const window = parsePayoffWindow(row.payload?.expectedPayoffWindow, row.narrative_order);
+      return {
+        id: row.id,
+        status: row.status,
+        plantedOrder: row.narrative_order,
+        anchor: typeof row.payload?.anchor === "string" ? row.payload.anchor : "",
+        description: typeof row.payload?.description === "string" ? row.payload.description : "",
+        window: formatPayoffWindow(row.payload?.expectedPayoffWindow),
+        overdue: row.status === "open" && window.kind === "chapter" && window.horizonOrder !== null && currentOrder !== null && currentOrder > window.horizonOrder,
+        ...(typeof row.payload?.readerQuestion === "string" && row.payload.readerQuestion ? { readerQuestion: row.payload.readerQuestion } : {}),
+      };
+    });
+  }
+
+  async triageForeshadowing(input: {
+    projectId: string;
+    actorId: string;
+    entries: Array<{ id: string; action: "abandon" | "rewrite-window"; reason: string; windowFrom?: number; windowTo?: number }>;
+  }): Promise<{ processed: string[]; skipped: Array<{ id: string; why: string }> }> {
+    const processed: string[] = [];
+    const skipped: Array<{ id: string; why: string }> = [];
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      for (const entry of input.entries) {
+        if (!entry.reason?.trim()) { skipped.push({ id: entry.id, why: "abandon/rewrite-window 必须带 reason（审计轨迹）" }); continue; }
+        if (entry.action === "rewrite-window") {
+          const from = entry.windowFrom; const to = entry.windowTo;
+          if (typeof from !== "number" || typeof to !== "number" || !Number.isInteger(from) || !Number.isInteger(to) || from < 1 || to < from) {
+            skipped.push({ id: entry.id, why: "rewrite-window 需要整数 windowFrom<=windowTo 且均≥1" });
+            continue;
+          }
+        }
+        const current = await client.query<{ status: string; payload: Record<string, unknown> }>(
+          "SELECT status,payload FROM foreshadowing WHERE id=$1 AND project_id=$2 FOR UPDATE", [entry.id, input.projectId],
+        );
+        if (!current.rowCount) { skipped.push({ id: entry.id, why: "伏笔不存在或不属于本项目" }); continue; }
+        if (current.rows[0].status !== "open") { skipped.push({ id: entry.id, why: `仅 open 可分流（当前 ${current.rows[0].status}）` }); continue; }
+        const triage = { action: entry.action, reason: entry.reason.trim(), actorId: input.actorId, at: new Date().toISOString() };
+        if (entry.action === "abandon") {
+          const payload = { ...current.rows[0].payload, triage };
+          await client.query("UPDATE foreshadowing SET status='abandoned', payload=$2 WHERE id=$1", [entry.id, payload]);
+        } else {
+          const payload = { ...current.rows[0].payload, expectedPayoffWindow: { scope: "chapter", from: entry.windowFrom, to: entry.windowTo }, triage };
+          await client.query("UPDATE foreshadowing SET payload=$2 WHERE id=$1", [entry.id, payload]);
+        }
+        await this.appendOutboxTx(client, "foreshadowing", entry.id, `foreshadowing.triaged.${entry.action}`, { projectId: input.projectId, foreshadowingId: entry.id, actorId: input.actorId, reason: entry.reason.trim(), ...(entry.action === "rewrite-window" ? { windowFrom: entry.windowFrom, windowTo: entry.windowTo } : {}) });
+        processed.push(entry.id);
+      }
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+    return { processed, skipped };
   }
 
   async getChapterTitleSource(projectId: string, documentId: string): Promise<Omit<ChapterTitleSource, "plainText" | "blueprint"> & { blueprint: Record<string, unknown>; objectKey?: string } | undefined> {
@@ -5528,21 +6458,21 @@ export class NovelPostgresRepository {
       : "SELECT id, planted_revision_id, payload FROM foreshadowing WHERE project_id=$1 AND status='open' AND narrative_order <= $2 ORDER BY narrative_order ASC, planted_revision_id ASC";
     const foreshadowingParams = narrativeCutoff === undefined ? [projectId] : [projectId, narrativeCutoff];
     // 查询未兑现的 foreshadowing
-    const foreshadowingRows = await connection.query<{ id: string; planted_revision_id: string; payload: { description?: string; triggerKeywords?: string[]; expectedPayoffWindow?: string; readerQuestion?: string; possiblePayoffs?: string[]; meaningDelta?: string; cost?: string } }>(
+    const foreshadowingRows = await connection.query<{ id: string; planted_revision_id: string; payload: { description?: string; triggerKeywords?: string[]; expectedPayoffWindow?: PayoffWindowRaw; readerQuestion?: string; possiblePayoffs?: string[]; meaningDelta?: string; cost?: string } }>(
       foreshadowingSql,
       foreshadowingParams,
     );
-    const foreshadowings = foreshadowingRows.rows.map((row) => ({
+    const foreshadowings = dedupeByNarrativeText(foreshadowingRows.rows.map((row) => ({
       id: row.id,
       description: row.payload?.description ?? "",
       triggerKeywords: row.payload?.triggerKeywords ?? [],
-      expectedPayoffWindow: row.payload?.expectedPayoffWindow ?? "未指定",
+      expectedPayoffWindow: formatPayoffWindow(row.payload?.expectedPayoffWindow),
       readerQuestion: row.payload?.readerQuestion || undefined,
       possiblePayoffs: row.payload?.possiblePayoffs?.length ? row.payload.possiblePayoffs : undefined,
       meaningDelta: row.payload?.meaningDelta || undefined,
       cost: row.payload?.cost || undefined,
       plantedRevisionId: row.planted_revision_id,
-    }));
+    })), (item) => item.description);
 
     // 查询未兑现的 promises
     const promiseSql = narrativeCutoff === undefined
@@ -5552,13 +6482,13 @@ export class NovelPostgresRepository {
       promiseSql,
       narrativeCutoff === undefined ? [projectId] : [projectId, narrativeCutoff],
     );
-    const promises = promiseRows.rows.map((row) => ({
+    const promises = dedupeByNarrativeText(promiseRows.rows.map((row) => ({
       id: row.id,
       promiser: row.payload?.promiser ?? "",
       promisee: row.payload?.promisee ?? "",
       statement: row.statement,
       sourceRevisionId: row.source_revision_id,
-    }));
+    })), (item) => `${item.promiser}\u0000${item.promisee}\u0000${item.statement}`);
 
     return { foreshadowings, promises };
   }
@@ -5719,8 +6649,8 @@ export class NovelPostgresRepository {
       ],
     );
     await connection.query(
-      "INSERT INTO outbox_events(aggregate_type,aggregate_id,event_type,payload) VALUES('chapter-memory',$1,'chapter-memory.upserted',$2)",
-      [input.id, { projectId: input.projectId, documentId: input.documentId, revisionId: input.revisionId, narrativeStart: input.narrativeRange.start, narrativeEnd: input.narrativeRange.end }],
+      "INSERT INTO outbox_events(aggregate_type,aggregate_id,event_type,payload,project_id) VALUES('chapter-memory',$1,'chapter-memory.upserted',$2,$3)",
+      [input.id, { projectId: input.projectId, documentId: input.documentId, revisionId: input.revisionId, narrativeStart: input.narrativeRange.start, narrativeEnd: input.narrativeRange.end }, input.projectId],
     );
     return input;
   }
@@ -5770,8 +6700,64 @@ export class NovelPostgresRepository {
    * 排序：按 narrative_start ASC（章节顺序），让上游能按时间线串联前章进展。
    * narrativeCutoff：若提供，只返回 narrative_start <= cutoff 的章节（叙事截止前）。
    */
-  async getChapterMemories(input: { projectId: string; narrativeCutoff?: number; limit?: number }): Promise<ChapterMemory[]> {
-    const params: unknown[] = [input.projectId];
+  /**
+   * 全部定稿章的正文对象引用（供线索静默账等需要**全量**正文的确定性扫描）。
+   *
+   * 与 getChapterContentRefsByOrders（按指定章序取）并列：静默判定需要"该线索在
+   * 埋设后到当前章之间何时最后出现"，窗口内取不到答案，必须全量（P1 2026-09-18）。
+   */
+  async listFinalChapterContentRefs(projectId: string): Promise<Array<{ documentId: string; narrativeOrder: number; objectKey: string }>> {
+    const result = await this.pool.query<{ document_id: string; narrative_order: string | number; object_key: string }>(
+      `SELECT d.id AS document_id, d.narrative_order, cb.object_key
+       FROM manuscript_documents d
+       JOIN manuscript_revisions mr ON mr.id = d.current_revision_id
+       JOIN content_blobs cb ON cb.content_hash = mr.content_hash
+       WHERE d.project_id=$1 AND d.status='final' AND d.narrative_order IS NOT NULL AND cb.object_key IS NOT NULL
+       ORDER BY d.narrative_order`,
+      [projectId],
+    );
+    return result.rows.map((row) => ({ documentId: row.document_id, narrativeOrder: Number(row.narrative_order), objectKey: row.object_key }));
+  }
+
+  /**
+   * open 伏笔的"在场判定输入"（P1 2026-09-18）：id + 描述 + 埋设章序 + 触发关键词。
+   *
+   * 专供线索静默账（narrative-dormancy）的全量正文扫描——`getOpenForeshadowingAndPromises`
+   * 的投影是给创作上下文用的，不含 narrative_order，无法支撑"埋设后是否再出现"的判定。
+   * 索引名与 plant 章序在此一次性取齐，避免调用方拼装。
+   */
+  async listOpenForeshadowingPresenceInputs(projectId: string): Promise<Array<{ id: string; description: string; plantedOrder: number | null; keywords: string[] }>> {
+    const result = await this.pool.query<{ id: string; narrative_order: number | null; payload: Record<string, unknown> }>(
+      "SELECT id,narrative_order,payload FROM foreshadowing WHERE project_id=$1 AND status='open' ORDER BY narrative_order ASC NULLS LAST, id",
+      [projectId],
+    );
+    return result.rows.map((row) => {
+      const rawKeywords = row.payload?.triggerKeywords;
+      return {
+        id: row.id,
+        description: typeof row.payload?.description === "string" ? row.payload.description : "",
+        plantedOrder: row.narrative_order,
+        keywords: Array.isArray(rawKeywords) ? rawKeywords.filter((item): item is string => typeof item === "string") : [],
+      };
+    });
+  }
+
+  /** 窗口章节的正文对象引用（供资产数量账本等确定性扫描按叙事序取正文）。 */
+  async getChapterContentRefsByOrders(projectId: string, narrativeOrders: number[]): Promise<Array<{ documentId: string; narrativeOrder: number; objectKey: string }>> {
+    if (!narrativeOrders.length) return [];
+    const result = await this.pool.query<{ document_id: string; narrative_order: string | number; object_key: string }>(
+      `SELECT d.id AS document_id, d.narrative_order, cb.object_key
+       FROM manuscript_documents d
+       JOIN manuscript_revisions mr ON mr.id = d.current_revision_id
+       JOIN content_blobs cb ON cb.content_hash = mr.content_hash
+       WHERE d.project_id=$1 AND d.narrative_order = ANY($2::int[]) AND cb.object_key IS NOT NULL
+       ORDER BY d.narrative_order`,
+      [projectId, narrativeOrders],
+    );
+    return result.rows.map((row) => ({ documentId: row.document_id, narrativeOrder: Number(row.narrative_order), objectKey: row.object_key }));
+  }
+
+  async getChapterMemories(input: { projectId: string; narrativeCutoff?: number; limit?: number }): Promise<ChapterMemory[]> {    const params: unknown[] = [input.projectId];
     let cutoffClause = "";
     if (input.narrativeCutoff !== undefined) {
       params.push(input.narrativeCutoff);
@@ -5962,6 +6948,88 @@ export class NovelPostgresRepository {
     return assessment;
   }
 
+  /**
+   * SK-3 候选聚合（product-audit-20260910 C3）：learning prompt 注入的排队候选摘要。
+   * 只投影未关闭三态（proposed/evidencing/reviewing）——promoted/rejected 已离开队列，
+   * 聚合引用它们没有意义（且会被 aggregate 通道的状态守卫拒绝）。
+   */
+  async listPendingCraftRuleCandidates(projectId: string, limit = 15): Promise<Array<{ id: string; targetKind: string; targetId: string; proposedVersion: string; rationale: string; underlyingMechanism?: string }>> {
+    const result = await this.pool.query<{ id: string; target_kind: string; target_id: string; proposed_version: string; rationale: string; scope: Record<string, unknown> }>(
+      `SELECT id, target_kind, target_id, proposed_version, rationale, scope
+       FROM craft_rule_candidates
+       WHERE project_id=$1 AND status IN ('proposed','evidencing','reviewing')
+       ORDER BY updated_at DESC LIMIT $2`,
+      [projectId, limit],
+    );
+    return result.rows.map((row) => ({
+      id: row.id,
+      targetKind: row.target_kind,
+      targetId: row.target_id,
+      proposedVersion: row.proposed_version,
+      rationale: row.rationale,
+      underlyingMechanism: typeof row.scope?.underlyingMechanism === "string" ? row.scope.underlyingMechanism : undefined,
+    }));
+  }
+
+  /**
+   * SK-3 聚合通道：把一次 learning assessment 的证据挂到既有排队候选上
+   * （learning_source.aggregateAssessments 追加去重，updated_at 前进=停滞计时重置）。
+   * 状态守卫（pending 三态 + 同项目）保证 LLM 幻觉 id / 已关闭候选不会静默吞证据——
+   * 返回 false 时调用方回退为正常新建候选。幂等：同一 assessmentId 重放不重复追加。
+   */
+  async aggregateCraftRuleCandidateLearning(input: { projectId: string; candidateId: string; assessmentId: string }): Promise<boolean> {
+    const existing = await this.pool.query<{ learning_source: Record<string, unknown> | null }>(
+      `SELECT learning_source FROM craft_rule_candidates
+       WHERE id=$1 AND project_id=$2 AND status IN ('proposed','evidencing','reviewing')`,
+      [input.candidateId, input.projectId],
+    );
+    if (!existing.rowCount) return false;
+    const source = existing.rows[0].learning_source ?? {};
+    const prior = Array.isArray(source.aggregateAssessments) ? (source.aggregateAssessments as unknown[]) : [];
+    if (prior.includes(input.assessmentId)) return true;
+    await this.pool.query(
+      `UPDATE craft_rule_candidates
+       SET learning_source = COALESCE(learning_source, '{}'::jsonb) || $3::jsonb, updated_at = now()
+       WHERE id=$1 AND project_id=$2 AND status IN ('proposed','evidencing','reviewing')`,
+      [input.candidateId, input.projectId, JSON.stringify({ ...source, aggregateAssessments: [...prior, input.assessmentId] })],
+    );
+    await this.appendOutbox("craft-rule-candidate", input.candidateId, "craft-rule.candidate-aggregated", { projectId: input.projectId, candidateId: input.candidateId, assessmentId: input.assessmentId });
+    return true;
+  }
+
+  /**
+   * SK-3 候选关闭通道（product-audit-20260910 C3）：排队候选停滞超阈值且无证据时，
+   * 发 `craft-rule.candidate-stale` outbox 事件给编排者/作者裁决（晋升、驳回或补证据），
+   * 队列不再只进不出。不改 status——stale 是提醒不是判定。
+   * 事件幂等：同一候选在最后一次 updated_at 之后只发一次（updated_at 前进=重新计时）。
+   * 触发时机挂在 recordLearning（随章节提交自然发生，无需独立调度器）。
+   */
+  async detectStaleCraftRuleCandidates(projectId: string, input: { nowMs: number; staleAfterDays?: number }): Promise<string[]> {
+    const staleAfterDays = input.staleAfterDays ?? 30; // TODO P3: 停滞阈值应可配置（memory-gate.blocked 同款提醒模板语义）
+    const stale = await this.pool.query<{ id: string; status: string; target_kind: string; target_id: string; proposed_version: string }>(
+      `SELECT c.id, c.status, c.target_kind, c.target_id, c.proposed_version
+       FROM craft_rule_candidates c
+       WHERE c.project_id=$1
+         AND c.status IN ('proposed','evidencing')
+         AND c.updated_at < to_timestamp($2 / 1000.0) - make_interval(days => $3::int)
+         AND c.evidence_cases = '[]'::jsonb
+         AND NOT EXISTS (
+           SELECT 1 FROM outbox_events e
+           WHERE e.aggregate_type='craft-rule-candidate' AND e.aggregate_id=c.id
+             AND e.event_type='craft-rule.candidate-stale' AND e.created_at >= c.updated_at
+         )
+       ORDER BY c.updated_at LIMIT 20`,
+      [projectId, input.nowMs, staleAfterDays],
+    );
+    for (const row of stale.rows) {
+      await this.appendOutbox("craft-rule-candidate", row.id, "craft-rule.candidate-stale", {
+        projectId, candidateId: row.id, status: row.status, targetKind: row.target_kind, targetId: row.target_id, proposedVersion: row.proposed_version,
+        decisionHint: "停滞候选需裁决：补证据、晋升（走双回归）或显式 rejected；编排者可用 novel_rule_review_submit/novel_rule_promote 或作者驳回。",
+      });
+    }
+    return stale.rows.map((row) => row.id);
+  }
+
   async requestLearningPromotion(assessmentId: string) {
     const result = await this.pool.query<{ project_id: string; payload: RuntimeLearningAssessmentV2 }>("SELECT project_id,payload FROM learning_assessments WHERE id=$1", [assessmentId]);
     const assessment = result.rows[0]?.payload;
@@ -5984,7 +7052,21 @@ export class NovelPostgresRepository {
        ORDER BY mc.created_at DESC,mc.id`,
       [projectId, documentId ?? null],
     );
-    return result.rows.map((row) => ({
+    return result.rows.map((row) => this.factClaimFromRow(row));
+  }
+
+  /** 裁决通道（REST/MCP/workflow）事后取整行做向量索引同步。 */
+  async getMemoryClaimById(projectId: string, claimId: string): Promise<MemoryClaim | undefined> {
+    const result = await this.pool.query<any>(
+      "SELECT * FROM memory_claims WHERE project_id=$1 AND id=$2",
+      [projectId, claimId],
+    );
+    const row = result.rows[0];
+    return row ? this.factClaimFromRow(row) : undefined;
+  }
+
+  private factClaimFromRow(row: any): MemoryClaim {
+    return {
       id: row.id,
       projectId: row.project_id,
       kind: row.kind,
@@ -6005,7 +7087,323 @@ export class NovelPostgresRepository {
       sourceArtifactId: row.source_artifact_id ?? undefined,
       decidedBy: row.decided_by ?? undefined,
       decidedAt: row.decided_at ? iso(row.decided_at) : undefined,
-    }));
+    };
+  }
+
+  /**
+   * 事实候选积压画像（product-audit-20260910 A3/FM-2）：候选队列此前对编排层
+   * 完全不可见（无聚合、无裁决工具入口），导致整本书人工确认零运转、候选沦为
+   * 事实坟场。按章聚合待裁决数量、账龄与可见事实占比，作为编排者的债务面板。
+   */
+  async getFactCandidateBacklog(projectId: string): Promise<{
+    totalPending: number;
+    stagedDebris: number;
+    oldestPendingDays: number | null;
+    byChapter: Array<{
+      chapterIndex: number | null;
+      pending: number;
+      maxAgeDays: number;
+      visibleFacts: number;
+      pendingRatio: number;
+      samples: Array<{ id: string; title: string; predicate?: string; confidence: number }>;
+    }>;
+  }> {
+    const pending = await this.pool.query<any>(
+      `SELECT id,title,predicate,confidence,narrative_start,EXTRACT(EPOCH FROM (now()-created_at))/86400.0 AS age_days
+       FROM memory_claims
+       WHERE project_id=$1 AND authority='candidate' AND lifecycle_status='active'
+       ORDER BY narrative_start ASC NULLS LAST,created_at ASC`,
+      [projectId],
+    );
+    const staged = await this.pool.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM memory_claims WHERE project_id=$1 AND authority='candidate' AND lifecycle_status='staged'`,
+      [projectId],
+    );
+    const visibleCountsQuery = await this.pool.query<{ chapter: string | null; visible_facts: string }>(
+      `SELECT narrative_start AS chapter,count(*)::text AS visible_facts
+       FROM memory_claims
+       WHERE project_id=$1 AND ${retrievalVisibleClaimsSql("memory_claims")}
+       GROUP BY narrative_start`, [projectId]);
+    const visibleByChapter = new Map<string, number>();
+    for (const row of visibleCountsQuery.rows) {
+      visibleByChapter.set(row.chapter ?? "null", Number(row.visible_facts));
+    }
+    const chapters = new Map<string, { chapterIndex: number | null; rows: typeof pending.rows }>();
+    for (const row of pending.rows) {
+      const key = row.narrative_start === null || row.narrative_start === undefined ? "null" : String(row.narrative_start);
+      const bucket = chapters.get(key) ?? { chapterIndex: key === "null" ? null : Number(key), rows: [] };
+      bucket.rows.push(row);
+      chapters.set(key, bucket);
+    }
+    const byChapter = [...chapters.values()].map((bucket) => {
+      const visibleFacts = visibleByChapter.get(bucket.chapterIndex === null ? "null" : String(bucket.chapterIndex)) ?? 0;
+      return {
+        chapterIndex: bucket.chapterIndex,
+        pending: bucket.rows.length,
+        maxAgeDays: Number(Math.max(...bucket.rows.map((row) => Number(row.age_days))).toFixed(1)),
+        visibleFacts,
+        pendingRatio: Number((bucket.rows.length / (bucket.rows.length + visibleFacts)).toFixed(3)),
+        samples: bucket.rows.slice(0, 3).map((row) => ({
+          id: row.id,
+          title: row.title,
+          predicate: row.predicate ?? undefined,
+          confidence: Number(row.confidence),
+        })),
+      };
+    });
+    byChapter.sort((a, b) => (a.chapterIndex ?? -1) - (b.chapterIndex ?? -1));
+    const ages = pending.rows.map((row) => Number(row.age_days));
+    return {
+      totalPending: pending.rows.length,
+      stagedDebris: Number(staged.rows[0]?.count ?? "0"),
+      oldestPendingDays: ages.length ? Number(Math.max(...ages).toFixed(1)) : null,
+      byChapter,
+    };
+  }
+
+  /**
+   * staged 重建残骸对账（product-audit-20260910 A3/FM-2 修复③）。重建/重抽取会把
+   * 与既有可见 active 行**精确同文**（content_hash 相同）的 staged 候选留在账上
+   * （激活走 ON CONFLICT DO NOTHING，永不移除），只读诊断不涉裁决：这类行从未参与
+   * 检索、无审计增量（原文与证据在 artifacts/active 行里都在），物理清理仅降噪。
+   * 模糊近重复**不**自动清理——那是 grooming 报告 + 裁决通道的人类决策域。
+   */
+  async reconcileStagedClaimDebris(projectId: string, documentId?: string): Promise<number> {
+    const result = await this.pool.query(
+      `DELETE FROM memory_claims staged
+       WHERE staged.project_id=$1 AND staged.lifecycle_status='staged'
+         AND ($2::text IS NULL OR staged.source_document_id=$2)
+         AND EXISTS (
+           SELECT 1 FROM memory_claims live
+           WHERE live.project_id=staged.project_id
+             AND live.content_hash=staged.content_hash
+             AND ${retrievalVisibleClaimsSql("live")}
+         )
+       RETURNING staged.id`,
+      [projectId, documentId ?? null],
+    );
+    return result.rowCount ?? 0;
+  }
+
+  /**
+   * PL-2 存量清理（product-audit-20260910 A4 修复③的库存面）。历史上弧审批对复合串
+   * 引用静默 auto-create，产生了 title 形如 `<真实id> <slug>` 的影子对象，后续弧又
+   * 引用影子 id 形成逐代放大。规则纯结构化、幂等：
+   * - 影子判定：source='story-arc-reference' 的对象，title 的 token 中恰好命中一个
+   *   同项目同 kind 的其他 id → 它是那个 id 的影子（多命中/无命中不动，交给 health
+   *   的 embedded-identifier 报告人工处理）；
+   * - 引用重定向：弧 payload 的 threadRef / foreshadowingRefs 元素只要内嵌影子 id 或
+   *   真实 id 的 token 形态，一律收敛为该 id（复合串自愈），影子 id 再映射到真实 id；
+   * - 影子行删除（其显示名与真实对象同 slug，无独立信息；原始证据仍在弧蓝图 artifact）。
+   */
+  async repairStoryArcReferenceHygiene(): Promise<{ deletedShadows: string[]; rewrittenArcs: string[] }> {
+    const objects = await this.pool.query<{ project_id: string; id: string; kind: "thread" | "foreshadowing"; title: string; referenced: boolean }>(
+      `SELECT project_id, id, 'thread' AS kind, title, (payload->>'source')='story-arc-reference' AS "referenced" FROM plot_threads
+       UNION ALL
+       SELECT project_id, id, 'foreshadowing' AS kind, coalesce(payload->>'description',''), (payload->>'source')='story-arc-reference' FROM foreshadowing`,
+    );
+    const shadows: Array<{ projectId: string; kind: "thread" | "foreshadowing"; shadowId: string; targetId: string }> = [];
+    for (const row of objects.rows) {
+      if (!row.referenced) continue; // 影子只可能来自弧引用物化通道；其余对象即使同名不猜
+      const tokens = row.title.split(/[\s,，、;；|]+/u).filter(Boolean);
+      const targets = [...new Set(tokens.filter((token) => token !== row.id && objects.rows.some((candidate) => candidate.project_id === row.project_id && candidate.kind === row.kind && candidate.id === token)))];
+      if (targets.length === 1) shadows.push({ projectId: row.project_id, kind: row.kind, shadowId: row.id, targetId: targets[0] });
+    }
+    // 历史重放面：既往 hygiene 事件记录过的 shadowId→targetId 映射是系统自证的
+    // provenance。单跳重定向年代（本函数修复前）曾把弧引用落到"当时还是影子、
+    // 随后被删除"的行上——这类悬空引用靠活行检测永远修不到，必须重放历史映射。
+    const historyEvents = await this.pool.query<{ project_id: string; payload: { shadows?: Array<{ shadowId: string; targetId: string }> } }>(
+      "SELECT project_id,payload FROM audit_records WHERE action='story-arc.reference-hygiene' ORDER BY created_at",
+    );
+    const historyByProject = new Map<string, Array<{ shadowId: string; targetId: string }>>();
+    for (const event of historyEvents.rows) {
+      const list = historyByProject.get(event.project_id) ?? [];
+      for (const entry of event.payload.shadows ?? []) list.push({ shadowId: entry.shadowId, targetId: entry.targetId });
+      historyByProject.set(event.project_id, list);
+    }
+    const projectIds = [...new Set([...shadows.map((shadow) => shadow.projectId), ...historyByProject.keys()])];
+    if (!projectIds.length) return { deletedShadows: [], rewrittenArcs: [] };
+    const shadowByProject = new Map<string, Array<{ kind: string; shadowId: string; targetId: string }>>();
+    for (const shadow of shadows) {
+      const list = shadowByProject.get(shadow.projectId) ?? [];
+      list.push(shadow);
+      shadowByProject.set(shadow.projectId, list);
+    }
+    const rewrittenArcs: string[] = [];
+    const shadowMapDeleted = new Set<string>();
+    for (const projectId of projectIds) {
+      const projectShadows = shadowByProject.get(projectId) ?? [];
+      const rawMap = new Map<string, string>();
+      for (const entry of historyByProject.get(projectId) ?? []) rawMap.set(entry.shadowId, entry.targetId);
+      for (const shadow of projectShadows) rawMap.set(shadow.shadowId, shadow.targetId);
+      // 影子链必须传递解析到不动点：影子的目标可能本身是另一代影子的行（逐代
+      // auto-create 的真实形态）；只走一跳会把弧引用收敛到即将被删除的影子行上，
+      // 删除后成为 dangling unknown-reference（arc4 threadRef fce92edd 实证）。
+      // 环（A→B→A）没有可信落点，放弃该条重定向，留给 health 人工处理。
+      // 所有本项目 id（含活影子）作为可识别 token；重写后的值收敛为规范 id。
+      const allIds = new Set(objects.rows.filter((row) => row.project_id === projectId).map((row) => row.id));
+      const resolveShadowTarget = (start: string): string | undefined => {
+        const seen = new Set<string>([start]);
+        let current = rawMap.get(start);
+        while (current !== undefined) {
+          if (seen.has(current)) return undefined;
+          seen.add(current);
+          const next = rawMap.get(current);
+          if (next === undefined) return allIds.has(current) ? current : undefined;
+          current = next;
+        }
+        return undefined;
+      };
+      const shadowMap = new Map([...rawMap.keys()].map((id) => [id, resolveShadowTarget(id)]).filter((entry): entry is [string, string] => entry[1] !== undefined));
+      const fixRef = (value: unknown): unknown => {
+        if (typeof value !== "string") return value;
+        const tokens = value.split(/[\s,，、;；|]+/u).filter(Boolean);
+        // token 命中活行（含未删影子）或历史映射里的已删影子都算可识别引用；
+        // 后者是"重定向到已删影子"的存量残局，只有历史重放面能修。
+        const embedded = [...new Set(tokens.filter((token) => allIds.has(token) || shadowMap.has(token)))];
+        if (embedded.length === 1) return shadowMap.get(embedded[0]) ?? embedded[0];
+        return value;
+      };
+      const arcs = await this.pool.query<{ id: string; payload: Record<string, unknown> }>("SELECT id,payload FROM arcs WHERE project_id=$1", [projectId]);
+      const projectRewritten: string[] = [];
+      for (const arc of arcs.rows) {
+        let changed = false;
+        const payload = { ...arc.payload };
+        const responsibilities = Array.isArray(payload.threadResponsibilities) ? payload.threadResponsibilities : [];
+        const seenThreadRefs = new Set<string>();
+        payload.threadResponsibilities = responsibilities.filter((entry) => {
+          if (!entry || typeof entry !== "object" || typeof (entry as Record<string, unknown>).threadRef !== "string") return true;
+          const fixed = fixRef((entry as Record<string, unknown>).threadRef);
+          if (fixed !== (entry as Record<string, unknown>).threadRef) {
+            (entry as Record<string, unknown>).threadRef = fixed;
+            changed = true;
+          }
+          // 重定向后同一条线的责任条目合一（保持"threadRef 不得重复"的既有契约）。
+          const ref = String((entry as Record<string, unknown>).threadRef);
+          if (seenThreadRefs.has(ref)) {
+            changed = true;
+            return false;
+          }
+          seenThreadRefs.add(ref);
+          return true;
+        });
+        if (Array.isArray(payload.foreshadowingRefs)) {
+          const originalRefs: unknown[] = payload.foreshadowingRefs;
+          const fixedRefs = originalRefs.map((ref) => fixRef(ref));
+          if (fixedRefs.some((ref, index) => ref !== originalRefs[index])) {
+            payload.foreshadowingRefs = [...new Set(fixedRefs)];
+            changed = true;
+          }
+        }
+        if (changed) {
+          await this.pool.query("UPDATE arcs SET payload=$3,updated_at=now() WHERE id=$1 AND project_id=$2", [arc.id, projectId, payload]);
+          rewrittenArcs.push(arc.id);
+          projectRewritten.push(arc.id);
+        }
+      }
+      for (const shadow of projectShadows) {
+        // 只删除已成功重定向的影子：环中未解析者保留原行，否则弧引用会被指向
+        // 已删除的行（dangling unknown-reference），health 的人工处理承诺落空。
+        if (!shadowMap.has(shadow.shadowId)) continue;
+        shadowMapDeleted.add(shadow.shadowId);
+        if (shadow.kind === "thread") await this.pool.query("DELETE FROM plot_threads WHERE id=$1 AND project_id=$2", [shadow.shadowId, projectId]);
+        else await this.pool.query("DELETE FROM foreshadowing WHERE id=$1 AND project_id=$2", [shadow.shadowId, projectId]);
+      }
+      const localRewritten = projectRewritten;
+      if (projectShadows.length || localRewritten.length) {
+        await this.pool.query(
+          "INSERT INTO audit_records(project_id,actor,action,aggregate_type,aggregate_id,payload) VALUES($1,$2,'story-arc.reference-hygiene','project',$3,$4)",
+          [projectId, "migration", projectId, { shadows: projectShadows, replayRedirectedArcs: localRewritten }],
+        );
+      }
+    }
+    return { deletedShadows: shadows.filter((shadow) => shadowMapDeleted.has(shadow.shadowId)).map((shadow) => shadow.shadowId), rewrittenArcs };
+  }
+
+  /**
+   * PL-5/084 补账缺口：084 回填是迁移时刻的一次性动作，此后仍可能存在"只翻 status
+   * 不落账"的历史行（例如迁移后由旧代码路径写入、或迁移当时锚点判定未覆盖的形态）。
+   * 本修复只对有真实修订证据的行补合成兑现账（evidence 标记 backfilled 来源，与 084
+   * 语义一致、可审计），无锚点的 fulfilled 行刻意保持无账——那正是 health
+   * fulfilledWithoutPayoff blocking 要曝光的"无证据兑现"，补伪造账等于消灭信号。
+   * 幂等：NOT EXISTS + ON CONFLICT DO NOTHING 双保险。
+   */
+  async repairForeshadowingPayoffLedger(): Promise<{ backfilled: string[] }> {
+    const result = await this.pool.query<{ id: string }>(
+      `INSERT INTO payoffs(id, promise_id, foreshadowing_id, revision_id, evidence)
+       SELECT 'foreshadowing-payoff:' || f.id, NULL, f.id, f.payoff_revision_id,
+              jsonb_build_object('backfilled', true, 'source', 'fulfilled-status-only')
+       FROM foreshadowing f
+       WHERE f.status='fulfilled' AND f.payoff_revision_id IS NOT NULL
+         AND EXISTS (SELECT 1 FROM manuscript_revisions mr WHERE mr.id=f.payoff_revision_id)
+         AND NOT EXISTS (SELECT 1 FROM payoffs p WHERE p.foreshadowing_id=f.id)
+       ON CONFLICT (id) DO NOTHING
+       RETURNING payoffs.foreshadowing_id AS id`,
+    );
+    return { backfilled: result.rows.map((row) => row.id) };
+  }
+
+  /**
+   * workspace yaml → skill_definitions 种子同步（migrate 尾部，幂等）：数据库消费面
+   * （学习闭环 promote、实验/评估执行走 database provider）一直隐含要求"库里已有
+   * 当前 yaml 种子"，但该前提只靠人工 `novel:skills:sync` 维持——测试库重建后
+   * evaluation 集成套件的失败实证了这个隐藏环境依赖。护栏与 SK-2 单一真源一致：
+   * 库内版本高于种子（晋升内容）绝不回滚；同版/落后/缺行按种子 upsert。
+   * workspace yaml 不存在（纯包部署）时跳过不抛错，SQL 迁移照常可用。刻意不读
+   * NOVEL_SKILL_ROOT：那是 SK-2 晋升/测试的显式隔离通道，启动种子恒跟仓库规范目录。
+   */
+  async seedWorkspaceSkills(): Promise<{ synced: string[]; skippedAheadOfSeed: string[]; skippedNoWorkspace?: string }> {
+    const seedId = "runtime-skill-seed";
+    let skills;
+    try {
+      skills = await listCurrentSkillDescriptors(createWorkspaceSkillProvider(), seedId);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      console.warn(`[skills-seed] 跳过 workspace 种子同步（skill 目录不可用）：${reason}`);
+      return { synced: [], skippedAheadOfSeed: [], skippedNoWorkspace: reason };
+    }
+    // 伪项目只做审计 FK 锚：值短路（upsertKnowledgeRecord）生效后稳态零写入；
+    // metadata.systemKind 标记使其被 listProjects 排除，不再出现在作者项目面。
+    const seededProject = await this.pool.query("SELECT 1 FROM novel_projects WHERE id=$1", [seedId]);
+    if (!seededProject.rowCount) {
+      await this.ensureProject(seedId, "运行时 Skill 种子"); // 种子写入经 upsertKnowledgeRecord 记审计，audit_records 有 project FK
+    }
+    // 幂等打标含存量自愈（上一版 migrate 建的未标行）；打标条件写进 WHERE，稳态零写入。
+    await this.pool.query(
+      "UPDATE novel_projects SET metadata=COALESCE(metadata,'{}'::jsonb) || '{\"systemKind\":\"runtime-skill-seed\"}'::jsonb WHERE id=$1 AND COALESCE(metadata->>'systemKind','') <> 'runtime-skill-seed'",
+      [seedId],
+    );
+    const databaseRows = await this.pool.query<{ skill_id: string; version: string }>("SELECT skill_id, version FROM skill_definitions");
+    const databaseVersions = new Map(databaseRows.rows.map((row) => [row.skill_id, row.version]));
+    const synced: string[] = [];
+    const skippedAheadOfSeed: string[] = [];
+    for (const skill of skills) {
+      const promotedAhead = databaseVersions.get(skill.skillId);
+      if (promotedAhead && compareSkillVersions(promotedAhead, skill.version) > 0) {
+        skippedAheadOfSeed.push(skill.skillId);
+        continue;
+      }
+      await this.upsertKnowledgeRecord(seedId, "skills", {
+        id: skill.skillId,
+        version: skill.version,
+        capabilities: skill.capabilities,
+        applicableTasks: skill.applicableTasks,
+        requiredMemoryKinds: skill.requiredMemoryKinds,
+        conflicts: skill.conflicts,
+        qualityGates: skill.qualityGates,
+        promptSections: skill.promptSections,
+        applicableGenres: skill.applicableGenres,
+        executionPoints: skill.executionPoints,
+        roles: skill.roles,
+        dependsOn: skill.dependsOn,
+        priority: skill.priority ?? "required",
+        contentFingerprint: skill.contentFingerprint,
+        sourceRef: skill.sourceRef,
+        enabled: skill.enabled,
+      });
+      synced.push(skill.skillId);
+    }
+    return { synced, skippedAheadOfSeed };
   }
 
   async decideFactCandidate(input: { projectId: string; claimId: string; actorId: string; decision: "approve" | "reject"; reason?: string }): Promise<{ claimId: string; authority: "approved" | "rejected" }> {
@@ -6037,13 +7435,7 @@ export class NovelPostgresRepository {
       `SELECT id,content_hash,subject_refs,predicate,title,content
        FROM memory_claims
        WHERE project_id=$1 AND lifecycle_status='active' AND authority <> 'rejected'
-         AND NOT EXISTS (
-           SELECT 1 FROM memory_claims newer
-           WHERE newer.project_id=memory_claims.project_id
-             AND newer.lifecycle_status='active'
-             AND newer.authority <> 'rejected'
-             AND memory_claims.id=ANY(newer.supersedes)
-         )
+         AND NOT ${retiredByVisibleKillerSql("memory_claims")}
          AND ($2::bigint IS NULL OR narrative_start IS NULL OR narrative_start <= $2)
        ORDER BY narrative_start DESC NULLS LAST,created_at DESC
        LIMIT 200`,
@@ -6059,8 +7451,56 @@ export class NovelPostgresRepository {
         claimsIndex.set(key, [...(claimsIndex.get(key) ?? []), row.id]);
       }
     }
-    const claimsDigest = result.rows.length
-      ? result.rows.map((row) => `- [${row.id}] ${(row.subject_refs ?? []).join("、") || "未指定主体"} ${row.predicate ?? "相关事实"}：${row.content}`).join("\n")
+    // 同主体同谓词历史槽位聚合（memory-governance-audit-20260909 §M5/§5.3.2）：
+    // 近期明细 LIMIT 200 对更早历史存在静默盲区，而 novelty 判定需要全史感知。
+    // 槽位按（规范化主体, 规范谓词）聚合全部截止点内 active 声明，每槽位输出累计条数
+    // 与最近值。Foundation 投影（predicate IS NULL）与 rollup 不参与。
+    const SLOT_LIMIT = 40; // TODO: move into runtime configuration (magic value: number of historical slots per extraction)
+    const totalResult = await this.pool.query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM memory_claims
+       WHERE project_id=$1 AND lifecycle_status='active' AND authority <> 'rejected'
+         AND ($2::bigint IS NULL OR narrative_start IS NULL OR narrative_start <= $2)`,
+      [projectId, narrativeCutoff ?? null],
+    );
+    const totalEligible = Number(totalResult.rows[0]?.n ?? 0);
+    const slotRows = await this.pool.query<{ ref: string; predicate: string; content: string; narrative_start: number | null }>(
+      `SELECT unnest(subject_refs) AS ref, predicate, left(content, 120) AS content, narrative_start
+       FROM memory_claims
+       WHERE project_id=$1 AND lifecycle_status='active' AND authority <> 'rejected' AND predicate IS NOT NULL
+         AND ($2::bigint IS NULL OR narrative_start IS NULL OR narrative_start <= $2)`,
+      [projectId, narrativeCutoff ?? null],
+    );
+    const slotMap = new Map<string, { subject: string; predicate: string; count: number; latest: string; latestOrder: number | null }>();
+    for (const row of slotRows.rows) {
+      const key = `${normalizeFactToken(row.ref)}|${canonicalizeFactPredicate(row.predicate)}`;
+      const order = row.narrative_start === null ? null : Number(row.narrative_start);
+      const existing = slotMap.get(key);
+      if (!existing) {
+        slotMap.set(key, { subject: row.ref, predicate: canonicalizeFactPredicate(row.predicate), count: 1, latest: row.content, latestOrder: order });
+        continue;
+      }
+      existing.count += 1;
+      if (order !== null && (existing.latestOrder === null || order > existing.latestOrder)) {
+        existing.latest = row.content;
+        existing.latestOrder = order;
+      }
+    }
+    const truncationNotice = totalEligible > result.rows.length
+      ? [`（注意：近期明细仅显示最近 ${result.rows.length} 条，另有 ${totalEligible - result.rows.length} 条更早明细未列出；对未列出历史无法确认是否重复时，novelty 输出 new 并由后续事实梳理处理，不要猜测 duplicate。）`]
+      : [];
+    const slotLines = slotMap.size
+      ? [
+          ``,
+          `## 同主体同谓词历史槽位（上表明细未覆盖的更早历史以此辅助 novelty/conflict 判断）`,
+          ...[...slotMap.values()]
+            .sort((a, b) => b.count - a.count || (b.latestOrder ?? 0) - (a.latestOrder ?? 0))
+            .slice(0, SLOT_LIMIT)
+            .map((slot) => `- ${slot.subject}｜${slot.predicate}：历史累计 ${slot.count} 条；最近：${slot.latest}`),
+        ]
+      : [];
+    const detailLines = result.rows.map((row) => `- [${row.id}] ${(row.subject_refs ?? []).join("、") || "未指定主体"} ${row.predicate ?? "相关事实"}：${row.content}`);
+    const claimsDigest = detailLines.length || slotLines.length
+      ? [...truncationNotice, ...detailLines, ...slotLines].join("\n")
       : "- 暂无已存在记忆。所有事实 novelty=new。";
     return { contentHashes, claimsIndex, claimsDigest };
   }
@@ -6209,37 +7649,17 @@ export class NovelPostgresRepository {
         }
 
         const affectedIds = [...new Set([...activatedIds, ...priorClaimIds])];
-        for (const claimId of affectedIds) {
+        if (affectedIds.length) {
           await client.query(
             `UPDATE memory_claims claim SET
-               lifecycle_status=CASE WHEN EXISTS (
-                 SELECT 1 FROM memory_claim_sources source
-                 WHERE source.claim_id=claim.id AND source.lifecycle_status='active'
-               ) THEN 'active' ELSE 'staged' END,
-               source_revision_ids=COALESCE((
-                 SELECT array_agg(DISTINCT source.revision_id) FILTER (WHERE source.revision_id IS NOT NULL)
-                 FROM memory_claim_sources source
-                 WHERE source.claim_id=claim.id AND source.lifecycle_status='active'
-               ),'{}'),
-               narrative_start=(
-                 SELECT MIN(document.narrative_order)
-                 FROM memory_claim_sources source
-                 JOIN manuscript_documents document ON document.id=source.document_id
-                 WHERE source.claim_id=claim.id AND source.lifecycle_status='active'
-               ),
-               narrative_end=(
-                 SELECT MIN(document.narrative_order)
-                 FROM memory_claim_sources source
-                 JOIN manuscript_documents document ON document.id=source.document_id
-                 WHERE source.claim_id=claim.id AND source.lifecycle_status='active'
-               ),
+               ${CLAIM_PROJECTION_SET_SQL},
                source_document_id=COALESCE((
                  SELECT source.document_id FROM memory_claim_sources source
                  WHERE source.claim_id=claim.id AND source.lifecycle_status='active' AND source.document_id IS NOT NULL
                  ORDER BY source.created_at DESC LIMIT 1
                ),source_document_id)
-             WHERE claim.id=$1`,
-            [claimId],
+             WHERE claim.id=ANY($1::text[])`,
+            [affectedIds],
           );
         }
 
@@ -6265,39 +7685,28 @@ export class NovelPostgresRepository {
           activatedClaims = activeRows.rows.map(memoryClaimFromRow);
         }
       }
-      await client.query(
-        `UPDATE arcs a SET execution_status='completed',completed_at=now(),updated_at=now()
-         WHERE a.id=(SELECT arc_id FROM chapters WHERE document_id=$1)
-           AND a.execution_status='active'
-           AND EXISTS (SELECT 1 FROM chapters c WHERE c.arc_id=a.id)
-           AND NOT EXISTS (
-             SELECT 1
-             FROM chapters c
-             LEFT JOIN manuscript_documents d ON d.id=c.document_id AND d.project_id=c.project_id
-             WHERE c.arc_id=a.id
-               AND (d.id IS NULL OR d.status<>'final' OR d.current_revision_id IS NULL)
-           )
-           AND EXISTS (
-             SELECT 1
-             FROM story_arc_batches b
-             WHERE b.arc_id=a.id
-               AND b.batch_index=(SELECT MAX(batch_index) FROM story_arc_batches WHERE arc_id=a.id AND status='approved')
-               AND b.status='approved'
-               AND (
-                 COALESCE((b.payload->>'complete')::boolean,false)=true
-                 OR (
-                   COALESCE((a.payload->>'expectedChapterCount')::integer,0)>0
-                   AND b.end_chapter_index >= (a.payload->>'expectedChapterCount')::integer
-                 )
-               )
-               AND b.end_chapter_index >= CASE
-                 WHEN COALESCE((a.payload->>'expectedChapterCount')::integer,0)>0
-                   THEN (a.payload->>'expectedChapterCount')::integer
-                 ELSE b.end_chapter_index
-               END
-           )`,
-        [input.documentId],
-      );
+        const arcCompletions = await client.query<{ id: string; project_id: string }>(
+          `UPDATE arcs a SET execution_status='completed',completed_at=now(),updated_at=now()
+          WHERE a.id=(SELECT arc_id FROM chapters WHERE document_id=$1)
+            AND a.execution_status='active'
+            AND EXISTS (SELECT 1 FROM chapters c WHERE c.arc_id=a.id)
+            AND NOT EXISTS (
+              SELECT 1
+              FROM chapters c
+              LEFT JOIN manuscript_documents d ON d.id=c.document_id AND d.project_id=c.project_id
+              WHERE c.arc_id=a.id
+                AND (d.id IS NULL OR d.status<>'final' OR d.current_revision_id IS NULL)
+            )
+            AND ${arcCompletionPredicateSql("a", "b")}
+          RETURNING a.id,a.project_id`,
+          [input.documentId],
+        );
+        for (const completedArc of arcCompletions.rows) {
+          await client.query(
+            "INSERT INTO audit_records(project_id,actor,action,aggregate_type,aggregate_id,payload) VALUES($1,$2,'story-arc.completion-reconciled','story-arc',$3,$4)",
+            [completedArc.project_id, "runtime-commit", completedArc.id, { reason: "chapter commit closed the arc under the local-count completion predicate" }],
+          );
+        }
       await client.query("UPDATE novel_projects SET current_revision=$1,updated_at=now() WHERE id=$2", [revision, input.projectId]);
       const result: CommitResult = {
         revisionId: input.revisionId,
@@ -6316,13 +7725,17 @@ export class NovelPostgresRepository {
     } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
   }
 
+  private outboxProjectId(payload: Record<string, unknown>): string | null {
+    return typeof payload.projectId === "string" && payload.projectId ? payload.projectId : null;
+  }
+
   private async appendOutbox(aggregateType: string, aggregateId: string, eventType: string, payload: Record<string, unknown>) {
-    const result = await this.pool.query<{ id: number }>("INSERT INTO outbox_events(aggregate_type,aggregate_id,event_type,payload) VALUES($1,$2,$3,$4) RETURNING id", [aggregateType, aggregateId, eventType, payload]);
+    const result = await this.pool.query<{ id: number }>("INSERT INTO outbox_events(aggregate_type,aggregate_id,event_type,payload,project_id) VALUES($1,$2,$3,$4,$5) RETURNING id", [aggregateType, aggregateId, eventType, payload, this.outboxProjectId(payload)]);
     return Number(result.rows[0].id);
   }
 
   private async appendOutboxTx(client: PoolClient, aggregateType: string, aggregateId: string, eventType: string, payload: Record<string, unknown>) {
-    const result = await client.query<{ id: number }>("INSERT INTO outbox_events(aggregate_type,aggregate_id,event_type,payload) VALUES($1,$2,$3,$4) RETURNING id", [aggregateType, aggregateId, eventType, payload]);
+    const result = await client.query<{ id: number }>("INSERT INTO outbox_events(aggregate_type,aggregate_id,event_type,payload,project_id) VALUES($1,$2,$3,$4,$5) RETURNING id", [aggregateType, aggregateId, eventType, payload, this.outboxProjectId(payload)]);
     return Number(result.rows[0].id);
   }
 

@@ -5,7 +5,7 @@ import { canonicalSha256 } from "../canonical-json";
  * 文风契约：书级、可版本的叙述声音约束。
  *
  * 设计依据：参考手册 §7.1 把文风记录为一组可解释滑杆而不是作者名或固定范文。
- * 本模块提供十维滑杆的载荷类型、校验、指纹、prompt 渲染和记忆注入。
+ * 本模块提供十二维滑杆的载荷类型、校验、指纹、prompt 渲染和记忆注入。
  * 滑杆是 prose-reviewer 与 draft/revision 的对照参考基线，不是逐章清单，
  * 也不把任何取值变成质量门（与 REVIEW_COVERAGE 只做内部映射的模式一致）。
  */
@@ -21,6 +21,15 @@ export const STYLE_DIMENSION_KEYS = [
   "dialogueRatio",
   "restraintLevel",
   "narrationAttitude",
+  // 2026-09-18 全本逐章精读沉淀（docs/novel-v2/full-read-quality-review-20260918.md）：
+  // 原十维只能描述"声音底色"，无法约束两种**跨章累积型口癖**——它们在单章内
+  // 看似风格，跨章才暴露为机械重复，故各立一维，供 draft/revision 对照：
+  //   · measureVariety（F2 半X量词）：同一计量刻度词（半拍/半寸/半分…）反复折算体验。
+  //   · closureRhythm（章末仪式）：章末反复使用同一收束句式（并列不判/原样悬置）。
+  // 边界：这两维是**参照基线**，不进质量门；对应的门见
+  // manuscript-structure 的 manuscript.syntactic-tic / manuscript.ending-ritual。
+  "measureVariety",
+  "closureRhythm",
 ] as const;
 
 export type StyleDimensionKey = (typeof STYLE_DIMENSION_KEYS)[number];
@@ -36,6 +45,8 @@ export const STYLE_DIMENSION_LABELS: Record<StyleDimensionKey, string> = {
   dialogueRatio: "对白比例",
   restraintLevel: "留白程度",
   narrationAttitude: "叙述态度",
+  measureVariety: "计量表达多样性",
+  closureRhythm: "章末收束方式",
 };
 
 export interface StyleDimension {
@@ -46,7 +57,7 @@ export interface StyleDimension {
 }
 
 export interface StyleContractPayload {
-  /** 十维滑杆；缺失的维度按未指定处理，不阻断。 */
+  /** 十二维滑杆；缺失的维度按未指定处理，不阻断。 */
   dimensions: Partial<Record<StyleDimensionKey, StyleDimension>>;
   /** 可选：适用范围与边界说明。 */
   note?: string;

@@ -15,18 +15,25 @@
 import type { ModelGateway } from "../model-gateway";
 import type { NovelPostgresRepository } from "../postgres-repository";
 import type { Client } from "@temporalio/client";
+import type { ContentObjectStore } from "../object-store";
+import type { MemoryIndex } from "../qdrant-memory";
 
 /**
  * 工具执行上下文。
  *
  * repository 是必选的 Postgres 仓库实例；
- * model 是可选的 LLM 网关，仅在需要 LLM 调用的工具（如 closed-loop）中必填。
+ * model 是可选的 LLM 网关，仅在需要 LLM 调用的工具（如 closed-loop）中必填；
+ * memoryIndex 是可选的向量索引面（Qdrant），提供时人工/编排裁决事实候选会同步
+ * 向量层（与 workflow approveFactClaims 同一契约），缺省时裁决仍为权威落库。
  */
 export interface ToolContext {
+  /** 对象存储（issue 段落号自动定位等需要读取正文的工具使用；可选）。 */
+  objects?: ContentObjectStore;
   repository: NovelPostgresRepository;
   model?: ModelGateway;
   temporal?: Client;
   taskQueue?: string;
+  memoryIndex?: MemoryIndex;
 }
 
 /**

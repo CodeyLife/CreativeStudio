@@ -411,11 +411,21 @@ describe("evaluation integration", () => {
     return document;
   }
 
+  // 迭代目标 skill 从 workspace 启用集动态选取：082 卫生迁移后，enabled 集合由
+  // 种子同步/晋升维护，写死历史 id 会让用例随库内技能退役而腐化（曾因空跑被掩盖）。
+  // 必须挑绑定 chapter.revision 的技能：迭代产物要注入修订 prompt 才能真正驱动回归对比。
+  let iterationSkillTarget = "longform-continuity";
+  async function pickIterationSkillTarget(workspace: ExperimentWorkspaceHandle): Promise<void> {
+    const rows = await workspace.query<{ skill_id: string }>(`SELECT skill_id FROM ${workspace.schemaName}.skill_definitions WHERE enabled = TRUE AND 'chapter.revision' = ANY(execution_points) ORDER BY skill_id LIMIT 1`);
+    expect(rows.rows.length).toBeGreaterThan(0);
+    iterationSkillTarget = rows.rows[0].skill_id;
+  }
+
   beforeAll(async () => {
     model = new InMemoryModelGateway(() => ({
       iterations: [
         {
-          skillId: "longform-continuity",
+          skillId: iterationSkillTarget,
           promptSections: {
             foundation: "根据章节功能与情绪弧线动态分配段落长度；场景推进时压缩重复描写，沉浸与心理转折段保留必要细节，并以可验证的动作、感官和因果变化承载节奏。每次调整都应维持视角知识边界、人物行动动机与前后事实连续，不得为了缩短篇幅删除关键铺垫。",
             planning: "根据章节功能与情绪弧线动态分配段落长度；场景推进时压缩重复描写，沉浸与心理转折段保留必要细节，并以可验证的动作、感官和因果变化承载节奏。每次调整都应维持视角知识边界、人物行动动机与前后事实连续，不得为了缩短篇幅删除关键铺垫。",
@@ -609,6 +619,7 @@ describe("evaluation integration", () => {
       const snapshot = await captureProjectSnapshot(repository, projectId);
       const workspace = await createExperimentWorkspace(repository, snapshot);
       try {
+        await pickIterationSkillTarget(workspace);
         const learningAssessment: RuntimeLearningAssessmentV2 = {
           id: "la-test",
           projectId,
@@ -645,6 +656,7 @@ describe("evaluation integration", () => {
       const snapshot = await captureProjectSnapshot(repository, projectId);
       const workspace = await createExperimentWorkspace(repository, snapshot);
       try {
+        await pickIterationSkillTarget(workspace);
         const learningAssessment: RuntimeLearningAssessmentV2 = {
           id: "la-warn-test",
           projectId,
@@ -709,6 +721,10 @@ describe("evaluation integration", () => {
     integrationIt("runs closed-loop in dryRun mode without promoting", async () => {
       const projectId = `loop-dry-${randomUUID().slice(0, 8)}`;
       const doc = await seedFinalChapter(projectId);
+      const enabledSkills = await repository.listSkills(projectId);
+      const revisionBound = enabledSkills.find((skill) => skill.executionPoints?.includes("chapter.revision"));
+      expect(revisionBound).toBeDefined();
+      iterationSkillTarget = revisionBound!.skillId; // 同上：候选与迭代瞄准库内真实技能
       const regressionMarker = "回归规则标记：按章节功能动态调整具象细节、节奏与信息密度，同时保持人物知识边界和事实连续。";
       let standaloneCharacterExtractions = 0;
       const closedLoopModel = new InMemoryModelGateway((input) => {
@@ -718,14 +734,17 @@ describe("evaluation integration", () => {
           return {
             verdict: passed ? "passed" : "revise",
             score: passed ? 5 : 3,
-            issues: passed ? [] : [{ severity: "major", title: "抽象叙述缺少现场承载", description: "关键体验被概括性表达替代", revisionRanges: [{ start: 1, end: 1 }], rule: "longform-continuity", suggestion: "用动作、感官和因果变化承载信息" }],
+            issues: passed ? [] : [{ severity: "major", title: "抽象叙述缺少现场承载", description: "关键体验被概括性表达替代", excerpt: "值夜人把未寄出的信压在登记册下", revisionRanges: [{ start: 1, end: 1 }], rule: iterationSkillTarget, suggestion: "用动作、感官和因果变化承载信息", readerReconstruction: { impact: "core", missingEvidence: ["action", "consequence"], blockedQuestion: "读者无法判断值夜人压信这一动作改变了什么决定" } }],
           };
         }
         if (properties?.conclusion) {
           if (input.prompt.includes("无审核问题")) return { conclusion: "no-shared-learning" };
-          return { conclusion: "propose-improvement", symptom: "抽象叙述削弱沉浸", failingLayer: "共享 skill prompt", underlyingMechanism: "prompt 未要求根据章节功能选择具象承载方式", affectedInputClass: "需要同时处理氛围、心理与信息推进的章节", boundaries: "不要求所有段落堆叠感官细节，只修复承担关键体验的段落", regressionRisks: ["过度具象可能拖慢行动章节"], candidate: { targetKind: "skill", targetId: "longform-continuity", rationale: "补足通用的具象化决策规则", afterText: JSON.stringify({ revision: regressionMarker.repeat(3) }), applicableGenres: [] } };
+          return { conclusion: "propose-improvement", symptom: "抽象叙述削弱沉浸", failingLayer: "共享 skill prompt", underlyingMechanism: "prompt 未要求根据章节功能选择具象承载方式", affectedInputClass: "需要同时处理氛围、心理与信息推进的章节", boundaries: "不要求所有段落堆叠感官细节，只修复承担关键体验的段落", regressionRisks: ["过度具象可能拖慢行动章节"], candidate: { targetKind: "skill", targetId: iterationSkillTarget, rationale: "补足通用的具象化决策规则", afterText: JSON.stringify({ revision: regressionMarker.repeat(3) }), applicableGenres: [] } };
         }
-        if (properties?.iterations) return { iterations: [{ skillId: "longform-continuity", promptSections: { revision: regressionMarker.repeat(3) }, rationale: "让不同章节功能都按证据选择具象承载方式", triggeredByIssueIds: ["抽象叙述缺少现场承载"] }] };
+        if (properties?.iterations) {
+          const allSections = { foundation: regressionMarker.repeat(3), planning: regressionMarker.repeat(3), drafting: regressionMarker.repeat(3), review: regressionMarker.repeat(3), revision: regressionMarker.repeat(3), "fact-extraction": regressionMarker.repeat(3) };
+          return { iterations: [{ skillId: iterationSkillTarget, promptSections: allSections, rationale: "让不同章节功能都按证据选择具象承载方式", triggeredByIssueIds: ["抽象叙述缺少现场承载"] }] };
+        }
         if (properties?.characters) {
           standaloneCharacterExtractions += 1;
           return { characters: [] };
@@ -736,8 +755,8 @@ describe("evaluation integration", () => {
         };
         if (properties?.keyEvents) return { summary: "值夜人在废弃车站守着一封未寄出的信，雨水和钟声构成现场压力；他始终没有抬头，纸边却在指腹下发抖，说明平静表面下仍有尚未说出的决定与持续悬念。".repeat(2), keyEvents: ["值夜人在第二声钟响后仍压着未寄出的信"], characterStates: [], unresolvedThreads: ["信为何没有寄出"], emotionalArc: "由克制的平静转为可感知的紧张" };
         if (!input.schema) return input.prompt.includes(regressionMarker)
-          ? "雨水沿着裂纹分叉，值夜人用拇指压住信封翘起的角。第二声钟响时，纸边仍在他指腹下发抖。现场承载已改善。"
-          : "雨水沿着玻璃下坠，值夜人把信压在登记册下，钟声之后仍没有抬头。";
+          ? "雨水沿着裂纹分叉，值夜人把未寄出的信压在登记册下，纸边在指腹下发抖。第二声钟响时仍没有抬头。现场承载已改善。"
+          : "雨水沿着玻璃下坠，值夜人把未寄出的信压在登记册下，钟声之后仍没有抬头。";
         throw new Error(`未覆盖的测试 schema: ${Object.keys(properties ?? {}).join(",")}`);
       });
 
@@ -754,7 +773,10 @@ describe("evaluation integration", () => {
       expect(result.candidateBundle).toBeDefined();
       expect(result.promotionReceipt).toBeUndefined();
       expect(result.candidateBundle?.acceptedFacts.length).toBeGreaterThan(0);
-      expect(standaloneCharacterExtractions).toBe(0);
+      // 角色富化只允许随 commit 后正式路径触发一次；closed-loop 自身不得再叠加独立抽取。
+      // 精确计数（审核 B#6 收紧 ≤1 恒宽松）：本用例链路里 exp-1 无提交（0 次），
+      // exp-2 提交一次经 commit 后置富化（1 次）——0 或 2 都是通道漂移信号。
+      expect(standaloneCharacterExtractions).toBe(1);
 
       const workspace = await getExperimentWorkspace(repository, result.experimentId);
       expect(workspace).not.toBeNull();

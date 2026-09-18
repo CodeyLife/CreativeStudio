@@ -1,14 +1,16 @@
 import { createHash, randomUUID } from "node:crypto";
 import Ajv from "ajv";
-import type { Artifact, ContextManifest, CreativeReview, CreativeRun, CreativeWorkItem, ExecutionBlueprint, MemoryBundle, MemoryClaim, MemoryHit, MemoryProvider, NovelIntent, PreflightPlan, PreflightProjectSnapshot, PromptContextManifest, Review, ReviewIssue, RuntimeLearningAssessmentV2, SkillBundle, SkillExecutionPoint, SkillProvider, StageContextSection, StageGoalContract, TaskAttemptRecord } from "../protocol";
+import type { Artifact, ChapterChangeScope, ContextManifest, CreativeReview, CreativeRun, CreativeWorkItem, ExecutionBlueprint, MemoryBundle, MemoryClaim, MemoryHit, MemoryProvider, NovelIntent, PreflightPlan, PreflightProjectSnapshot, PromptContextManifest, Review, ReviewIssue, RuntimeLearningAssessmentV2, SkillBundle, SkillExecutionPoint, SkillProvider, StageContextSection, StageGoalContract, TaskAttemptRecord } from "../protocol";
 import { buildContextManifest, buildMemoryBundle, compileExecutionBlueprint, computeTokenBudget, createPreflightPlan, isMemoryClaimVisibleAtCutoff, matchedFacetsOf } from "../cognition";
 import { canonicalSha256 } from "../canonical-json";
+import { extractAssetMentions, groupAssetSpans, type AssetMention } from "../asset-ledger";
 import { NovelPostgresRepository } from "../postgres-repository";
 import type { ModelGateway } from "../model-gateway";
 import { ExternalMcpRequiredError, type ModelExecutionProvenance, type ModelPurpose, type ModelRoutingSnapshot, type ModelTaskRecord, type ModelWorkPackage } from "../model-routing";
 import { ContentObjectStore } from "../object-store";
-import { normalizeStoryArcRebaseBundle, parseStoryArcBundle, validateChapterExecutionContract, validateStoryArcExecutionContracts, validateStoryArcRebaseBundle, type ChapterPlanningContext, type StoryArcBundle } from "../application/story-arc";
-import { inspectManuscript, structuralReviewFromReport, type ManuscriptStructuralReport } from "../application/manuscript-structure";
+import { assertStoryArcBatchWindow, normalizeStoryArcRebaseBundle, parseStoryArcBundle, storyArcBatchWindow, validateChapterExecutionContract, validateStoryArcExecutionContracts, validateStoryArcRebaseBundle, type ChapterPlanningContext, type StoryArcBundle } from "../application/story-arc";
+import { extractChapterEnding, inspectManuscript, structuralReviewFromReport, type ManuscriptStructuralReport } from "../application/manuscript-structure";
+import { summarizeDormancy, type DormancyLedger } from "../narrative-dormancy";
 import { buildStoryArcChaptersPrompt, buildStoryArcPlanPrompt, buildStoryArcPlanningContextSections, buildStoryArcReviewPrompt, buildStoryArcRevisionPrompt, storyArcBundleSchema, storyArcChaptersOutputSchema, storyArcPlanBatchSchema, type StoryArcReviewOutput } from "../prompts/story-arc";
 import { foundationArtifactToMemoryClaim } from "../foundation-memory";
 import { CommitService } from "../commit-service";
@@ -19,7 +21,8 @@ import { buildChapterReviewPromptPackage, getReviewFocus, reviewExecutionPoint, 
 import { applyRevisionWindows, applyTargetedRevisionReplacements, authorRevisionAlignmentSchema, buildAuthorRevisionRepairPromptPackage, buildFullChapterRevisionPromptPackage, buildRevisionWindowPromptPackage, buildTargetedRevisionBatchPromptPackage, planRevisionWindows, revisionWindowsCoverAllIssues, sanitizeRevisionOutput, shouldUseRevisionWindows, splitChapterParagraphs, TargetedRevisionContractError, targetedRevisionBatchSchema, type AuthorRevisionAlignment, type RevisionAttempt, type TargetedRevisionReplacement } from "../prompts/chapter-revision";
 import { chapterStateDeltaSchema, reviewerSchema, type ChapterStateDelta, type FactExtractionOutput, type FoundationOutput, type ReviewerOutput } from "../prompts/schemas";
 import { extractFactsWithStats, projectFactExtractionOutput } from "../fact-extraction";
-import { enrichCharactersFromChapter, parseCharacterEnrichmentOutput } from "../character-enrichment";
+import { enrichCharactersFromChapter, loadCharacterIdentityRegistry, parseCharacterEnrichmentOutput } from "../character-enrichment";
+import { uniqueCharacterIdentities, type CharacterIdentityIndex } from "../character-identity";
 import { characterEnrichmentSchema } from "../prompts/schemas";
 import { buildFactExtractionPrompt } from "../fact-extraction/prompt";
 import { styleContractAsMemoryHit } from "../style-contract";
@@ -139,6 +142,10 @@ export function buildCraftRuleCandidateInput(assessment: RuntimeLearningAssessme
 export function createNovelWorkflowActivities(deps: { repository: NovelPostgresRepository; memoryProvider: MemoryProvider; skillProvider: SkillProvider; modelGateway: ModelGateway; objectStore?: ContentObjectStore; commitService?: CommitService; memoryIndex?: MemoryIndex; /** 是否启用 chapter memory 创建（默认 true，需 modelGateway 支持）。 */ enableChapterMemory?: boolean }) {
   const model = deps.modelGateway;
   const objects = deps.objectStore ?? new ContentObjectStore();
+  // 线索静默账按 projectId 记忆化：一次工作流内定稿集不变，结果相同，而扫描全书
+  // 正文代价高（弧规划/蓝图/审核三处都要用）。null 表示"已试算且无结果"，与
+  // "未试算"（undefined）区分，避免失败后每处重试。
+  const narrativeDormancyCache = new Map<string, DormancyLedger | null>();
   const reviewerPurpose = (role: ReviewerRole): ModelPurpose => ({
     "structure-reviewer": "review.structure",
     "character-reviewer": "review.character",
@@ -160,10 +167,79 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
     genre: input.genre,
     requestedCapabilities: input.requestedCapabilities,
   });
+  /**
+   * 线索静默账加载（P1 2026-09-18）：扫本书全部定稿章正文，判定每条 open 伏笔
+   * 是"从未再被提及 / 曾活跃现已静默 / 仍在推进"。
+   *
+   * 设计依据：AGENTS.md「在拥有错误行为的最低共享层修复」——旧口径把
+   * `parsePayoffWindow` 的窗口上界当死线报"超期"，实测 244 条里 238 条仍在活跃
+   * 推进（见 docs/novel-v2/p1-foreshadowing-survey-20260918.md）；真正需要行动的
+   * 信号是"曾活跃→近 N 章消失"，而这个判定必须看全量正文，只有本活动有对象存储。
+   * 失败软降级返回 undefined（不注入该段），与 loadPriorChapterEndings 同型。
+   *
+   * 按 projectId 记忆化：一次工作流内定稿集不变、结果相同，而弧规划/蓝图/审核
+   * 三处都要用，重复扫描全书正文代价过高。null 为"已试算且无结果"哨兵。
+   */
+  const loadNarrativeDormancy = async (projectId: string): Promise<DormancyLedger | undefined> => {
+    const cached = narrativeDormancyCache.get(projectId);
+    if (cached !== undefined) return cached ?? undefined;
+    if (typeof deps.repository.listFinalChapterContentRefs !== "function" || typeof deps.repository.listOpenForeshadowingPresenceInputs !== "function") return undefined;
+    try {
+      const [refs, items] = await Promise.all([
+        deps.repository.listFinalChapterContentRefs(projectId),
+        deps.repository.listOpenForeshadowingPresenceInputs(projectId),
+      ]);
+      if (!refs.length || !items.length) { narrativeDormancyCache.set(projectId, null); return undefined; }
+      const currentOrder = refs[refs.length - 1]!.narrativeOrder;
+      const chapterTexts: Array<{ narrativeOrder: number; text: string }> = [];
+      for (const ref of refs) {
+        try {
+          chapterTexts.push({ narrativeOrder: ref.narrativeOrder, text: await objects.getText(ref.objectKey) });
+        } catch (error) {
+          console.warn(`[dormancy] 第 ${ref.narrativeOrder} 章正文读取失败（跳过该章）：${(error as Error).message}`);
+        }
+      }
+      // 缺章会让"末次提及"失真——漏读的章可能正是末次出现处，会把仍在推进的线
+      // 误判为静默。此时宁可不产出账，也不产出偏高的静默数。
+      if (chapterTexts.length < refs.length) {
+        console.warn(`[dormancy] 有 ${refs.length - chapterTexts.length} 章正文不可得，静默账本次不产出（避免失真）`);
+        narrativeDormancyCache.set(projectId, null);
+        return undefined;
+      }
+      const ledger = summarizeDormancy(items, chapterTexts, currentOrder);
+      narrativeDormancyCache.set(projectId, ledger);
+      return ledger;
+    } catch (error) {
+      console.warn(`[dormancy] 线索静默扫描失败，该通道本次不注入：${(error as Error).message}`);
+      narrativeDormancyCache.set(projectId, null);
+      return undefined;
+    }
+  };
   // CommitService 自动注入 chapter memory 依赖（若未提供 commitService 且未显式禁用）
   // 设计依据：AGENTS.md「commit-stage 对新 DocumentRevision 创建 chapter memory」契约
   const enableChapterMemory = deps.enableChapterMemory ?? true;
   const commitService = deps.commitService ?? new CommitService(deps.repository, objects, enableChapterMemory ? { model, memoryIndex: deps.memoryIndex } : undefined);
+  /**
+   * 加载人物身份注册上下文（memory-governance-audit-20260909 §5.1.1）。
+   *
+   * 供 fact-extraction 与 chapter-state-rebuild 注入：prompt 带规范人物名册 +
+   * 提取结果经同一索引归一。注册表读取失败不阻塞提取——缺失时保持既有行为
+   * （主体 ID 由模型自由生成），降级只影响新写入行的键一致性，不产生错误数据。
+   */
+  const loadExtractionIdentityContext = async (projectId: string): Promise<{ identityIndex: CharacterIdentityIndex; canonicalCharacters: Array<{ canonicalId: string; displayName: string }> } | undefined> => {
+    try {
+      const registry = await loadCharacterIdentityRegistry(projectId, deps.repository);
+      return {
+        identityIndex: registry.index,
+        canonicalCharacters: uniqueCharacterIdentities(registry.index)
+          .filter((identity) => identity.status === "identified")
+          .map((identity) => ({ canonicalId: identity.canonicalId, displayName: identity.displayName })),
+      };
+    } catch (error) {
+      console.warn(`[fact-extraction] 人物身份注册表加载失败，本次提取退回无归一模式：${(error as Error).message}`);
+      return undefined;
+    }
+  };
   const compileSinglePrompt = (input: { projectId: string; workflowId: string; purpose: ModelPurpose; stage: "foundation" | "planning" | "review" | "revision" | "fact-extraction"; system: string; prompt: string; schema?: Record<string, unknown>; reservedOutputTokens?: number; provenanceRefs?: string[]; skillBundle?: SkillBundle; skillExecutionPoint?: string; contextSections?: StageContextSection[] }) => {
     const skillSections = input.skillBundle && input.skillExecutionPoint
       ? buildSkillContextSections(input.skillBundle, input.skillExecutionPoint)
@@ -193,8 +269,22 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
   };
   const recordLearning = async (assessment: RuntimeLearningAssessmentV2) => {
     const recorded = await deps.repository.recordLearningAssessment(assessment);
+    // SK-3 候选聚合：LLM 判定与排队候选同机制时走聚合通道（证据挂到既有候选）；
+    // 聚合被状态守卫拒绝（幻觉 id/已出队）时回退新建——证据宁可重复不可丢失。
+    const aggregateTo = recorded.candidate?.aggregateToCandidateId;
+    if (aggregateTo) {
+      const aggregated = await deps.repository.aggregateCraftRuleCandidateLearning({ projectId: recorded.projectId, candidateId: aggregateTo, assessmentId: recorded.id });
+      if (aggregated) return recorded;
+      console.warn(`[learning] 聚合目标 ${aggregateTo} 不在排队队列，回退为新建候选`);
+    }
     const candidateInput = buildCraftRuleCandidateInput(recorded);
     if (candidateInput) await createCraftRuleCandidate(deps.repository, candidateInput);
+    // SK-3 关闭通道：learning 运行时顺带扫描停滞无证据的排队候选并发 stale 事件
+    // （随提交自然节拍触发，无独立调度器）；扫描失败不影响本次学习落库。
+    await deps.repository.detectStaleCraftRuleCandidates?.(recorded.projectId, { nowMs: Date.now() }).catch((error: unknown) => {
+      console.warn(`[learning] 停滞候选扫描失败（本次跳过）：${(error as Error).message}`);
+      return [];
+    });
     return recorded;
   };
   const loadNarrativeRhythm = async (projectId: string, documentId: string, narrativeCutoff: number) => {
@@ -223,7 +313,11 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
     recordWorkflowSignal: (input: { workflowId: string; taskId: string; signal: string; payload?: Record<string, unknown> }) => deps.repository.recordTaskSignal(input),
     updateTaskAttempt: (input: { id: string; workflowRunId?: string; taskId: string; status: TaskAttemptRecord["status"]; payload?: Record<string, unknown> }) => deps.repository.upsertTaskAttempt(input),
     loadProjectSnapshot: (input: { projectId: string; targetDocumentId?: string }) => deps.repository.getProjectSnapshot(input.projectId, input.targetDocumentId),
-    createPreflight: async (input: { intent: NovelIntent; snapshot: PreflightProjectSnapshot }) => createPreflightPlan(input.intent, input.snapshot),
+    createPreflight: async (input: { intent: NovelIntent; snapshot: PreflightProjectSnapshot }) => {
+      // E4 语义守卫在 createPreflightPlan 纯函数层（全入口共用，双向测试在
+      // change-scope.test）；此处不重复第二判据。
+      return createPreflightPlan(input.intent, input.snapshot);
+    },
     retrieveMemory: async (input: { projectId: string; plan: PreflightPlan }): Promise<MemoryBundle> => {
       const repairedFoundationClaims = await deps.repository.ensureFoundationMemoryClaims(input.projectId);
       if (repairedFoundationClaims.length && deps.memoryIndex) {
@@ -387,7 +481,15 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
         validateChapterExecutionContract(input.planningContext.chapter);
       }
       const context = buildContextManifest(input.plan, input.memory, { retrievalRunId: `retrieval:${input.plan.id}` });
-      const blueprint = compileExecutionBlueprint(input.intent, input.plan, input.memory, input.skills, input.snapshot, context, input.foundationArtifacts, input.planningContext);
+      // 候选积压 facet（FM-2）：轻量聚合查询随 blueprint 落库，供编排者可见；失败不阻断编译。
+      let factCandidateBacklog: { pending: number; oldestPendingDays: number | null } | undefined;
+      try {
+        const backlog = await deps.repository.getFactCandidateBacklog(input.intent.projectId);
+        factCandidateBacklog = { pending: backlog.totalPending, oldestPendingDays: backlog.oldestPendingDays };
+      } catch (error) {
+        console.warn("[compileBlueprint] 候选积压统计失败（不阻断）：", error);
+      }
+      const blueprint = compileExecutionBlueprint(input.intent, input.plan, input.memory, input.skills, input.snapshot, context, input.foundationArtifacts, input.planningContext, factCandidateBacklog);
       await deps.repository.putCognition(input.plan, input.memory, input.skills, blueprint, context);
       if (input.planningContext && input.intent.target?.id) await deps.repository.putChapterPlanningContext(blueprint.id, input.intent.target.id, input.planningContext);
       return { blueprint, context, routingSnapshot: model.getRoutingSnapshot() };
@@ -411,6 +513,9 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
     assertChapterGenerationAllowed: (input: { projectId: string; documentId: string }) => deps.repository.assertChapterGenerationAllowed(input.projectId, input.documentId),
     loadChapterPlanningContext: (input: { projectId: string; documentId: string }) => deps.repository.getChapterPlanningContext(input.projectId, input.documentId),
     loadChapterPlanningContextSnapshot: (input: { blueprintId: string }) => deps.repository.getChapterPlanningContextSnapshot(input.blueprintId),
+    // POV 残留扫描的显示名解析（P4 残留登记项）：蓝图 povCharacterId 是登记 id，
+    // 正文出现的是显示名——不换算会把视角人物自己的内心戏误标为"他人残留"。
+    resolveCharacterDisplayNames: (input: { projectId: string; refs: string[] }) => deps.repository.resolveCharacterDisplayNames(input.projectId, input.refs),
     draft: async (input: { workflowId: string; intent: NovelIntent; blueprint: ExecutionBlueprint; memory: MemoryBundle; skills: SkillBundle; routingSnapshot: ModelRoutingSnapshot; candidateStartIndex?: number; foundationArtifacts?: Artifact[]; planningContext?: ChapterPlanningContext }): Promise<GeneratedTextResult> => {
       const skills = await resolveCurrentSkills({ projectId: input.intent.projectId, executionPoint: "chapter.drafting", role: "writer", memory: input.memory, preflightId: input.blueprint.preflightId });
       const system = "你是长篇小说写作 Worker。只写当前章节正文，不解释流程；只使用当前环境解析出的 Skill 和冻结 MemoryBundle 中的事实；严格尊重叙事截止、视角知识边界、章节功能、文风目标和质量门。";
@@ -466,7 +571,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
             promptContext: promptPackage.manifest,
           });
         const review = {
-          ...toReview({ artifact: input.artifact, identity: input.identity, role: input.role, output: generated.value }),
+          ...toReview({ artifact: input.artifact, identity: input.identity, role: input.role, output: generated.value, currentText: input.text }),
           modelProvenance: {
             ...generated.provenance,
             skillBundleId: roleSkills.id,
@@ -482,13 +587,50 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
         return { kind: "external", task };
       }
     },
-    inspectManuscript: async (input: { projectId: string; artifact: Artifact; text: string }) => {
+    inspectManuscript: async (input: { projectId: string; artifact: Artifact; text: string; priorEndings?: string[] }) => {
       const stopReason = typeof input.artifact.structuredData?.stopReason === "string" ? input.artifact.structuredData.stopReason : undefined;
-      const report = inspectManuscript({ text: input.text, stopReason });
+      const report = inspectManuscript({ text: input.text, stopReason, priorEndings: input.priorEndings });
       const review = structuralReviewFromReport(input.projectId, input.artifact, report);
       await deps.repository.putReview(review, { refreshChapterSnapshot: false });
       return { report, review };
     },
+    /**
+     * 跨章语境加载（2026-09-18 全书精修 P0）：取本章之前最近 N 章的结尾末段正文，
+     * 供 manuscript.ending-ritual 判据做跨章重复度测量。
+     *
+     * 设计依据：AGENTS.md「在拥有错误行为的最低共享层修复」——单章门对"留白收尾"
+     * 与"口癖收尾"形态相同、无法区分，只有把前章末段喂进判据才有跨章证据。
+     * 失败时不阻断生成（返回空数组，通道不触发），与 loadSerialContext 同型软降级。
+     */
+    loadPriorChapterEndings: async (input: { projectId: string; narrativeOrder?: number; count: number }): Promise<string[]> => {
+      // narrativeOrder 缺失（如项目级任务）时无"前章"概念，该通道不适用——
+      // 与 runEnrichCharacters 的 narrativeOrder 缺失语义一致。
+      if (input.narrativeOrder === undefined) return [];
+      if (typeof deps.repository.getPriorChapterEndings !== "function") return [];
+      try {
+        const objectKeys = await deps.repository.getPriorChapterEndings({ projectId: input.projectId, narrativeOrder: input.narrativeOrder, count: input.count });
+        const endings: string[] = [];
+        for (const key of objectKeys) {
+          try {
+            const text = await objects.getText(key);
+            const ending = extractChapterEnding(text);
+            if (ending) endings.push(ending);
+          } catch (error) {
+            console.warn(`[ending-ritual] 前章末段读取失败（跳过该章）：${(error as Error).message}`);
+          }
+        }
+        return endings;
+      } catch (error) {
+        console.warn(`[ending-ritual] 跨章结尾语境加载失败，该通道本次不触发：${(error as Error).message}`);
+        return [];
+      }
+    },
+    /**
+     * 线索静默账（P1 2026-09-18）：扫本书全部定稿章正文，判定每条 open 伏笔
+     * 是"从未再被提及 / 曾活跃现已静默 / 仍在推进"。见 loadNarrativeDormancy 定义。
+     */
+    loadNarrativeDormancy: async (input: { projectId: string }): Promise<DormancyLedger | undefined> => loadNarrativeDormancy(input.projectId),
+
     revise: async (input: { workflowId: string; intent: NovelIntent; artifact: Artifact; text: string; reviews: Review[]; directedIssues?: ReviewIssue[]; strictRevisionWindows?: boolean; authorInstruction?: string; memory: MemoryBundle; blueprint: ExecutionBlueprint; skills: SkillBundle; routingSnapshot: ModelRoutingSnapshot; candidateStartIndex?: number; planningContext?: ChapterPlanningContext; revisionHistory?: RevisionAttempt[] }): Promise<GeneratedTextResult> => {
       const currentSkills = await resolveCurrentSkills({ projectId: input.intent.projectId, executionPoint: "chapter.revision", role: "reviser", memory: input.memory, preflightId: input.blueprint.preflightId });
       input = { ...input, skills: currentSkills };
@@ -501,11 +643,16 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       // 根因修复（2026-08-07）：修订阶段需要同时加载正文、记忆、规划上下文与审核意见，
       // 旧 blueprint 的 maxInputTokens（早期章节 32K）不足，实测必要上下文约 35K 触发
       // context-budget-exceeded（chapter-review 复用已固化 blueprint，computeTokenBudget
-      // 的新值不会追溯生效）。此处统一提升到至少 96K（模型上下文支持 128K），
+      // 的新值不会追溯生效）。此处统一提升下限（模型上下文支持 128K），
       // 新 blueprint 的预算若更大则取其值。
-      // TODO: 96K 下限是魔法值，应迁入 model-routing profile 的 revisionMinInputTokens 配置；
-      //   该下限使 computeTokenBudget 对 revision 的分级在 <96K 区间失效（只对 drafting 生效）。
-      const revisionMaxInputTokens = Math.max(input.blueprint.budget.maxInputTokens, 96_000);
+      // 96K→112K（弧14 ch92 实证 97.2K）→118K（弧17 ch114 实证 112.3K 顶穿旧下限：
+      // memory 面随章数/开放伏笔自然增长，该下限约每 25 章被顶穿一次）。
+      // 118K→128K（弧18 ch125 生成实证 118.8K 顶穿：118K+预留已不够）。取 fact-extraction/
+      // learning 阶段同模型已实证的 128K 为对齐值——这是本窗口的**最后一次抬升**：
+      // 128K+预留=窗内顶格，再被顶穿时正解是给 revision 的 reviews/skills/memory 分段设
+      // 独立预算（压缩记忆注入而非继续抬数字），不得再原地加数。
+      // TODO: 该下限仍是魔法值，应迁入 model-routing profile 的 revisionMinInputTokens 配置。
+      const revisionMaxInputTokens = Math.max(input.blueprint.budget.maxInputTokens, 128_000);
       if (shouldBlockRevisionForConflicts(revisionBrief.conflicts, hasAuthorInstruction)) {
         throw new Error(`revision-brief-conflict: ${revisionBrief.conflicts.map((conflict) => conflict.mechanism).join("、")}`);
       }
@@ -527,6 +674,27 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       const system = hasAuthorInstruction
         ? "你是长篇小说定向修订编辑。作者原话是本轮任务目标，审核问题是辅助证据，技能是仅在不冲突时使用的背景方法；不得用完成审校问题代替完成作者目标。先理解它们的关系，再让修改结果在正文中明确可见，同时保持冻结事实、章节规划与既定因果。"
         : "你是长篇小说修订编辑。依据审核证据修订正文，保持原作的文风、节奏与叙事质感。修订应聚焦于解决审核指出的问题，同时保持原文已有的文学品质——不因修订而降低文笔质量或丢失原文的有效细节。不得新增冻结上下文之外的事实。";
+      // 分段预算（2026-09-16 ch126 v3 顶穿 133.7K 兑现承诺，停止抬总闸）：修订轮的
+      // 记忆包按 30K 字符独立预算截断（修订者主看正文+问题+规划上下文，全量记忆是
+      // 草稿期需求）；修订历史只保留近 3 轮（更早轮次的教训已凝固进当轮意见）。
+      // 两处截断都是阶段输入构造，不动冻结事实与问题清单本身。
+      const memoryHits = (input.memory as unknown as { hits?: Array<{ content: string }> } | undefined)?.hits;
+      const revisionMemory = input.memory && Array.isArray(memoryHits)
+        ? (() => {
+            let used = 0;
+            const kept: Array<{ content: string }> = [];
+            for (const hit of memoryHits) {
+              used += hit.content?.length ?? 0;
+              // 12K 上限（ch129 顶穿 135.5K 二次实证后自 30K 收紧）：召回全复活+账本
+              // 增长使辅助记忆位成为 revision 段主要超载源——修订主料是正文+问题+
+              // 规划上下文，记忆仅作一致性护栏，按相关度前 12K 字符保留。
+              if (used > 8_000) break;
+              kept.push(hit);
+            }
+            return { ...input.memory, hits: kept } as typeof input.memory;
+          })()
+        : input.memory;
+      const revisionHistory = Array.isArray(input.revisionHistory) ? input.revisionHistory.slice(-3) : input.revisionHistory;
       const fullRevisionPackage = buildFullChapterRevisionPromptPackage({
         projectId: input.intent.projectId,
         workflowId: input.workflowId,
@@ -537,11 +705,11 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
         maxOutputTokens: input.blueprint.budget.maxOutputTokens,
         text: input.text,
         issues: actionableIssues,
-        memory: input.memory,
+        memory: revisionMemory,
         skills: input.skills,
         planningContext: input.planningContext,
         authorInstruction: input.authorInstruction,
-        revisionHistory: input.revisionHistory,
+        revisionHistory,
       });
       try {
         const windows = planRevisionWindows(input.text, actionableIssues);
@@ -569,7 +737,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
               maxOutputTokens: batchMaxTokens,
               text: input.text,
               windows: revisionWindows,
-              memory: input.memory,
+              memory: revisionMemory,
               skills: input.skills,
               planningContext: input.planningContext,
               authorInstruction: input.authorInstruction,
@@ -617,7 +785,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
         }
         for (const window of revisionWindows) {
           const source = paragraphs.slice(window.start, window.end + 1).join("\n\n");
-          const windowPackage = buildRevisionWindowPromptPackage({ projectId: input.intent.projectId, workflowId: input.workflowId, system, goal: stageGoal, maxInputTokens: revisionMaxInputTokens, maxOutputTokens: Math.min(4096, Math.max(1024, source.length * 2)), text: input.text, window, memory: input.memory, skills: input.skills, planningContext: input.planningContext, authorInstruction: input.authorInstruction, revisionHistory: input.revisionHistory });
+          const windowPackage = buildRevisionWindowPromptPackage({ projectId: input.intent.projectId, workflowId: input.workflowId, system, goal: stageGoal, maxInputTokens: revisionMaxInputTokens, maxOutputTokens: Math.min(4096, Math.max(1024, source.length * 2)), text: input.text, window, memory: revisionMemory, skills: input.skills, planningContext: input.planningContext, authorInstruction: input.authorInstruction, revisionHistory: input.revisionHistory });
           const generated = await model.generateText({
             purpose: "writing.revision",
             system,
@@ -699,7 +867,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
                 candidate: revisedText,
                 authorInstruction: input.authorInstruction!,
                 alignment: alignment.value,
-                memory: input.memory,
+                memory: revisionMemory,
                 skills: input.skills,
                 planningContext: input.planningContext,
               });
@@ -756,7 +924,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
               candidate: revisedText,
               authorInstruction: input.authorInstruction!,
               alignment: unresolvedAlignment,
-              memory: input.memory,
+              memory: revisionMemory,
               skills: input.skills,
               planningContext: input.planningContext,
             });
@@ -793,7 +961,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
           maxOutputTokens: input.blueprint.budget.maxOutputTokens,
           text: input.text,
           windows,
-          memory: input.memory,
+          memory: revisionMemory,
           skills: input.skills,
           planningContext: input.planningContext,
           authorInstruction: input.authorInstruction,
@@ -827,14 +995,14 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       const task = await deps.repository.getModelTask(input.modelTaskId);
       const validate = new Ajv({ allErrors: true, strict: false }).compile(reviewerSchema);
       if (!task || task.status !== "submitted" || !validate(input.value)) throw new Error(`外部审核结果无效：${validate.errors?.map((item) => item.message).join("；") ?? "任务未提交"}`);
-      const review = { ...toReview({ artifact: input.artifact, identity: input.identity, role: input.role, output: input.value as ReviewerOutput }), modelProvenance: { routeSnapshotId: task.configRevision, purpose: task.purpose, candidateIndex: task.candidateIndex, executor: "external-mcp" as const, model: "external-mcp", promptFingerprint: task.workPackage.inputFingerprint, skillBundleId: task.workPackage.contextRefs.skillBundleId, skillBundleFingerprint: task.workPackage.contextRefs.skillBundleFingerprint, contextManifestId: task.workPackage.contextRefs.contextManifestId } };
       // 与内部审校路径（plainText: input.text）对齐：外部路径从被审 artifact 的
-      // objectKey 解析正文，供 evidence 软校验落库时确定性标记；存储不可用时报
-      // 级降级为不标记（软标记仅作人工参考，不影响审校落库）。
+      // objectKey 解析正文——既供证据软校验落库标记，也供 toReview 的摘录在场性
+      // 机械门禁（陈旧复读丢弃）；存储不可用时两处一并降级为不判定。
       let plainText: string | undefined;
       if (input.artifact.objectKey) {
         try { plainText = await objects.getText(input.artifact.objectKey); } catch { plainText = undefined; }
       }
+      const review = { ...toReview({ artifact: input.artifact, identity: input.identity, role: input.role, output: input.value as ReviewerOutput, currentText: plainText }), modelProvenance: { routeSnapshotId: task.configRevision, purpose: task.purpose, candidateIndex: task.candidateIndex, executor: "external-mcp" as const, model: "external-mcp", promptFingerprint: task.workPackage.inputFingerprint, skillBundleId: task.workPackage.contextRefs.skillBundleId, skillBundleFingerprint: task.workPackage.contextRefs.skillBundleFingerprint, contextManifestId: task.workPackage.contextRefs.contextManifestId } };
       await deps.repository.putReview(review, { refreshChapterSnapshot: !input.suppressChapterSnapshotPromotion, plainText });
       return review;
     },
@@ -847,8 +1015,9 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
         const openNarrativeElements = input.narrativeOrder === undefined
           ? undefined
           : await deps.repository.getOpenForeshadowingAndPromises(input.projectId, input.narrativeOrder - 1).catch(() => undefined);
+        const identityContext = await loadExtractionIdentityContext(input.projectId);
         // Phase 3.1: 提取 claims 与正文修订派生数据；派生数据等待 commit 取得真实 revisionId 后落库。
-        const result = await extractFactsWithStats({ projectId: input.projectId, artifact: factArtifact, text: input.text, model, existingClaimsDigest: extractionContext.claimsDigest, existingContentHashes: extractionContext.contentHashes, existingClaimsIndex: extractionContext.claimsIndex, openNarrativeElements, narrativeOrder: input.narrativeOrder, routingSnapshot: input.routingSnapshot, candidateStartIndex: input.candidateStartIndex, workflowRunId: input.workflowId, taskId: `${input.artifact.taskId}:facts:model`, skillBundle: currentSkills });
+        const result = await extractFactsWithStats({ projectId: input.projectId, artifact: factArtifact, text: input.text, model, existingClaimsDigest: extractionContext.claimsDigest, existingContentHashes: extractionContext.contentHashes, existingClaimsIndex: extractionContext.claimsIndex, openNarrativeElements, narrativeOrder: input.narrativeOrder, routingSnapshot: input.routingSnapshot, candidateStartIndex: input.candidateStartIndex, workflowRunId: input.workflowId, taskId: `${input.artifact.taskId}:facts:model`, skillBundle: currentSkills, identityIndex: identityContext?.identityIndex, canonicalCharacters: identityContext?.canonicalCharacters });
         await deps.repository.recordFactExtraction({ projectId: input.projectId, artifact: factArtifact, claims: result.claims, lifecycleStatus: "staged", documentId: input.documentId, workflowId: input.workflowId, narrativeOrder: input.narrativeOrder });
         return { kind: "completed", artifact: { ...factArtifact, structuredData: { ...factArtifact.structuredData, narrativeElements: result.narrativeElements } } };
       } catch (error) {
@@ -857,7 +1026,8 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
         const openNarrativeElements = input.narrativeOrder === undefined
           ? undefined
           : await deps.repository.getOpenForeshadowingAndPromises(input.projectId, input.narrativeOrder - 1).catch(() => undefined);
-        const prompt = buildFactExtractionPrompt({ artifact: factArtifact, text: input.text, existingClaimsDigest: extractionContext.claimsDigest, openNarrativeElements });
+        const identityContext = await loadExtractionIdentityContext(input.projectId);
+        const prompt = buildFactExtractionPrompt({ artifact: factArtifact, text: input.text, existingClaimsDigest: extractionContext.claimsDigest, openNarrativeElements, canonicalCharacters: identityContext?.canonicalCharacters });
         const system = "你是事实提取 Worker。只输出符合 JSON Schema 的 JSON。只提取正文实际呈现的事实，不提取隐喻、修辞或读者推断。";
         const promptPackage = compileSinglePrompt({ projectId: input.projectId, workflowId: input.workflowId, purpose: "facts.extract", stage: "fact-extraction", system, prompt, schema: chapterStateDeltaSchema as unknown as Record<string, unknown>, provenanceRefs: [factArtifact.id], skillBundle: currentSkills, skillExecutionPoint: "chapter.fact-extraction" });
         const task = await externalTask({ workflowId: input.workflowId, taskId: `${input.artifact.taskId}:facts:model`, purpose: "facts.extract", candidateIndex: error.candidateIndex, routingSnapshot: input.routingSnapshot, outputKind: "structured", system, instruction: promptPackage.instruction, schema: chapterStateDeltaSchema as unknown as Record<string, unknown>, schemaName: "chapter-state-delta", baseRevision: input.artifact.baseRevision, contextRefs: { artifactId: factArtifact.id, blueprintId: input.blueprint.id, skillBundleId: currentSkills.id }, promptContext: promptPackage.manifest });
@@ -869,7 +1039,8 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       const validate = new Ajv({ allErrors: true, strict: false }).compile(chapterStateDeltaSchema);
       if (!task || task.status !== "submitted" || !validate(task.result?.value)) throw new Error(`外部事实提取结果无效：${validate.errors?.map((item) => item.message).join("；") ?? "任务未提交"}`);
       const extractionContext = await deps.repository.getFactExtractionContext(input.projectId, input.narrativeOrder === undefined ? undefined : input.narrativeOrder - 1);
-      const projected = projectFactExtractionOutput({ projectId: input.projectId, artifact: input.artifact, text: input.text, existingClaimsDigest: extractionContext.claimsDigest, existingContentHashes: extractionContext.contentHashes, existingClaimsIndex: extractionContext.claimsIndex, narrativeOrder: input.narrativeOrder }, task.result!.value as ChapterStateDelta);
+      const identityContext = await loadExtractionIdentityContext(input.projectId);
+      const projected = projectFactExtractionOutput({ projectId: input.projectId, artifact: input.artifact, text: input.text, existingClaimsDigest: extractionContext.claimsDigest, existingContentHashes: extractionContext.contentHashes, existingClaimsIndex: extractionContext.claimsIndex, narrativeOrder: input.narrativeOrder, identityIndex: identityContext?.identityIndex }, task.result!.value as ChapterStateDelta);
       await deps.repository.recordFactExtraction({ projectId: input.projectId, artifact: input.artifact, claims: projected.claims, lifecycleStatus: "staged", documentId: input.documentId, workflowId: task.workflowRunId, narrativeOrder: input.narrativeOrder });
       return { ...input.artifact, structuredData: { ...input.artifact.structuredData, narrativeElements: projected.narrativeElements } };
     },
@@ -896,7 +1067,13 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       const plainText = input.artifact.objectKey
         ? await objects.getText(input.artifact.objectKey).catch(() => undefined)
         : undefined;
-      const learningEvidence = { serialContext, recentIssueClusters, plainText };
+      // SK-3 候选聚合：把未晋升候选队列投影给 LLM（同机制改进引用既有 id 聚合，
+      // 不再新建重复候选）。查询失败不阻断 learning——聚合是抑重复的增益通道。
+      const pendingCandidates = await deps.repository.listPendingCraftRuleCandidates?.(input.projectId).catch((error: unknown) => {
+        console.warn(`[learning] 排队候选投影加载失败，本次评估不带队列摘要：${(error as Error).message}`);
+        return undefined;
+      });
+      const learningEvidence = { serialContext, recentIssueClusters, plainText, pendingCandidates };
       try {
         const { assessment, validationError } = await assessRuntimeLearningWithModel({ ...input, ...learningEvidence, model, routingSnapshot: input.routingSnapshot, candidateStartIndex: input.candidateStartIndex, availableSkills, skillBundle: learningSkills });
         const recorded = validationError ? { ...assessment, validationError } : assessment;
@@ -935,15 +1112,16 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       };
       const learningSkills = await resolveCurrentSkills({ projectId: input.projectId, executionPoint: "learning.assessment", role: "learning-auditor" });
       const availableSkills = learningSkills.availableSkills ?? learningSkills.skills.map((skill) => ({ skillId: skill.skillId, capabilities: skill.capabilities ?? [], executionPoints: skill.executionPoints }));
+      const pendingCandidates = await deps.repository.listPendingCraftRuleCandidates?.(input.projectId).catch(() => undefined);
       try {
-        const { assessment, validationError } = await assessRuntimeLearningWithModel({ projectId: input.projectId, workflowId: input.workflowId, artifact: input.artifact, reviews: [review], model, routingSnapshot: input.routingSnapshot, candidateStartIndex: input.candidateStartIndex, availableSkills, skillBundle: learningSkills });
+        const { assessment, validationError } = await assessRuntimeLearningWithModel({ projectId: input.projectId, workflowId: input.workflowId, artifact: input.artifact, reviews: [review], model, routingSnapshot: input.routingSnapshot, candidateStartIndex: input.candidateStartIndex, availableSkills, pendingCandidates, skillBundle: learningSkills });
         return { kind: "completed", assessment: await recordLearning(validationError ? { ...assessment, validationError } : assessment) };
       } catch (error) {
         if (!(error instanceof ExternalMcpRequiredError)) throw error;
         const learningIssues = reviewIssuesForLearning([review]);
         if (!learningIssues.length) throw error;
         const system = "你是长篇小说 Runtime 的学习闭环审计员，只在能说明底层机制和影响输入类时提出可复用规则改进。";
-        const promptPackage = compileSinglePrompt({ projectId: input.projectId, workflowId: input.workflowId, purpose: "learning.assess", stage: "review", system, prompt: buildRuntimeLearningPrompt({ artifact: input.artifact, reviews: [review], availableSkills }), schema: runtimeLearningAssessmentSchema, reservedOutputTokens: 4_096, provenanceRefs: [input.artifact.id, input.reviewArtifact.id], skillBundle: learningSkills, skillExecutionPoint: "learning.assessment" });
+        const promptPackage = compileSinglePrompt({ projectId: input.projectId, workflowId: input.workflowId, purpose: "learning.assess", stage: "review", system, prompt: buildRuntimeLearningPrompt({ artifact: input.artifact, reviews: [review], availableSkills, pendingCandidates }), schema: runtimeLearningAssessmentSchema, reservedOutputTokens: 4_096, provenanceRefs: [input.artifact.id, input.reviewArtifact.id], skillBundle: learningSkills, skillExecutionPoint: "learning.assessment" });
         const task = await externalTask({ workflowId: input.workflowId, taskId: `${input.artifact.taskId}:learning:story-arc:${input.reviewArtifact.id}`, purpose: "learning.assess", candidateIndex: error.candidateIndex, routingSnapshot: input.routingSnapshot, outputKind: "structured", system, instruction: promptPackage.instruction, schema: runtimeLearningAssessmentSchema, schemaName: "runtime-learning-assessment", baseRevision: input.artifact.baseRevision, contextRefs: { artifactId: input.artifact.id, reviewIds: review.id }, promptContext: promptPackage.manifest });
         return { kind: "external", task };
       }
@@ -954,7 +1132,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       const assessment = parseRuntimeLearningAssessmentV2(input.value, { id: `learning:${input.reviewArtifact.id}:story-arc`, projectId: input.projectId, source: { workflowId: input.workflowId, artifactId: input.artifact.id, reviewIds: [reviewId], fingerprint: input.artifact.fingerprint }, createdAt: Date.now() });
       return recordLearning({ ...assessment, source: { ...assessment.source, reviewIds: hasOpinion ? [reviewId] : [] } });
     },
-    commit: async (input: { projectId: string; documentId: string; artifact: Artifact; factArtifact?: Artifact; narrativeOrder?: number; text: string; reviews: Review[]; structuralReport: ManuscriptStructuralReport; baseRevision: number; idempotencyKey: string }) => {
+    commit: async (input: { projectId: string; documentId: string; artifact: Artifact; factArtifact?: Artifact; narrativeOrder?: number; text: string; reviews: Review[]; structuralReport: ManuscriptStructuralReport; baseRevision: number; idempotencyKey: string; changeScope?: ChapterChangeScope }) => {
       const chapterMemorySkills = await resolveCurrentSkills({ projectId: input.projectId, executionPoint: "chapter.fact-extraction", role: "fact-extractor", preflightId: input.artifact.taskId });
       return commitService.commit({ ...input, chapterMemorySkills, factArtifactId: input.factArtifact?.id, narrativeElements: input.factArtifact?.structuredData?.narrativeElements as FactExtractionOutput["narrativeElements"] | undefined });
     },
@@ -1109,7 +1287,16 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
     },
 
     loadTargetedReviewIssues: async (input: { projectId: string; documentId: string; issueIds: string[] }): Promise<{ snapshotId: string; reviewedContentHash: string; fingerprints: string[]; issues: ReviewIssue[] }> => {
-      return deps.repository.getTargetedChapterReviewIssues(input);
+      // Evidence 闭环校验·消费时：把当前正文传给 repository，让过报/陈旧意见
+      // （证据已不在正文中）带上 [evidence-stale] 标记进入修订与审批链路。
+      let plainText: string | undefined;
+      try {
+        const content = await deps.repository.getFinalDocumentContentRef(input.projectId, input.documentId);
+        plainText = content?.objectKey ? await objects.getText(content.objectKey) : undefined;
+      } catch {
+        plainText = undefined; // 取不到正文时跳过标记（软校验不阻塞审校启动）
+      }
+      return deps.repository.getTargetedChapterReviewIssues({ ...input, plainText });
     },
 
     loadProposedDraft: async (input: { projectId: string; artifactId: string }): Promise<{ artifact: Artifact; text: string }> => {
@@ -1167,6 +1354,23 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
             loadSerialContext(input.projectId, input.documentId, narrativeCutoff),
           ])
         : [undefined, undefined];
+      // 资产数量账本（确定性扫描）：对窗口各章正文提取「数字+量词+名词」提及，
+      // 同一实体 ≥2 章出现时生成漂移对照信号（见 asset-ledger.ts）。失败降级不阻塞审校。
+      if (serialContext && !serialContext.assetSpans?.length) {
+        try {
+          const orders = serialContext.chapters.map((chapter) => chapter.narrativeOrder);
+          const refs = await deps.repository.getChapterContentRefsByOrders(input.projectId, orders);
+          const perChapter: Array<{ narrativeOrder: number; mentions: AssetMention[] }> = [];
+          for (const ref of refs) {
+            try {
+              perChapter.push({ narrativeOrder: ref.narrativeOrder, mentions: extractAssetMentions(await objects.getText(ref.objectKey)) });
+            } catch { /* 单章正文不可得时跳过 */ }
+          }
+          serialContext.assetSpans = groupAssetSpans(perChapter);
+        } catch (error) {
+          console.warn(`[asset-ledger] 资产数量扫描失败，降级为无资产对照：${(error as Error).message}`);
+        }
+      }
       const latestBundle = await deps.repository.getLatestMemoryBundle(input.projectId);
       if (!latestBundle) {
         // 即使没有历史记忆，也持久化不可变空快照；按引用执行不能依赖只存在于 workflow 内存的对象。
@@ -1415,6 +1619,14 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       const bundle = parseStoryArcBundle(artifact.structuredData);
       const artifactArcId = typeof artifact.structuredData?.arcId === "string" ? artifact.structuredData.arcId : undefined;
       if (artifactArcId && artifactArcId !== input.arcId) throw new Error("故事弧蓝图 artifact 不属于当前故事弧");
+      // 读取面坐标归一（弧6 恢复环实证）：蓝图 artifact 的 batch 坐标是模型自报 echo（首弧常写
+      // 局部 1 基），批次行坐标是系统派生事实；窗口契约只管写侧，重审/修订经本读取口回来时两套
+      // 坐标系打架（重基线守卫与投影对账各信一边）。同"系统可推导事实不留裁量权"族：读入即对齐批次行。
+      const arcRow = await deps.repository.getStoryArc(input.projectId, input.arcId);
+      const batchRow = arcRow?.batches?.find((batch) => batch.sourceArtifactId === input.artifactId) ?? (arcRow?.batches?.length === 1 ? arcRow.batches[0] : undefined);
+      if (batchRow) {
+        bundle.batch = { ...bundle.batch, batchIndex: batchRow.batchIndex, startChapterIndex: batchRow.startChapterIndex, complete: batchRow.complete };
+      }
       return { artifact, bundle };
     },
     expireExternalModelTask: async (input: { modelTaskId: string; reason: string }) => deps.repository.expireModelTask(input.modelTaskId, input.reason),
@@ -1552,10 +1764,10 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       if (chapterTitleSourceFingerprint(source) !== input.sourceFingerprint) throw new Error("章节命名来源已变化，请重新生成");
       const plainText = source.objectKey ? await objects.getText(source.objectKey) : undefined;
       const prompt = buildChapterTitlePrompt({ ...source, plainText });
-      const skills = await resolveCurrentSkills({ projectId: input.projectId, executionPoint: "chapter.blueprint", role: "planner" });
+      const skills = await resolveCurrentSkills({ projectId: input.projectId, executionPoint: "chapter.title", role: "planner" });
       const system = "你是中文长篇小说的章节命名编辑。标题必须忠实于本章独特内容，优先简练的四字中文，但不以牺牲准确性换取字数整齐。";
       const routingSnapshot = model.getRoutingSnapshot();
-      const promptPackage = compileSinglePrompt({ projectId: input.projectId, workflowId: input.workflowId, purpose: "planning.foundation", stage: "foundation", system, prompt, schema: CHAPTER_TITLE_SCHEMA as unknown as Record<string, unknown>, reservedOutputTokens: 300, provenanceRefs: [input.documentId, input.sourceFingerprint], skillBundle: skills, skillExecutionPoint: "chapter.blueprint" });
+      const promptPackage = compileSinglePrompt({ projectId: input.projectId, workflowId: input.workflowId, purpose: "planning.foundation", stage: "foundation", system, prompt, schema: CHAPTER_TITLE_SCHEMA as unknown as Record<string, unknown>, reservedOutputTokens: 300, provenanceRefs: [input.documentId, input.sourceFingerprint], skillBundle: skills, skillExecutionPoint: "chapter.title" });
       try {
         const generated = await model.generateStructured<{ title: string }>({
           purpose: "planning.foundation",
@@ -1610,7 +1822,9 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
     },
 
     generateStoryArcBundle: async (input: { workflowId: string; projectId: string; arcId: string; authorIntent?: string; routingSnapshot: ModelRoutingSnapshot; candidateStartIndex?: number; batchIndex?: number; startChapterIndex?: number; rebase?: boolean; arcPlan?: StoryArcPlanOutput }): Promise<GeneratedStoryArcResult> => {
-      const planning = await deps.repository.getStoryArcPlanningInput(input.projectId, input.arcId);
+      // 线索静默账（P1）：与 planning 一并取，供弧规划/审核/修订三面看到
+      // "曾活跃现已静默"的线索。取不到（无定稿/正文不可得）时该段不注入。
+      const planning = { ...(await deps.repository.getStoryArcPlanningInput(input.projectId, input.arcId)), narrativeDormancy: await loadNarrativeDormancy(input.projectId) };
       const skills = await resolveCurrentSkills({ projectId: input.projectId, executionPoint: "arc.plan", role: "planner" });
       const rebaseTarget = input.rebase ? await deps.repository.getStoryArcRebaseTarget(input.projectId, input.arcId) : undefined;
       const arc = input.batchIndex ? await deps.repository.getStoryArc(input.projectId, input.arcId) : undefined;
@@ -1632,7 +1846,14 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
         }
       }
 
-      const chapterPromptPackage = compileSinglePrompt({ projectId: input.projectId, workflowId: input.workflowId, purpose: "planning.arc", stage: "planning", system, prompt: buildStoryArcChaptersPrompt({ ...planning, authorIntent: input.authorIntent, arc: plan.arc, batch: plan.batch }, rebaseTarget), schema: storyArcChaptersOutputSchema as unknown as Record<string, unknown>, reservedOutputTokens: 10_000, provenanceRefs: [input.arcId, "segment:chapters"], skillBundle: skills, skillExecutionPoint: "arc.plan" });
+      // 批次窗口=系统分配事实（弧内剩余章数按上限截断；重基线走自己的逐章目标
+      // 契约）。新弧无既有投影 ⇒ planned=0 ⇒ 窗口=全弧期望章数；expected 缺失
+      // （旧弧形态）⇒ window=0 ⇒ 生成面契约与校验面守卫双跳过（零回归）。
+      const batchWindow = !rebaseTarget ? storyArcBatchWindow({ expectedChapterCount: plan.arc.expectedChapterCount, plannedBeforeInArc: arc?.chapters.length ?? 0 }) : 0;
+      // SK-5/C5：章节蓝图段消费 chapter.blueprint 执行点（蓝图契约 skill 的真实消费者），
+      // 弧结构段留在 arc.plan——此前两段共用 arc.plan，蓝图指引反被标题任务占用。
+      const chapterSkills = await resolveCurrentSkills({ projectId: input.projectId, executionPoint: "chapter.blueprint", role: "planner" });
+      const chapterPromptPackage = compileSinglePrompt({ projectId: input.projectId, workflowId: input.workflowId, purpose: "planning.arc", stage: "planning", system, prompt: buildStoryArcChaptersPrompt({ ...planning, authorIntent: input.authorIntent, arc: plan.arc, batch: plan.batch, ...(batchWindow ? { windowChapters: batchWindow } : {}) }, rebaseTarget), schema: storyArcChaptersOutputSchema as unknown as Record<string, unknown>, reservedOutputTokens: 10_000, provenanceRefs: [input.arcId, "segment:chapters"], skillBundle: chapterSkills, skillExecutionPoint: "chapter.blueprint" });
       try {
         const generatedChapters = await model.generateStructured<StoryArcChaptersOutput>({ purpose: "planning.arc", system, prompt: chapterPromptPackage.instruction, schema: storyArcChaptersOutputSchema as unknown as Record<string, unknown>, schemaName: "story-arc-chapters", maxTokens: 10_000, workflowRunId: input.workflowId, taskId: `${input.arcId}:story-arc:chapters`, routingSnapshot: input.routingSnapshot, candidateStartIndex: input.candidateStartIndex, promptContext: chapterPromptPackage.manifest });
         let bundle = parseStoryArcBundle({ ...plan, chapters: generatedChapters.value.chapters });
@@ -1641,12 +1862,13 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
           bundle = normalizeStoryArcRebaseBundle(bundle, rebaseTarget);
           validateStoryArcRebaseBundle(bundle, rebaseTarget);
         }
+        if (batchWindow) assertStoryArcBatchWindow({ expectedChapterCount: plan.arc.expectedChapterCount, plannedBeforeInArc: arc?.chapters.length ?? 0, chaptersCount: bundle.chapters.length });
         if (input.batchIndex && (bundle.batch.batchIndex !== input.batchIndex || bundle.batch.startChapterIndex !== input.startChapterIndex)) throw new Error("生成结果的故事弧批次位置与请求不一致");
         const artifact = await makeArtifact({ projectId: input.projectId, taskId: `${input.arcId}:story-arc`, kind: "chapter-blueprint", baseRevision: 0, text: JSON.stringify(bundle, null, 2), structuredData: { ...bundle, workflowId: input.workflowId, arcId: input.arcId, ...(planning.plotOutline ? { plotOutline: planning.plotOutline } : {}), modelProvenance: { plan: planProvenance, chapters: generatedChapters.provenance } } });
         return { kind: "completed", artifact, bundle };
       } catch (error) {
         if (!(error instanceof ExternalMcpRequiredError)) throw error;
-        return { kind: "external", task: await externalTask({ workflowId: input.workflowId, taskId: `${input.arcId}:story-arc:chapters`, purpose: "planning.arc", candidateIndex: error.candidateIndex, routingSnapshot: input.routingSnapshot, outputKind: "structured", system, instruction: chapterPromptPackage.instruction, schema: storyArcChaptersOutputSchema as unknown as Record<string, unknown>, schemaName: "story-arc-chapters", baseRevision: 0, contextRefs: { arcId: input.arcId, skillBundleId: skills.id, outputSegment: "chapters", segmentIndex: "2", segmentCount: "2", arcJson: JSON.stringify(plan.arc), batchJson: JSON.stringify(plan.batch), outlineJson: JSON.stringify(planning.plotOutline ?? null) }, promptContext: chapterPromptPackage.manifest }) };
+        return { kind: "external", task: await externalTask({ workflowId: input.workflowId, taskId: `${input.arcId}:story-arc:chapters`, purpose: "planning.arc", candidateIndex: error.candidateIndex, routingSnapshot: input.routingSnapshot, outputKind: "structured", system, instruction: chapterPromptPackage.instruction, schema: storyArcChaptersOutputSchema as unknown as Record<string, unknown>, schemaName: "story-arc-chapters", baseRevision: 0, contextRefs: { arcId: input.arcId, skillBundleId: chapterSkills.id, outputSegment: "chapters", segmentIndex: "2", segmentCount: "2", arcJson: JSON.stringify(plan.arc), batchJson: JSON.stringify(plan.batch), outlineJson: JSON.stringify(planning.plotOutline ?? null) }, promptContext: chapterPromptPackage.manifest }) };
       }
     },
 
@@ -1692,6 +1914,13 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       else bundle = parseStoryArcBundle(bundle);
       validateStoryArcExecutionContracts(bundle);
       if (rebaseTarget) validateStoryArcRebaseBundle(bundle, rebaseTarget);
+      // 外部物化与内部生成同守卫：窗口是系统分配事实，提交方同样无裁量权。
+      // expected 取 bundle 自身（外部 plan 段可能尚未回写弧行），planned 取弧上
+      // 已投影章行（本批未投影，天然排除）。
+      if (!rebaseTarget) {
+        const arcRecord = await deps.repository.getStoryArc(input.projectId, input.arcId);
+        if (arcRecord) assertStoryArcBatchWindow({ expectedChapterCount: bundle.arc.expectedChapterCount, plannedBeforeInArc: arcRecord.chapters.length, chaptersCount: bundle.chapters.length });
+      }
       const artifact = await makeArtifact({ projectId: input.projectId, taskId: task.taskId, kind: "chapter-blueprint", baseRevision: 0, text: JSON.stringify(bundle, null, 2), structuredData: { ...bundle, workflowId: task.workflowRunId, arcId: input.arcId, externalModelTaskId: task.id, ...(plotOutline ? { plotOutline } : {}) } });
       return { artifact, bundle };
     },
@@ -1699,7 +1928,9 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
     projectStoryArcBundle: async (input: { projectId: string; arcId: string; artifact: Artifact; bundle: StoryArcBundle; actor: string; edited?: boolean }) => deps.repository.projectStoryArcBundle(input),
 
     reviewStoryArcBundle: async (input: { workflowId: string; projectId: string; arcId: string; artifact: Artifact; bundle: StoryArcBundle; routingSnapshot: ModelRoutingSnapshot; candidateStartIndex?: number; rebase?: boolean }): Promise<GeneratedStoryArcReviewResult> => {
-      const planning = await deps.repository.getStoryArcPlanningInput(input.projectId, input.arcId);
+      // 线索静默账（P1）：与 planning 一并取，供弧规划/审核/修订三面看到
+      // "曾活跃现已静默"的线索。取不到（无定稿/正文不可得）时该段不注入。
+      const planning = { ...(await deps.repository.getStoryArcPlanningInput(input.projectId, input.arcId)), narrativeDormancy: await loadNarrativeDormancy(input.projectId) };
       const skills = await resolveCurrentSkills({ projectId: input.projectId, executionPoint: "arc.review", role: "structure-reviewer" });
       const rebaseTarget = input.rebase ? await deps.repository.getStoryArcRebaseTarget(input.projectId, input.arcId) : undefined;
       const prompt = buildStoryArcReviewPrompt(input.bundle, "", rebaseTarget);
@@ -1764,7 +1995,9 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
     },
 
     reviseStoryArcBundle: async (input: { workflowId: string; projectId: string; arcId: string; artifact: Artifact; bundle: StoryArcBundle; review: StoryArcReviewOutput; routingSnapshot: ModelRoutingSnapshot; candidateStartIndex?: number; rebase?: boolean }): Promise<GeneratedStoryArcResult> => {
-      const planning = await deps.repository.getStoryArcPlanningInput(input.projectId, input.arcId);
+      // 线索静默账（P1）：与 planning 一并取，供弧规划/审核/修订三面看到
+      // "曾活跃现已静默"的线索。取不到（无定稿/正文不可得）时该段不注入。
+      const planning = { ...(await deps.repository.getStoryArcPlanningInput(input.projectId, input.arcId)), narrativeDormancy: await loadNarrativeDormancy(input.projectId) };
       const skills = await resolveCurrentSkills({ projectId: input.projectId, executionPoint: "arc.revision", role: "reviser" });
       const rebaseTarget = input.rebase ? await deps.repository.getStoryArcRebaseTarget(input.projectId, input.arcId) : undefined;
       const prompt = buildStoryArcRevisionPrompt(input.bundle, input.review, "", rebaseTarget);
@@ -1779,6 +2012,11 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
         validateStoryArcExecutionContracts(bundle);
         if (rebaseTarget) validateStoryArcRebaseBundle(bundle, rebaseTarget);
         if (bundle.batch.batchIndex !== input.bundle.batch.batchIndex || bundle.batch.startChapterIndex !== input.bundle.batch.startChapterIndex) throw new Error("故事弧修订不得改写批次位置");
+        // 窗口不变量（非重基线）：修订是对候选批次窗口的修复，不是重新分配——
+        // 章数必须与候选一致，否则修订成为静默缩窗通道。
+        if (!rebaseTarget && bundle.chapters.length !== input.bundle.chapters.length) {
+          throw new Error(`故事弧修订必须保持候选批次的章节窗口（${input.bundle.chapters.length} 章），本次输出 ${bundle.chapters.length} 章`);
+        }
         const artifact = await makeArtifact({ projectId: input.projectId, taskId: `${input.arcId}:story-arc-revision`, kind: "chapter-blueprint", baseRevision: 0, text: JSON.stringify(bundle, null, 2), structuredData: { ...bundle, workflowId: input.workflowId, arcId: input.arcId, sourceArtifactId: input.artifact.id, modelProvenance: generated.provenance } });
         return { kind: "completed", artifact, bundle };
       } catch (error) {
@@ -1908,9 +2146,12 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
         const foundationClaim = foundationArtifactToMemoryClaim(artifact, {
           objective: typeof run.payload?.objective === "string" ? run.payload.objective : undefined,
         });
-        const recordedClaims = await deps.repository.recordMemoryClaims({
+        // recordFoundationClaim：同 taskKey 只有最新代际投影保持 active（supersedes 其余
+        // active 投影），更早代际回填按 staged 落库——修复全部历史 Foundation 投影常驻
+        // 检索竞争的问题（memory-governance-audit-20260909 §M4/§5.3.1）。
+        const recordedClaims = await deps.repository.recordFoundationClaim({
           projectId: run.projectId,
-          claims: [foundationClaim],
+          claim: foundationClaim,
           sourceArtifactId: artifact.id,
         });
         if (recordedClaims.length && deps.memoryIndex) {
@@ -2001,9 +2242,10 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       const foundationClaim = foundationArtifactToMemoryClaim(artifact, {
         objective: typeof run.payload?.objective === "string" ? run.payload.objective : undefined,
       });
-      const recordedClaims = await deps.repository.recordMemoryClaims({
+      // 与内部生成路径同一退役契约（memory-governance-audit-20260909 §5.3.1）。
+      const recordedClaims = await deps.repository.recordFoundationClaim({
         projectId: run.projectId,
-        claims: [foundationClaim],
+        claim: foundationClaim,
         sourceArtifactId: artifact.id,
       });
       if (recordedClaims.length && deps.memoryIndex) {

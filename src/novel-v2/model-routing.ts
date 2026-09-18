@@ -101,6 +101,8 @@ export interface ModelTaskRecord {
   workPackage: ModelWorkPackage;
   result?: { text?: string; value?: unknown; reviewer?: string; verdict?: string; issues?: unknown[] };
   idempotencyKey: string;
+  /** Project attribution, derived from the owning workflow run at insert time. */
+  projectId?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -121,6 +123,19 @@ export class ExternalMcpRequiredError extends Error {
     super(`模型任务 ${purpose} 需要由外部 MCP 执行`);
     this.name = "ExternalMcpRequiredError";
   }
+}
+
+/**
+ * 同步链路的外部 MCP 兜底状态映射（机制契约 2026-09-07）。
+ *
+ * workflow 链路中 ExternalMcpRequiredError 由 activity 物化为可认领的外部任务，
+ * 属正常等待而非错误；但 API 进程内同步调用（创意短剧、章节剧本直出）没有物化
+ * 通道，异常直接冒泡——映射为 503 Service Unavailable（候选全部失败、可行动：
+ * 补充 API 候选或走外部 submit 双轨），而非裸 500（语义为系统内部错误）。
+ * 非 ExternalMcpRequiredError 返回 null，调用方按原错误通道处理。
+ */
+export function syncExternalMcpHttpStatus(error: unknown): number | null {
+  return error instanceof ExternalMcpRequiredError ? 503 : null;
 }
 
 export function requiredCapability(purpose: ModelPurpose): ModelCapability {
@@ -149,15 +164,25 @@ export function validateModelRoutingConfig(config: ModelRoutingConfig): void {
   if (!Object.keys(config.routes ?? {}).length) problems.push("至少需要一条模型路由");
   for (const purpose of MODEL_PURPOSES) {
     const route = resolveRoute(config, purpose);
-    if (!route?.candidates.length) {
-      problems.push(`purpose ${purpose} 没有可用候选链`);
+    if (!route || !route.candidates.length) {
+      // 空候选链合法：网关在链尾隐式外部 MCP 兜底位执行（externalMcpFallback），
+      // 不再要求每条 purpose 显式配置候选。显式配置仅用于挑选/排序 API 模型。
       continue;
     }
     if (route.conversationPolicy === "task-chain" && !purpose.startsWith("writing.")) {
       problems.push(`task-chain 仅允许 writing.*：${purpose}`);
     }
     for (const candidate of route.candidates) {
-      if (candidate.executor === "external-mcp") continue;
+      // 机制契约（2026-09-07）：外部 MCP 不再是调用位置的可选执行者，而是所有
+      // 调用链的隐式链尾兜底（候选耗尽时自动进入外部任务物化路径）。显式候选
+      // 只允许 API provider；禁止在链中/链尾显式放置 external-mcp，避免「显式
+      // 外部候选短路内部模型」与「显式外部候选把兜底位顶掉」两类配置形态。
+      // 历史运行快照中的显式外部候选按原语义继续执行（invokeCandidate 兼容），
+      // 保证在途工作流不受配置契约变更影响。
+      if (candidate.executor === "external-mcp") {
+        problems.push(`purpose ${purpose} 的候选链不允许显式 external-mcp（外部 MCP 已作为所有调用链的隐式兜底，候选链只配置 API 模型）`);
+        continue;
+      }
       const profile = profiles.get(candidate.profileId);
       if (!profile) {
         problems.push(`purpose ${purpose} 引用了不存在的 profile ${candidate.profileId}`);

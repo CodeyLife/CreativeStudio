@@ -10,7 +10,10 @@ export function normalizeFactToken(value: string): string {
 const PRESET_PREDICATE_ALIASES: ReadonlyArray<readonly [canonical: string, aliases: ReadonlySet<string>]> = [
   ["持有", new Set(["持有", "拥有", "携带", "保管", "握有", "持有物品", "拥有物品", "发现并持有", "识海中拥有"])],
   ["位于", new Set(["位于", "身处", "所在地为", "抵达地点"])],
-  ["知晓", new Set(["知道", "知晓", "得知", "获知", "意识到"])],
+  // character-knows 是 character-enrichment 管道写入知识边界声明的固定谓词；纳入"知晓"
+  // 别名集使两条提取管道对同一"谁知道什么"事实落入同一身份槽位（identityHash 一致），
+  // 检索层 value 合并键与同槽位聚簇统计才能跨管道对账。这是跨管道对账契约，不是题材规则。
+  ["知晓", new Set(["知道", "知晓", "得知", "获知", "意识到", "character-knows"])],
   ["隶属", new Set(["隶属", "隶属于", "属于", "所属组织"])],
   ["给予", new Set(["给予", "赠予", "交付", "给予物品"])],
   ["状态变化", new Set(["状态变化", "出现反应", "产生反应", "发生异动"])],
@@ -34,7 +37,19 @@ function normalizeFactValue(value: unknown): unknown {
   return value;
 }
 
-export function factIdentityPayload(fact: Fact): Record<string, unknown> {
+/**
+ * 身份/取值指纹的最小输入形状。
+ *
+ * 设计依据：memory-governance-audit-20260909 §5.1.2——character-enrichment 管道此前
+ * 只有字符串 contentHash、无 identityHash，与 fact-extraction 的结构化哈希体系不兼容，
+ * 导致同章双管道重复无法在任何层对账。放宽参数类型让两条管道复用同一指纹函数，
+ * 这是"统一事实指纹契约"的最低共享层实现；不改 fact-extraction 存量行的哈希算法，
+ * 同一管道内新旧行 identityHash 保持可比。
+ */
+type FactIdentitySource = Pick<Fact, "subject" | "predicate">;
+type FactValueSource = FactIdentitySource & Pick<Fact, "object" | "polarity" | "truthStatus">;
+
+export function factIdentityPayload(fact: FactIdentitySource): Record<string, unknown> {
   return {
     subject: { kind: fact.subject.kind, id: normalizeFactToken(fact.subject.id) },
     predicate: canonicalizeFactPredicate(fact.predicate),
@@ -42,7 +57,7 @@ export function factIdentityPayload(fact: Fact): Record<string, unknown> {
   };
 }
 
-export function factValuePayload(fact: Fact): Record<string, unknown> {
+export function factValuePayload(fact: FactValueSource): Record<string, unknown> {
   return {
     ...factIdentityPayload(fact),
     object: { kind: fact.object.kind, value: normalizeFactValue(fact.object.value) },
@@ -51,14 +66,14 @@ export function factValuePayload(fact: Fact): Record<string, unknown> {
   };
 }
 
-export function factIdentityHash(fact: Fact): string {
+export function factIdentityHash(fact: FactIdentitySource): string {
   return canonicalSha256(factIdentityPayload(fact));
 }
 
-export function factValueHash(fact: Fact): string {
+export function factValueHash(fact: FactValueSource): string {
   return canonicalSha256(factValuePayload(fact));
 }
 
-export function factCanonicalValue(fact: Fact): string {
+export function factCanonicalValue(fact: FactValueSource): string {
   return canonicalJson(factValuePayload(fact));
 }

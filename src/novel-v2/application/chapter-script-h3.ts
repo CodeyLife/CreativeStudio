@@ -516,18 +516,54 @@ export function collectSegmentHintIssues(fields: ChapterScriptSegmentFields, sha
 
 /**
  * 影视镜头语言提示（提示级，不阻断、不回灌 repair）。
- * 仅做切点时序观察：开场镜头时间戳、缺切点、超时长、非递增。
- * 不做镜头四要素（景别/角度/运镜/光线氛围）覆盖检测——描述语言放开中文后
+ * 观察两类结构特征：① 切点时序（开场镜头时间戳、缺切点、超时长、非递增）；
+ * ② 语音口播预算（段内台词口播估算超出段时长）。
+ * 不做镜头要素（景别/角度/运镜/光线氛围）覆盖检测——描述语言放开中文后
  * （v1.4.2）英文术语词表无法覆盖中文镜头描述，误报率高、价值低，已移除
  * （根因：中文"大远景主观俯视角/中景弧形环绕"被英文词表判为缺失）。
  */
+// TODO P2: 口播折算语速（中文 4-5 字/秒、英文 2.5-3 词/秒的中值）与单镜平均时长
+// 观察阈值（3s，与 skill v1.8.x 镜头层"单镜平均低于 3 秒优先合并镜头"口径一致）
+// 均为结构观察阈值（魔法值），宜随剧本契约版本化一并改为可配置；不针对特定题材。
+const VOICEOVER_CJK_CHARS_PER_SECOND = 4.5;
+const VOICEOVER_LATIN_WORDS_PER_SECOND = 2.75;
+const MIN_SHOT_SECONDS_OBSERVATION = 3;
+
+/** 估算 detailedDescription 中全部台词（含画外音）的口播时长：剥离语言标注与说话人编号等非朗读标记后，按中英文平均语速折算。 */
+function estimateDialogueSpokenSeconds(detailedDescription: string): number {
+  let cjkChars = 0;
+  let latinWords = 0;
+  for (const match of detailedDescription.matchAll(DIALOGUE_PAIR_RE)) {
+    const spoken = match[1].replace(/\[[^\]]*\]/gu, "").replace(/\([^)]*\)/gu, "");
+    cjkChars += (spoken.match(/[\u3400-\u9fff]/gu) ?? []).length;
+    latinWords += (spoken.match(/[A-Za-z]+/gu) ?? []).length;
+  }
+  return cjkChars / VOICEOVER_CJK_CHARS_PER_SECOND + latinWords / VOICEOVER_LATIN_WORDS_PER_SECOND;
+}
+
 export function computeCinematicHints(segments: ReadonlyArray<AssembledChapterScriptSegment>): string[] {
   const hints: string[] = [];
   for (const segment of segments) {
     const description = segment.detailedDescription;
+    // 语音口播预算观察（提示级）：台词是按时间轴播放的音频而非免费标注，口播总时长
+    // 超出段时长即物理不可交付（生成端只会截断或倍速带过）；指引层契约见运行时 skill
+    // h3-video-prompt v1.8.0 语音层（口播守恒）。无台词段是展示型的合法形态，不观察。
+    const spokenSeconds = estimateDialogueSpokenSeconds(description);
+    if (spokenSeconds > segment.durationSeconds) {
+      hints.push(`片段 ${segment.index} 台词口播估算 ${spokenSeconds.toFixed(1)}s 超出片段时长 ${segment.durationSeconds}s（按中文约 4-5 字/秒折算；超出部分会被生成端截断或倍速带过，建议压缩台词或移交相邻段承载，供人工复核）`);
+    }
     // 提示级时序观察（不阻断）：H3 生成器对切点风格差异兼容性好，
     // 开场镜头时间戳、缺切点、超时长、非递增只在 hints 中提示，不再回灌 repair。
     const timeline = collectShotTimeline(description);
+    // 镜头时间预算观察（提示级）：单镜平均时长低于阈值时镜头动作与运镜没有时间
+    // 展开——"给镜头留足时长"的观察面（skill v1.8.2 镜头层：10-15s 段以 2-3 镜为
+    // 常态）；一镜到底（单镜段）不受此限。
+    if (timeline.length > 1) {
+      const perShotSeconds = segment.durationSeconds / timeline.length;
+      if (perShotSeconds < MIN_SHOT_SECONDS_OBSERVATION) {
+        hints.push(`片段 ${segment.index} 共 ${timeline.length} 镜、单镜平均 ${perShotSeconds.toFixed(1)}s 低于 ${MIN_SHOT_SECONDS_OBSERVATION}s（镜头动作与运镜没有时间展开，优先合并镜头或改单镜内多阶段运镜，供人工复核）`);
+      }
+    }
     timeline.forEach((entry, position) => {
       if (position === 0 && entry.cutMs !== null) hints.push(`片段 ${segment.index} [Shot 1] 携带 At 时间戳（开场镜头惯例上不带；H3 可容忍，供人工复核）`);
       if (position > 0 && entry.cutMs === null) hints.push(`片段 ${segment.index} [Shot ${entry.shotNumber}] 缺少 At MM:SS.mmm 切点（H3 可容忍，建议补写以精确控制切镜时刻）`);
@@ -648,9 +684,18 @@ export function normalizeChapterScriptOutput(raw: unknown, options: { minSegment
     if (!coveredBeats.has(beat.id)) hintLines.push(`- 剧情节拍未被任何片段承载：[${beat.kind}] ${beat.summary}（id=${beat.id}）`);
   }
   for (const segment of segments) {
+    // 语音时间预算观察（提示级）：承载 dialogue 节拍的片段完全无台词，说明该节拍的
+    // 口播时间没有被分配（对话交换是按时间播放的音频，不是画面标注）——"给语音留足
+    // 时长"的观察面；展示型产物天然低台词，片段若同时承载展示性节拍属合法形态。
+    // 置于呈现必需检查之前：dialogue 类节拍不在 PRESENTATION_REQUIRED 内，早退会跳过本观察。
+    const hasDialogue = segment.detailedDescription.includes("<d>");
+    const carriedDialogue = segment.beatIds.map((id) => beats.get(id)).filter((beat): beat is PlotBeat => Boolean(beat) && beat!.kind === "dialogue");
+    if (carriedDialogue.length && !hasDialogue) {
+      const kinds = carriedDialogue.map((beat) => beat.id).join(", ");
+      hintLines.push(`- 片段 ${segment.index}: 承载对话节拍（${kinds}）但没有任何台词——该节拍的口播时间没有被分配，语音内容需以台词 <d>（含画外音）或屏幕可读文字呈现；若该段实为纯画面呈现可忽略。`);
+    }
     const carriedRequired = segment.beatIds.map((id) => beats.get(id)).filter((beat): beat is PlotBeat => Boolean(beat) && PRESENTATION_REQUIRED_BEAT_KINDS.includes(beat!.kind));
     if (!carriedRequired.length) continue;
-    const hasDialogue = segment.detailedDescription.includes("<d>");
     const hasFlashback = /\[Flashback\]/iu.test(segment.detailedDescription);
     const hasOnScreenText = /<\/?text>|屏幕字|字幕|on-screen text/iu.test(segment.detailedDescription);
     if (!hasDialogue && !hasFlashback && !hasOnScreenText) {
@@ -745,7 +790,7 @@ async function loadChapterCast(projectId: string, repository: NovelPostgresRepos
     ),
     repository.pool.query<{ name: string; payload: Record<string, unknown> | null }>(
       // TODO P2: 角色实体读取上限 50 是上下文预算魔法值，超限项目会静默丢角色；宜并入整体 token 预算计算。
-      "SELECT name, payload FROM entities WHERE project_id=$1 AND kind='character' ORDER BY name ASC LIMIT 50",
+      "SELECT name, payload FROM entities WHERE project_id=$1 AND kind='character' AND (payload->>'mergedInto') IS NULL ORDER BY name ASC LIMIT 50",
       [projectId],
     ),
   ]);

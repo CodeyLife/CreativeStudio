@@ -14,6 +14,7 @@
  * - 不依赖 IndexedDB，纯 Postgres
  */
 import { describe, expect, it, beforeAll, afterAll, beforeEach } from "vitest";
+import { isPostgresUnavailable } from "./test-db";
 import { randomUUID } from "node:crypto";
 import { NovelPostgresRepository } from "../postgres-repository";
 import { InMemoryModelGateway } from "../model-gateway";
@@ -28,7 +29,21 @@ import {
   type CraftRuleScopeAnalysis,
 } from "../craft-rule";
 import { createCraftRulePromotionService } from "../craft-rule/promotion-service";
+import { renderPromotedSkillYaml } from "../craft-rule/skill-yaml-patch";
 import type { RuntimeLearningAssessmentV2 } from "../protocol";
+
+describe("SK-2 渲染不动点（纯函数，无 DB）", () => {
+  it("render 输出再 render 得到 changed=false（sidecar 与应用幂等成立的根判据）", () => {
+    const seed = ["skillId: fixed-x", "version: 1.0.0", "promptSections:", "  chapter.drafting: |", "    基线内容说明段落，这里足够长以贴近真实文档形态。", ""].join("\n");
+    const descriptor = { skillId: "fixed-x", version: "1.0.1", promptSections: { "chapter.drafting": "晋升后内容说明段落，这里足够长以贴近真实文档形态。" }, executionPoints: ["chapter.drafting"], capabilities: [], applicableTasks: [], requiredMemoryKinds: [], conflicts: [], qualityGates: [], applicableGenres: [], roles: [], dependsOn: [] } as never;
+    const prov = { skillId: "fixed-x", version: "1.0.1", candidateId: "c-1", receiptId: "r-1", authorId: "a-1" };
+    const first = renderPromotedSkillYaml(seed, descriptor, prov);
+    expect(first.changed).toBe(true);
+    const second = renderPromotedSkillYaml(first.patchedYaml, descriptor, prov);
+    expect(second.changed).toBe(false);
+    expect(second.patchedYaml).toBe(first.patchedYaml);
+  });
+});
 
 /**
  * 基础任务评估结果类型（与 craft-rule/index.ts 内部 FoundationEvaluationResult 一致）。
@@ -146,6 +161,7 @@ describe("craft-rule integration", () => {
       await repository.migrate();
       postgresAvailable = true;
     } catch (error) {
+      if (!isPostgresUnavailable(error)) throw error;
       console.warn(`[craft-rule.test] Postgres 不可用，跳过集成测试: ${(error as Error).message}`);
     }
   }, 30000);
@@ -164,6 +180,62 @@ describe("craft-rule integration", () => {
   });
 
   // ===== skill target happy path =====
+
+  it("SK-2 重合自动 rejected：补丁合并后与当前目标结构等价 → rejected(superseded-by-manual)，不再排队僵尸", async () => {
+    if (!postgresAvailable) return;
+    const projectId = `test-craft-overlap-${randomUUID().slice(0, 8)}`;
+    await repository.ensureProject(projectId, "Craft Overlap Test");
+    const skillId = "test-craft-overlap-skill";
+    await repository.pool.query(
+      `INSERT INTO skill_definitions(skill_id, version, prompt_sections) VALUES($1, '1.4.0', $2::jsonb)
+       ON CONFLICT(skill_id) DO UPDATE SET version = EXCLUDED.version, prompt_sections = EXCLUDED.prompt_sections`,
+      [skillId, JSON.stringify({ drafting: "章尾必须回查本章节奏与伏笔账，禁止以摘要叙述代替可经历的现场；明喻密度超过每千字四处时改写为直接动作或感官证据，保留人物视角的认知边界不被叙述者越权解释，未完成的动作留给下一章承担。", "chapter.review.prose": "检查比喻密度与套话开头，逐段给出正文证据后才允许判为问题。" })],
+    );
+    // afterText 只覆盖单 section 且与现文只差空白——合并后无净变化（crc-1788959069599 僵尸形态的机械等价类）。
+    const candidate = await createCraftRuleCandidate(repository, {
+      projectId,
+      targetKind: "skill",
+      targetId: skillId,
+      afterText: JSON.stringify({ drafting: "  章尾必须回查本章节奏与伏笔账，禁止以摘要叙述代替可经历的现场；明喻密度超过每千字四处时改写为直接动作或感官证据，保留人物视角的认知边界不被叙述者越权解释，未完成的动作留给下一章承担。  " }),
+      rationale: "重复提交既有规则",
+      scope: makeScope(),
+    });
+    expect(candidate.status).toBe("rejected");
+    expect(candidate.reviews[0]).toMatchObject({ verdict: "rejected", reviewerId: "overlap-check" });
+    expect(candidate.reviews[0].summary).toContain("superseded-by-manual");
+    // 幂等：同输入重放命中同一 rejected 行（不制造第二条队列记录）。
+    const again = await createCraftRuleCandidate(repository, {
+      projectId, targetKind: "skill", targetId: skillId,
+      afterText: JSON.stringify({ drafting: "章尾必须回查本章节奏与伏笔账，禁止以摘要叙述代替可经历的现场；明喻密度超过每千字四处时改写为直接动作或感官证据，保留人物视角的认知边界不被叙述者越权解释，未完成的动作留给下一章承担。" }),
+      rationale: "重复提交既有规则", scope: makeScope(),
+    });
+    expect(again.id).toBe(candidate.id);
+  });
+
+  it("SK-2 反向：新增执行点段/实质改写的候选不被重合门误杀（仍 proposed）", async () => {
+    if (!postgresAvailable) return;
+    const projectId = `test-craft-notnoop-${randomUUID().slice(0, 8)}`;
+    await repository.ensureProject(projectId, "Craft NotNoop Test");
+    const skillId = "test-craft-notnoop-skill";
+    await repository.pool.query(
+      `INSERT INTO skill_definitions(skill_id, version, prompt_sections) VALUES($1, '1.0.0', $2::jsonb)
+       ON CONFLICT(skill_id) DO UPDATE SET version = EXCLUDED.version, prompt_sections = EXCLUDED.prompt_sections`,
+      [skillId, JSON.stringify({ drafting: "原始指引内容：保持窗口边界与已冻结事实，修订只动证据不动结论，逐场景核对状态转换并保留可验证的入口压力。" })],
+    );
+    const candidate = await createCraftRuleCandidate(repository, {
+      projectId,
+      targetKind: "skill",
+      targetId: skillId,
+      // drafting 段与现文一致但新增 chapter.revision 段——合并后有净变化，重合门必须放行。
+      afterText: JSON.stringify({
+        drafting: "  原始指引内容：保持窗口边界与已冻结事实，修订只动证据不动结论，逐场景核对状态转换并保留可验证的入口压力。 ",
+        "chapter.revision": "修订时优先修复因果断点而不是追加新危机，保留既有效果链并给出可验证的证据变化路径与最小改动面说明，禁止用新增外部事件掩盖过程缺失导致的因果断裂。",
+      }),
+      rationale: "为修订阶段补一份缺失指引",
+      scope: makeScope(),
+    });
+    expect(candidate.status).toBe("proposed");
+  });
 
   it("skill target happy path: create → inspect → recordEvidence → evaluate → review → promote → rollback", async () => {
     if (!postgresAvailable) return;
@@ -719,5 +791,161 @@ describe("craft-rule integration", () => {
       [projectId, assessmentId],
     );
     expect(remaining.rows[0].count).toBe("0");
+  });
+
+  it("SK-3 聚合通道：证据追加去重幂等、outbox 留痕；幻觉 id 与已出队候选被守卫拒绝", async () => {
+    if (!postgresAvailable) return;
+    const projectId = `test-craft-aggregate-${randomUUID().slice(0, 8)}`;
+    await repository.ensureProject(projectId, "Craft Aggregate Test");
+    const skillId = "test-craft-aggregate-skill";
+    await repository.pool.query(
+      `INSERT INTO skill_definitions(skill_id, version, prompt_sections) VALUES($1, '1.0.0', $2::jsonb)
+       ON CONFLICT(skill_id) DO UPDATE SET version = EXCLUDED.version, prompt_sections = EXCLUDED.prompt_sections`,
+      [skillId, JSON.stringify({ drafting: "聚合测试基线指引内容，长度需要达到候选校验的最低要求所以这里补充一些通用文字说明。" })],
+    );
+    const candidate = await createCraftRuleCandidate(repository, {
+      projectId, targetKind: "skill", targetId: skillId,
+      afterText: JSON.stringify({ drafting: "聚合测试候选的完整替换规则文本，必须显著区别于基线内容才能通过创建校验进入队列等待聚合。".repeat(3) }),
+      rationale: "聚合通道验证", scope: makeScope(),
+    });
+    expect(candidate.status).toBe("proposed");
+
+    expect(await repository.aggregateCraftRuleCandidateLearning({ projectId, candidateId: candidate.id, assessmentId: "learning-ag-1" })).toBe(true);
+    // 幂等重放不增长。
+    expect(await repository.aggregateCraftRuleCandidateLearning({ projectId, candidateId: candidate.id, assessmentId: "learning-ag-1" })).toBe(true);
+    expect(await repository.aggregateCraftRuleCandidateLearning({ projectId, candidateId: candidate.id, assessmentId: "learning-ag-2" })).toBe(true);
+    const stored = await repository.pool.query<{ learning_source: Record<string, unknown> }>(
+      "SELECT learning_source FROM craft_rule_candidates WHERE id=$1", [candidate.id],
+    );
+    expect(stored.rows[0].learning_source.aggregateAssessments).toEqual(["learning-ag-1", "learning-ag-2"]);
+    const events = await repository.pool.query<{ count: string }>(
+      "SELECT count(*)::text AS count FROM outbox_events WHERE aggregate_type='craft-rule-candidate' AND aggregate_id=$1 AND event_type='craft-rule.candidate-aggregated'",
+      [candidate.id],
+    );
+    expect(Number(events.rows[0].count)).toBe(2); // 每次真实追加留一条事件（幂等重放不留）
+
+    // 守卫双向：幻觉 id 与已出队（promoted）候选都拒绝，让调用方回退新建。
+    expect(await repository.aggregateCraftRuleCandidateLearning({ projectId, candidateId: "crc-does-not-exist", assessmentId: "learning-ag-3" })).toBe(false);
+    await repository.pool.query("UPDATE craft_rule_candidates SET status='promoted' WHERE id=$1", [candidate.id]);
+    expect(await repository.aggregateCraftRuleCandidateLearning({ projectId, candidateId: candidate.id, assessmentId: "learning-ag-4" })).toBe(false);
+    // pending 队列投影只含未关闭三态。
+    const pending = await repository.listPendingCraftRuleCandidates(projectId);
+    expect(pending.map((item) => item.id)).not.toContain(candidate.id);
+  });
+
+  it("SK-2 路线二：skill 晋升生成待审 yaml patch sidecar（receipt.yamlPatch），seed 缺失/无变化不产工件", async () => {
+    if (!postgresAvailable) return;
+    const os = await import("node:os");
+    const fsp = await import("node:fs/promises");
+    const nodePath = await import("node:path");
+    const skillRoot = await fsp.mkdtemp(nodePath.join(os.tmpdir(), "skill-patch-"));
+    const prevRoot = process.env.NOVEL_SKILL_ROOT;
+    process.env.NOVEL_SKILL_ROOT = skillRoot;
+    try {
+      const projectId = `test-craft-patch-${randomUUID().slice(0, 8)}`;
+      await repository.ensureProject(projectId, "Craft Patch Test");
+      // skill_definitions 是全局表：测试 id 必须每次运行唯一，否则重跑撞主键/脏基线。
+      const runTag = randomUUID().slice(0, 8);
+      const skillId = `test-craft-patch-skill-${runTag}`;
+      // 正向：workspace seed 存在（1.0.0），晋升后 sidecar 出现且内容含新版本+晋升注释。
+      await fsp.writeFile(nodePath.join(skillRoot, `${skillId}.yaml`), [
+        `skillId: ${skillId}`,
+        "version: 1.0.0",
+        "executionPoints: [chapter.drafting]",
+        "capabilities: [continuity]",
+        "# 裁决者手工注释：挂在非晋升触碰的扩展键上（N3/D5：Document 原位 set 保留文档级注释）",
+        "authorNote: 手工笔记",
+        "promptSections:",
+        "  chapter.drafting: |",
+        "    原始指引内容，长度需要达到最低要求所以补充一些通用文字说明在这里。",
+        "",
+      ].join("\n"), "utf8");
+      await repository.pool.query(
+        `INSERT INTO skill_definitions(skill_id, version, prompt_sections, execution_points) VALUES($1, '1.0.0', $2::jsonb, $3::text[])
+         ON CONFLICT(skill_id) DO UPDATE SET version = EXCLUDED.version, prompt_sections = EXCLUDED.prompt_sections, execution_points = EXCLUDED.execution_points`,
+        [skillId, JSON.stringify({ "chapter.drafting": "原始指引内容，长度需要达到最低要求所以补充一些通用文字说明在这里。" }), ["chapter.drafting"]],
+      );
+      const candidate = await createCraftRuleCandidate(repository, {
+        projectId, targetKind: "skill", targetId: skillId,
+        afterText: JSON.stringify({ "chapter.drafting": "晋升后的新指引内容，替换原始段落并显著加长以满足候选最低长度校验要求，这里继续补充通用说明文字。".repeat(2) }),
+        rationale: "patch 工件生成验证", scope: makeScope(),
+      });
+      await evaluateCraftRuleOnFoundation(repository, makeModelWithScoreDelta(70, 85), { projectId, candidateId: candidate.id, taskKey: "project-positioning", scenarioClass: "场景甲", scenarioRole: "source-failure" });
+      await evaluateCraftRuleOnFoundation(repository, makeModelWithScoreDelta(70, 85), { projectId, candidateId: candidate.id, taskKey: "worldview", scenarioClass: "场景乙", scenarioRole: "cross-scenario" });
+      await submitCraftRuleReview(repository, { projectId, candidateId: candidate.id, role: "internal", reviewerId: "t", reviewRunId: "r-1", model: "in-memory", verdict: "passed", summary: "ok", concerns: [] });
+      const promoted = await promoteCraftRuleCandidate(repository, makeModelWithScoreDelta(85, 85), { projectId, candidateId: candidate.id });
+      expect(promoted.receipt.status).toBe("promoted");
+      const receipt = await repository.pool.query<{ result: Record<string, unknown> }>(
+        "SELECT result FROM promotion_receipts WHERE id=$1", [`promote:${candidate.id}`],
+      );
+      const patch = receipt.rows[0].result.yamlPatch as Record<string, unknown>;
+      expect(patch.skillId).toBe(skillId);
+      expect(patch.version).toBe("1.0.1");
+      expect(typeof patch.sidecarFile).toBe("string");
+      const sidecarText = await fsp.readFile(nodePath.resolve(process.cwd(), String(patch.sidecarFile)), "utf8");
+      expect(sidecarText).toContain("version: 1.0.1");
+      expect(sidecarText).toContain(`# promoted:${skillId}@1.0.1 candidate=${candidate.id}`);
+      expect(sidecarText).toContain("晋升后的新指引内容");
+      // N3/D5：手工注释随 Document 原位 set 存活（此前 parse→stringify 全丢，
+      // changed 恒真、already-in-seed 分支不可达）。
+      expect(sidecarText).toContain("裁决者手工注释");
+      expect(sidecarText).toContain("authorNote: 手工笔记");
+
+      // rollback 失效面（审核 N4）：DB 回滚后待审 sidecar 是陈旧工件，必须消失，
+      // 防止 `--apply` 把已回滚内容再写进 seed；版本随 rollback 回到 1.0.0。
+      const rolledBack = await rollbackCraftRuleCandidate(repository, makeModelWithScoreDelta(85, 85), { projectId, candidateId: candidate.id });
+      expect(rolledBack.candidate.status).toBe("rolled-back");
+      await expect(fsp.readFile(nodePath.resolve(process.cwd(), String(patch.sidecarFile)), "utf8")).rejects.toThrow();
+
+      // 反向二（D6/test#4 第三分支）：seed 已与晋升快照全等、DB 回到晋升前版本
+      // （真实对应"seed 先行同步/回滚后重放"）→ changed=false → already-in-seed。
+      await fsp.writeFile(nodePath.join(skillRoot, `${skillId}.yaml`), sidecarText, "utf8");
+      await repository.pool.query("DELETE FROM promotion_receipts WHERE id=$1", [`promote:${candidate.id}`]);
+      await repository.pool.query("UPDATE craft_rule_candidates SET status='reviewing' WHERE id=$1", [candidate.id]);
+      const replayed = await promoteCraftRuleCandidate(repository, makeModelWithScoreDelta(85, 85), { projectId, candidateId: candidate.id });
+      expect(replayed.receipt.status).toBe("promoted");
+      const replayReceipt = await repository.pool.query<{ result: Record<string, unknown> }>("SELECT result FROM promotion_receipts WHERE id=$1", [`promote:${candidate.id}`]);
+      expect((replayReceipt.rows[0].result.yamlPatch as Record<string, unknown>).skipped).toBe("already-in-seed");
+      // 反向三：不合法 targetId（路径注入形态）→ 显式 skipped 而非落盘。
+      const evilId = `../evil-skill-${runTag}`;
+      await repository.pool.query(
+        `INSERT INTO skill_definitions(skill_id, version, prompt_sections, execution_points) VALUES($1, '1.0.0', $2::jsonb, $3::text[])`,
+        [evilId, JSON.stringify({ "chapter.drafting": "非法 id 测试基线指引内容，长度需要达到最低要求所以补充通用说明在这里。" }), ["chapter.drafting"]],
+      );
+      const evil = await createCraftRuleCandidate(repository, {
+        projectId, targetKind: "skill", targetId: evilId,
+        afterText: JSON.stringify({ "chapter.drafting": "非法 id 晋升后的替换内容，与基线不同且足够长通过候选创建校验，这里继续补通用说明。".repeat(2) }),
+        rationale: "targetId 净化验证", scope: makeScope(),
+      });
+      await evaluateCraftRuleOnFoundation(repository, makeModelWithScoreDelta(70, 85), { projectId, candidateId: evil.id, taskKey: "project-positioning", scenarioClass: "场景甲", scenarioRole: "source-failure" });
+      await evaluateCraftRuleOnFoundation(repository, makeModelWithScoreDelta(70, 85), { projectId, candidateId: evil.id, taskKey: "worldview", scenarioClass: "场景乙", scenarioRole: "cross-scenario" });
+      await submitCraftRuleReview(repository, { projectId, candidateId: evil.id, role: "internal", reviewerId: "t", reviewRunId: "r-3", model: "in-memory", verdict: "passed", summary: "ok", concerns: [] });
+      await promoteCraftRuleCandidate(repository, makeModelWithScoreDelta(85, 85), { projectId, candidateId: evil.id });
+      const evilReceipt = await repository.pool.query<{ result: Record<string, unknown> }>("SELECT result FROM promotion_receipts WHERE id=$1", [`promote:${evil.id}`]);
+      expect((evilReceipt.rows[0].result.yamlPatch as Record<string, unknown>).skipped).toBe("unsafe-target-id");
+
+      // 反向一：seed 缺失的 skill → skipped:no-workspace-seed，不产 sidecar。
+      const orphanId = `test-craft-patch-orphan-${runTag}`;
+      await repository.pool.query(
+        `INSERT INTO skill_definitions(skill_id, version, prompt_sections, execution_points) VALUES($1, '1.0.0', $2::jsonb, $3::text[])`,
+        [orphanId, JSON.stringify({ "chapter.drafting": "孤儿测试基线指引内容，长度需要达到最低要求所以补充一些通用文字说明。" }), ["chapter.drafting"]],
+      );
+      const orphan = await createCraftRuleCandidate(repository, {
+        projectId, targetKind: "skill", targetId: orphanId,
+        afterText: JSON.stringify({ "chapter.drafting": "孤儿测试晋升后的替换内容，与基线显著不同且足够长以通过创建校验，这里继续补充通用说明。".repeat(2) }),
+        rationale: "无 seed 面验证", scope: makeScope(),
+      });
+      await evaluateCraftRuleOnFoundation(repository, makeModelWithScoreDelta(70, 85), { projectId, candidateId: orphan.id, taskKey: "project-positioning", scenarioClass: "场景甲", scenarioRole: "source-failure" });
+      await evaluateCraftRuleOnFoundation(repository, makeModelWithScoreDelta(70, 85), { projectId, candidateId: orphan.id, taskKey: "worldview", scenarioClass: "场景乙", scenarioRole: "cross-scenario" });
+      await submitCraftRuleReview(repository, { projectId, candidateId: orphan.id, role: "internal", reviewerId: "t", reviewRunId: "r-2", model: "in-memory", verdict: "passed", summary: "ok", concerns: [] });
+      const orphanPromoted = await promoteCraftRuleCandidate(repository, makeModelWithScoreDelta(85, 85), { projectId, candidateId: orphan.id });
+      const orphanReceipt = await repository.pool.query<{ result: Record<string, unknown> }>("SELECT result FROM promotion_receipts WHERE id=$1", [`promote:${orphan.id}`]);
+      expect((orphanReceipt.rows[0].result.yamlPatch as Record<string, unknown>).skipped).toBe("no-workspace-seed");
+      expect(orphanPromoted.receipt.status).toBe("promoted");
+    } finally {
+      if (prevRoot === undefined) delete process.env.NOVEL_SKILL_ROOT;
+      else process.env.NOVEL_SKILL_ROOT = prevRoot;
+      await fsp.rm(skillRoot, { recursive: true, force: true });
+    }
   });
 });

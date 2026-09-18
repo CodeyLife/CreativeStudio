@@ -87,7 +87,10 @@ type JsonSchema = Record<string, unknown>;
 
 const stringSchema: JsonSchema = { type: "string", minLength: 1 };
 const stringOrObjectSchema: JsonSchema = { anyOf: [{ type: "string", minLength: 1 }, { type: "object" }] };
-const nonEmptyArraySchema = (items: JsonSchema = { type: "object" }): JsonSchema => ({ type: "array", minItems: 1, items });
+// 默认成员形态 string∪object：校验器激活（PL-8）前这些约束从未真正验证过数据，
+// 无证据支持"成员必须是对象"；契约只强制键存在、数组非空与已验证的嵌套结构
+// （volumes/rules/destinations 等各自显式给 items），散文列表两可形态都合法。
+const nonEmptyArraySchema = (items: JsonSchema = stringOrObjectSchema): JsonSchema => ({ type: "array", minItems: 1, items });
 const objectSchema = (required: string[], properties: Record<string, JsonSchema> = {}): JsonSchema => ({
   type: "object",
   additionalProperties: true,
@@ -170,7 +173,7 @@ const foundationDataSchemas: Record<string, JsonSchema> = {
     volumes: nonEmptyArraySchema(architectureVolumeSchema),
     povStrategy: stringSchema,
     timeSpan: stringSchema,
-    longHorizonBoundaries: { type: "object" },
+    longHorizonBoundaries: stringOrObjectSchema,
   }),
   characters: nonEmptyArraySchema(objectSchema(["id", "name", "role", "motivation", "fear", "voiceAnchor", "arc", "independentAction"], {
     id: stringSchema,
@@ -178,14 +181,17 @@ const foundationDataSchemas: Record<string, JsonSchema> = {
     role: stringSchema,
     motivation: stringSchema,
     fear: stringSchema,
-    voiceAnchor: { type: "object" },
-    arc: { type: "object" },
+    // 散文语义字段的合法形态是"文本或结构"两可（模型两种都稳定产出）；校验的价值在
+    // 键存在与数组类型，不在猜叶子形态，故用 union。纯 string 字段（role/motivation…）
+    // 的 stringSchema 保持收紧。
+    voiceAnchor: stringOrObjectSchema,
+    arc: stringOrObjectSchema,
     independentAction: independentActionSchema,
   })),
   worldview: objectSchema(["geography", "politics", "factions", "rules"], {
-    geography: { type: "object" },
-    politics: { type: "object" },
-    factions: nonEmptyArraySchema(),
+    geography: stringOrObjectSchema,
+    politics: stringOrObjectSchema,
+    factions: nonEmptyArraySchema(stringOrObjectSchema),
     rules: nonEmptyArraySchema(objectSchema(["statement", "cost", "boundary"], {
       statement: stringSchema,
       cost: stringSchema,
@@ -212,7 +218,9 @@ const foundationDataSchemas: Record<string, JsonSchema> = {
     evolution: { type: "object" },
     choiceConsequence: stringSchema,
   })),
-  plotThreads: objectSchema(["main", "subplots"], { main: { type: "object" }, subplots: nonEmptyArraySchema() }),
+  // legacy 任务（五阶段外）：历史数据 main 为字符串列表（见 foundation-contract 测试
+  // fixture 复刻的真实形态），校验器激活前该约束从未验证过数据——按实际历史形态放开。
+  plotThreads: objectSchema(["main", "subplots"], { main: { anyOf: [{ type: "string", minLength: 1 }, { type: "object" }, { type: "array" }] }, subplots: nonEmptyArraySchema() }),
   foreshadowings: nonEmptyArraySchema(objectSchema(["id", "description", "expectedPayoffWindow"], { id: stringSchema, description: stringSchema, expectedPayoffWindow: stringSchema })),
   timeline: objectSchema(["storyEvents"], { storyEvents: nonEmptyArraySchema() }),
   storyControl: objectSchema(["paceCurve", "payoffDistribution"], { paceCurve: nonEmptyArraySchema(), payoffDistribution: nonEmptyArraySchema() }),
@@ -225,7 +233,7 @@ const foundationDataSchemas: Record<string, JsonSchema> = {
       notDesigned: { type: "array", items: { type: "object" } },
       open: { type: "array", items: { type: "object" } },
     }),
-    endingEnvelope: { type: "object" },
+    endingEnvelope: stringOrObjectSchema,
     nonNegotiables: nonEmptyArraySchema({ type: "string", minLength: 1 }),
   }),
 };
@@ -279,11 +287,62 @@ export function normalizeFoundationStructuredDataFlat(root: Record<string, unkno
   const contract = FOUNDATION_TASK_CONTRACTS[taskKey];
   if (!contract) return root;
   if (foundationDataSchemaForTask(taskKey)?.type === "array") return root;
+  let flat: Record<string, unknown> = root;
   const container = root[contract.dataRoot];
   if (container && typeof container === "object" && !Array.isArray(container)) {
-    return container as Record<string, unknown>;
+    flat = container as Record<string, unknown>;
   }
-  return root;
+  // 别名迁移（product-audit-20260910 B3/PL-8）：第一代 prompt 的 informationBoundaries 用
+  // hiddenInformation/notDesignedYet 键与裸字符串成员；契约规范形态是 {hidden,notDesigned,open}
+  // 对象数组（作者秘密对象化：至少含 claim）。结构重命名不改语义，未知键原样保留
+  // （additionalProperties 是刻意的前向兼容面）。旧段完全缺键时按"未显式声明"归 []。
+  if (taskKey === "plot-design") {
+    const boundaries = flat.informationBoundaries;
+    if (boundaries && typeof boundaries === "object" && !Array.isArray(boundaries)) {
+      const renamed: Record<string, unknown> = { ...(boundaries as Record<string, unknown>) };
+      const toMembers = (value: unknown): unknown[] | unknown => Array.isArray(value)
+        ? value.map((member) => (typeof member === "string" ? { claim: member } : member))
+        : value;
+      for (const [legacyKey, canonicalKey] of [["hiddenInformation", "hidden"], ["notDesignedYet", "notDesigned"]] as const) {
+        if (renamed[canonicalKey] === undefined && renamed[legacyKey] !== undefined) {
+          renamed[canonicalKey] = toMembers(renamed[legacyKey]);
+          delete renamed[legacyKey];
+        }
+      }
+      for (const canonicalKey of ["hidden", "notDesigned", "open"] as const) {
+        if (renamed[canonicalKey] === undefined) renamed[canonicalKey] = [];
+        else renamed[canonicalKey] = toMembers(renamed[canonicalKey]);
+      }
+      flat = { ...flat, informationBoundaries: renamed };
+    }
+  }
+  // 卷序记法归一（PL-8，纯记法非语义）：契约要求 responsibleVolumeOrdinals 为整数，模型
+  // 惯用 "V1"/"卷2"/"第3卷" 指称同一概念（跨题材通用记法，与 hiddenInformation 别名同类）。
+  // 可无损映射整数的成员归一；映射不了的保留原值交校验如实报告。刻意**不**修 narrativePromises
+  // 装错容器、coupling 对象等真·内容缺陷——那属语义问题，自动拍平会制造"通过校验的垃圾"，
+  // 由 stale-foundation-contract 暴露给作者/重新生成回路处理。
+  const volumeOrdinal = (value: unknown): number | null => {
+    if (typeof value === "number" && Number.isInteger(value) && value > 0) return value;
+    if (typeof value !== "string") return null;
+    const bare = /^\d+$/u.exec(value) ? value : null;
+    const prefixed = /^[Vv]\s*(\d+)$/.exec(value)?.[1] ?? /^卷\s*(\d+)$/.exec(value)?.[1] ?? /^第\s*(\d+)\s*卷$/.exec(value)?.[1];
+    const resolved = bare ?? prefixed;
+    return resolved ? Number(resolved) : null;
+  };
+  if (taskKey === "plot-design" && Array.isArray(flat.longHorizonThreads)) {
+    flat = {
+      ...flat,
+      longHorizonThreads: (flat.longHorizonThreads as unknown[]).map((thread) => {
+        if (!thread || typeof thread !== "object" || Array.isArray(thread)) return thread;
+        const item = thread as Record<string, unknown>;
+        if (!Array.isArray(item.responsibleVolumeOrdinals)) return thread;
+        const members = (item.responsibleVolumeOrdinals as unknown[]).map((entry) => volumeOrdinal(entry) ?? entry);
+        const allNumeric = members.every((entry) => typeof entry === "number");
+        return allNumeric ? { ...item, responsibleVolumeOrdinals: members } : thread;
+      }),
+    };
+  }
+  return flat;
 }
 
 /** Decode the compact native boundary; object-rooted tasks are flattened to the task data. */
@@ -404,10 +463,19 @@ function validateArchitectureVolumes(structuredData: Record<string, unknown>, er
 }
 
 /** Resolve the task data schema by taskKey or its dataRoot container key. */
-function foundationDataSchemaForTask(taskKey: string): JsonSchema | undefined {
+export function foundationDataSchemaForTask(taskKey: string): JsonSchema | undefined {
   const contract = FOUNDATION_TASK_CONTRACTS[taskKey];
   return foundationDataSchemas[taskKey] ?? (contract ? foundationDataSchemas[contract.dataRoot] : undefined);
 }
+
+/**
+ * 契约内容指纹（PL-8）：批准时落进 section payload，health 重算对比——契约（requiredPaths
+ * + data schema + 别名迁移）一旦演进，旧的 approved 段即报 `approved-but-stale-contract`，
+ * 让"契约演进无痕迹"（审计 B3：校验修了没人知道哪些段是修复前批的）变成可观测状态。
+ * 无手写版本号，自动追踪代码演进。
+ * 实现位于 ./foundation-contract-fingerprint（sha256 依赖 node:crypto，本模块会被
+ * workflow 沙箱打包，禁止顶层引入 node:crypto——2026-09-08 与 2026-09-11 两次实证）。
+ */
 
 /** Validate semantic fields that generic foundationSchema cannot express. */
 export function validateFoundationTaskContract(value: FoundationOutput, taskKey: string): string[] {
@@ -421,6 +489,10 @@ export function validateFoundationTaskContract(value: FoundationOutput, taskKey:
     const validate = new Ajv({ allErrors: true, strict: false }).compile(arrayRooted
       ? { type: "object", additionalProperties: true, required: [contract.dataRoot], properties: { [contract.dataRoot]: taskDataSchema } }
       : taskDataSchema);
+    // 根因修复（product-audit-20260910 B3/PL-8）：此前 compile 后从未调用，未调用的
+    // validator 的 errors 恒为 undefined——schema 层校验自落地起即为死代码，键名漂移、
+    // 类型错误（integer 数组装 "V1"）、子对象缺键全部静默放行。必须真正执行。
+    validate(structuredData);
     for (const issue of validate.errors ?? []) {
       const missingRoot = arrayRooted
         && issue.keyword === "required"

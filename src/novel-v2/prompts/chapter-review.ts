@@ -10,6 +10,9 @@ import { normalizeReviewIssueReaderEvidence, READER_RECONSTRUCTION_CONTRACT } fr
 
 export type ReviewerRole = "structure-reviewer" | "character-reviewer" | "prose-reviewer";
 
+/** E4（product-audit-20260910）：意图变更范围档位常量（评审面收窄的单一真源）。 */
+export const CHAPTER_CHANGE_SCOPES = ["mechanical-format", "local-text", "narrative"] as const;
+
 export const REVIEW_ROLE_EXECUTION_POINTS: Record<ReviewerRole, SkillExecutionPoint> = {
   "structure-reviewer": "chapter.review.structure",
   "character-reviewer": "chapter.review.character",
@@ -98,8 +101,14 @@ function reviewInstruction(input: ReviewPromptInput, memory: MemoryBundle): stri
     "",
     "关系、生活、背景、内省或余波章节可以通过过程、理解、关系温度或语言体验成立；只检查当前章节合同和事实边界，不要求每章发生不可逆变化，不提前消费后续规划。",
   ];
-  if (input.stageGoal) lines.push("", "## 本轮阶段目标", input.stageGoal.authorInstruction || "无额外作者要求", "验收点：" + (input.stageGoal.acceptanceCriteria.join("；") || "按本角色职责判断"), "允许范围：" + input.stageGoal.allowedChangeScope);
-  if (memory.claims.length) lines.push("", "相关冻结事实数量：" + memory.claims.length + "；只以这些来源和正文证据为准。");
+  if (input.stageGoal) {
+    lines.push("", "## 本轮阶段目标", input.stageGoal.authorInstruction || "无额外作者要求", "验收点：" + (input.stageGoal.acceptanceCriteria.join("；") || "按本角色职责判断"), "允许范围：" + input.stageGoal.allowedChangeScope);
+    // 验收点核实纪律（2026-09-11 实证：修订轮评审把上一轮问题当作结论复述，摘录引用
+    // 修订前文本，导致连续多轮 revise）。验收点是待核实清单而非待复述的结论——这是
+    // 通用机制约束，适用于所有修订轮评审角色，不绑定任何具体章节或问题。
+    lines.push("验收点核实纪律：验收点条目是此前轮次提出的问题或本轮修订目标，必须逐条对照当前正文重新核实——正文已解决的直接视为通过（verdict 与 issues 按当前文本实际状态给出），不再作为 issue 复述；只有当前正文中仍存在可引用证据的问题才能立为 issue，且 excerpt 必须摘自当前正文，不得沿用历史摘录。");
+  }
+  if (memory.claims.length) lines.push("", "相关冻结事实数量：" + memory.claims.filter((claim) => !claim.id.startsWith("foundation:")).length + "；只以这些来源和正文证据为准。");
   return lines.join("\n");
 }
 
@@ -112,7 +121,19 @@ export function buildChapterReviewPromptPackage(input: ReviewPromptInput & { wor
     ...(input.planningContext ? [{ id: "execution-contract", kind: "planning" as const, title: "章节执行合同", text: renderChapterExecutionContract(input.planningContext), priority: "required" as const, provenanceRefs: [input.planningContext.fingerprint] }] : []),
     ...(memory.narrativeRhythm ? [{ id: "narrative-rhythm", kind: "planning" as const, title: "连续章节位置", text: renderNarrativeRhythm(memory.narrativeRhythm), priority: "normal" as const, provenanceRefs: [memory.narrativeRhythm.fingerprint] }] : []),
     ...(memory.serialContext ? [{ id: "serial-context", kind: "planning" as const, title: "跨章序列证据", text: renderSerialContext(memory.serialContext), priority: "normal" as const, provenanceRefs: [memory.serialContext.fingerprint] }] : []),
-    ...memory.claims.map((claim) => ({ id: "memory:" + claim.id, kind: "fact" as const, title: "相关事实：" + claim.title, text: claim.content, priority: memoryClaimPriority(memory, claim), provenanceRefs: [claim.id, ...claim.sourceRevisionIds] })),
+    ...memory.claims.filter((claim) => !claim.id.startsWith("foundation:")).map((claim) => ({ id: "memory:" + claim.id, kind: "fact" as const, title: "相关事实：" + claim.title, text: claim.content, priority: memoryClaimPriority(memory, claim), provenanceRefs: [claim.id, ...claim.sourceRevisionIds] })),
+    // A2 分轨：foundation 投影是创作边界契约，事实连续性 issue 不以规划措辞为准。
+    ...(memory.claims.some((claim) => claim.id.startsWith("foundation:")) ? [{
+      id: "creative-contract",
+      kind: "planning" as const,
+      title: "创作契约（已批准规划投影）",
+      text: [
+        "以下是已批准的全局规划投影。审校时作为创作边界参考：正文与契约方向冲突可提示，但事实/连续性 issue 的判定依据是冻结事实与正文证据，不得以规划措辞本身为准绳。",
+        ...memory.claims.filter((claim) => claim.id.startsWith("foundation:")).map((claim) => `- ${claim.title}: ${claim.content}`),
+      ].join("\n"),
+      priority: "normal" as const,
+      provenanceRefs: memory.claims.filter((claim) => claim.id.startsWith("foundation:")).map((claim) => claim.id),
+    }] : []),
     ...buildSkillContextSections(skills ?? { skills: [] }, skills?.executionPoint ?? reviewExecutionPoint(input.role), "审校 Skill"),
   ];
   const purpose = ({ "structure-reviewer": "review.structure", "character-reviewer": "review.character", "prose-reviewer": "review.prose" } as const)[input.role];
@@ -122,10 +143,40 @@ export function buildChapterReviewPromptPackage(input: ReviewPromptInput & { wor
   return compileStageContext({ projectId: input.artifact.projectId, workflowId: input.workflowId, purpose, stage: "review", system: input.system, schema: reviewerSchema, maxInputTokens: input.blueprint.budget.maxInputTokens, reservedOutputTokens: input.blueprint.budget.maxOutputTokens, goal: input.stageGoal, skillManifest: skills?.resolution, sections });
 }
 
-export function toReview(params: { artifact: Artifact; identity: "internal" | "independent"; role: ReviewerRole; output: ReviewerOutput }): Review {
-  const issues: ReviewIssue[] = params.output.issues.map((issue) => {
+export function toReview(params: { artifact: Artifact; identity: "internal" | "independent"; role: ReviewerRole; output: ReviewerOutput; currentText?: string }): Review {
+  const mapped: ReviewIssue[] = params.output.issues.map((issue) => {
     const normalized = normalizeReviewIssueReaderEvidence(issue);
     return { severity: normalized.severity, title: normalized.title, description: normalized.description, evidence: normalized.excerpt ?? normalized.description, excerpt: normalized.excerpt, paragraph: normalized.paragraph ?? normalized.revisionRanges[0]?.start, revisionRanges: normalized.revisionRanges, rule: normalized.rule, sourceId: normalized.sourceId, suggestion: normalized.suggestion, readerReconstruction: normalized.readerReconstruction };
   });
-  return { id: randomUUID(), projectId: params.artifact.projectId, artifactId: params.artifact.id, reviewerId: params.identity + "-" + params.role, identity: params.identity, role: params.role, verdict: params.output.verdict, issues, score: params.output.score, createdAt: Date.now(), artifactFingerprint: params.artifact.fingerprint };
+  // 摘录在场性机械门禁：复审 prompt 会内嵌上一轮 stageGoal（旧 issue 标题与作者逐字
+  // 引文），复读型模型会把已消失的旧文本当作"当前正文仍存在的问题"原样再报（弧10 ch67
+  // 实证：修订稿已净、复审仍引用旧稿句作证据并把修订拖进回滚死循环）。契约本就要求
+  // "excerpt 必须摘自当前正文"（验收点核实纪律），这里把该契约从提示词自觉升级为输出
+  // 机械执行：摘录（按省略号分段后）每一段都不在当前正文中且存在 ≥8 字的长段 → 判为
+  // 陈旧复读、丢弃；无摘录或短摘录不判（保守不误杀）。verdict 因全部 issue 被丢弃而
+  // 悬空时按契约语义（revise=存在可修复问题）回推 passed，score 不动。
+  let issues = mapped;
+  let verdict = params.output.verdict;
+  if (params.currentText) {
+    const kept = mapped.filter((issue) => !isStaleExcerptIssue(issue, params.currentText!));
+    if (kept.length < mapped.length) {
+      issues = kept;
+      if (verdict === "revise" && kept.length === 0) verdict = "passed";
+    }
+  }
+  return { id: randomUUID(), projectId: params.artifact.projectId, artifactId: params.artifact.id, reviewerId: params.identity + "-" + params.role, identity: params.identity, role: params.role, verdict, issues, score: params.output.score, createdAt: Date.now(), artifactFingerprint: params.artifact.fingerprint };
+}
+
+/**
+ * 纯谓词：issue 的摘录是否为"当前正文中已不存在的旧文"（复读）。分段规则与
+ * 判定保守性见 toReview 注释；可跨题材/角色复用，不识别任何特定内容。
+ */
+export function isStaleExcerptIssue(issue: { excerpt?: string; evidence?: string }, currentText: string): boolean {
+  const excerpt = (issue.excerpt ?? issue.evidence ?? "").trim();
+  if (!excerpt) return false;
+  const normalize = (s: string) => s.replace(/[\s\p{P}\p{S}]/gu, "");
+  const hay = normalize(currentText);
+  const segments = excerpt.split(/[…⋯]+|\.{3,}/u).map(normalize).filter((s) => s.length >= 8);
+  if (!segments.length) return false;
+  return segments.every((segment) => !hay.includes(segment));
 }

@@ -137,15 +137,41 @@ export const factExtractionSchema = {
           items: {
             type: "object",
             additionalProperties: false,
-            required: ["description", "triggerKeywords", "expectedPayoffWindow", "readerQuestion", "possiblePayoffs", "meaningDelta", "cost", "evidence"],
+            required: ["description", "anchor", "triggerKeywords", "expectedPayoffWindow", "readerQuestion", "possiblePayoffs", "meaningDelta", "cost", "evidence"],
             properties: {
               description: { type: "string", minLength: 1, description: "伏笔内容描述" },
+              // PL-5③：锚点=承载伏笔的正文载体短词（实物/话语/异象名，如"祠堂石阶的裂缝"），
+              // 跨轮重抽取措辞再改写、载体不变——登记身份按 (文档, 规范化锚点) 归并。
+              anchor: { type: "string", minLength: 1, maxLength: 30, description: "承载本伏笔的正文载体短词（一个名词短语：实物/景象/一句话），不是整句描述" },
               triggerKeywords: {
                 type: "array",
                 items: { type: "string", minLength: 1 },
                 description: "触发关键词（后续章节兑现时应出现的关键词）",
               },
-              expectedPayoffWindow: { type: "string", minLength: 1, description: "预期兑现窗口（如 5 章内、本卷末、长篇后期）" },
+              // PL-5①写侧：窗口结构化（自由文本 24 形态是 overdue 不可判的根因）。
+              // strict json_schema 契约下"可选"= 可空类型联合（properties 必须全 required）。
+              //
+              // 2026-09-18 实测修正（docs/novel-v2/p1-foreshadowing-survey-20260918.md）：
+              // 旧 prompt 给了一个 count:5 的 worked example，导致 168 章实测 494 条可判定条目中
+              // 160 条 delta 恰为 10、75 条恰为 5——期限退化为抽取模型的默认值，overdue 告警
+              // 因此产生 465 条假阳性而彻底失去信号价值。结构性对策（非词表）：schema 层
+              // 明确 null 是合法且首选的不确定表达，prompt 层移除取整示例并标注禁止编造。
+              expectedPayoffWindow: {
+                type: "object",
+                additionalProperties: false,
+                required: ["scope", "count", "from", "to", "note"],
+                properties: {
+                  scope: {
+                    type: "string",
+                    enum: ["chapters", "volume", "book", "unbounded"],
+                    description: "chapters=正文/设计明确给出按章时限；volume/book=卷/全书内；unbounded=时机不明（判断不出时的**正确选择**，不要为填满而选 chapters）",
+                  },
+                  count: { type: ["integer", "null"], description: "scope=chapters：埋设后 N 章内兑现。须有正文或设计依据，禁止凭印象取整；不确定填 null" },
+                  from: { type: ["integer", "null"], description: "scope=chapters：绝对章序范围起，否则 null" },
+                  to: { type: ["integer", "null"], description: "scope=chapters：绝对章序范围止/章点，否则 null。须有依据，禁止编造整数" },
+                  note: { type: ["string", "null"], maxLength: 24, description: "引自正文的原措辞短语（如“三日内”“本月十五”）；无依据时填 null，不要自造" },
+                },
+              },
               readerQuestion: { type: "string", description: "读者会自然产生的具体问题；无法确定时留空" },
               possiblePayoffs: {
                 type: "array",
@@ -223,8 +249,11 @@ export interface FactExtractionOutput {
   narrativeElements: {
     foreshadowings: Array<{
       description: string;
+      /** PL-5③ 锚点：登记身份键成分；旧代输出可缺（退回描述内容键）。 */
+      anchor?: string;
       triggerKeywords: string[];
-      expectedPayoffWindow: string;
+      /** PL-5①：写侧新形态为结构化对象；读侧兼容历史自由文本。 */
+      expectedPayoffWindow: string | PayoffWindowStructured;
       readerQuestion?: string;
       possiblePayoffs?: string[];
       meaningDelta?: string;
@@ -327,6 +356,29 @@ export interface ChapterMemoryOutput {
  * - prompt 只描述通用提取规则，不嵌入任何题材/类型/角色名 fixture
  * - 不内置网文套路识别（走 craft rule 沉淀）
  */
+/**
+ * 兑现窗口结构化形态（PL-5①，product-audit-20260910 B2）：写侧 schema 强制，
+ * 读侧 parsePayoffWindow 同时接受历史自由文本（新旧统一入口）。scope 词表与
+ * narrative-elements.parsePayoffWindow 的结构化分支保持一致。
+ */
+export interface PayoffWindowStructured {
+  scope: "chapters" | "volume" | "book" | "unbounded";
+  count?: number | null;
+  from?: number | null;
+  to?: number | null;
+  note?: string | null;
+}
+
+/**
+ * PL-4（product-audit-20260910 B4）关系谓词受控词表：人类关系的通用短词，跨题材复用，
+ * 不含题材/角色特定项；"其他:<标签>"为逃生通道（写入侧把超词表短语归入该通道），
+ * "未知"等占位词刻意排除（关系未定应写 delta，不伪装成谓词入库、污染检索槽位）。
+ */
+export const RELATION_PREDICATE_WORDS = [
+  "信任", "不信", "敌对", "友好", "合作", "冲突", "疏远", "依恋",
+  "敬畏", "感激", "怨恨", "爱慕", "师徒", "主从", "亲缘", "结盟", "背叛", "提防", "利用",
+] as const;
+
 export const characterEnrichmentSchema = {
   type: "object",
   additionalProperties: false,
@@ -372,7 +424,9 @@ export const characterEnrichmentSchema = {
               required: ["targetCharacterId", "predicate", "delta"],
               properties: {
                 targetCharacterId: { type: "string", minLength: 1 },
-                predicate: { type: "string", minLength: 1 },
+                // PL-4：谓词受控枚举（人类关系通用词集，跨题材）+ `其他:<标签>` 逃生通道。
+                // "未知"类占位词刻意不在枚举内——关系未定写进 delta，不伪装成谓词入库。
+                predicate: { type: "string", pattern: `^(${RELATION_PREDICATE_WORDS.join("|")}|其他:.{1,12})$` },
                 delta: { type: "string", minLength: 1 },
               },
             },
@@ -452,7 +506,9 @@ export const chapterStateDeltaSchema = factExtractionSchema;
  * - 顶层与 section/section-item 层均使用 additionalProperties: true
  * - 原因：LLM 在生成复杂结构化产出时，常会附加 metadata/notes/index 等辅助字段。
  *   additionalProperties: false 会把这些视为非法，导致 schema-validation 失败 →
- *   修复循环 3 次仍失败 → 回退到 external-mcp 候选（若无 worker 则永久卡住）。
+ *   修复循环耗尽 → 跳到下一个 API 候选 → 链尾隐式外部 MCP 兜底（2026-09-07
+ *   机制契约：外部 MCP 不再是显式候选，而是所有调用链的隐式链尾兜底；
+ *   兜底被认领前任务保持 waiting-external，不产生 workflow failed）。
  * - 允许额外字段不影响核心契约：required 字段（title/summary/sections/structuredData
  *   及 section 的 heading/content、item 的 label/detail）仍被强制校验，类型仍被校验。
  * - 不覆盖：LLM 缺失 required 字段或返回错误类型时仍会失败——这类是内容质量问题，

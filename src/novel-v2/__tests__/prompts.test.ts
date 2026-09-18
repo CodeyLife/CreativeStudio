@@ -3,7 +3,7 @@ import { buildChapterDraftPromptPackage, buildFoundationContextMarkdown } from "
 import { dedupeNarrativeRhythmMemory } from "../prompts/chapter-planning-context";
 import { buildFoundationPrompt } from "../prompts/foundation";
 import { buildFoundationReviewPrompt } from "../prompts/foundation-review";
-import { getReviewFocus, toReview } from "../prompts/chapter-review";
+import { getReviewFocus, isStaleExcerptIssue, toReview } from "../prompts/chapter-review";
 import Ajv from "ajv";
 import { buildStoryArcChaptersPrompt, buildStoryArcPlanningContextSections, buildStoryArcPrompt, buildStoryArcRebasePrompt, buildStoryArcReviewPrompt, buildStoryArcRevisionPrompt, storyArcBundleSchema } from "../prompts/story-arc";
 
@@ -101,6 +101,38 @@ describe("long-form prompt contracts", () => {
     });
     expect(prompt).toContain("确认规则的陈述若改变了角色后续选择或风险判断，即算功能");
     expect(prompt).toContain("状态保持稳定也是合法结果");
+    // 窗口契约双向：未声明 windowChapters（旧弧/无预算形态）不得出现窗口句——
+    // 契约只随系统分配走，不凭空发明窗口。
+    expect(prompt).not.toContain("本批次窗口由系统定为");
+  });
+
+  it("批次窗口契约注入生成面（arc5 单章坍缩根因；重基线契约不受影响）", () => {
+    const prompted = buildStoryArcChaptersPrompt({
+      projectTitle: "测试项目",
+      macro: [],
+      recentChapters: [],
+      openThreads: [],
+      arc: { title: "守夜名册与渠道反噬", expectedChapterCount: 7 } as never,
+      batch: { batchIndex: 1, startChapterIndex: 28, complete: false },
+      windowChapters: 7,
+    });
+    expect(prompted).toContain("本批次窗口由系统定为 7 章");
+    expect(prompted).toContain("完整覆盖序号 28 至 34");
+    expect(prompted).toContain("不是缩减本批次章节窗口");
+    // 正常批次面不得混入重基线专属契约文本（两分支契约互不泄漏）。
+    expect(prompted).not.toContain("重基线");
+    expect(prompted).not.toContain("数量必须等于");
+    // 截断窗口（剩余>上限）：数字随系统分配而非硬编码全弧。
+    const capped = buildStoryArcChaptersPrompt({
+      projectTitle: "测试项目",
+      macro: [],
+      recentChapters: [],
+      openThreads: [],
+      arc: { title: "长弧" } as never,
+      batch: { batchIndex: 1, startChapterIndex: 5, complete: false },
+      windowChapters: 16,
+    });
+    expect(capped).toContain("本批次窗口由系统定为 16 章：chapters 必须完整覆盖序号 5 至 20");
   });
 
   it("checks arc design contracts during arc review without requiring per-chapter events or blanket gates", () => {
@@ -139,6 +171,49 @@ describe("long-form prompt contracts", () => {
     expect(prompt).toContain("index、title、narrativeFunction、povCharacterId、stateTransition、scenes、continuityConstraints、unresolvedAtClose");
     expect(prompt).toContain("before、after、evidence 三个非空字符串");
     expect(prompt).toContain("narrativeFunction 必须使用 schema 枚举值");
+  });
+
+  it("重基线 chapters 面携带逐章对应硬契约（数量与序号按 target 泛化），普通批次不携带", () => {
+    const target = {
+      arcId: "arc-x", executionStatus: "completed", approvedArc: {} as never,
+      batchIndex: 1, startChapterIndex: 8,
+      chapters: [8, 9, 10].map((globalOrder) => ({ globalOrder, chapterId: `ch-${globalOrder}`, documentId: `doc-${globalOrder}`, title: `第${globalOrder}章`, revisionId: `rev-${globalOrder}`, committedBlueprint: { index: globalOrder } as never })),
+    } as never;
+    const rebased = buildStoryArcChaptersPrompt({
+      projectTitle: "测试项目", macro: [], recentChapters: [], openThreads: [],
+      arc: { title: "当前弧" } as never,
+      batch: { batchIndex: 1, startChapterIndex: 8, complete: true },
+    }, target);
+    expect(rebased).toContain("数量必须等于 3");
+    expect(rebased).toContain("8、9、10");
+    expect(rebased).toContain("不得只输出单章或窗口子集");
+    // 反方向：普通批次不得出现重基线措辞（防把批次生成误导成冻结保真）。
+    const normal = buildStoryArcChaptersPrompt({
+      projectTitle: "测试项目", macro: [], recentChapters: [], openThreads: [],
+      arc: { title: "当前弧" } as never,
+      batch: { batchIndex: 2, startChapterIndex: 11, complete: false },
+    });
+    expect(normal).not.toContain("重基线");
+    expect(normal).not.toContain("数量必须等于"); // 冻结保真契约词也不许泄漏进普通批次（审核 B#7）
+    expect(normal).not.toContain("逐章对应");
+    // 修订回流面同样带契约（数量泛化自 target）。
+    const revision = buildStoryArcRevisionPrompt(
+      { arc: { title: "当前弧" }, batch: { batchIndex: 1, startChapterIndex: 8, complete: true }, chapters: [] } as never,
+      { opinion: "修一下", verdict: "revise" } as never,
+      "",
+      target,
+    );
+    expect(revision).toContain("数量等于 3");
+    expect(revision).toContain("不得缩减为子集");
+    expect(revision).toContain("chapters[].globalOrder"); // N7/D4：契约字段名必须=StoryArcRebaseTargetChapter 实形
+    // 无 target 的修订回流不得携带任何重基线措辞（双向）。
+    const normalRevision = buildStoryArcRevisionPrompt(
+      { arc: { title: "当前弧" }, batch: { batchIndex: 2, startChapterIndex: 11, complete: false }, chapters: [] } as never,
+      { opinion: "修一下", verdict: "revise" } as never,
+      "",
+    );
+    expect(normalRevision).not.toContain("重基线");
+    expect(normalRevision).not.toContain("数量等于");
   });
 
   it("guards local reactions from becoming unsupported material functions", () => {
@@ -325,6 +400,125 @@ describe("long-form prompt contracts", () => {
     ]);
     expect(sections.find((section) => section.id === "arc-context-recent")?.text).toContain("叙事截止点：第 3 章");
     expect(sections.find((section) => section.id === "arc-context-macro")?.provenanceRefs).toContain("story-arc-section:macro:macro-fp");
+    // 负方向（PL-8③）：无秘密投影时不得出现该段（空清单不注入占位噪声）。
+    expect(sections.map((section) => section.id)).not.toContain("arc-context-secrets");
+  });
+
+  it("injects the undisclosed-secrets ledger into arc planning context and arms the review check (PL-8③)", () => {
+    const sections = buildStoryArcPlanningContextSections({
+      projectTitle: "测试项目",
+      macro: [],
+      recentChapters: [],
+      openThreads: [],
+      undisclosedSecrets: [
+        { claim: "旧秩序维护者的真实动机", revealWindow: "第三卷后" },
+        { claim: "力量体系的底层来源", carrier: "关键道具的来历" },
+      ],
+    });
+    const secrets = sections.find((section) => section.id === "arc-context-secrets");
+    expect(secrets).toBeDefined();
+    expect(secrets?.priority).toBe("required");
+    expect(secrets?.text).toContain("旧秩序维护者的真实动机");
+    expect(secrets?.text).toContain("揭示窗口：第三卷后");
+    expect(secrets?.text).toContain("载体：关键道具的来历");
+    // 段序：秘密清单先于开放候选（边界在消费清单之前呈现）。
+    const ids = sections.map((section) => section.id);
+    expect(ids.indexOf("arc-context-secrets")).toBeLessThan(ids.indexOf("arc-context-open-elements"));
+    // 审核侧：通用检查在场（清单为空时指令自身声明跳过，不依赖注入）。
+    const review = buildStoryArcReviewPrompt({ chapters: [] } as never, "上下文");
+    expect(review).toContain("秘密边界检查");
+    expect(review).toContain("未揭示作者秘密");
+    // P2 负结果收口：字面 carry-run 全书实测为零 → 不建确定性检测器；
+    // "悬念续费"是语义现象，落审核面语义检查（换措辞不换账）。
+    expect(review).toContain("悬念续费检查");
+    expect(review).toContain("语义同一");
+  });
+
+  it("injects the window-elapsed foreshadowing ledger without claiming debt (P1, 2026-09-18 语义修正)", () => {
+    const base = { projectTitle: "测试项目", macro: [], recentChapters: [], openThreads: [] };
+    const sections = buildStoryArcPlanningContextSections({
+      ...base,
+      dueLedger: {
+        currentOrder: 122,
+        windowElapsedCount: 2,
+        agedOpenCount: 3,
+        items: [
+          { id: "f1", description: "玉牌监控机制未明", horizonOrder: 40, plantedOrder: 6 },
+          { id: "f2", description: "黑风林影子的去向", horizonOrder: 80, plantedOrder: 20 },
+        ],
+      },
+    });
+    const due = sections.find((section) => section.id === "arc-context-due-ledger");
+    expect(due?.priority).toBe("required");
+    expect(due?.text).toContain("2 条 open 伏笔的兑现窗口上界已过");
+    expect(due?.text).toContain("3 条埋设 40+ 章");
+    // 清单按窗口上界升序呈现（最老的先面对规划者）。
+    expect(due!.text.indexOf("f1")).toBeLessThan(due!.text.indexOf("f2"));
+    // 语义修正的核心：不得把"上界已过"表述为欠债/超期，否则指挥作者处理不存在的问题。
+    expect(due?.text).toContain("不等于");
+    expect(due?.text).toContain("欠债");
+    expect(due?.text).not.toContain("已超自声明窗口上界");
+    // 负方向：无账不注入占位段（与秘密清单同纪律）。
+    expect(buildStoryArcPlanningContextSections(base).map((section) => section.id)).not.toContain("arc-context-due-ledger");
+    // 审核面检查常驻（无段时指令自身声明跳过）。
+    expect(buildStoryArcReviewPrompt({ chapters: [] } as never, "上下文")).toContain("到期账处置检查");
+  });
+
+  it("injects the narrative-dormancy ledger and marks silence as the actionable signal (P1, 2026-09-18)", () => {
+    const base = { projectTitle: "测试项目", macro: [], recentChapters: [], openThreads: [] };
+    const dormancy = {
+      currentOrder: 168,
+      measured: 427,
+      silent: [
+        // 账本按沉默章数降序给出（summarizeDormancy 的排序契约），渲染器信任该顺序。
+        { id: "f2", description: "树洞蓝光性质", plantedOrder: 34, lastMentionOrder: 42, silentFor: 126 },
+        { id: "f1", description: "齐姓人的去向", plantedOrder: 20, lastMentionOrder: 60, silentFor: 108 },
+      ],
+      // 15 条孤儿需与 silent 同形（DormancyLedgerEntry）。
+      neverMentioned: Array.from({ length: 15 }, (_, index) => ({ id: `n${index}`, description: `孤儿线索 ${index}`, plantedOrder: 1, lastMentionOrder: null, silentFor: null })),
+      silentBands: [{ fromOrder: 120, toOrder: 139, count: 37 }, { fromOrder: 140, toOrder: 159, count: 16 }],
+      running: 346,
+      unmeasurable: 0,
+    };
+    const sections = buildStoryArcPlanningContextSections({ ...base, narrativeDormancy: dormancy });
+    const seg = sections.find((section) => section.id === "arc-context-dormancy");
+    expect(seg?.priority).toBe("required");
+    expect(seg?.text).toContain("2 条线索");
+    expect(seg?.text).toContain("曾活跃、现已静默");
+    expect(seg?.text).toContain("15 条埋设后从未被正文再提及");
+    expect(seg?.text).toContain("仍在推进 346 条");
+    // 静默带呈现（成片失线优先核对）。
+    expect(seg?.text).toContain("第120-139章 37条");
+    // 清单按沉默章数降序：静默最久的先面对规划者。
+    expect(seg!.text.indexOf("f2")).toBeLessThan(seg!.text.indexOf("f1"));
+    // 负方向 1：无静默也无孤儿时不注入占位段。
+    expect(
+      buildStoryArcPlanningContextSections({ ...base, narrativeDormancy: { ...dormancy, silent: [], neverMentioned: [], silentBands: [] } })
+        .map((section) => section.id),
+    ).not.toContain("arc-context-dormancy");
+    // 负方向 2：完全无账不注入。
+    expect(buildStoryArcPlanningContextSections(base).map((section) => section.id)).not.toContain("arc-context-dormancy");
+  });
+
+  it("跨弧回报节奏信号：连续零兑付给出透支提示，密度正常不误伤（P5）", () => {
+    const base = { projectTitle: "测试项目", macro: [], recentChapters: [], openThreads: [] };
+    const sections = buildStoryArcPlanningContextSections({
+      ...base,
+      payoffRhythm: [
+        { arcOrdinal: 15, title: "用字的人", finalChapters: 7, payoffCount: 3 },
+        { arcOrdinal: 16, title: "弧16：看一眼", finalChapters: 7, payoffCount: 0 },
+        { arcOrdinal: 17, title: "弧17：补证人", finalChapters: 7, payoffCount: 0 },
+      ],
+    });
+    const serial = sections.find((section) => section.id === "arc-context-serial-signals");
+    expect(serial?.text).toContain("弧15《用字的人》 7章/3笔兑付");
+    expect(serial?.text).toContain("弧16《看一眼》 7章/0笔兑付");
+    expect(serial?.text).toContain("已连续 2 弧零兑付");
+    // 反例：有兑付节奏/无账目时不出现透支提示（不设数值硬门纪律）。
+    const healthy = buildStoryArcPlanningContextSections({ ...base, payoffRhythm: [{ arcOrdinal: 3, title: null, finalChapters: 6, payoffCount: 2 }] });
+    expect(healthy.find((section) => section.id === "arc-context-serial-signals")?.text).not.toContain("零兑付");
+    const none = buildStoryArcPlanningContextSections(base);
+    expect(none.find((section) => section.id === "arc-context-serial-signals")?.text).not.toContain("跨弧回报节奏");
   });
 
   it("treats rebase input envelopes as read-only and preserves the affected batch window", () => {
@@ -392,6 +586,7 @@ describe("long-form prompt contracts", () => {
         title: "安静的一章",
         narrativeFunction: "unspecified",
         povCharacterId: "",
+        targetWordCount: 2600,
         stateTransition: { before: "入口", after: "状态仍在", evidence: "观察与相处留下可见证据" },
         scenes: [{ title: "室内", participants: ["主角"], situation: "两人等待消息", observableActions: ["主角把未寄出的信收回抽屉"], planningRationale: "", opposition: "", decision: "", outcome: "关系和信息边界保持开放", cost: "" }],
         continuityConstraints: [],
@@ -422,6 +617,7 @@ describe("long-form prompt contracts", () => {
         title: "quiet chapter",
         narrativeFunction: "unspecified",
         povCharacterId: "",
+        targetWordCount: 1800,
         stateTransition: { before: "tired", after: "rested", evidence: "sleep" },
         scenes: [{ title: "rest", participants: ["person"], situation: "at home", observableActions: ["sleep"], planningRationale: "", opposition: "", decision: "", outcome: "rested", cost: "" }],
         continuityConstraints: [],
@@ -486,5 +682,21 @@ describe("long-form prompt contracts", () => {
     });
 
     expect(review).toMatchObject({ verdict: "revise", score: 3.2, issues: [{ title: "场景承载不足" }] });
+  });
+
+  it("currentText 在场时机械执行摘录契约：旧文复读丢弃+verdict 回推，现行文证据与无摘录 issue 不误杀（ch67 复读死循环实证）", () => {
+    const artifact = { id: "artifact-1", projectId: "p1", taskId: "task-1", attemptId: "attempt-1", kind: "draft" as const, contentHash: "hash", baseRevision: 0, fingerprint: "fp", createdAt: 0, text: "" };
+    const text = "他把空砚台扶正，白日收工时随手搁下的地方已经干透。窗外风把纸角掀起又放下。";
+    const stale = { severity: "major" as const, title: "正文夹杂外文词", description: "夹杂 daytime", excerpt: "窗台上摆着那只空砚台， daytime 收工时他随手搁的", revisionRanges: [], rule: "摘录须在场", suggestion: "核对当前正文", readerReconstruction: null };
+    const live = { severity: "warning" as const, title: "纸角动作重复", description: "掀起又放下与前段同构", excerpt: "窗外风把纸角掀起又放下", revisionRanges: [], rule: "重复动作", suggestion: "减一处", readerReconstruction: null };
+    const noExcerpt = { severity: "warning" as const, title: "收束略急", description: "结尾可再多一拍", excerpt: "", revisionRanges: [], rule: "收束", suggestion: "多一拍身体动作", readerReconstruction: null };
+    const dropped = toReview({ artifact, identity: "internal", role: "structure-reviewer", output: { verdict: "revise", score: 4, issues: [stale] }, currentText: text });
+    expect(dropped).toMatchObject({ verdict: "passed", issues: [] }); // 复读孤证被丢，revise 失去 issue 支撑按契约语义回推
+    const mixed = toReview({ artifact, identity: "internal", role: "structure-reviewer", output: { verdict: "revise", score: 4, issues: [stale, live, noExcerpt] }, currentText: text });
+    expect(mixed.issues.map((i) => i.title)).toEqual(["纸角动作重复", "收束略急"]); // 真证据保留、无摘录保守保留
+    expect(mixed.verdict).toBe("revise");
+    const legacy = toReview({ artifact, identity: "internal", role: "structure-reviewer", output: { verdict: "revise", score: 4, issues: [stale] } });
+    expect(legacy.issues).toHaveLength(1); // 无 currentText 时旧行为零回归
+    expect(isStaleExcerptIssue({ excerpt: "他把空砚台扶正……白日收工时随手搁下的地方已经干透" }, text)).toBe(false); // 省略号分段有一即真
   });
 });

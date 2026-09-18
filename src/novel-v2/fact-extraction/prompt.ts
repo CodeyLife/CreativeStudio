@@ -21,6 +21,11 @@ export interface FactExtractionPromptInput {
     foreshadowings: Array<{ id: string; description: string; triggerKeywords: string[]; expectedPayoffWindow: string; readerQuestion?: string; possiblePayoffs?: string[]; meaningDelta?: string; cost?: string }>;
     promises: Array<{ id: string; promiser: string; promisee: string; statement: string }>;
   };
+  /**
+   * 规范人物名册（memory-governance-audit-20260909 §5.1.1）。
+   * 与身份索引同源：已注册人物必须用规范 ID 作 subject.id，从源头消除主体键碎片化。
+   */
+  canonicalCharacters?: Array<{ canonicalId: string; displayName: string }>;
 }
 
 /**
@@ -43,11 +48,19 @@ export function buildFactExtractionPrompt(input: FactExtractionPromptInput): str
     "",
     `## 提取规则（facts）`,
     `- 准入原则：只有后续章节为避免矛盾、延续因果或维护角色知识边界而需要再次使用的信息，才是叙事事实。正文中出现过不等于值得沉淀。`,
-    `- 必须至少属于一类长期用途：身份/世界规则，关系或能力边界，持续状态，明确的状态变化，角色知识变化，尚未履行的承诺，或会约束后续行动的因果结果。`,
+    `- 必须至少属于一类长期用途：身份/世界规则，关系或能力边界，持续状态，明确的状态变化，尚未履行的承诺，或会约束后续行动的因果结果。`,
+    `- 角色的知识/信息边界（谁知道什么）由专门的角色富化通道提取并按人物知识范围落库；本通道不提取"某人知晓/得知某事"类认知事实。人物获得/失去物件、位置移动、伤势与状态变化仍按"持有/位于/状态变化"等谓词正常提取。`,
     `- 一次性动作、临时站位、普通行程过程、服饰、天气、表情和无后续影响的环境细节不提取；只有它们改变持续状态或形成后续约束时才提取变化后的事实。`,
     `- 同一持续状态在后续章节被再次提及但没有变化时必须省略，不得换一种谓词重复写入。`,
     `- subject.kind 限定为：project/entity/relation/outline/scene/thread/foreshadowing/timeline。`,
     `- subject.id 必须是正文中可指认的对象（人物名、地点名、关系名等）；不得用"主角""反派"等代词。`,
+    ...(input.canonicalCharacters?.length ? [
+      ``,
+      `## 规范人物名册（subject.id 必须命中）`,
+      `- 下方已注册人物的事实，subject.id 一律使用其规范 ID，禁止使用显示名、拼音转写或自造 ID：`,
+      ...input.canonicalCharacters.map((character) => `- ${character.canonicalId}｜显示名：${character.displayName}`),
+      `- 名册之外的人物（本章首次出场、后续可能复用）以正文原名作 subject.id，由系统登记为待补全实体。`,
+    ] : []),
     `- predicate 只写稳定、最短的关系词，不得夹带主体、客体、时间或原因；同类关系优先复用已存在记忆中的谓词。系统预置关系使用"身份/持有/位于/知晓/隶属/给予/状态变化"，确有不同语义时才使用项目自定义谓词。`,
     `- object.kind 限定为：entity-ref/string/number/boolean/json。value 始终是字符串：entity-ref/string 直接写值，number/boolean/json 写规范化 JSON 文本。`,
     `- polarity=affirmed 表示正面陈述；negated 表示正文明确否定（如"并未出生于此"）。`,
@@ -64,7 +77,12 @@ export function buildFactExtractionPrompt(input: FactExtractionPromptInput): str
     `### foreshadowings（本章埋设的伏笔）`,
     `- 只提取正文实际暗示但未明确揭示的内容（如"她注意到墙上那幅画似乎在动"）。`,
     `- triggerKeywords 是后续兑现时应出现的关键词（如"画""动""隐藏"）。`,
-    `- expectedPayoffWindow 是预期兑现时机（如"5 章内""本卷末""长篇后期"）。`,
+    `- anchor 是承载本伏笔的正文载体短词：一个名词短语（实物/景象/一句话，如"墙上那幅画"），不超过 30 字。同一伏笔在多轮提取中描述措辞会变化，锚点保持稳定——它是账本身份，请如实从正文取词，不要写成整句或感受。`,
+    `- expectedPayoffWindow 是预期兑现时机，必须结构化且五个键全给（不用的填 null）：scope 取 "chapters"（按章）/"volume"（本卷内）/"book"（全书内）/"unbounded"（长期未定）；scope=chapters 时 count=埋设后 N 章内 或 from/to=绝对章序范围（另一种留 null）；note 填给作者看的原措辞短语。`,
+    `- **expectedPayoffWindow 只填正文或设计意图中真实给出的时机。判断不出时机时，scope 必须填 "unbounded"、count/from/to 全填 null——"长期未定"是合法且常见的答案，不是缺陷。**`,
+    `- **禁止为填满而编造数字**：正文没有给出兑现时机时，不要写 count=5/10、也不要写 to=<某个整数>。凭印象取整会让期限失去意义——账本上每条期限都必须能在正文或设计意图里找到依据。`,
+    `- 只有正文明确出现"三日内""下月""本月十五"等时限、或设计意图明确指定了兑现章时，才填 scope="chapters"。`,
+    `- note 只在引用正文原措辞时有意义；凭空编造的时机不要写 note，直接留空字符串。`,
     `- readerQuestion 是读者读到此处会自然产生的具体问题；无法可靠判断时留空。`,
     `- possiblePayoffs 是 0 到多个可行的兑现方向（设计态，不是事实），用于后续规划安排兑现；没有明确可行方向时使用空数组。`,
     `- meaningDelta 是兑现后相较埋设时预期增加的新意义或变化（如"物件易主""关系破裂"）；无法判断时留空。`,
@@ -87,7 +105,6 @@ export function buildFactExtractionPrompt(input: FactExtractionPromptInput): str
     `1. 人物身份、关系、能力、知识边界（影响后续叙事连续性）。`,
     `2. 时间、地点、物件状态（影响事实账本）。`,
     `3. 伏笔、承诺、兑现、未解之谜（影响长篇追读）。`,
-    `4. 角色认知变化（谁知道了什么、何时知道）。`,
     "",
     `## 不提取`,
     `- 修辞、隐喻、意象（如"她的心像落叶"）。`,

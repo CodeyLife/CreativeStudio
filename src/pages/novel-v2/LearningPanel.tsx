@@ -90,6 +90,9 @@ export default function LearningPanel({ projectId, documents }: { projectId: str
     <div className="pb-learning-summary">
       <div><strong>{assessments.length}</strong><span>次评估</span></div>
       <div><strong>{candidates.length}</strong><span>条候选</span></div>
+      {/* SK-3③（product-audit-20260910 C3）：三态积压显性化——proposed/evidencing/reviewing
+          是"未关闭"队列，停滞候选由 craft-rule.candidate-stale 事件提醒裁决。 */}
+      <div><strong>{candidates.filter((candidate) => candidate.status === "proposed" || candidate.status === "evidencing" || candidate.status === "reviewing").length}</strong><span>未关闭（拟议 {candidates.filter((c) => c.status === "proposed").length}·证据 {candidates.filter((c) => c.status === "evidencing").length}·审核 {candidates.filter((c) => c.status === "reviewing").length}）</span></div>
       <div><strong>{candidates.filter((candidate) => candidate.status === "promoted").length}</strong><span>已晋升</span></div>
     </div>
 

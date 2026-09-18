@@ -18,7 +18,7 @@ import {
 import { Outlet, useLocation, useNavigate } from "react-router-dom";
 import { motion } from "motion/react";
 import { useUIStore, SIDEBAR_COLLAPSE_BREAKPOINT } from "@/stores/ui";
-import { SlidingIndicator, GlowPulse, ScrambleText } from "@/components/motion";
+import { SlidingIndicator, ScrambleText } from "@/components/motion";
 import { useMotionMode } from "@/hooks/useMotionMode";
 import { NoiseOverlay } from "@/components/Background";
 import { PageTransition, ScrollProgressBar } from "@/components/showtime";
@@ -176,14 +176,14 @@ export default function AppLayout() {
         {/* 右边缘垂直流光：极弱的 emerald 光带沿 sidebar 右边缓慢上下漂移 */}
         <span className="sidebar-edge-beam" aria-hidden />
 
-        {/* Logo / 品牌 */}
+        {/* Logo / 品牌 + 标题栏最右侧折叠按钮（仅图标，不显示文字） */}
         <div
           style={{
             height: 60,
             display: "flex",
             alignItems: "center",
-            gap: 11,
-            padding: collapsed ? "0 20px" : "0 20px 0 20px",
+            gap: collapsed ? 0 : 11,
+            padding: collapsed ? "0 4px" : "0 20px",
             borderBottom: "1px solid #18181b",
             flexShrink: 0,
           }}
@@ -203,6 +203,16 @@ export default function AppLayout() {
               <div style={{ fontSize: 11, color: "#71717a", letterSpacing: 0.4 }}>Ymcp v0.1</div>
             </div>
           )}
+          <Tooltip title={collapsed ? "展开侧边栏" : "折叠侧边栏"} placement="bottom">
+            <button
+              className="sidebar-collapse-btn"
+              onClick={toggleCollapsed}
+              aria-label={collapsed ? "展开侧边栏" : "折叠侧边栏"}
+              style={{ marginLeft: "auto" }}
+            >
+              {collapsed ? <MenuUnfoldOutlined style={{ fontSize: 14 }} /> : <MenuFoldOutlined style={{ fontSize: 14 }} />}
+            </button>
+          </Tooltip>
         </div>
 
         {/* 导航 */}
@@ -279,37 +289,6 @@ export default function AppLayout() {
             </div>
           ))}
         </nav>
-
-        {/* 底部底座：状态卡 + 折叠按钮整合为统一视觉块 */}
-        <div className="sidebar-footer">
-          {!collapsed && (
-            <div className="sidebar-status-card">
-              {/* 扫描线：从左到右循环扫过，模拟"正在监控" */}
-              <span className="sidebar-status-scan" aria-hidden />
-              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, position: "relative", zIndex: 1 }}>
-                <GlowPulse size={7} color="#34d399" />
-                <span style={{ fontSize: 12, fontWeight: 600, color: "#d4d4d8" }}>本地就绪</span>
-              </div>
-              <div style={{ fontSize: 11, color: "#71717a", lineHeight: 1.5, position: "relative", zIndex: 1 }}>
-                数据保存在你的设备上
-              </div>
-            </div>
-          )}
-          <div style={{ display: "flex", justifyContent: collapsed ? "center" : "flex-end", padding: collapsed ? "10px 0 0" : "12px 16px 0" }}>
-            <button
-              className="sidebar-collapse-btn"
-              onClick={toggleCollapsed}
-              aria-label={collapsed ? "展开侧边栏" : "折叠侧边栏"}
-            >
-              {collapsed ? <MenuUnfoldOutlined style={{ fontSize: 14 }} /> : (
-                <>
-                  <MenuFoldOutlined style={{ fontSize: 14 }} />
-                  <span className="sidebar-collapse-label">折叠</span>
-                </>
-              )}
-            </button>
-          </div>
-        </div>
       </aside>
 
       <main

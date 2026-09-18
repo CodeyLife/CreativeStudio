@@ -23,6 +23,40 @@ describe("V2 cognition compiler", () => {
     expect(bundle.sourceRevisionIds).toEqual(["r4"]);
   });
 
+  it("caps ranked-fill claims per identity slot without blocking pinned or required selections", async () => {
+    const slotClaims = Array.from({ length: 6 }, (_, index) => ({
+      id: `slot-${index}`,
+      projectId: "p1",
+      kind: "episodic" as const,
+      title: `槽位声明 ${index}`,
+      content: `同一槽位的第 ${index} 条事实`,
+      subjectRefs: ["hero"],
+      narrativeRange: { start: 3 + index },
+      knowledgeScope: "author" as const,
+      authority: "derived" as const,
+      confidence: 1,
+      sourceRevisionIds: [`r${index}`],
+      contentHash: `slot-${index}`,
+      supersedes: [],
+      identityHash: "slot-hero-knows",
+      score: 1 - index / 10,
+      matchedFacet: "fact" as const,
+      reason: "lexical",
+    }));
+    const otherClaim = { ...slotClaims[0], id: "other-slot", identityHash: "slot-other", title: "其他槽位", content: "不同槽位的事实", contentHash: "other", narrativeRange: { start: 3 } };
+    const provider: MemoryProvider = { search: async () => [...slotClaims, otherClaim] };
+    const plan = createPreflightPlan(intent, { projectId: "p1", currentRevision: 7, targetDocumentOrder: 12 });
+    const bundle = await buildMemoryBundle(plan, { projectId: "p1", provider });
+    const selectedIds = bundle.claims.map((claim) => claim.id);
+    // 同槽位最多 3 条（按 compareCandidates 序取最优），其余被配额排除；
+    // 不同槽位不受影响。
+    expect(selectedIds.filter((id) => id.startsWith("slot-"))).toHaveLength(3);
+    expect(selectedIds).toContain("other-slot");
+    for (const excluded of slotClaims.slice(3).map((claim) => claim.id)) {
+      expect(bundle.selectionReceipts).toContainEqual(expect.objectContaining({ claimId: excluded, status: "excluded", reason: "identity-slot-quota" }));
+    }
+  });
+
   it("marks a final target revision as a replacement boundary without moving the narrative cutoff", () => {
     const revisionIntent: NovelIntent = { ...intent, requestedStage: "revision" };
     const plan = createPreflightPlan(revisionIntent, {
@@ -84,8 +118,7 @@ describe("V2 cognition compiler", () => {
     expect(plan.replacementRevisionId).toBe("rev-12");
   });
 
-  it("excludes bounded aggregates that cross the cutoff without dropping open-ended durable facts", async () => {
-    const provider: MemoryProvider = { search: async () => [
+  it("excludes bounded aggregates that cross the cutoff without dropping open-ended durable facts", async () => {    const provider: MemoryProvider = { search: async () => [
       { id: "past-rollup", projectId: "p1", kind: "hierarchical", title: "历史汇总", content: "仅包含截止章之前的内容", subjectRefs: [], narrativeRange: { start: 1, end: 11 }, knowledgeScope: "author", authority: "derived", confidence: 1, sourceRevisionIds: ["r1", "r11"], contentHash: "past-rollup", supersedes: [], predicate: "chapter-memory-rollup", score: 1, matchedFacet: "chapter-memory", reason: "pinned" },
       { id: "future-spanning-rollup", projectId: "p1", kind: "hierarchical", title: "跨截止章汇总", content: "同时包含第 12 章以后的结果", subjectRefs: [], narrativeRange: { start: 1, end: 20 }, knowledgeScope: "author", authority: "derived", confidence: 1, sourceRevisionIds: ["r1", "r20"], contentHash: "future-rollup", supersedes: [], predicate: "chapter-memory-rollup", score: 1, matchedFacet: "chapter-memory", reason: "pinned" },
       { id: "durable-fact", projectId: "p1", kind: "canonical", title: "持续事实", content: "第一章建立且仍然有效", subjectRefs: ["hero"], narrativeRange: { start: 1 }, knowledgeScope: "author", authority: "approved", confidence: 1, sourceRevisionIds: ["r1"], contentHash: "durable", supersedes: [], score: 1, matchedFacet: "fact", reason: "exact" },

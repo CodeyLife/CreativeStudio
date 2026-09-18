@@ -15,6 +15,21 @@
       "version": "020_foreshadowing_narrative_order.sql",
       "checksum": "9adfb5c7150fa707440f13b67e04f5c5c9aee6e99f70ac22d3e5d58ab2bfc0a3",
       "reason": "020 在部分旧数据库按早期版本应用；当前 SQL 使用 IF NOT EXISTS 幂等，归档旧 checksum 后由迁移审计接受"
+    },
+    {
+      "version": "050_short_scripts.sql",
+      "checksum": "8929fae7c34c4a826d93ba4b77b8f1bf64065d9ec697e524bfb348ef8f1fc8f9",
+      "reason": "050 的早期草稿曾在部分数据库（如集成测试库）应用，该草稿校验和不对应任何已提交历史版本；当前 SQL 全幂等（IF NOT EXISTS/ON CONFLICT DO NOTHING），归档草稿 checksum 后由迁移审计接受"
+    },
+    {
+      "version": "087_context_manifest_sampling.sql",
+      "checksum": "ee2dd0bd93f0da58602f0c175651b7b2abc2b46c6df58c3b3cd8112da7370c8c",
+      "reason": "087 头注释纠偏（采样哈希输入漏写 purpose 因子，与实现不符——审核 N10）；纯注释变更，DDL 逐字未动，归档旧 checksum"
+    },
+    {
+      "version": "088_task_attempt_workflow_run_fk.sql",
+      "checksum": "735f7e1159b1d167cf68428f7e122f61228a7d5c379115362f734423594477fc",
+      "reason": "088 审核 N8 修正：去掉内嵌 BEGIN/COMMIT（migrate 按文件包事务）、加漂移预修正与残行诊断 RAISE；生产库 440/440 行 id===temporal 无漂移可修，新语义对已应用库幂等重放安全，归档旧 checksum"
     }
   ],
   "schemaSubtractions": [

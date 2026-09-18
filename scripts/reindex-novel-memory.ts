@@ -18,13 +18,25 @@ const { gateway } = await createRuntimeModelGateway(repository);
 const index = new QdrantMemoryProvider(qdrant, gateway, targetCollection, dimension);
 await index.ensureCollection();
 
+// Map.groupBy 属 ES2024（本包 lib 为 ES2022），且回调参数在此处无类型可推。
+function groupByProject<T extends { projectId: string }>(items: T[]): Map<string, T[]> {
+  const grouped = new Map<string, T[]>();
+  for (const item of items) {
+    const bucket = grouped.get(item.projectId);
+    if (bucket) bucket.push(item);
+    else grouped.set(item.projectId, [item]);
+  }
+  return grouped;
+}
+
+type AliasAction = Parameters<QdrantClient["updateCollectionAliases"]>[0]["actions"][number];
 type Progress = { claimOffset: number; chapterOffset: number };
 const key = `embedding-reindex:${targetCollection}`;
 const progress = reset ? { claimOffset: 0, chapterOffset: 0 } : await repository.getRuntimeConfiguration<Progress>(key) ?? { claimOffset: 0, chapterOffset: 0 };
 while (true) {
   const claims = await repository.listIndexableMemoryClaims({ offset: progress.claimOffset, limit: batchSize });
   if (!claims.length) break;
-  for (const [projectId, projectClaims] of Map.groupBy(claims, (claim) => claim.projectId)) await index.upsertClaims(projectId, projectClaims);
+  for (const [projectId, projectClaims] of groupByProject(claims)) await index.upsertClaims(projectId, projectClaims);
   progress.claimOffset += claims.length;
   await repository.setRuntimeConfiguration(key, { ...progress, status: "running", targetCollection, dimension });
 }
@@ -32,7 +44,7 @@ while (true) {
   const memories = await repository.listAllChapterMemories({ offset: progress.chapterOffset, limit: batchSize });
   if (!memories.length) break;
   const claims = memories.map(chapterMemoryAsClaim);
-  for (const [projectId, projectClaims] of Map.groupBy(claims, (claim) => claim.projectId)) await index.upsertClaims(projectId, projectClaims);
+  for (const [projectId, projectClaims] of groupByProject(claims)) await index.upsertClaims(projectId, projectClaims);
   progress.chapterOffset += memories.length;
   await repository.setRuntimeConfiguration(key, { ...progress, status: "running", targetCollection, dimension });
 }
@@ -47,7 +59,7 @@ if (physicalCollections.collections.some((item) => item.name === alias)) {
   await qdrant.deleteCollection(alias);
 }
 const aliases = await qdrant.getAliases();
-const actions: Array<Record<string, unknown>> = [];
+const actions: AliasAction[] = [];
 if (aliases.aliases.some((item) => item.alias_name === alias)) actions.push({ delete_alias: { alias_name: alias } });
 actions.push({ create_alias: { collection_name: targetCollection, alias_name: alias } });
 await qdrant.updateCollectionAliases({ actions });

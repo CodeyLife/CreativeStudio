@@ -19,10 +19,14 @@
  * AGENTS.md 契约：promote 后必须做回归验证（用新版本重跑失败场景）。
  * 回归验证由调用方负责，本服务只返回 receipt 供调用方决策。
  */
-import type { PromotionReceipt } from "../protocol";
+import type { PromotionReceipt, SkillDescriptor } from "../protocol";
 import type { NovelPostgresRepository } from "../postgres-repository";
 import type { CraftRuleCandidate } from "./index";
 import { mergeCraftRulePromptSections, parseCraftRulePromptPatch } from "./prompt-patch";
+import { renderPromotedSkillYaml } from "./skill-yaml-patch";
+import { normalizeSkillDescriptor } from "../skill-runtime";
+import { readFile, writeFile } from "node:fs/promises";
+import path from "node:path";
 
 // ===== 类型 =====
 
@@ -179,6 +183,25 @@ class CraftRulePromotionServiceImpl implements CraftRulePromotionService {
       );
 
       await client.query("COMMIT");
+      // SK-2 路线二（审计 C1）：skill 晋升成功后尽力生成"待审 yaml patch"工件存入
+      // receipt.result（jsonb 扩展键，零迁移）。失败不阻塞晋升（DB 已是运行真源），
+      // 只记 patchError——回写通道断裂从"静默"变"显式"。
+      if (candidate.targetKind === "skill") {
+        try {
+          const patch = await this.captureSkillYamlPatch(candidate, receiptId, input.authorId);
+          if (patch) {
+            await this.repository.pool.query(
+              "UPDATE promotion_receipts SET result = result || $2::jsonb WHERE id = $1",
+              [receiptId, JSON.stringify({ yamlPatch: patch })],
+            );
+          }
+        } catch (patchError) {
+          await this.repository.pool.query(
+            "UPDATE promotion_receipts SET result = result || $2::jsonb WHERE id = $1",
+            [receiptId, JSON.stringify({ yamlPatchError: patchError instanceof Error ? patchError.message : String(patchError) })],
+          );
+        }
+      }
       return receipt;
     } catch (error) {
       await client.query("ROLLBACK");
@@ -269,12 +292,94 @@ class CraftRulePromotionServiceImpl implements CraftRulePromotionService {
       );
 
       await client.query("COMMIT");
+      // 回滚后 DB 已回到 before_version：未应用的 sidecar 工件是陈旧 patch，失效它，
+      // 防止 `skills patch --apply` 把已回滚内容再写进 seed（审核 N4）。若 sidecar
+      // 已被应用（seed==proposed），seed 领先于回滚后的 DB——工作区写权不在部署进程，
+      // 只告警不代改，由 `skills check` 的 promotion-ahead/behind 视野承接。
+      if (candidateRow.target_kind === "skill") await this.invalidatePromotedSidecar(receiptId);
     } catch (error) {
       await client.query("ROLLBACK");
       throw error;
     } finally {
       client.release();
     }
+  }
+
+  /**
+   * rollback 收尾：删除该 receipt 留下的待审 sidecar；seed 若已应用则告警前移状态。
+   * capture 只在晋升成功后写 receipt.result.yamlPatch（skipped 分支无 sidecarFile），
+   * 且 sidecar 一经 `skills patch --apply` 即删除——rollback 读到未删除的 sidecarFile
+   * 必为"本次晋升、尚未应用"；seed==本次晋升版 的比对因此无误判路径。
+   * 路径存储与还原：capture 存 path.relative(cwd,…)；跨盘符时 relative 会退回
+   * "去反斜杠的绝对路径"（如 T:/Temp/…），故还原按绝对性分流，不能盲目 resolve。
+   * 注意走原始 result jsonb：mapReceiptRow 的白名单字段过滤会丢掉 yamlPatch 扩展键。
+   */
+  private async invalidatePromotedSidecar(receiptId: string): Promise<void> {
+    const raw = await this.repository.pool.query<{ result: Record<string, unknown> | null }>(
+      "SELECT result FROM promotion_receipts WHERE id=$1", [receiptId],
+    );
+    const patch = raw.rows[0]?.result?.yamlPatch as { sidecarFile?: unknown; seedFile?: unknown; version?: unknown } | undefined;
+    if (!patch || typeof patch.sidecarFile !== "string") return;
+    const { unlink, readFile } = await import("node:fs/promises");
+    const restore = (stored: string): string => (path.isAbsolute(stored) || /^[A-Za-z]:[\\/]/u.test(stored) ? stored : path.resolve(process.cwd(), stored));
+    try {
+      await unlink(restore(patch.sidecarFile));
+    } catch { /* sidecar 已被 --apply 消费或清理：无陈旧工件可失效 */ }
+    try {
+      // seed==本次晋升版 ⇒ 工件已被应用过：回滚后 seed 领先 DB，人工回写收口。
+      if (typeof patch.seedFile === "string" && typeof patch.version === "string") {
+        const seed = await readFile(restore(patch.seedFile), "utf8");
+        if (seed.match(/^version:\s*(\S+)/mu)?.[1] === patch.version) {
+          console.warn(`[promotion-rollback] seed ${patch.seedFile} 仍是晋升版 ${patch.version}（DB 已回滚）：需人工回写 seed，skills check 可见漂移`);
+        }
+      }
+    } catch { /* seed 不在盘上：无漂移可警 */ }
+  }
+
+  /**
+   * 晋升后从 skill_definitions 当前行（=晋升后累积真源）渲染目标 yaml，与盘上
+   * workspace seed 比对：有差异则写 sidecar（<name>.promoted.yaml，gitignore 面），
+   * 返回可审计的 patch 摘要。sidecar 而非直写：保留"待审"收口点，编排方审阅后
+   * `skills patch --apply` 落位。
+   */
+  private async captureSkillYamlPatch(candidate: CraftRuleCandidate, receiptId: string, authorId: string): Promise<Record<string, unknown> | null> {
+    // targetId 参与文件路径构造：格式白名单挡注入面（skill_id 本就是受控 token，
+    // 通用断言而非枚举已知 id——未来新 seed 名自动适用）。
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/u.test(candidate.targetId)) {
+      return { skipped: "unsafe-target-id", skillId: candidate.targetId };
+    }
+    const rows = await this.repository.pool.query(`SELECT * FROM skill_definitions WHERE skill_id = $1`, [candidate.targetId]);
+    if (!rows.rowCount) return null;
+    const row = rows.rows[0] as Record<string, unknown>;
+    const descriptor = normalizeSkillDescriptor({
+      skillId: String(row.skill_id), version: String(row.version),
+      capabilities: (row.capabilities as string[]) ?? [], applicableTasks: (row.applicable_tasks as never) ?? [],
+      requiredMemoryKinds: (row.required_memory_kinds as never) ?? [], conflicts: (row.conflicts as string[]) ?? [],
+      qualityGates: (row.quality_gates as string[]) ?? [], promptSections: (row.prompt_sections as Record<string, string>) ?? {},
+      applicableGenres: (row.applicable_genres as string[]) ?? [], executionPoints: (row.execution_points as never) ?? [],
+      roles: (row.roles as string[]) ?? [], dependsOn: (row.depends_on as string[]) ?? [],
+      priority: (row.priority as SkillDescriptor["priority"]) ?? undefined,
+    });
+    const root = process.env.NOVEL_SKILL_ROOT ? path.resolve(process.env.NOVEL_SKILL_ROOT) : path.resolve(process.cwd(), "skills", "novel-v2");
+    const candidates = [path.join(root, `${candidate.targetId}.yaml`), path.join(root, `${candidate.targetId}.yml`)];
+    let targetFile: string | undefined;
+    let currentText = "";
+    for (const file of candidates) {
+      try { currentText = await readFile(file, "utf8"); targetFile = file; break; } catch { /* try next */ }
+    }
+    if (!targetFile) return { skipped: "no-workspace-seed", skillId: candidate.targetId, version: descriptor.version };
+    const { patchedYaml, changed } = renderPromotedSkillYaml(currentText, descriptor, {
+      skillId: candidate.targetId, version: descriptor.version, candidateId: candidate.id, receiptId, authorId,
+    });
+    if (!changed) return { skipped: "already-in-seed", skillId: candidate.targetId, version: descriptor.version };
+    const sidecar = `${targetFile}.promoted.yaml`;
+    await writeFile(sidecar, patchedYaml, "utf8");
+    return {
+      skillId: candidate.targetId, version: descriptor.version,
+      seedFile: path.relative(process.cwd(), targetFile).replaceAll("\\", "/"),
+      sidecarFile: path.relative(process.cwd(), sidecar).replaceAll("\\", "/"),
+      fromVersion: candidate.beforeVersion,
+    };
   }
 
   private async writeFailedReceipt(

@@ -6,6 +6,8 @@ import type { ObjectStoreAdapter } from "../object-store";
 import type { MemoryIndex } from "../qdrant-memory";
 import { NovelPostgresRepository } from "../postgres-repository";
 import { extractFactsWithStats } from "../fact-extraction";
+import { loadCharacterIdentityRegistry } from "../character-enrichment";
+import { uniqueCharacterIdentities, type CharacterIdentityIndex } from "../character-identity";
 import { buildChapterMemoryProjection, chapterMemoryAsClaim, generateChapterMemoryOutput } from "../chapter-memory";
 import { resolveStageSkillBundle } from "../skill-runtime";
 export { ChapterStateRebuildConflictError, HISTORICAL_CHAPTER_REBUILD_REQUIRES_CASCADE } from "./chapter-state-rebuild-conflict";
@@ -54,6 +56,19 @@ export class ChapterStateRebuildService {
     };
     const extractionContext = await this.deps.repository.getFactExtractionContext(projectId, source.narrativeOrder - 1);
     const skillBundle = await resolveStageSkillBundle({ projectId, provider: this.deps.skillProvider, executionPoint: "chapter.fact-extraction", role: "fact-extractor", preflightId: workflowId });
+    // 与 extractFacts activity 同一身份契约：prompt 名册 + 提取结果归一（读取失败降级为无归一）。
+    let identityContext: { identityIndex: CharacterIdentityIndex; canonicalCharacters: Array<{ canonicalId: string; displayName: string }> } | undefined;
+    try {
+      const registry = await loadCharacterIdentityRegistry(projectId, this.deps.repository);
+      identityContext = {
+        identityIndex: registry.index,
+        canonicalCharacters: uniqueCharacterIdentities(registry.index)
+          .filter((identity) => identity.status === "identified")
+          .map((identity) => ({ canonicalId: identity.canonicalId, displayName: identity.displayName })),
+      };
+    } catch (error) {
+      console.warn(`[chapter-state-rebuild] 人物身份注册表加载失败，本次重建退回无归一模式：${(error as Error).message}`);
+    }
     const extracted = await extractFactsWithStats({
       projectId,
       artifact: factArtifact,
@@ -67,6 +82,8 @@ export class ChapterStateRebuildService {
       workflowRunId: workflowId,
       taskId: factArtifact.taskId,
       skillBundle,
+      identityIndex: identityContext?.identityIndex,
+      canonicalCharacters: identityContext?.canonicalCharacters,
     });
     const chapterMemorySkills = await resolveStageSkillBundle({ projectId, provider: this.deps.skillProvider, executionPoint: "chapter.fact-extraction", role: "fact-extractor", preflightId: `${workflowId}:chapter-memory` });
     const chapterMemoryOutput = await generateChapterMemoryOutput({
@@ -115,6 +132,13 @@ export class ChapterStateRebuildService {
       } catch (error) {
         await this.recordProjectionFailure(projectId, source.sourceRevisionId, "memory-index", error);
       }
+    }
+    // staged 残骸对账（FM-2 修复③）：grooming 有诊断能力但缺自动触发，这里补上
+    // 精确同文残骸的清理钩子；失败显式记录，不影响已成功的重建结果。
+    try {
+      await this.deps.repository.reconcileStagedClaimDebris(projectId, documentId);
+    } catch (error) {
+      await this.recordProjectionFailure(projectId, source.sourceRevisionId, "staged-debris-reconcile", error);
     }
     return { projectId, documentId, revisionId: source.sourceRevisionId, factArtifactId: factArtifact.id, chapterMemory, ...claimSwap };
   }

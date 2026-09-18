@@ -535,10 +535,14 @@ export function buildAuthorRevisionRepairPromptPackage(input: {
 }
 
 function revisionWindowSharedSections(input: RevisionWindowPromptInput): string[] {
-  const memory = dedupeNarrativeRhythmMemory(input.memory).claims.map((claim) => {
+  // 与正文起草一致：foundation 段级投影归「创作契约」轨，不与逐字冻结事实混列（A2）。
+  const allClaims = dedupeNarrativeRhythmMemory(input.memory).claims;
+  const renderLine = (claim: (typeof allClaims)[number]) => {
     const projected = renderExecutionMemoryClaim(claim);
     return `- [${claim.authority}/${claim.kind}] ${projected.title}: ${projected.text}`;
-  }).join("\n") || "（无冻结事实）";
+  };
+  const memory = allClaims.filter((claim) => !claim.id.startsWith("foundation:")).map(renderLine).join("\n") || "（无冻结事实）";
+  const contract = allClaims.filter((claim) => claim.id.startsWith("foundation:"));
   const historySection = renderRevisionHistory(input.revisionHistory ?? []);
   return [
     "## 审核问题解读指引",
@@ -548,6 +552,11 @@ function revisionWindowSharedSections(input: RevisionWindowPromptInput): string[
     buildAuthorRevisionBrief(input.authorInstruction),
     "## 冻结事实（只读）",
     memory,
+    ...(contract.length ? [
+      "## 创作契约（已批准规划投影，只读）",
+      "以下是已批准的全局规划投影，作为修订必须遵守的创作边界，不是逐字事实清单；与冻结事实冲突时以冻结事实为准，不得为了贴合规划措辞而虚构或改写正文既定事实。",
+      ...contract.map(renderLine),
+    ] : []),
     input.planningContext ? renderChapterExecutionContract(input.planningContext) : "## 冻结章节执行合同\n（历史章节无规划快照。）",
     renderRevisionRhythm(input.memory),
     ...(input.memory.serialContext ? [`## 跨章序列证据\n${renderSerialContext(input.memory.serialContext)}`] : []),

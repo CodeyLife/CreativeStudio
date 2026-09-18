@@ -14,6 +14,7 @@ import type { PromotionReceipt } from "../protocol";
 import type { ModelRoutingSnapshot } from "../model-routing";
 import { canonicalSha256 } from "../canonical-json";
 import { createCraftRulePromotionService } from "./promotion-service";
+import { craftRuleNormalizedPatchText, isCraftRuleNoopChange } from "./prompt-patch";
 import { compileStageContext } from "../stage-context";
 
 // ===== 类型定义 =====
@@ -271,16 +272,21 @@ export async function createCraftRuleCandidate(
     beforeVersion = result.rows[0].version;
     beforeText = result.rows[0].content;
   }
-  if (beforeText === input.afterText) {
-    const satisfied = await repository.pool.query<{ id: string }>(
-      `SELECT id FROM craft_rule_candidates
-       WHERE project_id=$1 AND target_kind=$2 AND target_id=$3 AND after_text=$4
-         AND status <> 'rejected'
-       ORDER BY created_at DESC LIMIT 1`,
-      [input.projectId, input.targetKind, input.targetId, input.afterText],
+  if (isCraftRuleNoopChange(input.targetKind, beforeText, input.afterText)) {
+    const id = `crc-superseded-${canonicalSha256({ projectId: input.projectId, targetKind: input.targetKind, targetId: input.targetId, patch: craftRuleNormalizedPatchText(input.targetKind, input.afterText) }).slice(0, 16)}`;
+    const now = Date.now();
+    await repository.pool.query(
+      `INSERT INTO craft_rule_candidates(id, project_id, target_kind, target_id, before_version, proposed_version, before_text, after_text, rationale, scope, status, evidence_cases, reviews, learning_source, applicable_genres, created_at, updated_at)
+       VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'rejected', '[]'::jsonb, $11, $12, $13, to_timestamp($14 / 1000.0), to_timestamp($14 / 1000.0))
+       ON CONFLICT(id) DO NOTHING`,
+      [id, input.projectId, input.targetKind, input.targetId, beforeVersion, nextPatchVersion(beforeVersion),
+       beforeText, input.afterText, input.rationale, JSON.stringify(input.scope),
+       JSON.stringify([{ role: "system", reviewerId: "overlap-check", reviewRunId: id, model: "structural-noop-detect", verdict: "rejected", summary: "superseded-by-manual：补丁合并后与当前目标版本内容结构等价，规则已在目标版本（多为人工 yaml 演进先行）。", concerns: [], submittedAt: now }]),
+       input.learningSource ? JSON.stringify(input.learningSource) : null,
+       (input.applicableGenres ?? []).length ? input.applicableGenres : null,
+       now],
     );
-    if (satisfied.rowCount) return fetchCandidate(repository, input.projectId, satisfied.rows[0].id);
-    throw new Error("afterText 与 beforeText 相同，且没有可证明该改进已应用的候选");
+    return fetchCandidate(repository, input.projectId, id);
   }
 
   const proposedVersion = nextPatchVersion(beforeVersion);

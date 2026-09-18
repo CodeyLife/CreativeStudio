@@ -13,6 +13,7 @@ import { bindRuntimeObjectStore } from "../src/novel-v2/runtime-object-store";
 import { createConfiguredSkillProvider } from "../src/novel-v2/skill-runtime";
 import { loadRuntimeEnv } from "./runtime-env.mjs";
 import { publicRuntimeIdentity, resolveNovelRuntimeConfig } from "../src/novel-v2/runtime-config";
+import { codeRevision } from "../src/novel-v2/code-revision";
 
 Object.assign(process.env, loadRuntimeEnv(process.cwd()));
 const runtime = resolveNovelRuntimeConfig(process.env);
@@ -49,8 +50,9 @@ const healthServer = createServer((request, response) => {
   const live = request.url === "/live";
   const ready = request.url === "/ready";
   const status = live || readiness.status === "healthy" ? 200 : 503;
-  response.writeHead(status, { "content-type": "application/json", "cache-control": "no-store", "x-novel-runtime-id": runtime.runtimeId, "x-novel-runtime-profile": runtime.profile, "x-novel-runtime-fingerprint": runtime.runtimeFingerprint });
-  response.end(JSON.stringify(live ? { status: "alive", serviceId, runtime: publicRuntimeIdentity(runtime) } : ready ? { ...readiness, serviceId, runtime: publicRuntimeIdentity(runtime) } : { error: "NOT_FOUND" }));
+  response.writeHead(status, { "content-type": "application/json", "cache-control": "no-store", "x-novel-runtime-id": runtime.runtimeId, "x-novel-runtime-profile": runtime.profile, "x-novel-runtime-fingerprint": runtime.runtimeFingerprint, "x-novel-code-revision": codeRevision() });
+  const identity = { ...publicRuntimeIdentity(runtime), codeRevision: codeRevision() };
+  response.end(JSON.stringify(live ? { status: "alive", serviceId, runtime: identity } : ready ? { ...readiness, serviceId, runtime: identity } : { error: "NOT_FOUND" }));
 });
 healthServer.listen(runtime.workerHealthPort, runtime.workerHealthHost);
 const heartbeat = async () => repository.heartbeatRuntimeService({ serviceId, serviceType: "novel-worker", status: readiness.status, details: readiness.details });

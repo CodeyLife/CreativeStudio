@@ -1,5 +1,8 @@
 /**
- * V2 MCP 工具定义：40 个工具的 inputSchema（JSON Schema draft-07）。
+ * V2 MCP 工具定义：每个工具的 name/description/inputSchema（JSON Schema draft-07）。
+ * 本数组是唯一注册表——工具数不写在这里，派生值看 `tool-metadata.ts` 的 `TOOL_COUNT`；
+ * docs/novel-v2/{mcp-orchestrator,workflow-map}.md 与各 skill 声明的数字由
+ * `__tests__/mcp-tool-face-single-source.test.ts` 强制与本数组一致。
  *
  * 设计依据：AGENTS.md 架构阶段和 V2 MCP 工具契约。
  *
@@ -7,17 +10,19 @@
  * - v1 含 novel_foundation_export，v2 替换为 novel_closed_loop_run（评估闭环）
  * - v2 全部基于 Postgres，inputSchema 严格校验入参
  *
- * 工具分组（37 个）：
+ * 工具分组（各括号数即该组工具数，总和 = TOOL_COUNT）：
  * - Run / Action 主体（7）
  * - Catalog / Receipt（3）
  * - Craft Rule 候选演进（7）
  * - 项目生命周期（3）
- * - 规划与创作（11，含外部编排模式 novel_story_arc_orchestrate、短剧剧本派生
- *   novel_chapter_script_h3 与创意短剧脚本 novel_short_script_h3）
+ * - 规划与创作（15，含外部编排模式 novel_story_arc_orchestrate、短剧剧本派生
+ *   novel_chapter_script_h3、伏笔账本分流 novel_foreshadowing_list/triage）
  * - 评估闭环（1，v2 新增）
  * - Workflow 查询（2）
  * - Workflow 决策（1）
- * - 上下文与产物查询（2，新增：novel_context_get / novel_artifact_list）
+ * - 上下文与产物查询（2，novel_context_get / novel_artifact_list）
+ * - 外部 LLM 深度参与（8，记忆查询/梳理报告/候选队列/裁决/skill 查询/prompt 审计/
+ *   调用审计/模型调度；明细见 tool-metadata.ts 的 TOOL_GROUPS）
  */
 import type { ToolDefinition } from "./types";
 import { readerReconstructionSchema } from "../reader-reconstruction-schema";
@@ -153,7 +158,7 @@ const plotOutlineSchema: Record<string, unknown> = {
       description: "本弧责任线（threadRef 必须能解析到当前项目剧情线，未解析引用会阻止批准）",
     },
     expectedChapterCount: { type: "integer", minimum: 1, maximum: MAX_EXPECTED_CHAPTER_COUNT, description: "期望章节数" },
-    phases: { type: "array", items: { type: "object", additionalProperties: false, required: ["title", "objective"], properties: { title: { type: "string", minLength: 1 }, objective: { type: "string", minLength: 1 } } }, description: "阶段划分" },
+    phases: { type: "array", items: { type: "object", additionalProperties: false, required: ["title", "objective"], properties: { title: { type: "string", minLength: 1 }, objective: { type: "string", minLength: 1 }, chapterOrdinals: { type: "array", minItems: 1, items: { type: "integer", minimum: 1 }, description: "本阶段覆盖的弧内章节序号（1-based）；提供后章节所属阶段按此绑定，不再等分推算" } } }, description: "阶段划分（建议绑定 chapterOrdinals）" },
     chapterHints: { type: "array", maxItems: MAX_CHAPTER_HINTS, items: { type: "string" }, description: `逐章提示（作为章节设计意图，最多 ${MAX_CHAPTER_HINTS} 条）` },
     plotNotes: { type: "string", description: "自由剧情编排说明：人物安排、伏笔、关系进展、信息释放节奏等" },
   },
@@ -187,22 +192,22 @@ export const TOOL_NAMES = [
   "novel_project_create",
   "novel_project_list",
   "novel_project_delete",
-  // 规划与创作（12）
+  // 规划与创作（13）
   "novel_bootstrap_run",
   "novel_chapter_review",
   "novel_chapter_review_issue_add",
   "novel_chapter_generate",
   "novel_chapter_script_h3",
-  "novel_short_script_h3",
-  "novel_short_script_h3_brainstorm",
   "novel_story_arc_start",
   "novel_story_arc_get",
   "novel_story_arc_review",
+  "novel_story_arc_decision",
   "novel_story_arc_batch_start",
   "novel_story_arc_orchestrate",
-  // 外部产出与 Skill 读取（3，v2 新增）
+  "novel_foreshadowing_list",
+  "novel_foreshadowing_triage",
+  // 外部产出与 Skill 读取（2，v2 新增）
   "novel_skill_get",
-  "novel_short_script_h3_submit",
   "novel_chapter_script_h3_submit",
   // 评估闭环（1，v2 新增）
   "novel_closed_loop_run",
@@ -214,6 +219,16 @@ export const TOOL_NAMES = [
   // 上下文与产物查询（2，新增）
   "novel_context_get",
   "novel_artifact_list",
+  // 外部 LLM 深度参与：上下文查询与子 agent 调度（6，2026-09-08；梳理报告 2026-09-09）
+  "novel_memory_query",
+  "novel_memory_grooming_report",
+  "novel_skill_query",
+  "novel_prompt_inspect",
+  "novel_invocation_list",
+  "novel_model_dispatch",
+  // 事实候选队列一等公民化（2，FM-2 2026-09-10：积压面板 + 批量裁决）
+  "novel_fact_candidate_queue",
+  "novel_fact_candidate_decide",
 ] as const;
 
 export type ToolName = (typeof TOOL_NAMES)[number];
@@ -653,7 +668,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
 
   {
     name: "novel_chapter_generate",
-    description: "生成已批准故事弧中的目标章节，并走完整审核修订闭环。未提供 documentId 时选择当前故事弧最早的 planned 章节。",
+    description: "生成已批准故事弧中的目标章节，并走完整审核修订闭环。未提供 documentId 时选择当前故事弧最早的 planned 章节。reprocess=true 时对已定稿章节整章重出：从已批准蓝图+instruction 全新生成正文（不是修订编辑——修订通道会把重写令执行成加法；新稿仍走三审/门/提交全链，旧正式稿在批准前保持不动）。",
     inputSchema: {
       type: "object",
       properties: {
@@ -661,6 +676,8 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
         documentId: { type: "string", description: "可选，当前已批准故事弧中的目标章节 document" },
         chapterTitle: { type: "string", description: "兼容旧客户端，章节标题以已批准蓝图为准" },
         instruction: { type: "string", description: "可选,章节生成指令/特殊要求" },
+        reprocess: { type: "boolean", description: "可选：对定稿章节整章重出（自足重写指令必配，语义=从蓝图新生成而非编辑旧稿）。默认 false=仅 planned 章可生成" },
+        changeScope: { type: "string", enum: ["mechanical-format", "local-text", "narrative"], description: "可选（E4）：变更意图档位。机械微修（黑话降噪/引号错别字/去重）用 mechanical-format，局部文本改写用 local-text——评审面按档位收窄（裁掉与该类变更无关的评审角色），结构校验与 commit gate 任何档位完整保留，非后门。缺省 narrative=全量三审" },
         idempotencyKey: { type: "string", minLength: 1 },
       },
       required: ["projectId", "idempotencyKey"],
@@ -670,7 +687,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
 
   {
     name: "novel_chapter_script_h3",
-    description: "为已定稿章节生成短剧分镜剧本提示词（MiniMax H3 Ref2VA 全参考模式六段结构：subject_definitions / summary / retention_analysis / detailed_description / overall_soundscape / non_diegetic_music）。按场景节拍拆分为多个 5-10 秒片段，每片段一条完整提示词、可含多镜头；人物外观基线跨片段一致。只读定稿正文派生辅助产物（kind=chapter-script），不改正文、不进质量门；同一定稿内容幂等复用既有产物。需要 ToolContext.model。",
+    description: "为已定稿章节生成短剧分镜剧本提示词（MiniMax H3 Ref2VA 全参考模式六段结构：subject_definitions / summary / retention_analysis / detailed_description / overall_soundscape / non_diegetic_music）。按场景节拍拆分为多个 10-15 秒片段，每片段一条完整提示词、可含多镜头；人物外观基线跨片段一致。只读定稿正文派生辅助产物（kind=chapter-script），不改正文、不进质量门；同一定稿内容幂等复用既有产物。需要 ToolContext.model。",
     inputSchema: {
       type: "object",
       properties: {
@@ -684,41 +701,9 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
   },
 
   {
-    name: "novel_short_script_h3",
-    description: "从一个核心创意生成简短短剧脚本提示词（MiniMax H3 Ref2VA 全参考模式六段结构），供单支竖屏短视频生成使用。完全独立于小说项目：无需任何定稿正文，剧情节拍从创意穷举自拟，目标时长 10-180 秒（默认 30，clamp 收敛），按 5-10 秒片段拆分，总时长落在目标 ±10 秒容差内；含剧集剧作契约（开场即冲突、情绪节点节奏、出口即钩子、台词密度、伏笔链、人物经济）。产物落 short_scripts 独立表（scriptId 主键），同一创意输入幂等复用；填 projectId 时产物关联该作品（衍生短剧）。需要 ToolContext.model。",
-    inputSchema: {
-      type: "object",
-      properties: {
-        projectId: { type: "string", minLength: 1, description: "可选：关联小说作品（为某部小说世界观创作衍生短剧时填写；缺省为独立短剧）" },
-        idea: { type: "string", minLength: 10, description: "核心创意：写清谁、何处、什么冲突（至少 10 字符）" },
-        instruction: { type: "string", description: "可选，短剧创作指令/特殊要求" },
-        targetDurationSeconds: { type: "integer", minimum: 10, maximum: 180, description: "目标总时长（秒），默认 30，超界收敛到边界" },
-      },
-      required: ["idea"],
-      additionalProperties: false,
-    },
-  },
-
-  {
-    name: "novel_short_script_h3_brainstorm",
-    description: "从一句开放的核心创意方向穷举 N 个彼此截然不同、各自拥有独立核心奇观意象的短剧创意候选（用于规避「开放命题塌缩到模型默认母题」问题：如开放命题喂给 novel_short_script_h3 会反复产出倒悬巨钟）。本工具只调模型做创意发散，不生成完整脚本、不落库；返回的每候选 wonder 已是可直接喂给 novel_short_script_h3 的 idea 字符串，编排者挑定其一后再调用 novel_short_script_h3 生成。需要 ToolContext.model。",
-    inputSchema: {
-      type: "object",
-      properties: {
-        idea: { type: "string", minLength: 10, description: "开放核心创意方向：写清题材/风格/场景/目标即可，无需指定具体奇观（至少 10 字符）" },
-        count: { type: "integer", minimum: 2, maximum: 6, description: "穷举候选数，2-6，默认 3" },
-        targetDurationSeconds: { type: "integer", minimum: 10, maximum: 180, description: "可选，目标时长提示（秒），仅告知模型每个候选的体量预期，不改变穷举行为" },
-        instruction: { type: "string", description: "可选，穷举时的额外约束（如「避免钟类母题」）" },
-      },
-      required: ["idea"],
-      additionalProperties: false,
-    },
-  },
-
-  {
     name: "novel_story_arc_start",
-    description: "依据当前宏观规划和定稿状态生成下一个顺序故事弧及整弧章节蓝图，由外部 LLM 审核并自动修订至通过。",
-    inputSchema: { type: "object", properties: { projectId: { type: "string", minLength: 1 }, authorIntent: { type: "string" } }, required: ["projectId"], additionalProperties: false },
+    description: "依据当前宏观规划生成故事弧及整弧章节蓝图，由外部 LLM 审核并自动修订至通过；默认生成下一个顺序弧，传 arcId 则重生成既有弧（该弧已有落稿章节（documentId 已投影）时自动进入 rebase：以已定稿事实为冻结权威重建规划；仅存失败尝试遗留的孤儿蓝图时按普通重生成，不进 rebase）。",
+    inputSchema: { type: "object", properties: { projectId: { type: "string", minLength: 1 }, arcId: { type: "string", description: "可选：重生成指定既有故事弧（缺省=创建下一个顺序弧）" }, authorIntent: { type: "string" } }, required: ["projectId"], additionalProperties: false },
   },
   {
     name: "novel_story_arc_get",
@@ -736,6 +721,64 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
         reviewPolicy: { type: "string", enum: ["manual", "auto"], default: "auto" },
       },
       required: ["projectId", "arcId"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "novel_story_arc_decision",
+    description: "故事弧人工门决策（与章节门 novel_chapter_review_decision 平权）：manual 审核策略下工作流停在人工稿审批门时用本工具放行。approve=批准当前蓝图（复用正式落库+唤醒信号，审核未过时会被门禁正当拒绝）；revise=把作者修订指令送进等待中的门，系统定向修订→重审→再入门（feedback 必填，与审核意见合并，不覆盖审核器发现的问题）。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectId: { type: "string", minLength: 1 },
+        arcId: { type: "string", minLength: 1 },
+        decision: { type: "string", enum: ["approve", "revise"] },
+        feedback: { type: "string", description: "decision=revise 必填：作者修订指令" },
+        actorId: { type: "string", description: "批准责任主体（审计用），默认 mcp-author" },
+      },
+      required: ["projectId", "arcId", "decision"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "novel_foreshadowing_list",
+    description: "伏笔账本分流视图：按状态列出伏笔（含 overdue 判定，与架构健康告警同一谓词），供作者/外部编排者做 兑现/改写窗口/放弃 决策；兑现由正文 payoffs 账驱动，本视图只暴露三态与窗口。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectId: { type: "string", minLength: 1 },
+        status: { type: "string", enum: ["open", "fulfilled", "abandoned", "all"], default: "open" },
+        limit: { type: "integer", minimum: 1, maximum: 400, default: 200 },
+      },
+      required: ["projectId"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "novel_foreshadowing_triage",
+    description: "伏笔账本作者分流：abandon=放弃（open 消费面出局，规划/审校/账本不再注入）；rewrite-window=改写兑现窗口上界（只动窗口，不动描述与埋设账）。每条必须带 reason（审计轨迹），逐条幂等 skip 不炸整批；兑现动作不经此门（由章节正文事实提取的 payoffs 账驱动）。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectId: { type: "string", minLength: 1 },
+        actorId: { type: "string", minLength: 1, description: "分流责任主体（作者/编排者），必填进审计" },
+        entries: {
+          type: "array", minItems: 1, maxItems: 100,
+          items: {
+            type: "object",
+            properties: {
+              id: { type: "string", minLength: 1 },
+              action: { type: "string", enum: ["abandon", "rewrite-window"] },
+              reason: { type: "string", minLength: 1 },
+              windowFrom: { type: "integer", minimum: 1 },
+              windowTo: { type: "integer", minimum: 1 },
+            },
+            required: ["id", "action", "reason"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["projectId", "actorId", "entries"],
       additionalProperties: false,
     },
   },
@@ -775,7 +818,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
 
   {
     name: "novel_skill_get",
-    description: "读取指定执行点的已解析运行时 Skill 指引文本（含 h3-video-prompt 等短剧剧本方法论），供外部 MCP 接手短剧内容产出：先读 skill 拿到方法论，再按核心创意与时长参数自行产出模型形态 JSON，最后用 novel_short_script_h3_submit / novel_chapter_script_h3_submit 落库。返回 skillText（可注入外部模型 prompt）、resolvedSkills 与 availableSkills（含各 skill 的 executionPoints，供发现合法执行点）。",
+    description: "读取指定执行点的已解析运行时 Skill 指引文本（含 h3-video-prompt 等短剧剧本方法论），供外部 MCP 接手短剧内容产出：先读 skill 拿到方法论，再按核心创意与时长参数自行产出模型形态 JSON，最后用 novel_chapter_script_h3_submit 落库（独立短剧已改浏览器本地存储，无外部落库工具）。返回 skillText（可注入外部模型 prompt）、resolvedSkills 与 availableSkills（含各 skill 的 executionPoints，供发现合法执行点）。",
     inputSchema: {
       type: "object",
       properties: {
@@ -783,33 +826,6 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
         projectId: { type: "string", description: "可选；DB 源 skill 按项目过滤（workspace 源忽略）" },
       },
       required: ["executionPoint"],
-      additionalProperties: false,
-    },
-  },
-
-  {
-    name: "novel_short_script_h3_submit",
-    description: "外部 MCP 接手短剧内容产出：提交自行生成的模型形态剧本 JSON（plotBeats / characters / segments 六段字段），系统负责零阻断组装 promptText、结构观察、契约版本与落库（short_scripts 独立表）。read-only 派生产物，不进正文质量门。幂等：同一外部内容重放复用既有产物（指纹前缀 ext: 与系统内部生成区分）。与 novel_short_script_h3（系统内部生成）互为双轨。",
-    inputSchema: {
-      type: "object",
-      properties: {
-        idea: { type: "string", minLength: 10, description: "核心创意：写清谁、何处、什么冲突（至少 10 字符）" },
-        instruction: { type: "string", description: "可选，短剧创作指令" },
-        targetDurationSeconds: { type: "integer", minimum: 10, maximum: 180, description: "目标总时长（秒），默认 30，超界收敛" },
-        projectId: { type: "string", description: "可选：关联小说作品（衍生短剧）" },
-        payload: {
-          type: "object",
-          description: "外部模型产出的剧本 JSON：{plotBeats:[{id,kind,summary}], characters:[{name,appearanceEn}], segments:[{title,synopsis,durationSeconds,beatIds,subjectDefinitions,summary,retentionAnalysis,detailedDescription,overallSoundscape,nonDiegeticMusic}]}",
-          properties: {
-            plotBeats: { type: "array" },
-            characters: { type: "array" },
-            segments: { type: "array" },
-          },
-          required: ["segments"],
-          additionalProperties: true,
-        },
-      },
-      required: ["idea", "payload"],
       additionalProperties: false,
     },
   },
@@ -825,7 +841,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
         instruction: { type: "string", description: "可选，改编指令" },
         payload: {
           type: "object",
-          description: "外部模型产出的剧本 JSON（同 novel_short_script_h3_submit 的 segments 结构）",
+          description: "外部模型产出的剧本 JSON（segments 结构约定见 novel_chapter_script_h3；独立短剧的外部提交已随 IndexedDB 迁移移除）",
           properties: {
             plotBeats: { type: "array" },
             characters: { type: "array" },
@@ -901,6 +917,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
         decision: { type: "string", enum: ["approve", "revise", "reject", "abandon"], description: "approve=定稿提交(需 interactive-web)、revise=按审核意见继续修订、reject=拒绝并保留原稿、abandon=放弃本轮修订" },
         feedback: { type: "string", description: "作者判断理由。approve 覆盖严重审校问题时必填；revise 时作为补充修订指令" },
         revisionBase: { type: "string", enum: ["current", "previous"], description: "revise 时选择修订基础：current=从当前候选稿修订、previous=从修订前原稿修订" },
+        actorId: { type: "string", description: "决策责任主体署名（审计用，如 author / orchestrator:<model>）；缺省 web-author" },
       },
       required: ["workflowId", "artifactId", "decision"],
       additionalProperties: false,
@@ -939,6 +956,127 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
         limit: { type: "integer", minimum: 1, maximum: MAX_LIST_LIMIT, default: DEFAULT_ARTIFACT_LIST_LIMIT },
       },
       required: ["projectId"],
+      additionalProperties: false,
+    },
+  },
+
+  // ===== 外部 LLM 深度参与：上下文查询与子 agent 调度（5，2026-09-08）=====
+
+  {
+    name: "novel_memory_query",
+    description: "查询指定章节/purpose 的 MemoryBundle 内容——冻结事实（claims 列表）、跨章序列证据（openPromises/assetSpans/characterSpans/subjectSpans）、叙事节奏摘要（narrativeRhythm）。外部编排 LLM 在故事弧规划、章节蓝图或正文创作前调用，精确了解模型将收到哪些记忆注入，避免'凭感觉编排'。只读，不调模型，不改变状态。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectId: { type: "string", minLength: 1 },
+        documentId: { type: "string", description: "目标章节文档 ID（用于计算 narrativeCutoff 防剧透；不传则返回最近全局记忆）" },
+        narrativeCutoff: { type: "integer", description: "可选，叙事截止章序（默认目标章-1）；小于 1 时返回全局记忆" },
+        compact: { type: "boolean", description: "true 时只返回 claims 摘要（id/title/subject）和序列证据计数，不返回完整 content 与 evidenceQuote" },
+      },
+      required: ["projectId"],
+      additionalProperties: false,
+    },
+  },
+
+  {
+    name: "novel_memory_grooming_report",
+    description: "生成记忆梳理诊断报告：把 active 事实账本按（规范化主体 × 规范谓词）身份槽位分组，组内给出近重复候选对（字符二元组 Dice 相似度排序）。外部编排 LLM 作为事实梳理审核者消费本报告，按文本意见契约输出梳理意见（通过=单行 PASSED；不通过=指出哪对是语义重复、哪对是状态演化需 supersedes、哪对是误提取），意见经作者确认后走既有 claim 生命周期，本工具不提供任何改库能力。只读。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectId: { type: "string", minLength: 1 },
+      },
+      required: ["projectId"],
+      additionalProperties: false,
+    },
+  },
+
+  {
+    name: "novel_fact_candidate_queue",
+    description: "事实候选积压面板（只读）：按章聚合待人工/外部裁决的 candidate 事实——数量、最长账龄、与该章可见冻结事实的积压率，附样本。外部编排 LLM 在章节收口、弧收口或定期巡检时调用，逐条裁决（approve/reject 走 novel_fact_candidate_decide），防止候选长期滞留成为事实坟场（未裁决候选不会退役既有事实，但正式事实供给被悬置）。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectId: { type: "string", minLength: 1 },
+      },
+      required: ["projectId"],
+      additionalProperties: false,
+    },
+  },
+
+  {
+    name: "novel_fact_candidate_decide",
+    description: "裁决事实候选（批量，逐条幂等检查）：approve 使候选升为 approved 并让其 supersedes 边生效（退役旧值、写入向量索引）；reject 拒绝并保留记录。reason 必填（审计轨迹：来自作者原话或外部审核意见引用）。已处理过的 claimId 不报错但标记 skipped，整批不因单条冲突中断。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectId: { type: "string", minLength: 1 },
+        claimIds: { type: "array", items: { type: "string", minLength: 1 }, minItems: 1, maxItems: 50 },
+        decision: { type: "string", enum: ["approve", "reject"] },
+        reason: { type: "string", minLength: 1 },
+        actorId: { type: "string", description: "裁决责任主体（如 author、orchestrator:<model>），默认 mcp-orchestrator" },
+      },
+      required: ["projectId", "claimIds", "decision", "reason"],
+      additionalProperties: false,
+    },
+  },
+
+  {
+    name: "novel_skill_query",
+    description: "查询指定 execution point 的 SkillBundle——哪些 skill 将被加载到 prompt 中、每个 skill 的 promptSections 完整文本、fingerprint。外部编排 LLM 在下达编辑指令或审核意见前调用，精确了解模型将收到哪些创作指引，用于判断'这段指引是否覆盖了我要检查的方面'。只读，不调模型。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectId: { type: "string", minLength: 1 },
+        executionPoint: { type: "string", description: "执行点（如 chapter.drafting / arc.plan / chapter.review.structure 等）" },
+        role: { type: "string", description: "可选，角色过滤（writer / structural-validator 等）" },
+      },
+      required: ["projectId", "executionPoint"],
+      additionalProperties: false,
+    },
+  },
+
+  {
+    name: "novel_prompt_inspect",
+    description: "审计指定模型调用的完整 StagePromptPackage——system 指令、组装后的 instruction、prompt manifest、模型响应、路由候选与 token 用量。外部编排 LLM 在诊断质量问题或优化 prompt 时调用，精确看到'模型收到了什么、返回了什么'。只读。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        workflowId: { type: "string", minLength: 1, description: "工作流 ID" },
+        taskId: { type: "string", minLength: 1, description: "任务 ID（如 blueprint:xxx:draft 或 blueprint:xxx:review:structure）" },
+      },
+      required: ["workflowId", "taskId"],
+      additionalProperties: false,
+    },
+  },
+
+  {
+    name: "novel_invocation_list",
+    description: "列出项目或工作流最近的模型调用审计记录——purpose、模型、候选序号、状态、token 用量、错误分类。外部编排 LLM 在诊断质量问题或了解模型使用情况时调用。只读。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectId: { type: "string", minLength: 1 },
+        workflowId: { type: "string", description: "可选，只返回该工作流的调用" },
+        limit: { type: "integer", minimum: 1, maximum: 100, default: 20 },
+      },
+      required: ["projectId"],
+      additionalProperties: false,
+    },
+  },
+
+  {
+    name: "novel_model_dispatch",
+    description: "外部编排 LLM 主动调度一个 API 模型执行子任务（子 agent 模式）：传入 purpose 和 prompt，系统从路由配置选择候选链首位可用模型，直接调用并返回结果。不进工作流、不落 artifact、不触发审核——外部 LLM 拿到结果后自行决定是否启动正式工作流。用途：前置草稿预生成、段落改写实验、审核意见预分析。purpose 白名单限制为创作类（writing.draft / writing.revision），不允许替代审核与事实提取。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        purpose: { type: "string", enum: ["writing.draft", "writing.revision"], description: "用途（决定路由到哪个模型候选链）" },
+        prompt: { type: "string", minLength: 1, description: "发给模型的 prompt（外部 LLM 自行组装，可包含从 novel_memory_query / novel_skill_query 获取的上下文）" },
+        system: { type: "string", description: "可选，system 指令" },
+        maxTokens: { type: "integer", minimum: 1024, maximum: 128000, default: 32768 },
+      },
+      required: ["purpose", "prompt"],
       additionalProperties: false,
     },
   },

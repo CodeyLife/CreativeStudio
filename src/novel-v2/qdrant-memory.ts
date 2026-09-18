@@ -1,6 +1,7 @@
 import { QdrantClient } from "@qdrant/js-client-rest";
 import { createHash } from "node:crypto";
 import type { MemoryClaim, MemoryHit, MemoryProvider, RetrievalFacet } from "./protocol";
+import { isVisibleClaimAuthority, VISIBLE_CLAIM_AUTHORITIES } from "./memory-visibility";
 import type { ModelGateway } from "./model-gateway";
 
 export interface MemoryIndex {
@@ -49,11 +50,13 @@ export class QdrantMemoryProvider implements MemoryProvider, MemoryIndex {
   async search(input: { projectId: string; facets: RetrievalFacet[]; narrativeCutoff?: number; povCharacterId?: string }): Promise<MemoryHit[]> {
     await this.ensureCollection();
     const query = input.facets.map((facet) => facet.query).join(" ");
-    const embedding = await this.gateway.embed({ purpose: "memory.embed", texts: [query] });
+    const embedding = await this.gateway.embed({ purpose: "memory.embed", texts: [query], projectId: input.projectId });
     if (embedding.vectors[0]?.length !== this.dimension) throw new Error(`查询向量维度 ${embedding.vectors[0]?.length ?? 0} 与集合维度 ${this.dimension} 不一致`);
     const filter: any = { must: [
       { key: "projectId", match: { value: input.projectId } },
       { key: "lifecycleStatus", match: { value: "active" } },
+      // 服务端就限死可见 authority，避免 candidate/rejected 点挤占召回名额后在应用层丢弃。
+      { key: "authority", match: { any: [...VISIBLE_CLAIM_AUTHORITIES] } },
     ] };
     // P0-A4: narrativeStart=null 表示全局可见（无章节归属的基础事实），
     // 不应被 narrativeCutoff 屏蔽。Qdrant 的 range:lte 过滤会排除 null 值，
@@ -121,7 +124,7 @@ export class QdrantMemoryProvider implements MemoryProvider, MemoryIndex {
     const filteredHits = supersededIds.size > 0 ? hits.filter((hit) => !supersededIds.has(hit.id)) : hits;
 
     // Phase 2.1 rerank：若 gateway.rerank 可用，对 top-N 做 cross-encoder rerank
-    return this.applyRerank(query, filteredHits);
+    return this.applyRerank(query, filteredHits, input.projectId);
   }
 
   /**
@@ -134,7 +137,7 @@ export class QdrantMemoryProvider implements MemoryProvider, MemoryIndex {
    * 设计依据：Phase 2.1 计划——rerank score 覆盖 semanticRank，
    * 让 buildMemoryBundle 的后续排序逻辑无需感知 rerank 存在。
    */
-  private async applyRerank(query: string, hits: MemoryHit[]): Promise<MemoryHit[]> {
+  private async applyRerank(query: string, hits: MemoryHit[], projectId?: string): Promise<MemoryHit[]> {
     const TOP_N = 64;
     const TOP_K = 32;
     if (hits.length === 0) return hits;
@@ -144,7 +147,7 @@ export class QdrantMemoryProvider implements MemoryProvider, MemoryIndex {
 
     try {
       const documents = candidates.map((hit) => `${hit.title}\n${hit.content}`);
-      const rerankResult = await this.gateway.rerank({ purpose: "memory.rerank", query, documents });
+      const rerankResult = await this.gateway.rerank({ purpose: "memory.rerank", query, documents, projectId });
       const scores = rerankResult.scores;
       if (scores.length !== candidates.length) {
         // scores 数量不匹配，降级
@@ -171,9 +174,11 @@ export class QdrantMemoryProvider implements MemoryProvider, MemoryIndex {
   async upsertClaims(projectId: string, claims: MemoryClaim[]) {
     if (!claims.length) return;
     await this.ensureCollection();
-    const supersededIds = [...new Set(claims.flatMap((claim) => claim.supersedes))];
+    // 退役不变量（memory-visibility）：只有检索可见的声明才有资格退役向量点，
+    // 否则未裁决的 candidate 会把它取代的旧派生事实从向量索引里盲删。
+    const supersededIds = [...new Set(claims.filter((claim) => isVisibleClaimAuthority(claim.authority)).flatMap((claim) => claim.supersedes))];
     if (supersededIds.length) await this.deleteClaims(projectId, supersededIds);
-    const embeddings = await this.gateway.embed({ purpose: "memory.embed", texts: claims.map((claim) => `${claim.title}\n${claim.content}`) });
+    const embeddings = await this.gateway.embed({ purpose: "memory.embed", texts: claims.map((claim) => `${claim.title}\n${claim.content}`), projectId });
     if (embeddings.vectors.length !== claims.length || embeddings.vectors.some((vector) => vector.length !== this.dimension)) {
       throw new Error(`embedding 返回 ${embeddings.vectors.length} 个向量，要求 ${claims.length} 个且每个维度为 ${this.dimension}`);
     }

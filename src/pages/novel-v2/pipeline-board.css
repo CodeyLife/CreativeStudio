@@ -256,7 +256,7 @@
 .pb-author-canvas { min-width: 0; }
 .pb-author-context { position: sticky; top: 14px; min-width: 0; max-height: calc(100dvh - 110px); overflow-y: auto; border-left: 1px solid #27272a; padding-left: 14px; }
 .pb-author-context .ant-tabs-nav { margin-bottom: 12px; }
-.pb-learning-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-bottom: 16px; }
+.pb-learning-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-bottom: 16px; }
 .pb-learning-summary > div { display: flex; flex-direction: column; gap: 3px; padding: 9px 8px; border: 1px solid #27272a; background: #18181b; }
 .pb-learning-summary strong { color: #e4e4e7; font: 700 18px/1 "Geist Mono", monospace; }
 .pb-learning-summary span { color: #71717a; font-size: 9px; }
@@ -702,21 +702,25 @@
 
 /* ===== 章节短剧剧本提示词（ChapterScriptModal） ===== */
 .pb-script-empty { display: grid; gap: 14px; padding: 8px 0 4px; }
-.pb-script-generated { display: grid; gap: 12px; }
+/* 单列轨道显式 minmax(0, 1fr)：阻断下游内容固有宽度（tab 导航、长 token）沿 auto 轨道向上撑破容器 */
+.pb-script-generated { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; }
 .pb-script-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .pb-script-toolbar-info { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .pb-script-time { color: var(--pb-muted, #94a3b8); font-size: 12px; }
 .pb-script-fingerprint { margin-bottom: 0 !important; font-size: 12px; }
-.pb-script-segment { border: 1px solid var(--pb-border, #e2e8f0); border-radius: 10px; padding: 12px 14px; display: grid; gap: 8px; background: var(--pb-surface-alt, rgba(148, 163, 184, 0.06)); }
-.pb-script-segment-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-.pb-script-segment-head strong { font-size: 14px; }
-.pb-script-segment-meta { display: inline-flex; align-items: center; gap: 6px; }
+.pb-script-segment { border: 1px solid var(--pb-border, #e2e8f0); border-radius: 10px; padding: 12px 14px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; background: var(--pb-surface-alt, rgba(148, 163, 184, 0.06)); }
+.pb-script-segment-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-width: 0; }
+.pb-script-segment-head strong { font-size: 14px; min-width: 0; }
+.pb-script-segment-meta { display: inline-flex; align-items: center; gap: 6px; flex-shrink: 0; }
 .pb-script-synopsis { margin: 0; color: var(--pb-muted, #64748b); font-size: 12.5px; line-height: 1.7; }
-.pb-script-prompt { margin: 0; max-height: 320px; overflow: auto; white-space: pre-wrap; word-break: break-word; font-size: 12.5px; line-height: 1.75; padding: 10px 12px; border-radius: 8px; background: var(--pb-code-bg, rgba(15, 23, 42, 0.05)); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+/* overflow-wrap: anywhere 计入固有尺寸，长 token 不再按完整宽度向上传播（word-break: break-word 不参与该计算） */
+.pb-script-prompt { margin: 0; max-height: 320px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12.5px; line-height: 1.75; padding: 10px 12px; border-radius: 8px; background: var(--pb-code-bg, rgba(15, 23, 42, 0.05)); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
 
 
 /* 片段横向 Tabs：压缩 tab 条留白，面板内仍用卡片样式 */
-.pb-script-tabs .ant-tabs-nav { margin-bottom: 10px; }
+/* min-width: 0 允许 Tabs 作为 grid item 收缩，nav 超宽时交给 antd 内建滚动而非撑破详情列 */
+.pb-script-tabs { min-width: 0; }
+.pb-script-tabs .ant-tabs-nav { margin-bottom: 10px; min-width: 0; }
 .pb-script-tabs .ant-tabs-tab { padding: 6px 4px; font-size: 13px; }
 
 /* 共享定义库编辑区 */
@@ -748,22 +752,61 @@
 .pb-script-history-copy { display: grid; gap: 2px; min-width: 0; }
 .pb-script-history-copy strong { font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pb-script-history-copy small { color: var(--pb-muted, #64748b); font-size: 12px; }
+.pb-script-history-materials { display: flex; flex-wrap: wrap; gap: 4px; font-style: normal; color: var(--pb-accent, #14b8a6); font-size: 11px; }
+.pb-script-history-materials span { background: rgba(20, 184, 166, 0.08); border-radius: 4px; padding: 1px 5px; }
 .pb-script-history-action { color: var(--pb-accent, #14b8a6); font-size: 12.5px; white-space: nowrap; }
 
-/* 详情区：核心创意卡片置顶，动作按钮靠右 */
-.pb-script-studio-detail { display: grid; gap: 12px; }
-.pb-script-detail-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; padding: 12px 14px; border: 1px dashed var(--pb-border, #e2e8f0); border-radius: 10px; background: var(--pb-surface-alt, rgba(20, 184, 166, 0.05)); }
-.pb-script-detail-idea { display: grid; gap: 4px; min-width: 0; }
-.pb-script-detail-idea-label { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; font-weight: 600; color: var(--pb-accent, #14b8a6); }
-.pb-script-detail-idea-text { margin: 0; font-size: 13px; line-height: 1.7; white-space: pre-wrap; word-break: break-word; }
-.pb-script-detail-instruction { margin: 0; color: var(--pb-muted, #64748b); font-size: 12px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
-.pb-script-detail-actions { display: inline-flex; align-items: center; gap: 6px; flex-shrink: 0; }
+/* 详情列：min-width 0 保证收缩链完整；overflow-x: hidden 仅作极端兜底，常规溢出应由上游收缩链消化而非依赖裁剪 */
+.pb-script-detail-pane { min-width: 0; overflow-x: hidden; }
 
-/* 窄屏：双栏退化为上下堆叠，历史列表限高滚动 */
+/* 详情区：创意头卡纵向堆叠（标签行动作行 → 创意文本 → 元信息条），动作按钮不再挤压文本列 */
+.pb-script-studio-detail { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; }
+.pb-script-detail-head { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; padding: 12px 14px; border: 1px dashed var(--pb-border, #e2e8f0); border-radius: 10px; background: var(--pb-surface-alt, rgba(20, 184, 166, 0.05)); }
+.pb-script-detail-idea { display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; min-width: 0; }
+.pb-script-detail-idea-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.pb-script-detail-idea-label { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; font-weight: 600; color: var(--pb-accent, #14b8a6); }
+.pb-script-detail-idea-text { margin: 0; font-size: 13px; line-height: 1.7; white-space: pre-wrap; overflow-wrap: anywhere; }
+.pb-script-detail-instruction { margin: 0; color: var(--pb-muted, #64748b); font-size: 12px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
+.pb-script-detail-actions { display: inline-flex; align-items: center; gap: 6px; flex-shrink: 0; }
+.pb-script-detail-meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-width: 0; padding-top: 8px; border-top: 1px solid var(--pb-border, #e2e8f0); }
+
+/* ---------- 短剧创作台（公用素材库 + 多剧情容器） ---------- */
+.pb-workspace-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.pb-workspace-select { min-width: 320px; max-width: 480px; }
+.pb-workspace-create { display: flex; align-items: center; gap: 8px; }
+.pb-workspace-create .ant-input { width: 220px; }
+.pb-workspace-hint { margin-top: 6px; color: var(--pb-muted, #64748b); font-size: 12px; }
+
+/* 公用素材库：拖拽上传区 + 网格预览（图片尽量大、纵向排列） */
+.pb-material-upload { display: block; margin-bottom: 12px; padding: 12px; border: 1px dashed var(--pb-border, #cbd5e1); border-radius: 10px; background: var(--pb-surface-alt, rgba(148, 163, 184, 0.06)); transition: border-color 0.15s ease, background 0.15s ease; }
+.pb-material-upload.is-dragging { border-color: var(--pb-accent, #14b8a6); background: rgba(20, 184, 166, 0.1); }
+.pb-material-dropzone { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; }
+.pb-material-dropzone-hint { color: var(--pb-muted, #64748b); font-size: 12.5px; text-align: center; padding: 6px 0; }
+.pb-material-dropzone .ant-input { width: 100%; }
+.pb-material-dropzone-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: center; }
+.pb-material-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 14px; }
+.pb-material-card { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; padding: 10px; border: 1px solid var(--pb-border, #e2e8f0); border-radius: 10px; background: var(--pb-surface-alt, rgba(148, 163, 184, 0.05)); }
+.pb-material-preview { width: 100%; aspect-ratio: 1 / 1; object-fit: cover; border-radius: 8px; background: #0f172a66; }
+.pb-material-meta { display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; min-width: 0; }
+.pb-material-desc { font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; min-height: 20px; }
+.pb-material-edit { display: grid; gap: 6px; }
+.pb-material-edit-actions { display: flex; gap: 6px; }
+.pb-material-tags { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+.pb-material-card-actions { display: inline-flex; align-items: center; gap: 2px; }
+
+/* 剧情创作：引入素材勾选区 */
+.pb-script-materials-select { display: grid; gap: 6px; padding: 8px 10px; border: 1px dashed var(--pb-border, #e2e8f0); border-radius: 10px; background: var(--pb-surface-alt, rgba(20, 184, 166, 0.04)); }
+.pb-script-materials-label { display: flex; align-items: center; gap: 5px; font-size: 12px; font-weight: 600; color: var(--pb-accent, #14b8a6); }
+.pb-script-materials-check { display: flex; flex-direction: column; gap: 4px; }
+
+/* 详情：本剧情引入的素材标签 */
+.pb-script-detail-materials { display: grid; gap: 6px; padding: 10px 14px; border: 1px solid var(--pb-border, #e2e8f0); border-radius: 10px; background: var(--pb-surface-alt, rgba(148, 163, 184, 0.05)); }
+.pb-script-detail-materials-label { display: flex; align-items: center; gap: 5px; font-size: 12px; font-weight: 600; color: var(--pb-accent, #14b8a6); }
+.pb-script-detail-materials-list { display: flex; flex-wrap: wrap; gap: 6px; }
+
+/* 窄屏：双栏退化为上下堆叠，历史列表限高滚动（详情头已是纵向堆叠结构，无需窄屏特判） */
 @media (max-width: 960px) {
   .pb-script-studio-body { grid-template-columns: minmax(0, 1fr); }
   .pb-script-history-pane { position: static; }
   .pb-script-history-list { max-height: 320px; }
-  .pb-script-detail-head { flex-direction: column; }
-  .pb-script-detail-actions { align-self: flex-end; }
 }

@@ -8,8 +8,10 @@ async function main() {
   const handle = client.workflow.getHandle(workflowId);
 
   const history = await handle.fetchHistory();
-  console.log(`Total events: ${history.events.length}`);
-  for (const event of history.events) {
+  // fetchHistory 对已清理/不存在的运行可返回无 events 的历史对象。
+  const events = history.events ?? [];
+  console.log(`Total events: ${events.length}`);
+  for (const event of events) {
     const eventType = (event as any).eventType;
     // 3 = WORKFLOW_EXECUTION_FAILED, 8 = ACTIVITY_TASK_FAILED
     if (eventType === 3 || eventType === 8) {

@@ -18,6 +18,7 @@
  *   hasBlockerOrMajor 分支，永远到不了 score 检查）。
  */
 import { describe, expect, it, beforeAll, afterAll } from "vitest";
+import { isPostgresUnavailable } from "./test-db";
 import { randomUUID } from "node:crypto";
 import { NovelPostgresRepository } from "../postgres-repository";
 import { evaluateReviewGate, hasPassedIndependentReviewForArtifact } from "../creative/review-gate";
@@ -207,6 +208,7 @@ describe("creative-execution integration", () => {
       await repository.migrate();
       postgresAvailable = true;
     } catch (error) {
+      if (!isPostgresUnavailable(error)) throw error;
       console.warn(`[creative-execution.test] Postgres 不可用: ${(error as Error).message}`);
     }
   }, 30000);

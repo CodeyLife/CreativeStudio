@@ -11,23 +11,24 @@
  * 与列表过滤。产物落 short_scripts 独立表（迁移 050），不再走 artifacts。
  *
  * 流程：
- * 1. 校验创意输入与目标时长预算（分段数上下限，仅作为 prompt 预算注入）
+ * 1. 校验创意输入与时长模式（fixed=固定目标时长预算，按预算推导分段数上下限，
+ *    仅作为 prompt 预算注入；auto=不限时长，总时长与片段数由模型依据核心创意
+ *    自行编排，仅保留段数硬顶保护输出预算）
  * 2. resolveStageSkillBundle(short.script) 注入 skill 指引 → generateStructured 调模型
  * 3. 复用 normalizeChapterScriptOutput 做零阻断组装（2026-08-31 起，用户指令：
  *    产物不做任何校验直接显示）——节拍覆盖、呈现手段、标签、时序、对白标记
  *    与总时长窗口全部降级为 hints 供人工复核，不回灌 repair、不阻止落库
  * 4. 六段按固定顺序组装成最终提示词，落 short_scripts 表
  *
- * 幂等键：作用域（projectId ?? "independent"）+ idea + instruction +
- * targetDuration + 契约版本，同输入重放复用既有产物；改创意、切换关联
- * 作用域或推进契约版本后自然失效重生成。
+ * 幂等键：作用域（projectId ?? "independent"）+ idea + instruction + 时长维度
+ * （fixed=目标时长数值，auto="auto" 占位）+ 契约版本，同输入重放复用既有产物；
+ * 改创意、切换时长模式、切换关联作用域或推进契约版本后自然失效重生成。
  */
 import { createHash, randomUUID } from "node:crypto";
 import type { SkillProvider } from "../protocol";
 import type { ModelRoutingSnapshot } from "../model-routing";
+import { ExternalMcpRequiredError } from "../model-routing";
 import type { ModelGateway } from "../model-gateway";
-import type { ObjectStoreAdapter } from "../object-store";
-import { NovelPostgresRepository, type StoredShortScript } from "../postgres-repository";
 import { buildSkillContextSections, resolveStageSkillBundle } from "../skill-runtime";
 import { compileStageContext } from "../stage-context";
 import {
@@ -40,8 +41,52 @@ import {
   normalizeChapterScriptOutput,
   PlotBeat,
 } from "./chapter-script-h3";
+import {
+  buildShortScriptBatchPrompt,
+  buildShortScriptBatchSchema,
+  buildShortScriptPlanPrompt,
+  buildShortScriptPlanSchema,
+  buildCreativeStrategySchema,
+  buildShortScriptAvoidMotifLine,
+  buildShortScriptMaterialLine,
+  normalizeCreativeStrategy,
+  shortScriptDurationBudgetLine,
+  SHORT_SCRIPT_AVOID_MOTIF_LIMIT,
+  SHORT_SCRIPT_SEGMENTS_PER_BATCH,
+  SHORT_SCRIPT_BOUNDARY_CONTRACT,
+  SHORT_SCRIPT_COVERAGE_CONTRACT,
+  SHORT_SCRIPT_DESCRIPTION_VOLUME_CONTRACT,
+  SHORT_SCRIPT_PRESENTATION_CONTRACT,
+  SHORT_SCRIPT_PLAN_MAX_TOKENS,
+  SHORT_SCRIPT_BATCH_MAX_TOKENS,
+  SHORT_SCRIPT_TOTAL_DURATION_TOLERANCE_SECONDS,
+  ShortScriptPlan,
+  ShortScriptPreviousSegment,
+  sliceShortScriptBatchRanges,
+  usesShortScriptStagedGeneration,
+  type ShortScriptCreativeStrategy,
+  type ShortScriptReferenceMaterial,
+} from "./staged-script-generation";
 
-/** 短剧产物类型标识：v2 起存储于 short_scripts 独立表，kind 仅作语义标签（迁移数据沿用 artifacts id）。 */
+/** 一部剧情选中的公用素材引用快照（material_refs：materialId + 描述 + <Subject N> 参考帧标签）。
+ * 独立短剧存浏览器 IndexedDB，此快照随脚本落前端 store；前端从创作台素材解析后直传。 */
+export interface ShortDramaMaterialRef {
+  materialId: string;
+  description: string;
+  subjectTag: string;
+}
+
+/** 吸引力设计（creativeStrategy）的类型与工具对外从本模块导出（short.script 专属契约的应用层入口）。 */
+export {
+  SHORT_SCRIPT_HOOK_ENGINES,
+  buildCreativeStrategySchema,
+  buildShortScriptAvoidMotifLine,
+  normalizeCreativeStrategy,
+  type ShortScriptCreativeStrategy,
+  type ShortScriptHookEngine,
+} from "./staged-script-generation";
+
+/** 短剧产物类型标识（语义标签；独立短剧本版本存储于浏览器 IndexedDB，不再落 short_scripts 表）。 */
 export const SHORT_SCRIPT_KIND = "short-script";
 export const SHORT_SCRIPT_EXECUTION_POINT = "short.script" as const;
 
@@ -52,24 +97,69 @@ export const MIN_SHORT_SCRIPT_TARGET_SECONDS = 10;
 export const MAX_SHORT_SCRIPT_TARGET_SECONDS = 180;
 /** 180s ÷ 最短单段 5s = 36：段数 cap 与目标时长上限自洽。 */
 export const MAX_SHORT_SCRIPT_SEGMENTS = 36;
-/** 总时长与目标时长的容差窗口：分段为 5-15s 整数粒度，任意合法目标可精确拼出；窗口用于吸收模型的近似分配。 */
-export const SHORT_SCRIPT_TOTAL_DURATION_TOLERANCE_SECONDS = 10;
+/** 总时长与目标时长的容差窗口：常量移至 staged-script-generation（两阶段/单次共享同一文本），此处保持原导出路径兼容。 */
+export { SHORT_SCRIPT_TOTAL_DURATION_TOLERANCE_SECONDS } from "./staged-script-generation";
 /** 核心创意输入最小长度：低于该长度无法承载"谁想要什么、什么阻止他"的最小创意单元。 */
 export const MIN_IDEA_LENGTH = 10;
 
+/**
+ * 短剧本时长模式：
+ * - fixed（默认）：作者给定目标时长（10-180s），分段数上下限与总时长窗口按预算推导；
+ * - auto（不限时长）：总时长与片段数由模型依据核心创意自行编排，节拍覆盖完整优先于
+ *   时长配额——创意需要多少节拍就交付多少片段，只受段数硬顶（MAX_SHORT_SCRIPT_SEGMENTS）
+ *   与单段时长区间约束，保护输出 token 预算并兼容 H3 片段生成。
+ */
+export const SHORT_SCRIPT_DURATION_MODES = ["fixed", "auto"] as const;
+export type ShortScriptDurationMode = (typeof SHORT_SCRIPT_DURATION_MODES)[number];
+
+/** 时长模式规范化：非法值收敛到 fixed（输入为运营参数级，超界收敛而非拒绝）。 */
+export function normalizeShortScriptDurationMode(mode: string | undefined): ShortScriptDurationMode {
+  return (SHORT_SCRIPT_DURATION_MODES as ReadonlyArray<string>).includes(mode ?? "") ? (mode as ShortScriptDurationMode) : "fixed";
+}
+
+/** 时长维度的幂等键表示：fixed 取目标时长数值，auto 取模式占位——两种模式产物互不复用。 */
+export function shortScriptDurationKey(input: { durationMode: ShortScriptDurationMode; targetDurationSeconds: number }): string {
+  return input.durationMode === "auto" ? "auto" : String(input.targetDurationSeconds);
+}
+
+/** auto（不限时长）模式的输出预算：段数硬顶沿用 MAX_SHORT_SCRIPT_SEGMENTS，
+ * 硬顶推导口径（180s ÷ 最短单段 10s = 36）保证 auto 产物的输出 token 上界与
+ * fixed 模式 180s 目标一致，不需要放宽 reservedOutputTokens/maxTokens。
+ */
+export const AUTO_DURATION_SEGMENT_CAP = MAX_SHORT_SCRIPT_SEGMENTS;
+
+/** 参考素材去重：按 subjectTag 去重（同一参考帧只注入一次，保序保留首个）。
+ * 键取「提示词参考帧编号」而非 description：素材来自 resolveMaterialRefs 时编号唯一递增、
+ * 内容已按 content_hash 在素材层去重，故此处对内部路径为防御性无操作；仅当外部调用方以
+ * 重复编号构造 referenceMaterials 时按编号保留首个，避免同一 <Subject N> 注入两次。 */
+function dedupeShortScriptMaterials(materials: ReadonlyArray<ShortScriptReferenceMaterial>): ShortScriptReferenceMaterial[] {
+  const seen = new Set<string>();
+  const result: ShortScriptReferenceMaterial[] = [];
+  for (const material of materials) {
+    if (material && material.subjectTag && !seen.has(material.subjectTag)) {
+      seen.add(material.subjectTag);
+      result.push(material);
+    }
+  }
+  return result;
+}
+
 export interface ShortScriptRecord {
-  /** 关联作品（衍生短剧）；undefined = 独立短剧，不依赖任何小说项目。 */
-  projectId?: string;
+  /** 该剧情手动选中素材的快照（material_refs），供素材引入审计与 Ref2VA 参考帧。 */
+  materialRefs?: ShortDramaMaterialRef[];
   scriptId: string;
   sourceFingerprint: string;
-  /** true = 同一创意输入已生成过，本次复用既有产物 */
-  reused?: boolean;
   /** 本次产物的创意来源（历史列表语义展示与幂等审计依据） */
   idea?: string;
   instruction?: string;
+  /** 时长模式：fixed=固定目标时长（targetDurationSeconds 生效）；auto=不限时长（由模型编排） */
+  durationMode: ShortScriptDurationMode;
+  /** fixed 模式的目标时长；auto 模式回填产物实际总时长（sum of durationSeconds），保证历史展示与排序可用 */
   targetDurationSeconds: number;
   /** 模型穷举的剧情节拍清单（审计与覆盖校验依据） */
   plotBeats: PlotBeat[];
+  /** 吸引力设计承诺（契约 v10）：主引擎/反转点/记忆镜头；旧产物与外部 submit 缺省为 undefined */
+  creativeStrategy?: ShortScriptCreativeStrategy;
   /** 影视镜头语言提示（提示级，不阻断）：缺少运镜/景别描述的镜头清单 */
   cinematicHints: string[];
   characters: ChapterScriptCharacterSheet[];
@@ -112,8 +202,27 @@ export interface ShortScriptRecord {
  *      （垂直拔升/无尽重复韵律/超验尺度/标志轮廓/表面密度/主导画框）。根因：
  *      这三项在 v8 由契约明文主张（blinding god-ray、violent 猛冲、仅"小人对比"
  *      交代尺度），模型照抄，故产物出现刺目天光、出戏快镜、建筑空旷。
+ * 不限时长模式（durationMode=auto，skill v1.7.0 同批）：新增输入维度而非既有
+ *      行为契约变更——fixed 路径的 prompt、schema 与指纹逐字节不变，故契约版本
+ *      不递增（递增会让全部既有产物无谓失效重生成）；auto 输入在幂等键时长槽位
+ *      记 "auto" 与 fixed 数值隔离，旧产物读取层按 payload.durationMode 缺省
+ *      fixed 兼容。
+ * v10 = 吸引力设计契约（skill v1.9.0；1.9.1/迁移 080 微修选型判据——引擎选择依据
+ *      "创意靠什么让观众看完"而非表面题材元素，悬疑反转型不得因超自然背景误归 awe，
+ *      schema 与契约语义不变；1.9.2/迁移 081 风格句移除画幅项——用户反馈产物每段都
+ *      描述长宽比 9:16：指引层原把「画幅与焦段」列为风格句必含项且示例锚定 9:16，而
+ *      两阶段规划的 styleLine 又被逐字复用到每一段，一次锚定即全片复读；比例由生成
+ *      参数决定、写进提示词不改变画面，故必含项改为「焦段与镜头感」并明文禁止画幅与
+ *      朝向进任何字段，schema 与契约语义不变）——schema 顶层新增 creativeStrategy
+ *      （hookType=awe/humor/conflict + subversion + signatureMoment，三字段强制承诺、
+ *      随 payload 落库）；short.script 指引新增「吸引力设计契约」「喜剧机制契约」，
+ *      反原型支点从「必须是巨构」放宽为引擎相关视觉/空间载体并删除具象母题示例。
+ *      根因（用户反馈：独立短剧缺乏创意和新意）：① 全部契约只服务震撼一条线，
+ *      搞笑/反差零指引，吸引类型单一化；② 创意决策（观众为什么看完、哪一帧值得
+ *      转发）无显式产出槽位，模型按模板走流程；③ 契约示例自教默认母题（倒悬巨钟）。
+ *      schema 强制承诺 + 落库审计是本版核心，指引层与 brainstorm 跨引擎升级同批。
  */
-export const SHORT_SCRIPT_CONTRACT_VERSION = "9";
+export const SHORT_SCRIPT_CONTRACT_VERSION = "10";
 
 /** 目标时长 clamp：超出上下限时收敛到边界而非拒绝（运营参数级输入）。 */
 export function clampShortScriptTargetSeconds(target: number | undefined): number {
@@ -145,14 +254,24 @@ export function observeShortScriptTotalDuration(segments: ReadonlyArray<{ durati
   return null;
 }
 
-/** 短剧本 schema：结构复用章节剧本 schema，分段数量上下限按目标时长预算收窄。 */
-export function buildShortScriptSchema(targetDurationSeconds: number): Record<string, unknown> {
+/**
+ * 短剧本 schema：结构复用章节剧本 schema，分段数量上下限按目标时长预算收窄；
+ * targetDurationSeconds=null（不限时长模式）时无预算可推导，放开为 1 段 - 段数
+ * 硬顶（AUTO_DURATION_SEGMENT_CAP=36），总时长与片段数由模型依据创意自定。
+ * v10 起顶层叠加 creativeStrategy（吸引力设计承诺）——只在短剧 schema 叠加，
+ * 章节剧本 schema 不继承（章节派生不创作故事，创意决策属于正文侧）。
+ */
+export function buildShortScriptSchema(targetDurationSeconds: number | null): Record<string, unknown> {
   const schema = JSON.parse(JSON.stringify(CHAPTER_SCRIPT_H3_SCHEMA)) as {
-    properties: { segments: { minItems: number; maxItems: number } };
-    [key: string]: unknown;
+    required: string[];
+    properties: { segments: { minItems: number; maxItems: number }; [key: string]: unknown };
   };
-  schema.properties.segments.minItems = deriveShortScriptMinSegments(targetDurationSeconds);
-  schema.properties.segments.maxItems = deriveShortScriptMaxSegments(targetDurationSeconds);
+  schema.properties.segments.minItems = targetDurationSeconds === null ? 1 : deriveShortScriptMinSegments(targetDurationSeconds);
+  schema.properties.segments.maxItems = targetDurationSeconds === null
+    ? AUTO_DURATION_SEGMENT_CAP
+    : deriveShortScriptMaxSegments(targetDurationSeconds);
+  schema.properties.creativeStrategy = buildCreativeStrategySchema();
+  if (!schema.required.includes("creativeStrategy")) schema.required.push("creativeStrategy");
   return schema;
 }
 
@@ -160,45 +279,55 @@ export function buildShortScriptPrompt(input: {
   projectTitle: string;
   idea: string;
   instruction?: string;
-  targetDurationSeconds: number;
+  /** 固定目标时长（fixed 模式）；null = 不限时长模式（auto），总时长与片段数由模型编排。 */
+  targetDurationSeconds: number | null;
   minSegments: number;
   maxSegments: number;
+  /** 近期已用母题（跨作品反同质，可选）：来自历史短剧产物的核心创意清单。 */
+  avoidMotifs?: ReadonlyArray<string>;
+  /** 本剧情选入的公用参考素材（素材库 → Ref2VA 参考帧，可选）。 */
+  referenceMaterials?: ReadonlyArray<ShortScriptReferenceMaterial>;
 }): string {
+  const autoDuration = input.targetDurationSeconds === null;
+  const strategyLine = "先按 skill「吸引力设计契约」输出顶层 creativeStrategy（主引擎 hookType=awe/humor/conflict 三选一、反转点 subversion、唯一记忆镜头 signatureMoment），再据此穷举节拍、拆分片段——全片节拍或为记忆镜头铺垫或为其引爆收束。";
+  const taskLine = autoDuration
+    ? `任务：把上述核心创意扩展为一条自洽的简短短剧脚本（MiniMax H3 全参考模式），总时长不设上限——由你依据核心创意的信息量与叙事节奏自行决定。先给出出场人物的 appearanceEn 外观基线（各片段 subjectDefinitions 必须复用同一外形描述；描述性文字中英文均可，H3 对中文提示词兼容），再拆分片段。${strategyLine}`
+    : `任务：把上述核心创意扩展为一条自洽的简短短剧脚本（MiniMax H3 全参考模式），共 ${input.targetDurationSeconds} 秒左右。先给出出场人物的 appearanceEn 外观基线（各片段 subjectDefinitions 必须复用同一外形描述；描述性文字中英文均可，H3 对中文提示词兼容），再拆分片段。${strategyLine}`;
+  // 时长预算行与覆盖/呈现/体量/边界契约块抽到 staged-script-generation 共享（两阶段
+  // 规划/批次 prompt 复用同一文本），此处保持原拼接顺序与措辞，fixed 单次路径逐字节不变。
+  const durationLine = shortScriptDurationBudgetLine({
+    targetDurationSeconds: input.targetDurationSeconds,
+    minSegments: input.minSegments,
+    maxSegments: input.maxSegments,
+  });
+  const avoidLine = buildShortScriptAvoidMotifLine(input.avoidMotifs ?? []);
   return [
     `作品名称：${input.projectTitle}`,
     `核心创意：${input.idea.trim()}`,
-    `任务：把上述核心创意扩展为一条自洽的简短短剧脚本（MiniMax H3 全参考模式），共 ${input.targetDurationSeconds} 秒左右。先给出出场人物的 appearanceEn 外观基线（各片段 subjectDefinitions 必须复用同一外形描述；描述性文字中英文均可，H3 对中文提示词兼容），再拆分片段。`,
+    taskLine,
     [
-      "剧情覆盖契约（先于拆分执行，输出为顶层 plotBeats + 各片段 beatIds 引用）：",
-      "- 第一步：从核心创意穷举剧情节拍，输出为 plotBeats 数组，每项 {id, kind, summary}。kind 取值：event=动作事件、dialogue=对话交换、memory=背景记忆与身份处境、setup=关键设定与伏笔、hook=期限任务与钩子、decision=信念转折与决策判断。summary 必须写出该节拍携带的具体信息点（谁、何处、什么事），不得只写情绪词。",
-      "- 第二步：拆分片段，每个片段用 beatIds 声明它承载的节拍；所有节拍都必须被某个片段承载，不得整块省略。",
-      [
-        "信息呈现手段（硬性规则，剧情型创意适用；展示型创意的 setup 类节拍以画面本身呈现——奇观即信息，无需台词或闪回）：",
-        "- memory / setup / hook 类节拍的承载片段，必须把具体信息呈现给观众，手段三选一：[Flashback] 闪回镜头（写出闪回画面里谁在何处做什么，2-4 个镜头）；台词 <d>（含画外音 voice-over，直接说出关键信息点）；屏幕可读文字。",
-        "- 抱头、颤抖、喘息等反应动作只能表达「有信息涌入」这一事件，不能替代信息内容本身；只写反应动作会被判定为呈现缺失。",
-      ].join("\n"),
-      `- 时长预算：目标时长 ${input.targetDurationSeconds} 秒；片段数须落在 ${input.minSegments}-${input.maxSegments} 个之间（每段 ${MIN_SEGMENT_SECONDS}-${MAX_SEGMENT_SECONDS}s），各片段 durationSeconds 之和须落在目标 ±${SHORT_SCRIPT_TOTAL_DURATION_TOLERANCE_SECONDS}s 容差内。片段时长禁止贴下限：宏大场面、战斗交锋与冲击性瞬间取区间上沿（约 12-15 秒）让画面充分展开；对话交锋与反应镜头也至少 10 秒，用镜头细节与氛围填充而非快切。`,
-      "描述体量：视频生成器只能依据文字复原画面，凡未写出的细节在成片中不存在。detailedDescription 每片段约 350-500 英文词或等体量中文，逐镜头写全 skill 指引的镜头六要素（景别角度/构图设计/运镜/光线氛围/色彩设计/状态变化）与主体外观；summary、retentionAnalysis、overallSoundscape 的写法见 skill 指引。禁止概要化、清单化或以一词带过。",
+      SHORT_SCRIPT_COVERAGE_CONTRACT,
+      SHORT_SCRIPT_PRESENTATION_CONTRACT,
+      durationLine,
+      SHORT_SCRIPT_DESCRIPTION_VOLUME_CONTRACT,
     ].join("\n"),
     // 创意意图忠实性（剧情型 / 展示型判定）与剧集剧作层（开场即冲突 / 情绪闭环 / 出口即
     // 钩子 / 台词密度 / 反转须有伏笔 / 人物经济）均由运行时 skill（h3-video-prompt，
     // priority=required）注入，此处不再重复。与章节链路同因：重复段此前挤占注意力预算，
     // 长指引被模型做词汇层合规（换大词、加 violent）而非真正执行；去重后新增的画面
     // 设计层才有预算落地。代码侧仅保留 skill 不掌握的运行时事实（时长预算、节拍映射、边界）。
-    "边界：忠实于核心创意给定的设定、冲突与人物关系，可以合理补全细节，不得新增与创意冲突的设定、人物或结局走向；创意点名的核心意象（标志性移动/驾驭方式、点名景观、标志性场面）属于不得替换范畴——专有概念必须在描述中展开为其文化语境的标准物理呈现（姿态、接触点、构图与地理形态），不得用字面直译、近似动作或模板化场景顶替；无对白来源约束时台词自拟，但语义须与节拍承载的信息一致。",
+    avoidLine,
+    buildShortScriptMaterialLine(input.referenceMaterials ?? []),
+    SHORT_SCRIPT_BOUNDARY_CONTRACT,
     input.instruction?.trim() ? `作者指令（优先遵守其与格式规范相容的部分）：${input.instruction.trim()}` : "",
   ].filter(Boolean).join("\n\n");
 }
 
-const SHORT_SCRIPT_SYSTEM_BASE = "你是短剧分镜剧本提示词创作器。只依据给定的核心创意与指令输出符合 JSON Schema 的剧本：顶层 plotBeats 是穷举的剧情节拍清单，characters 是出场人物外观基线，segments 是按播放顺序排列的片段数组（用 beatIds 引用节拍）。";
+const SHORT_SCRIPT_SYSTEM_BASE = "你是短剧分镜剧本提示词创作器。只依据给定的核心创意与指令输出符合 JSON Schema 的剧本：顶层 creativeStrategy 是全片吸引力设计承诺（主引擎 hookType、反转点 subversion、唯一记忆镜头 signatureMoment，先于节拍承诺、全片执行不可偏离），plotBeats 是穷举的剧情节拍清单，characters 是出场人物外观基线，segments 是按播放顺序排列的片段数组（用 beatIds 引用节拍）。";
 
-/** 关联作品标题：仅 projectId 显式提供时校验（404 语义保留——填错仍报错）；独立模式返回占位。 */
-async function loadProjectTitle(repository: NovelPostgresRepository, projectId: string | undefined): Promise<string> {
-  if (!projectId) return "独立短剧（未关联小说作品）";
-  const result = await repository.pool.query<{ title: string }>("SELECT title FROM novel_projects WHERE id=$1", [projectId]);
-  const title = result.rows[0]?.title ?? "";
-  if (!title) throw new ShortScriptInputError(404, `项目不存在：${projectId}`);
-  return title;
+/** 独立短剧不再关联小说项目（浏览器本地存储），项目标题固定占位。 */
+function independentProjectTitle(): string {
+  return "独立短剧";
 }
 
 /** 创意输入校验错误：携带建议 HTTP 状态码（与 ChapterScriptSourceError 同契约模式）。 */
@@ -209,80 +338,19 @@ export class ShortScriptInputError extends Error {
   }
 }
 
-/** 从 short_scripts 表读产物（迁移 050 带入的 v1 行 payload 结构一致，零转换读取）。 */
-function storedShortScriptToRecord(stored: StoredShortScript): ShortScriptRecord | undefined {
-  const data = stored.payload ?? {};
-  const segments = Array.isArray(data.segments) ? data.segments as AssembledChapterScriptSegment[] : [];
-  if (!segments.length) return undefined;
-  return {
-    projectId: stored.projectId,
-    scriptId: stored.id,
-    sourceFingerprint: stored.sourceFingerprint,
-    idea: stored.idea || (typeof data.idea === "string" ? data.idea : undefined),
-    instruction: stored.instruction ?? (typeof data.instruction === "string" ? data.instruction : undefined),
-    targetDurationSeconds: stored.targetDurationSeconds || DEFAULT_SHORT_SCRIPT_TARGET_SECONDS,
-    plotBeats: Array.isArray(data.plotBeats) ? data.plotBeats as PlotBeat[] : [],
-    cinematicHints: computeCinematicHints(segments),
-    characters: Array.isArray(data.characters) ? data.characters as ChapterScriptCharacterSheet[] : [],
-    segments,
-  };
-}
-
-async function persistShortScript(repository: NovelPostgresRepository, objects: ObjectStoreAdapter, context: {
-  projectId?: string;
-  idea: string;
-  instruction?: string;
-  targetDurationSeconds: number;
-  sourceFingerprint: string;
-  plotBeats: PlotBeat[];
-  characters: ChapterScriptCharacterSheet[];
-  segments: AssembledChapterScriptSegment[];
-  workflowId: string;
-  /** 产出来源标记：系统内部生成=short-script-h3，外部 MCP 接手产出=external-short-script-h3。 */
-  origin?: string;
-}): Promise<string> {
-  const scriptText = context.segments.map((segment) => `${segment.index}. ${segment.title}\n${segment.promptText}`).join("\n\n---\n\n");
-  const object = await objects.putText(scriptText);
-  const payload: Record<string, unknown> = {
-    origin: context.origin ?? "short-script-h3",
-    mode: "ref2va",
-    kind: SHORT_SCRIPT_KIND,
-    idea: context.idea,
-    ...(context.instruction ? { instruction: context.instruction } : {}),
-    targetDurationSeconds: context.targetDurationSeconds,
-    sourceFingerprint: context.sourceFingerprint,
-    contractVersion: SHORT_SCRIPT_CONTRACT_VERSION,
-    plotBeats: context.plotBeats,
-    characters: context.characters,
-    segments: context.segments,
-  };
-  const script: StoredShortScript = {
-    id: randomUUID(),
-    projectId: context.projectId,
-    idea: context.idea,
-    instruction: context.instruction,
-    targetDurationSeconds: context.targetDurationSeconds,
-    sourceFingerprint: context.sourceFingerprint,
-    contractVersion: SHORT_SCRIPT_CONTRACT_VERSION,
-    objectKey: object.key,
-    contentHash: createHash("sha256").update(scriptText).digest("hex"),
-    workflowId: context.workflowId,
-    payload,
-    createdAt: Date.now(),
-  };
-  await repository.recordShortScript(script);
-  return script.id;
-}
-
 export async function generateShortScriptH3(input: {
-  /** 可选关联作品（衍生短剧）；缺省为独立短剧，不依赖任何小说项目。 */
-  projectId?: string;
+  /** 本剧情选入的公用参考素材（素材库 → Ref2VA 参考帧），注入提示词并用幂等键约束。 */
+  referenceMaterials?: ReadonlyArray<ShortScriptReferenceMaterial>;
+  /** 该剧情选素材的历史快照（material_refs；随脚本落前端 IndexedDB）。 */
+  materialRefs?: ShortDramaMaterialRef[];
+  /** 跨作品反同质回避清单（前端从本地历史近期创意传入，可选）。 */
+  avoidMotifs?: ReadonlyArray<string>;
   idea: string;
   instruction?: string;
+  /** 时长模式：fixed（默认）=固定目标时长；auto=不限时长，由模型依据创意编排总时长与片段数。 */
+  durationMode?: string;
   targetDurationSeconds?: number;
 }, deps: {
-  repository: NovelPostgresRepository;
-  objects: ObjectStoreAdapter;
   model: ModelGateway;
   skillProvider: SkillProvider;
   routingSnapshot?: ModelRoutingSnapshot;
@@ -292,15 +360,17 @@ export async function generateShortScriptH3(input: {
   if (idea.length < MIN_IDEA_LENGTH) {
     throw new ShortScriptInputError(400, `核心创意过短：至少 ${MIN_IDEA_LENGTH} 个字符，须写清谁、何处、什么冲突`);
   }
-  const projectId = input.projectId?.trim() || undefined;
-  const targetDurationSeconds = clampShortScriptTargetSeconds(input.targetDurationSeconds);
-  const minSegments = deriveShortScriptMinSegments(targetDurationSeconds);
-  const maxSegments = deriveShortScriptMaxSegments(targetDurationSeconds);
+  // 参考素材去重（同帧只注入一次）。
+  const referenceMaterials = dedupeShortScriptMaterials(input.referenceMaterials ?? []);
+  const materialRefs = input.materialRefs && input.materialRefs.length ? input.materialRefs : undefined;
+  const durationMode = normalizeShortScriptDurationMode(input.durationMode);
+  // auto（不限时长）：schema/prompt 以 null 传"无目标时长"；fixed 沿用原 clamp 预算推导。
+  const budgetSeconds = durationMode === "auto" ? null : clampShortScriptTargetSeconds(input.targetDurationSeconds);
+  const minSegments = budgetSeconds === null ? 1 : deriveShortScriptMinSegments(budgetSeconds);
+  const maxSegments = budgetSeconds === null ? AUTO_DURATION_SEGMENT_CAP : deriveShortScriptMaxSegments(budgetSeconds);
 
   const workflowId = `short-script:${randomUUID()}`;
-  // skill 解析与 promptContext 对 projectId 无实质依赖（listSkills 不按项目过滤），
-  // 独立模式传空串占位。
-  const skillScopeId = projectId ?? "";
+  const skillScopeId = "";
   const skillBundle = await resolveStageSkillBundle({
     projectId: skillScopeId,
     provider: deps.skillProvider,
@@ -309,24 +379,59 @@ export async function generateShortScriptH3(input: {
   });
   const skillSections = buildSkillContextSections(skillBundle, SHORT_SCRIPT_EXECUTION_POINT);
 
-  // 幂等键绑定创意输入全量（作用域 + idea + instruction + target）+ 契约版本 + skill 版本：
-  // 同输入重放复用既有产物；改创意、切换关联作用域、契约升级或 skill 升级后自然失效重生成。
-  // skill 版本纳入幂等键的根因：指引（skill 内容）是产物内容的直接决定因素，纯文本修订
-  // （如 v1.5.x 一镜到底契约）虽不改结构契约，但会改变模型生成行为；不纳入则改指引后
-  // 同输入永远复用旧产物，无法验证新效果（实测盲点：v1.5.2→v1.5.3 后同创意被幂等挡住）。
-  // 作用域占位 "independent" 隔离独立/关联两种产物（同一创意不跨作用域误复用）。
+  // 幂等指纹（浏览器端幂等依据，stateless 不再落库/不复读 DB）：scope(independent) + idea
+  // + instruction + 时长维度 + 契约版本 + skill 版本 + 参考素材(mat: 段)；前端按
+  // sourceFingerprint / 本地键在 IndexedDB 内去重。
   const skillVersionPart = skillBundle.skills.map((skill) => `${skill.skillId}@${skill.version}`).sort().join("+");
+  const materialsPart = referenceMaterials.map((material) => `${material.subjectTag}:${material.description}`).join("|");
+  const fingerprintSuffix = materialsPart ? `:mat:${materialsPart}` : "";
   const sourceFingerprint = createHash("sha256").update(
-    `${projectId ?? "independent"}:${idea}:${input.instruction?.trim() ?? ""}:${targetDurationSeconds}:${SHORT_SCRIPT_CONTRACT_VERSION}:${skillVersionPart}`,
+    `independent:${idea}:${input.instruction?.trim() ?? ""}:${shortScriptDurationKey({ durationMode, targetDurationSeconds: budgetSeconds ?? DEFAULT_SHORT_SCRIPT_TARGET_SECONDS })}:${SHORT_SCRIPT_CONTRACT_VERSION}:${skillVersionPart}${fingerprintSuffix}`,
   ).digest("hex");
-  const existing = await deps.repository.findShortScriptByFingerprint(sourceFingerprint);
-  if (existing) {
-    const stored = storedShortScriptToRecord(existing);
-    if (stored) return { ...stored, reused: true };
+
+  // 跨作品反同质（契约 v10）：回避清单由前端从本地历史近期创意传入（浏览器端管理历史），
+  // 剔除与当前 idea 相同条目后注入 prompt。零阻断（空清单即不注入）。
+  const avoidMotifs = [...new Set((input.avoidMotifs ?? []).map((motif) => motif.trim()).filter((motif) => motif && motif !== idea))].slice(0, SHORT_SCRIPT_AVOID_MOTIF_LIMIT);
+
+  const projectTitle = independentProjectTitle();
+
+  // 大预算脚本（maxSegments 超过单次阈值：auto 恒为 36 段上界、fixed ≥70s）走
+  // 两阶段生成：规划骨架一次小输出 + 分批片段撰写。根因与机制见 staged-script-generation
+  // 模块注释——单次 36 段六段字段输出实测结构性断裂，且修复循环在恒温下逐字节复现失败。
+  if (usesShortScriptStagedGeneration(maxSegments)) {
+    const plan = await generateShortScriptStaged({
+      workflowId,
+      projectTitle,
+      idea,
+      instruction: input.instruction,
+      budgetSeconds,
+      minSegments,
+      maxSegments,
+      avoidMotifs,
+      referenceMaterials,
+      skillBundle,
+      skillScopeId,
+      deps,
+    });
+    const normalized = normalizeChapterScriptOutput(
+      { plotBeats: plan.plotBeats, characters: plan.characters, segments: plan.segments },
+      { minSegments, shared: { lines: [], maxLabel: 0 } },
+    );
+    return finalizeShortScriptRecord({
+      materialRefs,
+      idea,
+      instruction: input.instruction?.trim() || undefined,
+      durationMode,
+      budgetSeconds,
+      maxSegments,
+      sourceFingerprint,
+      normalized,
+      creativeStrategy: plan.creativeStrategy,
+      strategyHint: plan.strategyHint,
+    });
   }
 
-  const projectTitle = await loadProjectTitle(deps.repository, projectId);
-  const schema = buildShortScriptSchema(targetDurationSeconds);
+  const schema = buildShortScriptSchema(budgetSeconds);
   const promptPackage = compileStageContext({
     projectId: skillScopeId,
     workflowId,
@@ -347,12 +452,14 @@ export async function generateShortScriptH3(input: {
           projectTitle,
           idea,
           instruction: input.instruction,
-          targetDurationSeconds,
+          targetDurationSeconds: budgetSeconds,
           minSegments,
           maxSegments,
+          avoidMotifs,
+          referenceMaterials,
         }),
         priority: "critical",
-        provenanceRefs: [`input:idea:${projectId ?? "independent"}`],
+        provenanceRefs: ["input:idea:independent"],
       },
       ...skillSections,
     ],
@@ -374,230 +481,239 @@ export async function generateShortScriptH3(input: {
   });
 
   const normalized = normalizeChapterScriptOutput(generated.value, { minSegments, shared: { lines: [], maxLabel: 0 } });
-  // 零阻断契约：段数与总时长偏离只作为人工复核提示，不再抛错阻止落库展示。
-  const hints = [...normalized.hints];
-  if (normalized.segments.length > maxSegments) {
-    hints.push(`- 片段数 ${normalized.segments.length} 超过目标时长预算上限 ${maxSegments}（每段至少 ${MIN_SEGMENT_SECONDS}s）；供人工复核`);
-  }
-  const totalIssue = observeShortScriptTotalDuration(normalized.segments, targetDurationSeconds);
-  if (totalIssue) hints.push(`- ${totalIssue}`);
-  const scriptId = await persistShortScript(deps.repository, deps.objects, {
-    projectId,
+  const strategy = normalizeCreativeStrategy((generated.value as { creativeStrategy?: unknown } | null)?.creativeStrategy);
+  return finalizeShortScriptRecord({
+    materialRefs,
     idea,
     instruction: input.instruction?.trim() || undefined,
-    targetDurationSeconds,
+    durationMode,
+    budgetSeconds,
+    maxSegments,
     sourceFingerprint,
-    plotBeats: normalized.plotBeats,
-    characters: normalized.characters,
-    segments: normalized.segments,
-    workflowId,
+    normalized,
+    creativeStrategy: strategy.strategy,
+    strategyHint: strategy.hint,
   });
-  return {
-    projectId,
-    scriptId,
-    sourceFingerprint,
-    idea,
-    instruction: input.instruction?.trim() || undefined,
-    targetDurationSeconds,
-    plotBeats: normalized.plotBeats,
-    cinematicHints: [...hints, ...computeCinematicHints(normalized.segments)],
-    characters: normalized.characters,
-    segments: normalized.segments,
-  };
 }
 
-/**
- * 外部 MCP 接手短剧内容产出：接收外部已生成的「模型形态」剧本 JSON
- * （plotBeats / characters / segments 六段字段），系统负责零阻断组装 promptText、
- * 结构观察、契约版本与落库。与 generateShortScriptH3（系统内部模型生成）互为双轨。
- *
- * 设计依据：mcp-orchestrator.md 外部编排「治理与产出解耦」原则——短剧脚本是正文
- * 的只读派生物（不进正文质量门），故允许外部 MCP 直接产出内容；系统仍掌握
- * 组装、结构观察、契约版本与持久化（来源标记 origin=external-short-script-h3），
- * 不把产出权完全外溢。
- *
- * 幂等：以外部内容哈希（idea+instruction+target+契约版本+归一化内容）为指纹，
- * 同内容重放复用既有产物（前缀 ext: 与系统内部输入指纹区分，避免跨轨误复用）。
- *
- * 入参 payload 只要求 segments 非空（零阻断契约：缺字段进 hints 不阻断）；
- * 外部 MCP 应先经 novel_skill_get 读取 h3-video-prompt 方法论再产出。
- */
-export async function submitExternalShortScriptH3(input: {
-  /** 可选关联作品（衍生短剧）；缺省为独立短剧。 */
-  projectId?: string;
+/** 两阶段/单次共用的收尾：零阻断观察 → 实际总时长回填 → 落库 → 组装 record。 */
+async function finalizeShortScriptRecord(context: {
+  materialRefs?: ShortDramaMaterialRef[];
   idea: string;
   instruction?: string;
-  targetDurationSeconds?: number;
-  /** 外部模型产出的剧本 JSON：{ plotBeats?, characters?, segments }。 */
-  payload: { plotBeats?: unknown; characters?: unknown; segments?: unknown };
-}, deps: {
-  repository: NovelPostgresRepository;
-  objects: ObjectStoreAdapter;
+  durationMode: ShortScriptDurationMode;
+  budgetSeconds: number | null;
+  maxSegments: number;
+  sourceFingerprint: string;
+  normalized: ReturnType<typeof normalizeChapterScriptOutput>;
+  /** 吸引力设计承诺（已零阻断归一；非法/缺失时 undefined + strategyHint 进观察） */
+  creativeStrategy?: ShortScriptCreativeStrategy;
+  strategyHint?: string;
 }): Promise<ShortScriptRecord> {
-  const idea = input.idea?.trim() ?? "";
-  if (idea.length < MIN_IDEA_LENGTH) {
-    throw new ShortScriptInputError(400, `核心创意过短：至少 ${MIN_IDEA_LENGTH} 个字符，须写清谁、何处、什么冲突`);
-  }
-  const projectId = input.projectId?.trim() || undefined;
-  const targetDurationSeconds = clampShortScriptTargetSeconds(input.targetDurationSeconds);
-  const minSegments = deriveShortScriptMinSegments(targetDurationSeconds);
-
-  const rawSegments = Array.isArray(input.payload.segments) ? input.payload.segments : [];
-  if (!rawSegments.length) {
-    throw new ShortScriptInputError(400, "payload.segments 必填且非空（外部 MCP 产出的模型形态片段数组）");
-  }
-
-  // 复用共享零阻断组装：把外部模型形态 JSON 归一化为可落库片段。
-  const normalized = normalizeChapterScriptOutput(input.payload, { minSegments, shared: { lines: [], maxLabel: 0 } });
+  const { materialRefs, idea, instruction, durationMode, budgetSeconds, maxSegments, sourceFingerprint, normalized, creativeStrategy, strategyHint } = context;
+  // 零阻断契约：段数与总时长偏离只作为人工复核提示，不再抛错阻止落库展示。
+  // 不限时长模式（auto）没有外部目标时长：总时长窗口观察不适用（模型自定即其目标），
+  // 仅保留段数硬顶观察；产物 targetDurationSeconds 记为模型交付的实际总时长。
   const hints = [...normalized.hints];
-  if (normalized.segments.length > deriveShortScriptMaxSegments(targetDurationSeconds)) {
-    hints.push(`- 片段数 ${normalized.segments.length} 超过目标时长预算上限 ${deriveShortScriptMaxSegments(targetDurationSeconds)}（每段至少 ${MIN_SEGMENT_SECONDS}s）；供人工复核`);
+  if (strategyHint) hints.unshift(`- ${strategyHint}`);
+  if (normalized.segments.length > maxSegments) {
+    hints.push(`- 片段数 ${normalized.segments.length} 超过时长预算上限 ${maxSegments}（每段至少 ${MIN_SEGMENT_SECONDS}s）；供人工复核`);
   }
-  const totalIssue = observeShortScriptTotalDuration(normalized.segments, targetDurationSeconds);
-  if (totalIssue) hints.push(`- ${totalIssue}`);
-
-  const workflowId = `short-script-external:${randomUUID()}`;
-  // 内容指纹：外部产出以内容本身为幂等依据（与系统内部输入指纹区分）。
-  const contentFingerprint = createHash("sha256").update(
-    `${projectId ?? "independent"}:${idea}:${input.instruction?.trim() ?? ""}:${targetDurationSeconds}:${SHORT_SCRIPT_CONTRACT_VERSION}:`
-      + JSON.stringify({
-        pb: normalized.plotBeats,
-        ch: normalized.characters,
-        sg: normalized.segments.map((segment) => ({ ...segment })),
-      }),
-  ).digest("hex");
-  const externalFingerprint = `ext:${contentFingerprint}`;
-  const existing = await deps.repository.findShortScriptByFingerprint(externalFingerprint);
-  if (existing) {
-    const stored = storedShortScriptToRecord(existing);
-    if (stored) return { ...stored, reused: true };
+  const totalSeconds = normalized.segments.reduce((sum, segment) => sum + segment.durationSeconds, 0);
+  if (budgetSeconds !== null) {
+    const totalIssue = observeShortScriptTotalDuration(normalized.segments, budgetSeconds);
+    if (totalIssue) hints.push(`- ${totalIssue}`);
   }
-
-  const scriptId = await persistShortScript(deps.repository, deps.objects, {
-    projectId,
-    idea,
-    instruction: input.instruction?.trim() || undefined,
-    targetDurationSeconds,
-    sourceFingerprint: externalFingerprint,
-    plotBeats: normalized.plotBeats,
-    characters: normalized.characters,
-    segments: normalized.segments,
-    workflowId,
-    origin: "external-short-script-h3",
-  });
+  const recordTargetSeconds = budgetSeconds ?? totalSeconds;
+  const scriptId = randomUUID();
   return {
-    projectId,
+    ...(materialRefs ? { materialRefs } : {}),
     scriptId,
-    sourceFingerprint: externalFingerprint,
+    sourceFingerprint,
     idea,
-    instruction: input.instruction?.trim() || undefined,
-    targetDurationSeconds,
+    instruction,
+    durationMode,
+    targetDurationSeconds: recordTargetSeconds,
     plotBeats: normalized.plotBeats,
+    ...(creativeStrategy ? { creativeStrategy } : {}),
     cinematicHints: [...hints, ...computeCinematicHints(normalized.segments)],
     characters: normalized.characters,
     segments: normalized.segments,
   };
 }
 
-/**
- * 开放创意方向 → N 个截然不同的具体奇观候选（创意发散，不生成脚本、不落库）。
- *
- * 设计依据：实测开放命题（如「设计一个云上奇观」）直接喂给 generateShortScriptH3 时，
- * 模型因缺主语塌缩到该题材默认母题（东方仙侠+云上→倒悬巨钟），每次同款。该工具在
- * 正式生成前先让模型以「创意策划」视角穷举 N 个彼此明显不同的可拍奇观，每个候选
- * 已是可直接喂给 novel_short_script_h3 的 idea 字符串；编排者挑定其一后再走
- * novel_short_script_h3 真实生成。属「外部编排者给方向」层的创意发散，与 AGENTS.md
- * 的治理/产出解耦一致——本工具只产出方向（opinion），不产出正文、不落库。
- *
- * 不依赖 repository/objects/skillProvider，仅调模型网关，故快速且解耦。
- */
-export interface ShortScriptWonderCandidate {
-  /** 穷举出的具体可拍奇观（含明确核心意象），可直接作为 novel_short_script_h3 的 idea。 */
-  wonder: string;
-  /** 该候选相对其它候选的差异点（一句），供编排者挑选用。 */
-  why: string;
-}
-
-export const MIN_SHORT_SCRIPT_BRAINSTORM_COUNT = 2;
-export const MAX_SHORT_SCRIPT_BRAINSTORM_COUNT = 6;
-
-export async function brainstormShortScriptWonders(input: {
-  /** 开放核心创意方向：写清题材/风格/场景/目标即可，无需指定具体奇观（≥ MIN_IDEA_LENGTH）。 */
-  idea: string;
-  /** 穷举候选数，clamp 到 [MIN, MAX]，默认 3。 */
-  count?: number;
-  /** 可选，目标时长提示（秒），仅告知模型每个候选的体量预期，不改变穷举行为。 */
-  targetDurationSeconds?: number;
-  /** 可选，穷举时的额外约束（如「避免钟类母题」）。 */
-  instruction?: string;
-}, deps: {
+/** 生成依赖的公共形状（generateShortScriptH3 deps 的子集 + 两阶段复用）。stateless：无 repository/objects。 */
+interface ShortScriptGenerationDeps {
   model: ModelGateway;
+  skillProvider: SkillProvider;
   routingSnapshot?: ModelRoutingSnapshot;
   candidateStartIndex?: number;
-}): Promise<{ idea: string; count: number; candidates: ShortScriptWonderCandidate[] }> {
-  const idea = input.idea?.trim() ?? "";
-  if (idea.length < MIN_IDEA_LENGTH) {
-    throw new ShortScriptInputError(400, `核心创意过短：至少 ${MIN_IDEA_LENGTH} 个字符，须写清题材/风格/场景/目标`);
-  }
-  const count = Math.min(
-    MAX_SHORT_SCRIPT_BRAINSTORM_COUNT,
-    Math.max(MIN_SHORT_SCRIPT_BRAINSTORM_COUNT, Math.round(input.count ?? 3) || 3),
-  );
+}
 
-  const system =
-    "你是东方仙侠短剧的创意策划，擅长把开放的世界观方向转化为具体、可拍、有视觉奇观的短剧创意。";
-  const durationHint = typeof input.targetDurationSeconds === "number" && Number.isFinite(input.targetDurationSeconds)
-    ? `每个候选的预期体量为约 ${Math.round(input.targetDurationSeconds)} 秒短片，奇观规模须与该时长相称。\n`
-    : "";
-  const instructionHint = input.instruction?.trim() ? `额外约束：${input.instruction.trim()}\n` : "";
-  const prompt =
-    `给定一句开放的核心创意方向，请穷举提出 ${count} 个彼此截然不同、各自拥有独立核心奇观意象的短剧创意。\n` +
-    `要求：\n` +
-    `1. 每个创意必须是具体可拍的视觉奇观，明确写出"核心意象是什么"（如某种悬浮建筑、自然现象、法器、生灵、天地异象）；\n` +
-    `2. 各创意之间核心意象必须明显不同，不得雷同；\n` +
-    `3. 保持给定方向的题材、风格、场景与气质；\n` +
-    `4. 每个创意写成一句/两句可直接作为拍摄脚本创意的话（含具体核心意象与场景），并附一句说明它为何区别于其它候选。\n` +
-    durationHint +
-    instructionHint +
-    `核心创意方向：${idea}\n` +
-    `请输出 ${count} 个候选（每个含 wonder 与 why）。`;
+/**
+ * 两阶段生成执行器：阶段 1 规划骨架（creativeStrategy/styleLine/plotBeats/
+ * characters/segmentPlan），阶段 2 按 SHORT_SCRIPT_SEGMENTS_PER_BATCH 段一批撰写
+ * 完整片段并按全局序号拼接。
+ * 任一批候选链耗尽即整体失败，不落半成品；批 prompt 携带全片规划、风格句、人物
+ * 基线与前序段落摘要，保证跨批连续性与外观一致性。审计留痕按阶段拆分 taskId
+ * （:plan / :segments:N），prompt_executions 与 model_invocations 可逐批回读。
+ */
+async function generateShortScriptStaged(context: {
+  workflowId: string;
+  projectTitle: string;
+  idea: string;
+  instruction?: string;
+  budgetSeconds: number | null;
+  minSegments: number;
+  maxSegments: number;
+  avoidMotifs: ReadonlyArray<string>;
+  referenceMaterials?: ReadonlyArray<ShortScriptReferenceMaterial>;
+  skillBundle: Awaited<ReturnType<typeof resolveStageSkillBundle>>;
+  skillScopeId: string;
+  deps: ShortScriptGenerationDeps;
+}): Promise<{
+  plotBeats: PlotBeat[];
+  characters: ChapterScriptCharacterSheet[];
+  segments: Array<Record<string, unknown>>;
+  creativeStrategy?: ShortScriptCreativeStrategy;
+  strategyHint?: string;
+}> {
+  const { workflowId, projectTitle, idea, instruction, budgetSeconds, minSegments, maxSegments, avoidMotifs, referenceMaterials, skillBundle, skillScopeId, deps } = context;
+  const provenanceRefs = ["input:idea:independent"];
 
-  const schema = {
-    type: "object",
-    properties: {
-      wonders: {
-        type: "array",
-        items: {
-          type: "object",
-          properties: {
-            wonder: { type: "string", minLength: 10 },
-            why: { type: "string", minLength: 4 },
-          },
-          required: ["wonder", "why"],
-          additionalProperties: false,
-        },
-        minItems: count,
-        maxItems: count,
-      },
-    },
-    required: ["wonders"],
-    additionalProperties: false,
-  };
-
-  const generated = await deps.model.generateStructured<{ wonders: Array<{ wonder: string; why: string }> }>({
+  const planSchema = buildShortScriptPlanSchema(minSegments, maxSegments);
+  const planPackage = compileStageContext({
+    projectId: skillScopeId,
+    workflowId,
     purpose: "writing.script",
-    system,
-    prompt,
-    schema,
-    schemaName: "short-script-wonders",
-    maxTokens: 2000,
+    stage: "drafting",
+    system: SHORT_SCRIPT_SYSTEM_BASE,
+    schema: planSchema,
+    maxInputTokens: 128_000,
+    reservedOutputTokens: SHORT_SCRIPT_PLAN_MAX_TOKENS,
+    skillManifest: skillBundle.resolution,
+    sections: [
+      {
+        id: "short-script-plan",
+        kind: "manuscript",
+        title: "短剧脚本规划任务与核心创意",
+        text: buildShortScriptPlanPrompt({
+          projectTitle,
+          idea,
+          instruction,
+          targetDurationSeconds: budgetSeconds,
+          minSegments,
+          maxSegments,
+          avoidMotifs,
+          referenceMaterials,
+        }),
+        priority: "critical",
+        provenanceRefs,
+      },
+      ...skillSectionsOf(skillBundle),
+    ],
+  });
+  const planResult = await deps.model.generateStructured<ShortScriptPlan>({
+    purpose: "writing.script",
+    system: planPackage.system ?? SHORT_SCRIPT_SYSTEM_BASE,
+    prompt: planPackage.instruction,
+    schema: planSchema,
+    schemaName: "short-script-h3-plan",
+    maxTokens: SHORT_SCRIPT_PLAN_MAX_TOKENS,
     routingSnapshot: deps.routingSnapshot,
     candidateStartIndex: deps.candidateStartIndex,
+    workflowRunId: workflowId,
+    taskId: `${workflowId}:plan`,
+    promptContext: planPackage.manifest,
   });
+  const plan = planResult.value;
+  if (!Array.isArray(plan?.segmentPlan) || !plan.segmentPlan.length) {
+    throw new Error("两阶段规划没有返回任何分段骨架（segmentPlan 为空）");
+  }
+  // 吸引力设计在规划阶段一次承诺，批次逐段兑现（零阻断：非法只出复核提示）。
+  const strategy = normalizeCreativeStrategy(plan.creativeStrategy);
 
-  const raw = (generated.value?.wonders ?? [])
-    .slice(0, count)
-    .filter((w) => w && w.wonder && w.wonder.trim().length >= MIN_IDEA_LENGTH);
-  const candidates: ShortScriptWonderCandidate[] = raw.map((w) => ({ wonder: w.wonder.trim(), why: w.why?.trim() ?? "" }));
-  return { idea, count, candidates };
+  const batchRanges = sliceShortScriptBatchRanges(plan.segmentPlan.length, SHORT_SCRIPT_SEGMENTS_PER_BATCH);
+  const assembledSegments: Array<Record<string, unknown>> = [];
+  const previousSegments: ShortScriptPreviousSegment[] = [];
+  for (const [batchIndex, range] of batchRanges.entries()) {
+    const batchPlan = plan.segmentPlan.slice(range.start, range.start + range.count);
+    const batchSchema = buildShortScriptBatchSchema(batchPlan.length);
+    const batchPackage = compileStageContext({
+      projectId: skillScopeId,
+      workflowId,
+      purpose: "writing.script",
+      stage: "drafting",
+      system: SHORT_SCRIPT_SYSTEM_BASE,
+      schema: batchSchema,
+      maxInputTokens: 128_000,
+      reservedOutputTokens: SHORT_SCRIPT_BATCH_MAX_TOKENS,
+      skillManifest: skillBundle.resolution,
+      sections: [
+        {
+          id: "short-script-batch",
+          kind: "manuscript",
+          title: "短剧脚本片段批次撰写任务",
+          text: buildShortScriptBatchPrompt({
+            projectTitle,
+            idea,
+            instruction,
+            creativeStrategy: strategy.strategy,
+            styleLine: plan.styleLine,
+            characters: plan.characters,
+            plotBeats: plan.plotBeats,
+            segmentPlan: plan.segmentPlan,
+            batchStartIndex: range.start,
+            batchPlan,
+            previousSegments,
+            referenceMaterials,
+          }),
+          priority: "critical",
+          provenanceRefs,
+        },
+        ...skillSectionsOf(skillBundle),
+      ],
+    });
+    let batchSegments: Array<Record<string, unknown>>;
+    try {
+      const batchResult = await deps.model.generateStructured<{ segments: Array<Record<string, unknown>> }>({
+        purpose: "writing.script",
+        system: batchPackage.system ?? SHORT_SCRIPT_SYSTEM_BASE,
+        prompt: batchPackage.instruction,
+        schema: batchSchema,
+        schemaName: "short-script-h3-batch",
+        maxTokens: SHORT_SCRIPT_BATCH_MAX_TOKENS,
+        routingSnapshot: deps.routingSnapshot,
+        candidateStartIndex: deps.candidateStartIndex,
+        workflowRunId: workflowId,
+        taskId: `${workflowId}:segments:${batchIndex}`,
+        promptContext: batchPackage.manifest,
+      });
+      batchSegments = Array.isArray(batchResult.value?.segments) ? batchResult.value.segments : [];
+    } catch (error) {
+      // 外部 MCP 兜底等待保持原异常类型上抛（API 层按类型映射 503；包装会吞掉类型）。
+      if (error instanceof ExternalMcpRequiredError) throw error;
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(`短剧分批生成失败（第 ${batchIndex + 1}/${batchRanges.length} 批，全片第 ${range.start + 1}-${range.start + batchPlan.length} 段）：${detail}`);
+    }
+    if (batchSegments.length !== batchPlan.length) {
+      throw new Error(`两阶段批次 ${batchIndex + 1}/${batchRanges.length} 返回段数 ${batchSegments.length} 与规划 ${batchPlan.length} 不一致`);
+    }
+    for (const [position, segment] of batchSegments.entries()) {
+      const raw = segment as Record<string, unknown>;
+      // 全局段序号与 promptText 由 normalizeChapterScriptOutput 统一回填（批次模型输出无序号字段）。
+      assembledSegments.push(raw);
+      previousSegments.push({
+        index: range.start + position + 1,
+        title: typeof raw.title === "string" ? raw.title : "",
+        synopsis: typeof raw.synopsis === "string" ? raw.synopsis : "",
+      });
+    }
+  }
+  return { plotBeats: plan.plotBeats, characters: plan.characters, segments: assembledSegments, creativeStrategy: strategy.strategy, strategyHint: strategy.hint };
+}
+
+/** 两阶段各调用共用的 skill 注入段（与单次路径同一 bundle，不重复解析）。 */
+function skillSectionsOf(skillBundle: Awaited<ReturnType<typeof resolveStageSkillBundle>>) {
+  return buildSkillContextSections(skillBundle, SHORT_SCRIPT_EXECUTION_POINT);
 }

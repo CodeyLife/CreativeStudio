@@ -11,3 +11,13 @@
 // 16 与单批次章节窗口对齐。未来应由项目级配置或弧级预算决定，而非硬编码。
 export const MAX_EXPECTED_CHAPTER_COUNT = 80;
 export const MAX_CHAPTER_HINTS = 16;
+
+/**
+ * 单批次章节窗口的硬上限（批次数学 = 审核/批准循环成本；窗口越大，单轮驳回
+ * 的重做成本越高）。与 rebase 窗口上限（getStoryArcRebaseTarget 的 16 章门）
+ * 和 chapterHints 上限同源——三处是同一个"单批处理量"事实的投影面，此前各自
+ * 硬编码 16，现收敛到此单一真源。批次窗口由系统计算（弧内剩余章数按本上限
+ * 截断），生成模型无裁量权：arc5 实证模型把"保留后续发展的空间"读作"窗口可
+ * 缩到 1 章"，7 章弧只规划了 1 章且无任何机制拦截（弧 1-4 全弧一批是惯例）。
+ */
+export const MAX_STORY_ARC_BATCH_WINDOW = 16;

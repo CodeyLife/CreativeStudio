@@ -17,6 +17,7 @@
  *   任务示例中省略 idempotencyKey 会导致参数校验先失败，无法测到 handler 抛错。
  */
 import { describe, expect, it, beforeAll, afterAll, vi } from "vitest";
+import { isPostgresUnavailable } from "./test-db";
 import { randomUUID } from "node:crypto";
 import { NovelPostgresRepository } from "../postgres-repository";
 import { validateToolArgs } from "../mcp/validator";
@@ -37,12 +38,17 @@ const mockCtx = {
 // ===== A. 纯函数：validateToolArgs（无 Postgres 依赖）=====
 
 describe("validateToolArgs pure function", () => {
-  it("TOOL_NAMES has exactly 40 tools", () => {
-    expect(TOOL_NAMES).toHaveLength(40);
+  it("TOOL_NAMES has exactly 49 tools", () => {
+    // 47 → 49：2026-09-10 新增 novel_fact_candidate_queue/novel_fact_candidate_decide（FM-2）。
+    // 49 → 50：2026-09-12 弧6 新增 novel_story_arc_decision。
+    // 50 → 52：2026-09-12 弧6 新增 novel_foreshadowing_list/triage。
+    // 52 → 59：2026-09-17 短剧创作台新增 7 个创作台/素材工具（后来被浏览器化移除）。
+    // 59 → 49：2026-09-17 独立短剧改浏览器本地存储，移除 10 个独立短剧工具（short_script_h3/brainstorm/submit + 创作台/素材）。
+    expect(TOOL_NAMES).toHaveLength(49);
   });
 
-  it("TOOL_DEFINITIONS has 40 defs, each with name/description/inputSchema", () => {
-    expect(TOOL_DEFINITIONS).toHaveLength(40);
+  it("TOOL_DEFINITIONS has 49 defs, each with name/description/inputSchema", () => {
+    expect(TOOL_DEFINITIONS).toHaveLength(49);
     for (const def of TOOL_DEFINITIONS) {
       expect(typeof def.name).toBe("string");
       expect(def.name.length).toBeGreaterThan(0);
@@ -73,6 +79,51 @@ describe("validateToolArgs pure function", () => {
       scenarioClass: "",
       scenarioRole: "source-failure",
     });
+  });
+
+  it("novel_fact_candidate_queue surfaces per-chapter backlog (FM-2)", async () => {
+    const ctx = {
+      repository: {
+        getFactCandidateBacklog: async () => ({
+          totalPending: 2, stagedDebris: 1, oldestPendingDays: 12.5,
+          byChapter: [{ chapterIndex: 6, pending: 2, maxAgeDays: 12.5, visibleFacts: 20, pendingRatio: 0.091, samples: [] }],
+        }),
+      },
+    } as never;
+    const response = await executeTool("novel_fact_candidate_queue", { projectId: "p1" }, ctx);
+    expect(response.isError).toBeFalsy();
+    const body = JSON.parse(response.content[0].text);
+    expect(body.totalPending).toBe(2);
+    expect(body.byChapter[0].chapterIndex).toBe(6);
+  });
+
+  it("novel_fact_candidate_decide is idempotent per claim and syncs the approved point once", async () => {
+    const decided: string[] = [];
+    const upserted: string[] = [];
+    const ctx = {
+      repository: {
+        decideFactCandidate: async ({ claimId }: { claimId: string }) => {
+          if (claimId === "c2") throw new Error("事实候选已处理（当前 authority=approved）");
+          decided.push(claimId);
+          return { claimId, authority: "approved" as const };
+        },
+        getMemoryClaimById: async (_projectId: string, claimId: string) => ({ id: claimId }),
+      },
+      memoryIndex: {
+        upsertClaims: async (_projectId: string, claims: Array<{ id: string }>) => { upserted.push(...claims.map((claim) => claim.id)); },
+        deleteClaims: async () => undefined,
+      },
+    } as never;
+    const response = await executeTool("novel_fact_candidate_decide", { projectId: "p1", claimIds: ["c1", "c2"], decision: "approve", reason: "作者确认：以正文证据为准" }, ctx);
+    expect(response.isError).toBeFalsy();
+    const body = JSON.parse(response.content[0].text);
+    expect(body.results).toEqual([
+      { claimId: "c1", status: "decided", authority: "approved" },
+      { claimId: "c2", status: "skipped" },
+    ]);
+    expect(upserted).toEqual(["c1"]);
+    expect(body.indexed).toBe(true);
+    expect(body.vectorSyncError).toBeUndefined();
   });
 
   it("accepts targeted chapter review arguments", () => {
@@ -618,6 +669,33 @@ describe("executeTool error paths", () => {
     expect(payload.artifacts[0].id).toBe("a-1");
     expect(listProjectArtifacts).toHaveBeenCalledWith({ projectId: "p1", kind: "chapter-blueprint", limit: 50 });
   });
+
+  it("novel_foreshadowing_list passes status/limit through and rejects bad status", async () => {
+    const listForeshadowingForTriage = vi.fn().mockResolvedValue([{ id: "f-1", status: "open", overdue: true, window: "至第9章" }]);
+    const ok = await executeTool("novel_foreshadowing_list", { projectId: "p1", status: "open", limit: 5 }, { repository: { listForeshadowingForTriage } as never });
+    expect(ok.isError).toBeFalsy();
+    expect(JSON.parse(ok.content[0].text).foreshadowings[0].id).toBe("f-1");
+    expect(listForeshadowingForTriage).toHaveBeenCalledWith("p1", { status: "open", limit: 5 });
+    const bad = await executeTool("novel_foreshadowing_list", { projectId: "p1", status: "stale" }, { repository: { listForeshadowingForTriage } as never });
+    expect(bad.isError).toBe(true);
+  });
+
+  it("novel_foreshadowing_triage requires reason per entry and maps entries through", async () => {
+    const triageForeshadowing = vi.fn().mockResolvedValue({ processed: ["f-1"], skipped: [] });
+    const ok = await executeTool(
+      "novel_foreshadowing_triage",
+      { projectId: "p1", actorId: "orchestrator:test", entries: [{ id: "f-1", action: "abandon", reason: "早期噪声，正文已无承接" }] },
+      { repository: { triageForeshadowing } as never },
+    );
+    expect(ok.isError).toBeFalsy();
+    expect(triageForeshadowing).toHaveBeenCalledWith(expect.objectContaining({ projectId: "p1", actorId: "orchestrator:test", entries: [expect.objectContaining({ id: "f-1", action: "abandon" })] }));
+    // 反例：兑现不经此门
+    const payoff = await executeTool("novel_foreshadowing_triage", { projectId: "p1", actorId: "a", entries: [{ id: "f-1", action: "fulfill", reason: "越权" }] }, { repository: { triageForeshadowing } as never });
+    expect(payoff.isError).toBe(true);
+    // 反例：无 reason
+    const bare = await executeTool("novel_foreshadowing_triage", { projectId: "p1", actorId: "a", entries: [{ id: "f-1", action: "abandon", reason: "  " }] }, { repository: { triageForeshadowing } as never });
+    expect(bare.isError).toBe(true);
+  });
 });
 
 // ===== C. 集成测试：executeTool happy path（需 Postgres）=====
@@ -625,6 +703,15 @@ describe("executeTool error paths", () => {
 describe("mcp-tool-gateway integration", () => {
   let repository: NovelPostgresRepository;
   let postgresAvailable = false;
+  // 收集期条件 describe 的教训（DB 集成套件禁空过纪律的姊妹面）：
+  // `postgresAvailable ? describe : describe.skip` 在收集期求值，彼时 beforeAll 未跑、
+  // 恒为 false——真库用例在数据库明明可用的开发机上被整批静默跳过（弧6 收口批次实证
+  // 新写的伏笔分流用例根本没跑）。运行期 ctx.skip() 才把"跳过"如实呈现为 skipped。
+  const itDb = (name: string, fn: () => Promise<void>) =>
+    it(name, async (ctx) => {
+      if (!postgresAvailable) return ctx.skip();
+      await fn();
+    });
 
   beforeAll(async () => {
     try {
@@ -633,6 +720,7 @@ describe("mcp-tool-gateway integration", () => {
       await repository.migrate();
       postgresAvailable = true;
     } catch (error) {
+      if (!isPostgresUnavailable(error)) throw error;
       console.warn(`[mcp-tool-gateway.test] Postgres 不可用: ${(error as Error).message}`);
     }
   }, 30000);
@@ -641,13 +729,13 @@ describe("mcp-tool-gateway integration", () => {
     if (repository) await repository.close();
   });
 
-  (postgresAvailable ? describe : describe.skip)("with postgres", () => {
-    it("novel_project_create happy path", async () => {
+  describe("with postgres", () => {
+    itDb("novel_project_create happy path", async () => {
       // handler 使用 idempotencyKey 作为 projectId（schema additionalProperties: false 禁止传 projectId）
       const projectId = `mcp-test-${randomUUID().slice(0, 8)}`;
       const result = await executeTool(
         "novel_project_create",
-        { title: "MCP 测试项目", idempotencyKey: projectId },
+        { title: "MCP 测试项目", premise: "测试用创意：一名少年在旧宅发现会呼吸的石阶。", autoBootstrap: false, idempotencyKey: projectId },
         { repository },
       );
       expect(result.isError).toBeFalsy();
@@ -655,7 +743,7 @@ describe("mcp-tool-gateway integration", () => {
       expect(payload.project.id).toBe(projectId);
     });
 
-    it("novel_run_create happy path", async () => {
+    itDb("novel_run_create happy path", async () => {
       const projectId = `mcp-run-${randomUUID().slice(0, 8)}`;
       await repository.ensureProject(projectId, "Run Test");
       const result = await executeTool(
@@ -669,7 +757,7 @@ describe("mcp-tool-gateway integration", () => {
       expect(payload.run.status).toBe("pending");
     });
 
-    it("novel_project_list happy path", async () => {
+    itDb("novel_project_list happy path", async () => {
       // 先创建一个项目保证列表非空
       const projectId = `mcp-list-${randomUUID().slice(0, 8)}`;
       await repository.ensureProject(projectId, "List Test");
@@ -680,13 +768,61 @@ describe("mcp-tool-gateway integration", () => {
       expect(payload.projects.some((p: { id: string }) => p.id === projectId)).toBe(true);
     });
 
-    it("novel_artifact_get non-existent → isError=true", async () => {
+    itDb("novel_artifact_get non-existent → isError=true", async () => {
       const result = await executeTool(
         "novel_artifact_get",
         { artifactId: "nonexistent" },
         { repository },
       );
       expect(result.isError).toBe(true);
+    });
+
+    itDb("伏笔分流真库双向：abandon 出局留审计、窗口改写、非 open/未知/无 reason 逐条 skip", async () => {
+      const projectId = `mcp-fs-${randomUUID().slice(0, 8)}`;
+      await repository.ensureProject(projectId, "Foreshadow Triage");
+      const seed = async (id: string, status: string, window: unknown) => {
+        await repository.pool.query(
+          "INSERT INTO foreshadowing(id, project_id, status, payload, narrative_order) VALUES($1,$2,$3,$4,$5)",
+          [id, projectId, status, { description: `伏笔 ${id}`, anchor: "石阶裂缝", triggerKeywords: ["裂缝"], expectedPayoffWindow: window }, 3],
+        );
+      };
+      await seed("fs-open-1", "open", { scope: "chapter", from: 4, to: 6 });
+      await seed("fs-open-2", "open", { scope: "chapter", from: 4, to: 6 });
+      await seed("fs-done", "fulfilled", { scope: "chapter", from: 4, to: 6 });
+      try {
+        const list = await repository.listForeshadowingForTriage(projectId, { status: "all", overdueBeyondOrder: 10 });
+        expect(list).toHaveLength(3);
+        expect(list.filter((item) => item.status === "open").every((item) => item.overdue)).toBe(true);
+
+        const outcome = await repository.triageForeshadowing({
+          projectId,
+          actorId: "test-author",
+          entries: [
+            { id: "fs-open-1", action: "abandon", reason: "早期噪声，正文无承接" },
+            { id: "fs-open-2", action: "rewrite-window", reason: "弧7 digest", windowFrom: 43, windowTo: 48 },
+            { id: "fs-done", action: "abandon", reason: "越权尝试" },
+            { id: "fs-ghost", action: "abandon", reason: "不存在" },
+            { id: "fs-open-1", action: "rewrite-window", reason: "窗口非法", windowFrom: 9, windowTo: 5 },
+            { id: "fs-open-1", action: "abandon", reason: "   " },
+          ],
+        });
+        expect(outcome.processed).toEqual(["fs-open-1", "fs-open-2"]);
+        expect(outcome.skipped).toHaveLength(4); // fulfilled 拒改 / 未知 / 窗口倒挂 / 空 reason
+        const openList = await repository.listForeshadowingForTriage(projectId, { status: "open", overdueBeyondOrder: 10 });
+        expect(openList.map((item) => item.id)).toEqual(["fs-open-2"]);
+        expect(openList[0].overdue).toBe(false); // 窗口改到 43-48 后不再超 10 章
+        expect(openList[0].window).toContain("48");
+        const abandoned = await repository.listForeshadowingForTriage(projectId, { status: "abandoned" });
+        expect(abandoned[0].id).toBe("fs-open-1");
+        const audit = await repository.pool.query("SELECT payload FROM outbox_events WHERE aggregate_id=$1 AND event_type LIKE 'foreshadowing.triaged%' ORDER BY id", ["fs-open-1"]);
+        expect(audit.rowCount).toBe(1);
+        // 反例面：abandon 不删数据、埋设账保留
+        const row = await repository.pool.query("SELECT narrative_order, payload FROM foreshadowing WHERE id='fs-open-1'");
+        expect(Number(row.rows[0].narrative_order)).toBe(3);
+        expect(String(row.rows[0].payload.anchor)).toBe("石阶裂缝");
+      } finally {
+        await repository.deleteProject(projectId);
+      }
     });
   });
 });

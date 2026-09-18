@@ -153,6 +153,8 @@ learning 评估聚合跨章模式：`getRecentReviewIssueClusters` 按 rule/titl
 
 skill iteration 的 prompt 注入机制分析而非只注入症状。promote 后重新运行失败场景，验证候选没有扩大到无关题材、角色、章节号或固定短语。章节异构回归必须携带历史蓝图派生的 ScenarioProfile，不能仅以不同 documentId 作为跨场景证据；旧 foundation evidence 仍可读，但不能伪装成章节异构证据。
 
+learning prompt 注入未晋升候选队列摘要（pending 三态投影）；同机制改进必须输出 `candidate.aggregateToCandidateId` 引用既有候选，recordLearning 走聚合通道（`learning_source.aggregateAssessments` 去重追加、`craft-rule.candidate-aggregated` 事件、重置停滞计时）而非新建重复候选行；聚合目标被状态守卫拒绝时回退新建（证据宁可重复不可丢失）。超 30 天零证据的 pending 候选由 learning 时顺带扫描发 `craft-rule.candidate-stale` 提醒事件（不自动判定关闭）。
+
 Skill database check 必须报告未知 execution point；运行时不能静默删除失效点。context manifest 必须能审计 Story Arc 的 narrative cutoff、section provenance 和 fingerprint；章节修订的软背景与节奏上下文可被预算淘汰，定稿事实不能静默丢失。
 
 ## 5. 通用性与回归边界

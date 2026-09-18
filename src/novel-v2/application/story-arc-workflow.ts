@@ -37,7 +37,7 @@ export async function startStoryArcOrchestratedPlanning(
       });
       const handle = await temporal.workflow.start("storyArcPlanningWorkflow", {
         args: [{ workflowId, projectId: input.projectId, arcId: arc.id, mode: input.mode, reviewPolicy, authorIntent: input.authorIntent, plotOutline: input.plotOutline }],
-        taskQueue: input.taskQueue ?? "novel-v2",
+        taskQueue: input.taskQueue ?? "creative-studio-novel-v2",
         workflowId,
       });
       return { arcId: arc.id, workflowId, runId: handle.firstExecutionRunId, status: "accepted", orchestrated: true, plotOutline: input.plotOutline };
@@ -58,7 +58,10 @@ export async function startStoryArcPlanning(
     const workflowId = `story-arc-${randomUUID()}`;
     const reviewPolicy = input.reviewPolicy ?? (input.mode === "mcp" ? "auto" : "manual");
     const existingArc = input.arcId ? await repository.getStoryArc(input.projectId, input.arcId) : undefined;
-    const rebase = Boolean(input.arcId && (existingArc?.blueprintArtifactId || existingArc?.chapters.some((chapter) => Boolean(chapter.documentId))));
+    // rebase 谓词只认"已投影章节"（documentId 落账=有冻结史）；blueprintArtifactId 单存
+    // 不构成 rebase 条件——失败尝试同样会留下蓝图 artifact（弧15 三连败实证：孤儿蓝图把
+    // arc_start 恢复逼进'没有可重基线的已关联章节'死路），无章节时 regenerate 才是正确语义。
+    const rebase = Boolean(input.arcId && existingArc?.chapters.some((chapter) => Boolean(chapter.documentId)));
     let arc: Awaited<ReturnType<NovelPostgresRepository["getStoryArc"]>>;
     try {
       arc = input.arcId
@@ -75,7 +78,7 @@ export async function startStoryArcPlanning(
       });
       const handle = await temporal.workflow.start("storyArcPlanningWorkflow", {
         args: [{ workflowId, projectId: input.projectId, arcId: arc.id, mode: input.mode, reviewPolicy, authorIntent: input.authorIntent, rebase }],
-        taskQueue: input.taskQueue ?? "novel-v2",
+        taskQueue: input.taskQueue ?? "creative-studio-novel-v2",
         workflowId,
       });
       return { arcId: arc.id, workflowId, runId: handle.firstExecutionRunId, status: "accepted" };
@@ -119,7 +122,12 @@ export async function startStoryArcReview(
     // already committed; frozen-history rebase is for an artifact whose target
     // is the committed chapter set.
     const hasPendingBatchReview = arc.batches?.some((batch) => batch.status === "awaiting-review" && batch.sourceArtifactId === arc.blueprintArtifactId) ?? false;
-    const rebase = !hasPendingBatchReview && (arc.executionStatus === "completed" || arc.chapters.some((chapter) => Boolean(chapter.documentId)));
+    // 重基线对象是"已提交正文的冻结历史"（弧 completed，或章节文档已离开 planned 有正文活动）。
+    // 批次 approved 但章节仍 planned（投影出文档、尚无正文）时不存在冻结历史——误标 rebase 会让
+    // 修订物化套重基线守卫，恢复环被自家校验卡死（2026-09-12 弧6 批准竞态恢复首爆：documentId
+    // 存在≠已提交，spec §3"覆盖已提交章节"在代码里被弱化成了"挂过文档"）。
+    const hasCommittedChapters = arc.executionStatus === "completed" || arc.chapters.some((chapter) => Boolean(chapter.documentId) && chapter.status !== "planned");
+    const rebase = !hasPendingBatchReview && hasCommittedChapters;
     try {
       await repository.putWorkflowRun({
         id: workflowId,
@@ -131,7 +139,7 @@ export async function startStoryArcReview(
       });
       const handle = await temporal.workflow.start("storyArcPlanningWorkflow", {
         args: [{ workflowId, projectId: input.projectId, arcId: input.arcId, mode: input.mode, reviewPolicy, existingArtifactId: arc.blueprintArtifactId, rebase }],
-        taskQueue: input.taskQueue ?? "novel-v2",
+        taskQueue: input.taskQueue ?? "creative-studio-novel-v2",
         workflowId,
       });
       return { arcId: input.arcId, workflowId, runId: handle.firstExecutionRunId, status: "accepted" };
@@ -165,7 +173,7 @@ export async function startStoryArcBatchPlanning(
       });
       const handle = await temporal.workflow.start("storyArcPlanningWorkflow", {
         args: [{ workflowId, projectId: input.projectId, arcId: input.arcId, mode: input.mode, reviewPolicy, ...batch }],
-        taskQueue: input.taskQueue ?? "novel-v2",
+        taskQueue: input.taskQueue ?? "creative-studio-novel-v2",
         workflowId,
       });
       return { arcId: input.arcId, workflowId, runId: handle.firstExecutionRunId, status: "accepted", ...batch };

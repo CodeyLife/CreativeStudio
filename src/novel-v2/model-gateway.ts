@@ -71,13 +71,19 @@ export interface ModelGateway {
   getRoutingSnapshot(): ModelRoutingSnapshot;
   generateText(input: GenerateTextInput): Promise<ModelResult<string> & { text: string }>;
   generateStructured<T>(input: GenerateStructuredInput<T>): Promise<ModelResult<T>>;
-  embed(input: { purpose: "memory.embed"; texts: string[]; signal?: AbortSignal; routingSnapshot?: ModelRoutingSnapshot; workflowRunId?: string; taskId?: string }): Promise<ModelResult<number[][]> & { vectors: number[][] }>;
-  rerank(input: { purpose: "memory.rerank"; query: string; documents: string[]; signal?: AbortSignal; routingSnapshot?: ModelRoutingSnapshot; workflowRunId?: string; taskId?: string }): Promise<ModelResult<number[]> & { scores: number[] }>;
+  embed(input: { purpose: "memory.embed"; texts: string[]; signal?: AbortSignal; routingSnapshot?: ModelRoutingSnapshot; workflowRunId?: string; taskId?: string; projectId?: string }): Promise<ModelResult<number[][]> & { vectors: number[][] }>;
+  rerank(input: { purpose: "memory.rerank"; query: string; documents: string[]; signal?: AbortSignal; routingSnapshot?: ModelRoutingSnapshot; workflowRunId?: string; taskId?: string; projectId?: string }): Promise<ModelResult<number[]> & { scores: number[] }>;
 }
 
 export interface ModelInvocationAudit {
   workflowRunId?: string;
   taskId?: string;
+  /**
+   * OR-D2（product-audit-20260910 E5）：调用归属项目。memory.embed 等无 workflowRunId
+   * 的旁路调用此前 100% 不可归属（project_id 派生 SELECT 对 NULL run 恒空）；
+   * 显式带 projectId 让嵌入用量可按项目核算（派生仍作 run 存在时的兜底）。
+   */
+  projectId?: string;
   purpose: ModelPurpose;
   configRevision: string;
   candidateIndex: number;
@@ -164,16 +170,33 @@ class ModelTransportError extends Error {
   }
 }
 
-function exhaustedRouteError(purpose: ModelPurpose, error: unknown): ModelTransportError {
-  if (error instanceof ModelTransportError) {
-    return new ModelTransportError(error.message, false, error.category, error.status);
-  }
-  const message = error instanceof Error ? error.message : error === undefined ? `模型路由 ${purpose} 没有可执行候选` : String(error);
-  return new ModelTransportError(message, false, "route-exhausted");
-}
-
 function promptFingerprint(system: string | undefined, prompt: string): string {
   return createHash("sha256").update(`${system ?? ""}\n${prompt}`).digest("hex");
+}
+
+/**
+ * OR-D2（product-audit-20260910 E5）：嵌入幂等短路的缓存键。model 参与哈希是
+ * 正确性边界——不同 embedding 模型的向量空间不互通，绝不允许跨模型命中。
+ */
+export function embeddingFingerprint(model: string, text: string): string {
+  return createHash("sha256").update(`${model}\n${text}`).digest("hex");
+}
+
+/** OR-D2 嵌入缓存端口（repository 注入；端口失败必须退化为直连，不阻断检索/入库）。 */
+export interface EmbeddingCachePort {
+  lookupEmbeddings(model: string, texts: string[]): Promise<(number[] | undefined)[]>;
+  storeEmbeddings(model: string, entries: Array<{ text: string; vector: number[] }>): Promise<void>;
+}
+
+/** OR-D2 共用：把 OpenAI-compatible embeddings 响应按 index 归位成向量数组。 */
+function parseEmbeddingVectors(data: Record<string, unknown>, expected: number): number[][] {
+  const rows = Array.isArray(data.data) ? data.data as Array<{ embedding?: number[]; index?: number }> : [];
+  const vectors = Array.from({ length: expected }, () => [] as number[]);
+  rows.forEach((row, responseIndex) => {
+    const inputIndex = Number.isInteger(row.index) ? Number(row.index) : responseIndex;
+    if (inputIndex >= 0 && inputIndex < vectors.length && Array.isArray(row.embedding)) vectors[inputIndex] = row.embedding;
+  });
+  return vectors;
 }
 
 function modelErrorMessage(error: unknown): string {
@@ -479,6 +502,43 @@ export function normalizeStructuredContent<T>(content: string, validate: Validat
   return undefined;
 }
 
+/**
+ * 修复轮温度：首轮使用请求方默认（undefined），修复轮抬温重发。
+ * 根因：确定性 provider（temperature=0 或路由默认低温）在修复轮原样重发同一 prompt
+ * 时会逐字节复现同一非法输出（2026-09-07 实测：三次响应逐字节相同），修复循环退化为
+ * 空转并白白消耗预算。抬温打破确定性，对所有 purpose 通用；首轮行为不变。
+ */
+const REPAIR_TEMPERATURE = 0.7;
+
+/**
+ * 解析失败保真诊断：与 normalizeStructuredContent 相同的候选枚举（全文 / 围栏块 /
+ * 平衡对象），全部候选都无法 JSON.parse 时返回首个解析错误（含位置与附近原文）；
+ * 任一候选可解析则返回 undefined（此时失败属于 Schema 校验而非解析，沿用 AJV 错误）。
+ * 根因：2026-09-07 实测模型输出 segments 数组结构性断裂，报错却显示
+ * "root must have required property …"（对 undefined 做 AJV 校验的缺字段错误），
+ * 掩盖了真实失败模式，误导排障方向。
+ */
+function describeJsonParseFailure(content: string): string | undefined {
+  const fenced = [...content.matchAll(/```(?:json)?\s*([\s\S]*?)```/giu)].map((match) => match[1]);
+  const candidates = [content, ...fenced, ...balancedJsonObjects(content)];
+  let firstError: string | undefined;
+  for (const candidate of candidates) {
+    try {
+      JSON.parse(candidate);
+      return undefined;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (firstError === undefined) {
+        const position = Number(message.match(/position (\d+)/)?.[1] ?? NaN);
+        firstError = Number.isFinite(position) && candidate === content
+          ? `${message}（附近原文：${content.slice(Math.max(0, position - 60), position + 60)}）`
+          : message;
+      }
+    }
+  }
+  return firstError ?? "未找到任何可解析的 JSON 候选";
+}
+
 function repairPrompt(originalTask: string, content: string, errors: string, attempt: number, maxInputTokens: number, system?: string, transportOverheadCharacters = 0): string {
   const prefix = [
     attempt ? "上一次修复仍未通过。重新生成完整 JSON。" : "修复下面输出，使其严格符合 JSON Schema。",
@@ -505,7 +565,7 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 }
 
 export class RoutedModelGateway implements ModelGateway {
-  constructor(readonly configStore: ModelConfigStore, private readonly recordInvocation?: ModelInvocationRecorder, private readonly recordPromptExecution?: ModelPromptExecutionRecorder) {}
+  constructor(readonly configStore: ModelConfigStore, private readonly recordInvocation?: ModelInvocationRecorder, private readonly recordPromptExecution?: ModelPromptExecutionRecorder, private readonly embeddingCache?: EmbeddingCachePort) {}
 
   getRoutingSnapshot(): ModelRoutingSnapshot { return this.configStore.getSnapshot(); }
 
@@ -539,17 +599,9 @@ export class RoutedModelGateway implements ModelGateway {
     const candidate = route.candidates[candidateIndex];
     if (!candidate) throw new Error(`模型候选索引越界：${candidateIndex}`);
     if (candidate.executor === "external-mcp") {
-      const fingerprint = promptFingerprint(input.system, input.prompt);
-      const effectiveInputLimit = Math.min(route.maxInputTokens ?? Number.MAX_SAFE_INTEGER, input.promptContext?.maxInputTokens ?? Number.MAX_SAFE_INTEGER);
-      const estimatedInputTokens = Math.ceil(`${input.system ?? ""}\n${input.prompt}`.length / 2);
-      if (estimatedInputTokens > effectiveInputLimit) {
-        const error = new ModelContextBudgetError(estimatedInputTokens, effectiveInputLimit, input.purpose);
-        await this.recordPrompt({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, candidateIndex, status: "failed", system: input.system, prompt: input.prompt, promptFingerprint: fingerprint, contextManifest: input.promptContext, errorCategory: error.category });
-        await this.record({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, configRevision: snapshot.id, candidateIndex, executor: "external-mcp", model: "external-mcp", providerLabel: "external-mcp", status: "failed", inputTokens: estimatedInputTokens, outputTokens: 0, estimatedInputTokens, estimatedOutputTokens: 0, usageSource: "estimated", latencyMs: 0, promptFingerprint: fingerprint, errorCategory: error.category, errorMessage: modelErrorMessage(error) });
-        throw error;
-      }
-      await this.record({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, configRevision: snapshot.id, candidateIndex, executor: "external-mcp", model: "external-mcp", status: "waiting-external", inputTokens: 0, outputTokens: 0, latencyMs: 0, promptFingerprint: fingerprint });
-      throw new ExternalMcpRequiredError(input.purpose, snapshot.id, candidateIndex);
+      // 历史运行快照兼容：配置契约变更前冻结的快照仍可能携带显式外部候选，
+      // 按原语义在原候选位执行外部等待（新配置已禁止显式外部候选）。
+      return this.invokeExternalMcpWait(input, snapshot, route, candidateIndex);
     }
     const profile = this.resolveProfile(snapshot, candidate.profileId);
     const model = candidate.model ?? profile.model;
@@ -598,9 +650,34 @@ export class RoutedModelGateway implements ModelGateway {
     }
   }
 
+  /**
+   * 链尾外部 MCP 兜底（机制契约 2026-09-07）：外部 MCP 不再是调用位置的可选
+   * 执行者，而是所有文本/结构化调用链的隐式链尾兜底——显式 API 候选全部失败
+   * 或候选链为空时，在虚拟兜底位（candidateIndex = candidates.length）执行与
+   * 显式外部候选相同的路由级预算检查和 waiting-external 留痕，然后抛出
+   * ExternalMcpRequiredError 交由物化层创建可认领的外部任务。
+   *
+   * 刻意不覆盖：memory.embed / memory.rerank 向量链路没有外部任务物化路径
+   * （外部任务产出为 text/structured/review，无法承载向量），候选耗尽后按原
+   * 样失败；跨 provider 的 trade-off：原 exhaustedRouteError 的快速失败语义
+   * 移除，无外部 worker 认领时任务保持 waiting-external 而非 workflow failed。
+   */
+  private async invokeExternalMcpWait(input: BaseModelInput & { prompt: string }, snapshot: ModelRoutingSnapshot, route: ModelRoute, candidateIndex: number): Promise<never> {
+    const fingerprint = promptFingerprint(input.system, input.prompt);
+    const effectiveInputLimit = Math.min(route.maxInputTokens ?? Number.MAX_SAFE_INTEGER, input.promptContext?.maxInputTokens ?? Number.MAX_SAFE_INTEGER);
+    const estimatedInputTokens = Math.ceil(`${input.system ?? ""}\n${input.prompt}`.length / 2);
+    if (estimatedInputTokens > effectiveInputLimit) {
+      const error = new ModelContextBudgetError(estimatedInputTokens, effectiveInputLimit, input.purpose);
+      await this.recordPrompt({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, candidateIndex, status: "failed", system: input.system, prompt: input.prompt, promptFingerprint: fingerprint, contextManifest: input.promptContext, errorCategory: error.category });
+      await this.record({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, configRevision: snapshot.id, candidateIndex, executor: "external-mcp", model: "external-mcp", providerLabel: "external-mcp", status: "failed", inputTokens: estimatedInputTokens, outputTokens: 0, estimatedInputTokens, estimatedOutputTokens: 0, usageSource: "estimated", latencyMs: 0, promptFingerprint: fingerprint, errorCategory: error.category, errorMessage: modelErrorMessage(error) });
+      throw error;
+    }
+    await this.record({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, configRevision: snapshot.id, candidateIndex, executor: "external-mcp", model: "external-mcp", status: "waiting-external", inputTokens: 0, outputTokens: 0, latencyMs: 0, promptFingerprint: fingerprint });
+    throw new ExternalMcpRequiredError(input.purpose, snapshot.id, candidateIndex);
+  }
+
   async generateText(input: GenerateTextInput): Promise<ModelResult<string> & { text: string }> {
     const { snapshot, route } = this.route(input);
-    let lastError: unknown;
     for (let index = input.candidateStartIndex ?? 0; index < route.candidates.length; index += 1) {
       try {
         const result = await this.invokeCandidate(input, snapshot, route, index);
@@ -608,30 +685,26 @@ export class RoutedModelGateway implements ModelGateway {
         await this.record({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, configRevision: snapshot.id, candidateIndex: index, executor: "api", profileId: result.profile.id, protocol: result.profile.protocol, model: result.model, status: "completed", inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, providerInputTokens: usage.providerInputTokens, providerOutputTokens: usage.providerOutputTokens, providerCachedInputTokens: usage.providerCachedInputTokens, estimatedInputTokens: usage.estimatedInputTokens, estimatedOutputTokens: usage.estimatedOutputTokens, usageSource: usage.usageSource, latencyMs: usage.latencyMs, promptFingerprint: result.provenance.promptFingerprint, responseId: result.response.responseId });
         return { value: result.response.text, text: result.response.text, usage, provenance: result.provenance };
       } catch (error) {
+        // 历史快照的显式外部候选或兜底位本身抛出的等待，直接上抛给物化层。
         if (error instanceof ExternalMcpRequiredError) throw error;
-        // Empty output first exhausts transport retries, then moves only to the
-        // next explicit API candidate. Never turn it into an external-MCP wait.
-        if (error instanceof ModelTransportError && error.category === "empty-response") {
-          const nextApi = nextApiCandidateIndex(route, index);
-          if (nextApi === undefined) throw error;
-          lastError = error;
-          index = nextApi - 1;
-          continue;
-        }
-        lastError = error;
       }
     }
-    // Every API candidate already exhausted its transport retries here. Mark
-    // the terminal error non-retryable so Temporal does not repeat the entire
-    // activity and leave the chapter locked in `running` for many minutes.
-    throw exhaustedRouteError(input.purpose, lastError);
+    // 链尾兜底：所有显式 API 候选失败（或链为空）时转入外部 MCP 等待，替代
+    // 原 exhaustedRouteError 快速失败（机制契约 2026-09-07，见 invokeExternalMcpWait）。
+    // 零进展守卫（弧15 65 分钟空转实证）：调用方把起点推过终位
+    // （candidateStartIndex > candidates.length）意味着链尾兜底位也刚被消耗过——
+    // 再造同位外部任务只会开启下一段 15 分钟死窗。此时快速失败，让 run
+    // 进入正式恢复路径（provider 恢复后新快照从 0 位重跑）。
+    if ((input.candidateStartIndex ?? 0) > route.candidates.length) {
+      throw new Error(`model-route-exhausted: ${input.purpose} 候选链与链尾兜底位均已消耗（起点 ${input.candidateStartIndex} > 终位 ${route.candidates.length}）`);
+    }
+    return await this.invokeExternalMcpWait(input, snapshot, route, route.candidates.length);
   }
 
   async generateStructured<T>(input: GenerateStructuredInput<T>): Promise<ModelResult<T>> {
     assertNativeJsonSchema(input.schema, input.schemaName);
     const { snapshot, route } = this.route(input);
     const validate = new Ajv({ allErrors: true, strict: false }).compile(input.schema as AnySchema) as ValidateFunction<T>;
-    let lastError: unknown;
     for (let index = input.candidateStartIndex ?? 0; index < route.candidates.length; index += 1) {
       try {
         let currentPrompt = input.prompt;
@@ -659,7 +732,7 @@ export class RoutedModelGateway implements ModelGateway {
             const outputReserve = Math.max(1, Math.min(input.maxTokens ?? route.maxOutputTokens ?? 4_096, route.maxOutputTokens ?? Number.MAX_SAFE_INTEGER));
             if (profile.contextWindow) repairInputLimit = Math.min(repairInputLimit, Math.max(0, profile.contextWindow - outputReserve));
           }
-          latest = await this.invokeCandidate({ ...input, system: currentSystem, prompt: currentPrompt }, snapshot, route, index);
+          latest = await this.invokeCandidate({ ...input, system: currentSystem, prompt: currentPrompt, temperature: repair === 0 ? input.temperature : REPAIR_TEMPERATURE }, snapshot, route, index);
           totalInput += latest.response.inputTokens;
           totalOutput += latest.response.outputTokens;
           estimatedInputTotal += latest.response.estimatedInputTokens;
@@ -690,7 +763,13 @@ export class RoutedModelGateway implements ModelGateway {
             await this.record({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, configRevision: snapshot.id, candidateIndex: index, executor: "api", profileId: latest.profile.id, protocol: latest.profile.protocol, model: latest.model, status: "completed", inputTokens: totalInput, outputTokens: totalOutput, providerInputTokens: usage.providerInputTokens, providerOutputTokens: usage.providerOutputTokens, providerCachedInputTokens: usage.providerCachedInputTokens, estimatedInputTokens: usage.estimatedInputTokens, estimatedOutputTokens: usage.estimatedOutputTokens, usageSource: usage.usageSource, latencyMs: latest.latencyMs, promptFingerprint: latest.provenance.promptFingerprint, responseId: latest.response.responseId });
             return { value: parsed, usage, provenance: latest.provenance };
           }
-          const errors = validate.errors?.map((item) => `${item.instancePath || "root"} ${item.message ?? ""}`).join("；") ?? "JSON 无法解析";
+          // 报错保真：parsed === undefined 时先区分「解析失败」与「解析成功但校验失败」——
+          // 前者对 undefined 做 AJV 校验只会得到误导性的缺字段错误（实测掩盖了
+          // segments 数组结构性断裂的真实原因），必须报告解析错误位置。
+          const parseFailure = describeJsonParseFailure(latest.response.text);
+          const errors = parseFailure
+            ? `JSON 无法解析（${parseFailure}）`
+            : validate.errors?.map((item) => `${item.instancePath || "root"} ${item.message ?? ""}`).join("；") ?? "JSON 无法解析";
           if (repair === repairs) {
             const error = new ModelTransportError(`结构化输出校验失败：${errors}`, false, "schema-validation");
             await this.record({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, configRevision: snapshot.id, candidateIndex: index, executor: "api", profileId: latest.profile.id, providerLabel: latest.profile.label, protocol: latest.profile.protocol, model: latest.model, status: "failed", inputTokens: totalInput, outputTokens: totalOutput, providerInputTokens: providerInputSeen ? providerInputTotal : undefined, providerOutputTokens: providerOutputSeen ? providerOutputTotal : undefined, providerCachedInputTokens: providerCachedInputSeen ? providerCachedInputTotal : undefined, estimatedInputTokens: estimatedInputTotal, estimatedOutputTokens: estimatedOutputTotal, usageSource: providerInputComplete && providerOutputComplete ? "provider" : providerInputSeen || providerOutputSeen ? "mixed" : "estimated", latencyMs: latest.latencyMs, promptFingerprint: latest.provenance.promptFingerprint, responseId: latest.response.responseId, errorCategory: error.category, errorMessage: modelErrorMessage(error) });
@@ -700,32 +779,32 @@ export class RoutedModelGateway implements ModelGateway {
           currentPrompt = repairPrompt(input.prompt, latest.response.text, errors, repair, repairInputLimit, repairSystem);
         }
       } catch (error) {
+        // 历史快照的显式外部候选或兜底位本身抛出的等待，直接上抛给物化层。
         if (error instanceof ExternalMcpRequiredError) throw error;
-        if (error instanceof ModelTransportError && error.category === "empty-response") {
+        // Empty response and schema validation are candidate-local: providers
+        // can differ in output shape and schema adherence, so both exhaust the
+        // next explicit API candidates before the external-MCP tail fallback.
+        if (error instanceof ModelTransportError && (error.category === "schema-validation" || error.category === "empty-response")) {
           const nextApi = nextApiCandidateIndex(route, index);
-          if (nextApi === undefined) throw error;
-          lastError = error;
+          if (nextApi === undefined) break;
           index = nextApi - 1;
           continue;
         }
-        // Structured validation is candidate-local: providers can differ in their
-        // ability to honor the same schema. Exhaust the next explicit API
-        // candidates before surfacing the failure; never fall back to an
-        // external-MCP wait just because all API candidates failed.
-        if (error instanceof ModelTransportError && error.category === "schema-validation") {
-          const nextApi = nextApiCandidateIndex(route, index);
-          if (nextApi === undefined) throw error;
-          lastError = error;
-          index = nextApi - 1;
-          continue;
-        }
-        lastError = error;
       }
     }
-    throw exhaustedRouteError(input.purpose, lastError);
+    // 链尾兜底：所有显式 API 候选失败（或链为空）时转入外部 MCP 等待，替代
+    // 原 exhaustedRouteError 快速失败（机制契约 2026-09-07，见 invokeExternalMcpWait）。
+    // 零进展守卫（弧15 65 分钟空转实证）：调用方把起点推过终位
+    // （candidateStartIndex > candidates.length）意味着链尾兜底位也刚被消耗过——
+    // 再造同位外部任务只会开启下一段 15 分钟死窗。此时快速失败，让 run
+    // 进入正式恢复路径（provider 恢复后新快照从 0 位重跑）。
+    if ((input.candidateStartIndex ?? 0) > route.candidates.length) {
+      throw new Error(`model-route-exhausted: ${input.purpose} 候选链与链尾兜底位均已消耗（起点 ${input.candidateStartIndex} > 终位 ${route.candidates.length}）`);
+    }
+    return await this.invokeExternalMcpWait(input, snapshot, route, route.candidates.length);
   }
 
-  private async vectorRequest(input: { purpose: "memory.embed" | "memory.rerank"; body: Record<string, unknown>; path: string; signal?: AbortSignal; routingSnapshot?: ModelRoutingSnapshot; workflowRunId?: string; taskId?: string }): Promise<{ data: Record<string, unknown>; provenance: ModelExecutionProvenance; usage: ModelUsage }> {
+  private async vectorRequest(input: { purpose: "memory.embed" | "memory.rerank"; body: Record<string, unknown>; path: string; signal?: AbortSignal; routingSnapshot?: ModelRoutingSnapshot; workflowRunId?: string; taskId?: string; projectId?: string }): Promise<{ data: Record<string, unknown>; provenance: ModelExecutionProvenance; usage: ModelUsage }> {
     const { snapshot, route } = this.route(input);
     let lastError: unknown;
     for (let index = 0; index < route.candidates.length; index += 1) {
@@ -747,28 +826,73 @@ export class RoutedModelGateway implements ModelGateway {
         const normalized = normalizeUsage(data.usage ?? meta?.tokens, JSON.stringify(input.body), "");
         const usage = { model, ...normalized, costUsd: 0, latencyMs: Date.now() - started };
         const provenance = { routeSnapshotId: snapshot.id, purpose: input.purpose, candidateIndex: index, executor: "api" as const, profileId: profile.id, protocol: profile.protocol, model, promptFingerprint: fingerprint };
-        await this.record({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, configRevision: snapshot.id, candidateIndex: index, executor: "api", profileId: profile.id, protocol: profile.protocol, model, status: "completed", inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, providerInputTokens: usage.providerInputTokens, providerOutputTokens: usage.providerOutputTokens, providerCachedInputTokens: usage.providerCachedInputTokens, estimatedInputTokens: usage.estimatedInputTokens, estimatedOutputTokens: usage.estimatedOutputTokens, usageSource: usage.usageSource, latencyMs: usage.latencyMs, promptFingerprint: fingerprint });
+        await this.record({ workflowRunId: input.workflowRunId, taskId: input.taskId, projectId: input.projectId, purpose: input.purpose, configRevision: snapshot.id, candidateIndex: index, executor: "api", profileId: profile.id, protocol: profile.protocol, model, status: "completed", inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, providerInputTokens: usage.providerInputTokens, providerOutputTokens: usage.providerOutputTokens, providerCachedInputTokens: usage.providerCachedInputTokens, estimatedInputTokens: usage.estimatedInputTokens, estimatedOutputTokens: usage.estimatedOutputTokens, usageSource: usage.usageSource, latencyMs: usage.latencyMs, promptFingerprint: fingerprint });
         return { data, provenance, usage };
       } catch (error) {
-        await this.record({ workflowRunId: input.workflowRunId, taskId: input.taskId, purpose: input.purpose, configRevision: snapshot.id, candidateIndex: index, executor: "api", profileId: profile.id, providerLabel: profile.label, protocol: profile.protocol, model, status: "failed", inputTokens: 0, outputTokens: 0, latencyMs: Date.now() - started, promptFingerprint: fingerprint, errorCategory: error instanceof ModelTransportError ? error.category : "protocol", errorMessage: modelErrorMessage(error) });
+        await this.record({ workflowRunId: input.workflowRunId, taskId: input.taskId, projectId: input.projectId, purpose: input.purpose, configRevision: snapshot.id, candidateIndex: index, executor: "api", profileId: profile.id, providerLabel: profile.label, protocol: profile.protocol, model, status: "failed", inputTokens: 0, outputTokens: 0, latencyMs: Date.now() - started, promptFingerprint: fingerprint, errorCategory: error instanceof ModelTransportError ? error.category : "protocol", errorMessage: modelErrorMessage(error) });
         lastError = error;
       }
     }
     throw lastError ?? new Error(`模型路由 ${input.purpose} 没有可执行候选`);
   }
 
-  async embed(input: { purpose: "memory.embed"; texts: string[]; signal?: AbortSignal; routingSnapshot?: ModelRoutingSnapshot; workflowRunId?: string; taskId?: string }): Promise<ModelResult<number[][]> & { vectors: number[][] }> {
+  async embed(input: { purpose: "memory.embed"; texts: string[]; signal?: AbortSignal; routingSnapshot?: ModelRoutingSnapshot; workflowRunId?: string; taskId?: string; projectId?: string }): Promise<ModelResult<number[][]> & { vectors: number[][] }> {
+    if (this.embeddingCache && input.texts.length) {
+      const cached = await this.embedWithCache(input);
+      if (cached) return cached;
+    }
+    return this.embedDirect(input);
+  }
+
+  private async embedDirect(input: { purpose: "memory.embed"; texts: string[]; signal?: AbortSignal; routingSnapshot?: ModelRoutingSnapshot; workflowRunId?: string; taskId?: string; projectId?: string }): Promise<ModelResult<number[][]> & { vectors: number[][] }> {
     const result = await this.vectorRequest({ ...input, body: { input: input.texts, encoding_format: "float" }, path: "embeddings" });
-    const rows = Array.isArray(result.data.data) ? result.data.data as Array<{ embedding?: number[]; index?: number }> : [];
-    const vectors = Array.from({ length: input.texts.length }, () => [] as number[]);
-    rows.forEach((row, responseIndex) => {
-      const inputIndex = Number.isInteger(row.index) ? Number(row.index) : responseIndex;
-      if (inputIndex >= 0 && inputIndex < vectors.length && Array.isArray(row.embedding)) vectors[inputIndex] = row.embedding;
-    });
+    const vectors = parseEmbeddingVectors(result.data, input.texts.length);
     return { value: vectors, vectors, usage: result.usage, provenance: result.provenance };
   }
 
-  async rerank(input: { purpose: "memory.rerank"; query: string; documents: string[]; signal?: AbortSignal; routingSnapshot?: ModelRoutingSnapshot; workflowRunId?: string; taskId?: string }): Promise<ModelResult<number[]> & { scores: number[] }> {
+  /**
+   * OR-D2（product-audit-20260910 E5）嵌入幂等短路：以首选候选的 embedding 模型为
+   * 命名空间查内容寻址缓存，全部命中则零 provider 调用返回；部分命中只对缺失文本
+   * 调一次 embed（去重后），按原序回填。回填用实际执行模型（fallback 可能换模型），
+   * 空向量不缓存。缓存端口失败一律退化为直连路径——幂等短路是增益，不是新的失败面。
+   * 返回 undefined 表示"未走缓存路径"，由 embed() 直连。
+   */
+  private async embedWithCache(input: { purpose: "memory.embed"; texts: string[]; signal?: AbortSignal; routingSnapshot?: ModelRoutingSnapshot; workflowRunId?: string; taskId?: string; projectId?: string }): Promise<(ModelResult<number[][]> & { vectors: number[][] }) | undefined> {
+    const cache = this.embeddingCache;
+    if (!cache) return undefined;
+    const { snapshot, route } = this.route(input);
+    const primaryIndex = route.candidates.findIndex((candidate) => candidate.executor === "api");
+    const primary = primaryIndex >= 0 ? route.candidates[primaryIndex] : undefined;
+    if (!primary || primary.executor !== "api") return undefined;
+    const model = primary.model ?? (primary.profileId ? this.resolveProfile(snapshot, primary.profileId).model : undefined);
+    if (!model) return undefined;
+    let hits: (number[] | undefined)[];
+    try {
+      hits = await cache.lookupEmbeddings(model, input.texts);
+    } catch (error) {
+      console.warn(`[model-gateway] 嵌入缓存查询失败，退化直连：${error instanceof Error ? error.message : String(error)}`);
+      return undefined;
+    }
+    const missing = [...new Set(input.texts.filter((_text, index) => !(hits[index]?.length)))];
+    if (!missing.length) {
+      const vectors = input.texts.map((_, index) => hits[index] as number[]);
+      const usage: ModelUsage = { model, inputTokens: 0, outputTokens: 0, costUsd: 0, latencyMs: 0 };
+      const provenance: ModelExecutionProvenance = { routeSnapshotId: snapshot.id, purpose: input.purpose, candidateIndex: primaryIndex, executor: "api", profileId: primary.profileId, model, promptFingerprint: promptFingerprint(undefined, JSON.stringify({ cached: vectors.length })) };
+      return { value: vectors, vectors, usage, provenance };
+    }
+    const fresh = await this.vectorRequest({ ...input, body: { input: missing, encoding_format: "float" }, path: "embeddings" });
+    const freshVectors = parseEmbeddingVectors(fresh.data, missing.length);
+    try {
+      await cache.storeEmbeddings(fresh.provenance.model, missing.map((text, index) => ({ text, vector: freshVectors[index] ?? [] })).filter((entry) => entry.vector.length));
+    } catch (error) {
+      console.warn(`[model-gateway] 嵌入缓存回填失败（本次结果仍返回）：${error instanceof Error ? error.message : String(error)}`);
+    }
+    const missingPosition = new Map(missing.map((text, index) => [text, index]));
+    const vectors = input.texts.map((text, index) => (hits[index]?.length ? hits[index] as number[] : freshVectors[missingPosition.get(text) ?? -1] ?? []));
+    return { value: vectors, vectors, usage: fresh.usage, provenance: fresh.provenance };
+  }
+
+  async rerank(input: { purpose: "memory.rerank"; query: string; documents: string[]; signal?: AbortSignal; routingSnapshot?: ModelRoutingSnapshot; workflowRunId?: string; taskId?: string; projectId?: string }): Promise<ModelResult<number[]> & { scores: number[] }> {
     const result = await this.vectorRequest({
       ...input,
       body: { query: input.query, documents: input.documents, top_n: input.documents.length, return_documents: false },

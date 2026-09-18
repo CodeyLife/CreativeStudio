@@ -30,6 +30,7 @@ describe("ChapterStateRebuildService", () => {
       recordFactApprovalPolicy: vi.fn(async () => { calls.push("approve-facts"); return {}; }),
       applyCommittedChapterStateRebuild: vi.fn(async () => { calls.push("apply-state"); return { removedClaimIds: ["old-claim"], activatedClaims: [], narrativeState: {} }; }),
       refreshChapterMemoryRollup: vi.fn(async () => ({ id: "rollup", projectId: "p1", kind: "hierarchical", title: "汇总", content: "汇总", subjectRefs: [], knowledgeScope: "author", authority: "derived", confidence: 1, sourceRevisionIds: [], contentHash: "rollup", supersedes: [] })),
+      reconcileStagedClaimDebris: vi.fn(async () => 0),
       recordProjectionFailure: vi.fn(),
     };
     const output = {
@@ -67,6 +68,7 @@ describe("ChapterStateRebuildService", () => {
       recordFactApprovalPolicy: vi.fn(async () => ({})),
       applyCommittedChapterStateRebuild: vi.fn(async () => { calls.push("apply-state"); return { removedClaimIds: [], activatedClaims: [], narrativeState: {} }; }),
       refreshChapterMemoryRollup: vi.fn(async () => ({ id: "rollup", projectId: "p1", kind: "hierarchical", title: "汇总", content: "汇总", subjectRefs: [], knowledgeScope: "author", authority: "derived", confidence: 1, sourceRevisionIds: [], contentHash: "rollup", supersedes: [] })),
+      reconcileStagedClaimDebris: vi.fn(async () => 0),
       recordProjectionFailure: vi.fn(),
     };
     const factsWithoutMemory = { facts: [], narrativeElements: { foreshadowings: [], promises: [], payoffs: [] } };

@@ -147,16 +147,15 @@ async function main() {
     }
   }
 
-  // ---------- 路径二：创意短剧（--project 可选：缺省为独立模式） ----------
+  // ---------- 路径二：创意短剧（stateless，独立模式；不落库、不复用 DB 既有产物） ----------
   try {
     const record = await generateShortScriptH3(
-      { projectId: args.project, idea: args.idea, targetDurationSeconds: args.duration },
-      { repository, objects, model, skillProvider },
+      { idea: args.idea, targetDurationSeconds: args.duration },
+      { model, skillProvider },
     );
     const totalSeconds = record.segments.reduce((sum, segment) => sum + segment.durationSeconds, 0);
     paths.shortScript = {
       ok: true,
-      reused: record.reused ?? false,
       scriptId: record.scriptId,
       targetDurationSeconds: record.targetDurationSeconds,
       totalSeconds,
@@ -193,7 +192,7 @@ async function main() {
     lines.push("");
   }
   if (paths.shortScript) {
-    lines.push(`[创意短剧] ${paths.shortScript.ok ? "成功" : "失败"}${paths.shortScript.reused ? "（复用既有产物）" : ""}`);
+    lines.push(`[创意短剧] ${paths.shortScript.ok ? "成功" : "失败"}`);
     if (paths.shortScript.ok) {
       lines.push(`  时长：目标 ${paths.shortScript.targetDurationSeconds}s / 实际 ${paths.shortScript.totalSeconds}s（偏差 ${paths.shortScript.durationDeviationSeconds}s，容差内=${paths.shortScript.durationWithinTolerance}）`);
       lines.push(`  片段数：${paths.shortScript.segmentCount}；镜头语言提示：${paths.shortScript.cinematicHintCount} 个（密度 ${paths.shortScript.cinematicHintDensity}）`);

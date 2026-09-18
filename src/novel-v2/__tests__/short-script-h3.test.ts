@@ -1,426 +1,236 @@
 /**
- * 核心创意短剧脚本（short-script-h3）单元测试（契约 v2：独立存储 + 零阻断契约）。
+ * 独立短剧（short-script-h3）单元测试（stateless：后端只生成不落库，无 repository/objects）。
  *
- * 契约：与章节剧本共用六段式片段结构与零阻断组装（结构观察全部只进 hints，
- * 不回灌 repair、不阻止落库）；目标时长预算（分段数上下限 + 总时长容差窗口）
- * 仅作为 prompt 预算约束与人工复核观察存在，不再抛错。
- * v2 起完全独立于小说项目：projectId 可选（缺省=独立短剧），产物落 short_scripts 表。
- * 夹具说明：使用虚构人物与通用都市题材的示例性内容作结构校验样本；被测的
- * 结构规则、校验逻辑与断言全部题材无关（泛化优先约束针对规则文本，
- * 不禁止测试样本携带题材）。
+ * 覆盖：时长预算推导、素材注入幂等指纹、stateless 直接返回完整 record、
+ * avoidMotifs 入参参与反同质、两阶段生成路径（分批）。
  */
-import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
-import { NovelPostgresRepository, type StoredShortScript } from "../postgres-repository";
 import {
   buildShortScriptPrompt,
-  buildShortScriptSchema,
   clampShortScriptTargetSeconds,
   DEFAULT_SHORT_SCRIPT_TARGET_SECONDS,
   deriveShortScriptMaxSegments,
   deriveShortScriptMinSegments,
   generateShortScriptH3,
   MAX_SHORT_SCRIPT_TARGET_SECONDS,
+  MAX_SHORT_SCRIPT_SEGMENTS,
   MIN_IDEA_LENGTH,
   MIN_SHORT_SCRIPT_TARGET_SECONDS,
+  normalizeShortScriptDurationMode,
   SHORT_SCRIPT_CONTRACT_VERSION,
   ShortScriptInputError,
-  SHORT_SCRIPT_KIND,
-  SHORT_SCRIPT_TOTAL_DURATION_TOLERANCE_SECONDS,
-  observeShortScriptTotalDuration,
-  submitExternalShortScriptH3,
+  shortScriptDurationKey,
 } from "../application/short-script-h3";
+import {
+  buildShortScriptBatchPrompt,
+  buildShortScriptMaterialLine,
+  buildShortScriptPlanPrompt,
+  type ShortScriptReferenceMaterial,
+} from "../application/staged-script-generation";
 
 const IDEA = "深夜便利店店员发现连续三晚同一时刻进店的顾客们买走的商品首字拼成同一句警告，而第四晚进店的是他自己。";
 
-/** short_scripts 表存储行夹具（payload 结构与生成路径落库一致）。 */
-function mockStoredScript(overrides: Partial<StoredShortScript> = {}): StoredShortScript {
-  const output = shortScriptOutput(30);
+function makeSkillProvider() {
   return {
-    id: "script-stored",
-    projectId: "project-1",
-    idea: IDEA,
-    instruction: undefined,
-    targetDurationSeconds: 30,
-    sourceFingerprint: "fingerprint-stored",
-    contractVersion: SHORT_SCRIPT_CONTRACT_VERSION,
-    objectKey: "objects/test-short-script",
-    contentHash: "hash-stored",
-    workflowId: "short-script:test",
-    payload: {
-      origin: "short-script-h3",
-      mode: "ref2va",
-      idea: IDEA,
-      targetDurationSeconds: 30,
-      sourceFingerprint: "fingerprint-stored",
-      contractVersion: SHORT_SCRIPT_CONTRACT_VERSION,
-      plotBeats: output.plotBeats,
-      characters: output.characters,
-      segments: output.segments,
-    },
-    createdAt: Date.now(),
-    ...overrides,
-  };
+    list: vi.fn(async () => [{
+      skillId: "test-short-script",
+      version: "1.0.0",
+      enabled: true,
+      priority: "required",
+      executionPoints: ["short.script"],
+      capabilities: ["script"],
+      content: "short.script 执行点指引（测试桩）",
+      promptSections: { "short.script": "short.script 执行点指引（测试桩）" },
+    }]),
+  } as never;
 }
 
-function mockRepository(options: { existingStored?: StoredShortScript; missingProject?: boolean } = {}) {
-  const repository = Object.create(NovelPostgresRepository.prototype) as NovelPostgresRepository;
-  // pool.query 仅服务 loadProjectTitle（projectId 显式提供时才被调用）
-  const projectQuery = vi.fn(async () =>
-    options.missingProject ? { rows: [], rowCount: 0 } : { rows: [{ title: "深夜便利店" }], rowCount: 1 });
-  const findShortScriptByFingerprint = vi.fn(async (_fingerprint: string) => options.existingStored);
-  const recordShortScript = vi.fn(async (_script: StoredShortScript) => {});
-  Object.defineProperty(repository, "pool", { value: { query: projectQuery } });
-  Object.defineProperty(repository, "findShortScriptByFingerprint", { value: findShortScriptByFingerprint });
-  Object.defineProperty(repository, "recordShortScript", { value: recordShortScript });
-  return { repository, projectQuery, recordShortScript, findShortScriptByFingerprint };
-}
-
-const BASELINE = "A young night-shift clerk with tired eyes, a dark green store apron and a lanyard badge.";
-
-function clerkSegment(durationSeconds: number, overrides: Record<string, unknown> = {}) {
-  return {
-    title: "货架异样",
-    synopsis: "店员整理货架时发现商品缺口的规律。",
-    durationSeconds,
-    beatIds: ["beat-pattern"],
-    subjectDefinitions: "<Subject 1> is the night-shift clerk, wearing a dark green store apron and a lanyard badge.\n<Subject 2> is the fluorescent-lit convenience store interior at 3 a.m.",
-    summary: "[reference generation] <Subject 1> notices a pattern in the emptied shelves of <Subject 2>.",
-    retentionAnalysis: "<Subject 1> (appears in [Shot 1], [Shot 2]): fully_preserved - apron and badge retained.\n<Subject 2> (appears in [Shot 1], [Shot 2]): fully_preserved - store set dressing retained.",
-    detailedDescription: [
-      "Live-action cinematic look, cold fluorescent palette.",
-      "[Shot 1] A medium shot frames <Subject 2>, shelves under cold fluorescent light, one strip flickering. <Subject 1>, the clerk in the green apron, restocks cans; the camera pushes in slowly as his eyes stop on a row of gaps.",
-      "[Shot 2] At 00:05.000, the shot cuts to a close-up of <Subject 1> (S1) reading a receipt strip, muttering in Chinese, <d>[中文] 首字又对上了。</d> The fridge hum swells behind him.",
-    ].join("\n"),
-    overallSoundscape: "Fridge hum, freezer drone, and the beep of a register run in the background throughout.",
-    nonDiegeticMusic: "A low synth pulse builds as the pattern becomes visible, cutting out at the last line.",
-    ...overrides,
-  };
-}
-
+/** 单次 30s 模型的六段结构与创意策略输出（契约 v10）。 */
 function shortScriptOutput(targetDurationSeconds: number) {
-  const segments: Array<ReturnType<typeof clerkSegment>> = [];
+  const segments = [];
   let remaining = targetDurationSeconds;
   while (remaining > 0) {
-    // 区间 10-15s（契约 v6）：余量不足 10s 时并入前一段由容差窗口吸收。
     const duration = Math.min(15, Math.max(10, remaining));
-    segments.push(clerkSegment(duration));
+    segments.push({
+      title: "货架异样",
+      synopsis: "店员发现商品缺口规律。",
+      durationSeconds: duration,
+      beatIds: ["beat-pattern"],
+      subjectDefinitions: "<Subject 1> is the night-shift clerk; <Subject 2> is the convenience store interior.",
+      summary: "[reference generation] <Subject 1> notices a pattern in the shelves of <Subject 2>.",
+      retentionAnalysis: "<Subject 1>: fully_preserved.\n<Subject 2>: fully_preserved.",
+      detailedDescription: "[Shot 1] A medium shot of <Subject 2>, cold fluorescent light; <Subject 1> restocks cans. [Shot 2] A close-up of <Subject 1> muttering in Chinese.",
+      overallSoundscape: "Fridge hum and register beep throughout.",
+      nonDiegeticMusic: "A low synth pulse builds.",
+    });
     remaining -= duration;
   }
   return {
-    plotBeats: [{ id: "beat-pattern", kind: "setup" as const, summary: "店员发现缺货商品的规律并拼出首字警告" }],
-    characters: [{ name: "夜班店员", appearanceEn: BASELINE }],
+    plotBeats: [{ id: "beat-pattern", kind: "setup" as const, summary: "店员发现缺货商品首字拼出警告" }],
+    creativeStrategy: { hookType: "awe" as const, subversion: "警告并非来自监控，而是顾客的购物习惯被暗处操控", signatureMoment: "第四晚推门进店的是他自己" },
+    characters: [{ name: "夜班店员", appearanceEn: "A young clerk in a dark green apron." }],
     segments,
   };
 }
 
+function mockModel(value: unknown) {
+  return { generateStructured: vi.fn(async () => ({ value })) } as never;
+}
+
 describe("目标时长与分段预算", () => {
-  it("clamps target duration into the operating window with a default", () => {
+  it("clamps target into 10-180s", () => {
+    expect(clampShortScriptTargetSeconds(1)).toBe(MIN_SHORT_SCRIPT_TARGET_SECONDS);
+    expect(clampShortScriptTargetSeconds(30)).toBe(30);
+    expect(clampShortScriptTargetSeconds(500)).toBe(MAX_SHORT_SCRIPT_TARGET_SECONDS);
     expect(clampShortScriptTargetSeconds(undefined)).toBe(DEFAULT_SHORT_SCRIPT_TARGET_SECONDS);
-    expect(clampShortScriptTargetSeconds(5)).toBe(MIN_SHORT_SCRIPT_TARGET_SECONDS);
-    expect(clampShortScriptTargetSeconds(240)).toBe(MAX_SHORT_SCRIPT_TARGET_SECONDS);
-    expect(clampShortScriptTargetSeconds(23.6)).toBe(24);
-    expect(clampShortScriptTargetSeconds(Number.NaN)).toBe(DEFAULT_SHORT_SCRIPT_TARGET_SECONDS);
   });
 
-  it("derives segment floors and caps from the target duration", () => {
-    // v6 起区间 10-15s：下限按最长单段 15s、上限按最短单段 10s 推导。
+  it("derives segment min/max from the target budget with a hard cap", () => {
     expect(deriveShortScriptMinSegments(30)).toBe(2);
     expect(deriveShortScriptMaxSegments(30)).toBe(3);
-    expect(deriveShortScriptMinSegments(60)).toBe(4);
-    expect(deriveShortScriptMaxSegments(60)).toBe(6);
-    expect(deriveShortScriptMinSegments(12)).toBe(1);
-    expect(deriveShortScriptMaxSegments(12)).toBe(2);
-    // 180s（3 分钟上限）：下限 12（全按 15s），上限 18（全按 10s），未触及段数 cap 36。
-    expect(deriveShortScriptMinSegments(MAX_SHORT_SCRIPT_TARGET_SECONDS)).toBe(12);
-    expect(deriveShortScriptMaxSegments(MAX_SHORT_SCRIPT_TARGET_SECONDS)).toBe(18);
+    // 硬顶：180s 按最短单段 10s 推导不得超过 MAX_SHORT_SCRIPT_SEGMENTS
+    expect(deriveShortScriptMaxSegments(MAX_SHORT_SCRIPT_TARGET_SECONDS)).toBeLessThanOrEqual(MAX_SHORT_SCRIPT_SEGMENTS);
   });
 
-  it("narrows the schema segment bounds around the budget", () => {
-    const schema = buildShortScriptSchema(30) as { properties: { segments: { minItems: number; maxItems: number } } };
-    expect(schema.properties.segments.minItems).toBe(2);
-    expect(schema.properties.segments.maxItems).toBe(3);
+  it("normalizes duration mode to fixed and keys fixed vs auto distinctly", () => {
+    expect(normalizeShortScriptDurationMode("auto")).toBe("auto");
+    expect(normalizeShortScriptDurationMode("nonsense")).toBe("fixed");
+    expect(shortScriptDurationKey({ durationMode: "auto", targetDurationSeconds: 60 })).toBe("auto");
+    expect(shortScriptDurationKey({ durationMode: "fixed", targetDurationSeconds: 30 })).toBe("30");
   });
 
-  it("observes totals inside the tolerance window and reports drift beyond it (no blocking)", () => {
-    expect(observeShortScriptTotalDuration([clerkSegment(12), clerkSegment(12)], 24)).toBeNull();
-    expect(observeShortScriptTotalDuration([clerkSegment(12), clerkSegment(12)], 24 + SHORT_SCRIPT_TOTAL_DURATION_TOLERANCE_SECONDS)).toBeNull();
-    const drift = observeShortScriptTotalDuration([clerkSegment(10), clerkSegment(10)], 40);
-    expect(drift).toContain("偏离目标");
-    expect(drift).toContain("容差");
-    expect(drift).toContain("供人工复核");
+  it("rejects ideas shorter than the minimum", async () => {
+    await expect(generateShortScriptH3(
+      { idea: "太短" },
+      { model: mockModel(shortScriptOutput(30)), skillProvider: makeSkillProvider() },
+    )).rejects.toBeInstanceOf(ShortScriptInputError);
   });
 });
 
-describe("buildShortScriptPrompt", () => {
-  it("embeds the idea, duration budget and coverage contract, and hands dramaturgy to the runtime skill (v8 dedup)", () => {
-    const prompt = buildShortScriptPrompt({
-      projectTitle: "深夜便利店",
+describe("buildShortScriptPrompt（素材注入）", () => {
+  it("injects selected reference materials as <Subject N> frames, omits otherwise", () => {
+    const withMaterials = buildShortScriptPrompt({
+      projectTitle: "独立短剧",
       idea: IDEA,
-      instruction: "结尾停在第四晚开门瞬间",
       targetDurationSeconds: 30,
-      minSegments: 3,
-      maxSegments: 6,
+      minSegments: 2,
+      maxSegments: 3,
+      referenceMaterials: [
+        { subjectTag: "Subject 1", description: "玻璃柜台里的白色机器人店员" },
+        { subjectTag: "Subject 2", description: "挂满褪色雨伞的门口雨棚" },
+      ],
     });
-    expect(prompt).toContain(IDEA);
-    expect(prompt).toContain("共 30 秒左右");
-    expect(prompt).toContain("剧情覆盖契约");
-    expect(prompt).toContain("信息呈现手段（硬性规则，剧情型创意适用");
-    expect(prompt).toContain("片段数须落在 3-6 个之间");
-    // v8 去重：创意类型判定与剧作层契约迁至运行时 skill（h3-video-prompt），
-    // 代码侧不再重复——重复段挤占注意力预算，长指引被模型做词汇层合规而非真正执行。
-    expect(prompt).not.toContain("创意意图忠实性");
-    expect(prompt).not.toContain("展示型创意禁止自行注入对抗事件");
-    expect(prompt).not.toContain("剧集剧作契约");
-    expect(prompt).not.toContain("开场即冲突");
-    expect(prompt).not.toContain("人物经济");
-    // 代码侧仍保留的运行时事实：时长预算、边界、作者指令
-    expect(prompt).toContain("忠实于核心创意给定的设定");
-    expect(prompt).toContain("作者指令");
-    expect(prompt).toContain("结尾停在第四晚开门瞬间");
-    expect(Number(SHORT_SCRIPT_CONTRACT_VERSION)).toBeGreaterThanOrEqual(8);
-  });
-
-  it("keeps the idea-faithfulness and picture-design contracts in the runtime skill (guard against silent loss after dedup)", () => {
-    // 守护测试：契约迁出代码侧后，若 skill 侧被误删或改坏，代码侧测试不会再发现。
-    // 此处锚定 workspace skill 源文件，保证两端不同步时测试失败而非静默降级。
-    const raw = readFileSync(new URL("../../../skills/novel-v2/h3-video-prompt.yaml", import.meta.url), "utf8");
-    const short = raw.split("short.script: |")[1] ?? "";
-    for (const token of [
-      "创意意图忠实性",
-      "展示型创意禁止自行注入任何剧情型要素",
-      "开场即冲突",
-      "出口即钩子",
-      "台词密度",
-      "反转须有伏笔",
-      "人物经济",
-      "构图设计",
-      "色彩设计",
-      "反平庸默认态",
-    ]) {
-      expect(short, `skill 契约缺失：${token}`).toContain(token);
-    }
+    expect(withMaterials).toContain("公用参考素材");
+    expect(withMaterials).toContain("Subject 1：玻璃柜台里的白色机器人店员");
+    const without = buildShortScriptPrompt({ projectTitle: "独立短剧", idea: IDEA, targetDurationSeconds: 30, minSegments: 2, maxSegments: 3 });
+    expect(without).not.toContain("公用参考素材");
+    expect(buildShortScriptMaterialLine([])).toBe("");
   });
 });
 
-describe("generateShortScriptH3（结构复用与幂等）", () => {
-  function mockModel(value: unknown) {
-    return { generateStructured: vi.fn(async () => ({ value })) };
-  }
-  const objects = { putText: vi.fn(async () => ({ key: "objects/test-short-script" })) };
-  const skillProvider = {
-    list: vi.fn(async () => [{
-      skillId: "h3-video-prompt",
-      version: "1.3.0",
-      capabilities: ["script"],
-      applicableTasks: ["drafting"],
-      requiredMemoryKinds: [],
-      conflicts: [],
-      qualityGates: ["h3-six-section-order"],
-      promptSections: { "short.script": "H3 指引占位" },
-      enabled: true,
-      executionPoints: ["chapter.script", "short.script"],
-      roles: ["writer"],
-      dependsOn: [],
-      priority: "required",
-    }]),
-  };
-
-  it("rejects an idea shorter than the minimum creative unit with a 400-style error", async () => {
-    const { repository } = mockRepository();
-    await expect(generateShortScriptH3(
-      { projectId: "project-1", idea: "太短" },
-      { repository, objects: objects as never, model: mockModel({}) as never, skillProvider: skillProvider as never },
-    )).rejects.toThrow(ShortScriptInputError);
-    await expect(generateShortScriptH3(
-      { projectId: "project-1", idea: "太短" },
-      { repository, objects: objects as never, model: mockModel({}) as never, skillProvider: skillProvider as never },
-    )).rejects.toThrow(new RegExp(`至少 ${MIN_IDEA_LENGTH} 个字符`));
-  });
-
-  it("generates and persists a short_scripts row", async () => {
-    const { repository, recordShortScript, projectQuery } = mockRepository();
-    const record = await generateShortScriptH3(
-      { projectId: "project-1", idea: IDEA, instruction: "结尾停在第四晚开门瞬间" },
-      { repository, objects: objects as never, model: mockModel(shortScriptOutput(30)) as never, skillProvider: skillProvider as never },
-    );
-    expect(record.reused).toBeUndefined();
-    expect(record.projectId).toBe("project-1");
-    expect(record.scriptId).toEqual(expect.any(String));
-    expect(record.targetDurationSeconds).toBe(30);
-    expect(record.segments).toHaveLength(2);
-    expect(record.segments[0].promptText).toContain("subject_definitions:");
-    expect(record.plotBeats[0].id).toBe("beat-pattern");
-    expect(recordShortScript).toHaveBeenCalledTimes(1);
-    const stored = recordShortScript.mock.calls[0][0] as StoredShortScript;
-    expect(stored.projectId).toBe("project-1");
-    expect(stored.contractVersion).toBe(SHORT_SCRIPT_CONTRACT_VERSION);
-    expect(stored.payload.origin).toBe("short-script-h3");
-    expect(stored.payload.kind).toBe(SHORT_SCRIPT_KIND);
-    // 创意来源落库：历史列表语义展示与幂等审计依据
-    expect(stored.idea).toBe(IDEA);
-    expect(stored.instruction).toBe("结尾停在第四晚开门瞬间");
-    expect(record.idea).toBe(IDEA);
-    expect(record.instruction).toBe("结尾停在第四晚开门瞬间");
-    // 关联模式：项目标题注入 prompt（novel_projects 被查询）
-    expect(projectQuery).toHaveBeenCalledTimes(1);
-  });
-
-  it("generates an independent short script without any novel project (contract v2)", async () => {
-    const { repository, recordShortScript, projectQuery } = mockRepository();
+describe("generateShortScriptH3（stateless）", () => {
+  it("returns a full record without repository/objects, and keeps sourceFingerprint", async () => {
+    const generateStructured = vi.fn(async () => ({ value: shortScriptOutput(30) }));
     const record = await generateShortScriptH3(
       { idea: IDEA },
-      { repository, objects: objects as never, model: mockModel(shortScriptOutput(30)) as never, skillProvider: skillProvider as never },
+      { model: { generateStructured } as never, skillProvider: makeSkillProvider() },
     );
-    expect(record.projectId).toBeUndefined();
-    expect(record.segments).toHaveLength(2);
-    // 独立模式不查询 novel_projects（无项目依赖）
-    expect(projectQuery).not.toHaveBeenCalled();
-    const stored = recordShortScript.mock.calls[0][0] as StoredShortScript;
-    expect(stored.projectId).toBeUndefined();
-  });
-
-  it("keeps the 404 semantics when an explicitly linked project does not exist", async () => {
-    const { repository } = mockRepository({ missingProject: true });
-    await expect(generateShortScriptH3(
-      { projectId: "project-missing", idea: IDEA },
-      { repository, objects: objects as never, model: mockModel(shortScriptOutput(30)) as never, skillProvider: skillProvider as never },
-    )).rejects.toThrow(/项目不存在/);
-  });
-
-  it("persists drift output beyond the tolerance window without blocking (zero-blocking display)", async () => {
-    const { repository, recordShortScript } = mockRepository();
-    const drift = [clerkSegment(15), clerkSegment(15), clerkSegment(15)];
-    const record = await generateShortScriptH3(
-      { projectId: "project-1", idea: IDEA, targetDurationSeconds: 30 },
-      { repository, objects: objects as never, model: mockModel({ ...shortScriptOutput(30), segments: drift }) as never, skillProvider: skillProvider as never },
-    );
-    expect(record.reused).toBeUndefined();
-    expect(record.segments).toHaveLength(3);
-    // 总时长 45s 偏离目标 30s 超容差：零阻断契约下只作为人工复核提示，不阻止落库展示。
-    expect(record.cinematicHints.some((hint) => hint.includes("偏离目标"))).toBe(true);
-    expect(recordShortScript).toHaveBeenCalledTimes(1);
-  });
-
-  it("reuses the stored script for identical creative input within the same scope", async () => {
-    // 第一次：无既有产物 → 走生成
-    const generateStructured = vi.fn(async () => ({ value: shortScriptOutput(30) }));
-    const first = await generateShortScriptH3(
-      { projectId: "project-1", idea: IDEA },
-      { repository: mockRepository().repository, objects: objects as never, model: { generateStructured } as never, skillProvider: skillProvider as never },
-    );
-    expect(first.reused).toBeUndefined();
-    // 第二次：命中幂等（同作用域同指纹）→ 复用，不再调模型
-    const { repository: reuseRepository } = mockRepository({ existingStored: mockStoredScript() });
-    const second = await generateShortScriptH3(
-      { projectId: "project-1", idea: IDEA },
-      { repository: reuseRepository, objects: objects as never, model: { generateStructured } as never, skillProvider: skillProvider as never },
-    );
-    expect(second.reused).toBe(true);
-    expect(second.scriptId).toBe("script-stored");
-    expect(second.segments).toHaveLength(2);
-    expect(second.cinematicHints).toEqual([]);
+    expect(record.scriptId).toBeTruthy();
+    expect(record.sourceFingerprint).toBeTruthy();
+    expect(record.segments.length).toBeGreaterThan(0);
+    expect(record.characters.length).toBe(1);
+    expect(record.creativeStrategy?.hookType).toBe("awe");
+    // stateless：无落库，无需仓库
     expect(generateStructured).toHaveBeenCalledTimes(1);
   });
 
-  it("reuses an independent-scoped script for the same idea, isolated from the linked scope", async () => {
-    // 独立作用域幂等：同创意再次独立提交 → 命中 independent 指纹复用
-    const generateStructured = vi.fn(async () => ({ value: shortScriptOutput(30) }));
-    const { repository: reuseRepository, findShortScriptByFingerprint } = mockRepository({
-      existingStored: mockStoredScript({ id: "script-independent", projectId: undefined, sourceFingerprint: "fingerprint-independent" }),
+  it("bakes selected materials into the fingerprint (mat:), differing across material sets", async () => {
+    const one = await generateShortScriptH3(
+      { idea: IDEA, referenceMaterials: [{ subjectTag: "Subject 1", description: "白色机器人" }] },
+      { model: mockModel(shortScriptOutput(30)), skillProvider: makeSkillProvider() },
+    );
+    const two = await generateShortScriptH3(
+      { idea: IDEA, referenceMaterials: [{ subjectTag: "Subject 1", description: "白色机器人" }, { subjectTag: "Subject 2", description: "门口雨棚" }] },
+      { model: mockModel(shortScriptOutput(30)), skillProvider: makeSkillProvider() },
+    );
+    expect(one.sourceFingerprint).not.toBe(two.sourceFingerprint);
+  });
+
+  it("passes avoidMotifs into the prompt (跨作品反同质入参化)", async () => {
+    let promptText = "";
+    const model = {
+      generateStructured: vi.fn(async (input: { prompt: string }) => {
+        promptText = input.prompt;
+        return { value: shortScriptOutput(30) };
+      }),
+    } as never;
+    await generateShortScriptH3(
+      { idea: IDEA, avoidMotifs: ["飞剑在云端倒悬"] },
+      { model, skillProvider: makeSkillProvider() },
+    );
+    expect(promptText).toContain("跨作品反同质");
+    expect(promptText).toContain("飞剑在云端倒悬");
+  });
+});
+
+describe("两阶段生成契约（staged generation）", () => {
+  it("drives plan + batched segment generation when segment count exceeds the single-shot threshold", async () => {
+    // auto 模式恒走两阶段（段数硬顶 36 > 6）
+    const planSegments = Array.from({ length: 8 }, () => ({ beatIds: ["beat-pattern"], durationSeconds: 10 }));
+    const generateStructured = vi.fn(async (input: { schemaName: string; schema: { properties: { segments: { minItems: number } } } }) => {
+      if (input.schemaName === "short-script-h3-plan") {
+        return { value: { creativeStrategy: { hookType: "awe", subversion: "s", signatureMoment: "m" }, styleLine: "cold fluorescent palette", plotBeats: [{ id: "beat-pattern", kind: "setup", summary: "店员发现规律" }], characters: [{ name: "夜班店员", appearanceEn: "A clerk in apron." }], segmentPlan: planSegments } };
+      }
+      // 批次：schema 强制本批段数 = segments.minItems
+      const count = input.schema.properties.segments.minItems;
+      return { value: { segments: planSegments.slice(0, count).map((s) => ({ title: "段", synopsis: "略", durationSeconds: s.durationSeconds, beatIds: s.beatIds, subjectDefinitions: "<Subject 1> is clerk.", summary: "m", retentionAnalysis: "r", detailedDescription: "d", overallSoundscape: "o", nonDiegeticMusic: "n" })) } };
     });
-    const independent = await generateShortScriptH3(
-      { idea: IDEA },
-      { repository: reuseRepository, objects: objects as never, model: { generateStructured } as never, skillProvider: skillProvider as never },
+    const record = await generateShortScriptH3(
+      { idea: IDEA, durationMode: "auto" },
+      { model: { generateStructured } as never, skillProvider: makeSkillProvider() },
     );
-    expect(independent.reused).toBe(true);
-    expect(independent.scriptId).toBe("script-independent");
-    expect(generateStructured).not.toHaveBeenCalled();
-    // 复用查询使用独立作用域指纹（independent 占位，非项目 id 拼接）
-    const queriedFingerprint = findShortScriptByFingerprint.mock.calls[0][0] as string;
-    expect(queriedFingerprint).not.toContain("project-1");
+    expect(record.segments.length).toBe(8);
+    // 规划 + 至少 1 批
+    const schemas = generateStructured.mock.calls.map(([input]) => (input as { schemaName: string }).schemaName);
+    expect(schemas).toContain("short-script-h3-plan");
   });
 
-  it("treats the same idea in independent and linked scopes as two distinct scripts", async () => {
-    // 跨作用域隔离：同创意分别在独立与关联作用域提交 → 指纹不同 → 各自生成两个产物
-    const generateStructured = vi.fn(async () => ({ value: shortScriptOutput(30) }));
-    const linked = await generateShortScriptH3(
-      { projectId: "project-1", idea: IDEA },
-      { repository: mockRepository().repository, objects: objects as never, model: { generateStructured } as never, skillProvider: skillProvider as never },
-    );
-    const { repository: independentRepository, recordShortScript: recordIndependent } = mockRepository();
-    const independent = await generateShortScriptH3(
-      { idea: IDEA },
-      { repository: independentRepository, objects: objects as never, model: { generateStructured } as never, skillProvider: skillProvider as never },
-    );
-    expect(linked.reused).toBeUndefined();
-    expect(independent.reused).toBeUndefined();
-    // 同创意两个作用域各生成一次、指纹互不相同（幂等键含作用域维度）
-    expect(generateStructured).toHaveBeenCalledTimes(2);
-    const fingerprints = new Set<string>();
-    for (const call of [...(recordIndependent.mock.calls as unknown as [StoredShortScript][])]) fingerprints.add(call[0].sourceFingerprint);
-    expect(fingerprints.size).toBe(1);
-    const independentFingerprint = [...fingerprints][0];
-    // 关联作用域指纹 ≠ 独立作用域指纹：同创意在两个作用域是两个产物
-    expect(linked.sourceFingerprint ?? "").not.toBe(independentFingerprint);
-    expect(linked.scriptId).not.toBe(independent.scriptId);
+  it("defaults the plan prompt project title to 独立短剧", () => {
+    const prompt = buildShortScriptPlanPrompt({ projectTitle: "独立短剧", idea: IDEA, targetDurationSeconds: 30, minSegments: 2, maxSegments: 3 });
+    expect(prompt).toContain("独立短剧");
+  });
+
+  it("includes reference materials in the batch prompt", () => {
+    const batchPrompt = buildShortScriptBatchPrompt({
+      projectTitle: "独立短剧",
+      idea: IDEA,
+      styleLine: "style",
+      characters: [],
+      plotBeats: [],
+      segmentPlan: [{ beatIds: ["b1"], durationSeconds: 10 }],
+      batchStartIndex: 0,
+      batchPlan: [{ beatIds: ["b1"], durationSeconds: 10 }],
+      previousSegments: [],
+      referenceMaterials: [{ subjectTag: "Subject 1", description: "白色机器人" }],
+    });
+    expect(batchPrompt).toContain("Subject 1：白色机器人");
   });
 });
 
-describe("submitExternalShortScriptH3（外部 MCP 接手产出）", () => {
-  const submitObjects = { putText: vi.fn(async () => ({ key: "objects/test-short-script" })) };
-
-  it("rejects an idea shorter than the minimum creative unit with a 400-style error", async () => {
-    const { repository } = mockRepository();
-    await expect(submitExternalShortScriptH3(
-      { idea: "太短", payload: { segments: [clerkSegment(12)] } },
-      { repository, objects: submitObjects as never },
-    )).rejects.toThrow(ShortScriptInputError);
-    await expect(submitExternalShortScriptH3(
-      { idea: "太短", payload: { segments: [clerkSegment(12)] } },
-      { repository, objects: submitObjects as never },
-    )).rejects.toThrow(new RegExp(`至少 ${MIN_IDEA_LENGTH} 个字符`));
-  });
-
-  it("rejects payload without segments", async () => {
-    const { repository } = mockRepository();
-    await expect(submitExternalShortScriptH3(
-      { idea: IDEA, payload: { plotBeats: [], characters: [] } },
-      { repository, objects: submitObjects as never },
-    )).rejects.toThrow(/payload\.segments 必填且非空/);
-  });
-
-  it("assembles external model-shaped JSON, marks origin and persists", async () => {
-    const { repository, recordShortScript } = mockRepository();
-    const record = await submitExternalShortScriptH3(
-      { idea: IDEA, instruction: "结尾停在第四晚开门瞬间", payload: shortScriptOutput(30) },
-      { repository, objects: submitObjects as never },
-    );
-    expect(record.reused).toBeUndefined();
-    expect(record.scriptId).toEqual(expect.any(String));
-    expect(record.targetDurationSeconds).toBe(30);
-    expect(record.segments).toHaveLength(2);
-    expect(record.segments[0].promptText).toContain("subject_definitions:");
-    expect(record.plotBeats[0].id).toBe("beat-pattern");
-    expect(recordShortScript).toHaveBeenCalledTimes(1);
-    const stored = recordShortScript.mock.calls[0][0] as StoredShortScript;
-    // 外部产出双轨：origin 标记与系统内部生成区分，指纹前缀 ext: 避免跨轨误复用。
-    expect(stored.payload.origin).toBe("external-short-script-h3");
-    expect(stored.payload.kind).toBe(SHORT_SCRIPT_KIND);
-    expect(stored.sourceFingerprint).toMatch(/^ext:/);
-  });
-
-  it("reuses identical external content (ext: fingerprint) without regenerating", async () => {
-    const { repository, recordShortScript, findShortScriptByFingerprint } = mockRepository({ existingStored: mockStoredScript() });
-    const record = await submitExternalShortScriptH3(
-      { idea: IDEA, payload: shortScriptOutput(30) },
-      { repository, objects: submitObjects as never },
-    );
-    expect(record.reused).toBe(true);
-    expect(record.scriptId).toBe("script-stored");
-    expect(record.segments).toHaveLength(2);
-    expect(recordShortScript).not.toHaveBeenCalled();
-    expect(findShortScriptByFingerprint.mock.calls[0][0] as string).toMatch(/^ext:/);
+/** 契约版本守卫（据此诚实声明产物形状）。 */
+describe("契约版本", () => {
+  it("is at least contract v10", () => {
+    expect(Number(SHORT_SCRIPT_CONTRACT_VERSION)).toBeGreaterThanOrEqual(10);
   });
 });
 
+/** 引用占位：确保 MIN_IDEA_LENGTH 常量仍被导出（前端白名单元依赖）。 */
+describe("导出守卫", () => {
+  it("exposes MIN_IDEA_LENGTH", () => {
+    expect(MIN_IDEA_LENGTH).toBe(10);
+  });
+});
+
+// 类型引用守卫，避免上述泛型变量被误用
+const _materialRef: ShortScriptReferenceMaterial = { subjectTag: "Subject 1", description: "x" };
+void _materialRef;

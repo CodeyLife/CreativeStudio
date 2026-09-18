@@ -32,6 +32,16 @@ Where the subject sits and how the frame is built. This is the layer most often 
 
 Anti-flat check: a bare medium shot — subject centred, no foreground occlusion, no lead-in line, no layer separation — is the video model's default render. Rewrite it.
 
+### 2.1 The vertical frame
+
+The vertical frame is a depth instrument, not a cropped horizontal one; every tool above has a vertical-native reading:
+
+- **Vertical layering:** foreground occluders hang from the top edge (a door frame, branches, rain curtains, suspended objects) and close the frame's upper third; lead-in lines run vertically — corridors, stair shafts, light columns, a gaze tilting up or down the frame.
+- **Camera height does more work:** low angles turn a figure's height into power and scale against the tall frame; high angles compress the subject into the lower band, small and exposed. Dutch tilt reads vertically — the world sliding.
+- **Faces carry the story:** a close-up fills a vertical frame's width, so micro-expression is the close-up grammar. Reserve the top band for headroom or a hanging element and the bottom band for hands, props, and foreground texture; the subject's eyes sit near the upper third-line.
+- **Two-person blocking:** side-by-side pairs crowd a vertical frame. Prefer depth blocking (one figure behind the other, foreground back turned), or alternate singles (over-the-shoulder, POV) so each face gets the frame's width.
+- **Compose for it, don't name it:** the ratio and the words "vertical/horizontal frame" never appear in the script text — orientation is a generation parameter, and a prompt that declares it has described the container rather than the picture. Everything above is how the vertical frame reaches the render: through where subjects sit, what hangs from the top edge, which way the lines run, and how high the camera sits.
+
 ## 3. Camera Behavior (H3 three-dimension grammar)
 
 Motion type (from the H3 guide): push in / pull out / pan left / pan right / truck left / truck right / tilt up / tilt down / pedestal up / pedestal down / zoom in / zoom out / arc shot / tracking shot / static shot / shake slightly / shake strongly / roll clockwise / roll counterclockwise / POV.
@@ -106,3 +116,14 @@ Stage the signature pattern when the prose offers a natural high point: build (e
 Worldbuilding visuals (spirit-energy channels, runic glow, spell traces) are shot content, not abstract lore. Write them with the same grammar as physical light: colour, intensity, motion, onset, and where they appear on the body or in space — and keep them consistent with the shared visual system across segments. Abstract lore statements stay out of the storyboard; what the lens can see is what goes in.
 
 Genre visuals are also subject to the picture-design layer: a glowing sigil is still a compositional element that occupies a position in the frame and carries a colour relationship to its surroundings.
+
+## 9. The Standalone Visual Short (lens-aesthetics mode)
+
+A tens-of-seconds piece with no plot to carry is a single aesthetic statement shot by shot. Its beats are camera beats, not story beats. This section is the *camera-art* half of a standalone short; the *engine* half — which attention engine the piece commits (awe / humor / conflict), its one subversion and one signature frame — is designed first, in `attention-hooks.md`.
+
+- **One signature subject.** One visual subject or image owns the piece — every shot is a new way of seeing it (approach, scale step, detail, revelation), never a new topic. Subject definitions and the style line are built around it; atmosphere elements only dress it. The subject is a deliberate carrier choice (megastructure, celestial body, living colossal, frozen phenomenon, spatial-law anomaly — `attention-hooks.md`), not the archetype's most famous symbol; keep one human or human-scale reference in frame so the excess stays measurable.
+- **One aesthetic idea.** One lighting system plus one dominant/accent colour relationship, declared in the style line and held across the piece; variation comes from intensity, state change, and progression — not from switching palettes mid-piece.
+- **Progression is the spine.** Beats are visible steps of scale, depth, or revelation — near to far, small to vast, surface to interior. Each shot must advance the progression one step; a shot that repeats the previous step is filler, however beautiful.
+- **Prefer the long take.** Continuous spatial movement rides a single shot with multi-stage camera movement (push through, ascend past, descend into); cut only for necessary viewpoint or subject changes. One continuous 10-15s shot that travels beats a three-shot montage that hops.
+- **Atmosphere is connective tissue.** Particles, mist, reflections, drifting light carry continuity between shots and are the cheapest cinematic density — but they dress the signature subject; they never become the subject.
+- **Exit on the strongest frame.** The final shot is the most complete revelation of the signature subject — the piece ends on an image, not on a summary or a settled afterglow.

@@ -1,7 +1,13 @@
-import type { Review } from "../protocol";
+import type { ChapterChangeScope, Review } from "../protocol";
+import { reviewExecutionsForScope } from "../application/review-concurrency";
 import type { ManuscriptStructuralReport } from "../application/manuscript-structure";
 import { buildRevisionBrief } from "../application/revision-brief";
 
+/**
+ * 历史常量（E4 前"三类 reviewer 全量"的同义词）。评审面单一真源已移至
+ * `reviewExecutionsForScope`（review-concurrency）——新代码按档位取期望角色，
+ * 勿再直接引用本常量造第二权威。
+ */
 export const REQUIRED_CHAPTER_REVIEWERS = [
   { role: "structure-reviewer", identity: "internal" },
   { role: "character-reviewer", identity: "independent" },
@@ -104,24 +110,41 @@ export function evaluateCommitGate(
   reviews: Review[],
   artifactFingerprint: string,
   structuralReport: ManuscriptStructuralReport,
+  changeScope?: ChapterChangeScope,
+  length?: { plainTextLength: number; targetWordCount?: number },
 ) {
   const currentReviews = reviews.filter((review) => review.artifactFingerprint === artifactFingerprint);
-  const requiredReviews = REQUIRED_CHAPTER_REVIEWERS.map(({ role, identity }) =>
+  // E4：期望评审角色与评审面同源（reviewExecutionsForScope）——机械/局部意图下
+  // 被合法收窄掉的角色不计 missing，门禁宽度与执行宽度一处定义。
+  const required = reviewExecutionsForScope(changeScope);
+  const requiredReviews = required.map(({ role, identity }) =>
     currentReviews.find((review) => review.role === role && review.identity === identity),
   );
-  const missingRoles = REQUIRED_CHAPTER_REVIEWERS
+  const missingRoles = required
     .filter((_, index) => !requiredReviews[index])
     .map(({ role }) => role);
   const overallScore = scoreReviews(requiredReviews.filter((review): review is Review => Boolean(review)));
   const lowReviewer = requiredReviews.find((review) => review && scoreReviews([review]) < MIN_REVIEWER_SCORE);
   const hasBlockingIssue = requiredReviews.some((review) => review?.issues.some((issue) => issue.severity === "blocker" || issue.severity === "major"));
+  // 篇幅欠量（弧7 ch49 与弧5 ch32 成对实证）：蓝图声明 targetWordCount 后正文长度是
+  // 系统可推导事实，reject→重出路径两次产出 1.4k 字骨架稿全绿过审——审校面（叙事
+  // 质量）对计划兑现欠账失明。比率进 gate（拦而不杀：作者通道仍可批准），与
+  // complete 旗/窗口同族：可推导事实不留裁量权。
+  // TODO 可配置意图：0.6 为连载章对声明目标的最小可接受兑现率，按题材/发布节奏可调。
+  const MIN_LENGTH_RATIO = 0.6;
+  const lengthUnderTarget = Boolean(
+    length?.targetWordCount && length.targetWordCount >= 500
+    && length.plainTextLength < Math.floor(length.targetWordCount * MIN_LENGTH_RATIO),
+  );
   const qualityFailure = hasBlockingIssue
     ? "blocking-issue"
     : lowReviewer
       ? "reviewer-score"
       : requiredReviews.length > 0 && overallScore < MIN_AUTOMATIC_COMMIT_SCORE
         ? "overall-score"
-        : undefined;
+        : lengthUnderTarget
+          ? "length-under-target"
+          : undefined;
   return {
     passed: missingRoles.length === 0
     && requiredReviews.every((review) => review?.verdict === "passed")
@@ -144,6 +167,9 @@ export interface CandidateQualityKey {
   overallScore: number;
   /** Per-reviewer scores let the local degradation guard inspect every role, not just the minimum. */
   reviewerScores: Record<string, number>;
+  /** warning 族计数：作全字段平手后的终位决胜（ch67 实证：一字之外全同的修订
+   *  因质量键看不见 warning 级修复被判"未更好"而回滚，token 级修正永远活不下来）。 */
+  warningCount: number;
 }
 
 export function candidateQualityKey(reviews: Review[], structuralReport: ManuscriptStructuralReport): CandidateQualityKey {
@@ -158,6 +184,7 @@ export function candidateQualityKey(reviews: Review[], structuralReport: Manuscr
     minimumReviewerScore: scores.length ? Math.min(...scores) : 0,
     overallScore: scoreReviews(current),
     reviewerScores,
+    warningCount: issueFamilies.filter((item) => item.severity === "warning").length,
   };
 }
 
@@ -206,7 +233,13 @@ export function isCandidateQualityBetter(candidate: CandidateQualityKey, current
   }
 
   if (candidate.minimumReviewerScore !== currentBest.minimumReviewerScore) return candidate.minimumReviewerScore > currentBest.minimumReviewerScore;
-  return candidate.overallScore > currentBest.overallScore;
+  if (candidate.overallScore !== currentBest.overallScore) return candidate.overallScore > currentBest.overallScore;
+  // 终位决胜（ch74 二次实证扩宽）：warning 更少者胜；warning 相等时保留新候选——
+  // 填充/扩写/词级替换这类定向修订天然不移动任何键字段（质量不变即平手），旧语义
+  // "平手即回退"让它们永远白烧一轮（ch58/ch65/ch74 三例同型）。退化维度已被上方
+  // blocker/major/score/min 各层拦截，键全等意味着"可测维度无差异"，此时新候选
+  // 承载的是作者点名的具体指令（配额/替换），保新是唯一能让这类修订存活的语义。
+  return (candidate.warningCount ?? 0) <= (currentBest.warningCount ?? 0);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

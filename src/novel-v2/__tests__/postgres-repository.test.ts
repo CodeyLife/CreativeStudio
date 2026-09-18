@@ -55,4 +55,33 @@ describe("chapter blueprint row projection", () => {
       blueprint_revision: 0,
     }).scenes[0]).not.toHaveProperty("planningRationale");
   });
+
+  // 2026-09-17 断链修复双向锁（docs/novel-v2/ai-taint-diagnosis-20260917.md F1/§四-3）：
+  // 此前本映射不读 payload.targetWordCount，补录值在行→记录这一步被静默丢弃，
+  // chapter_planning_contexts 因此 226 行全空、写作端回落默认 3500，与编排指令
+  // 手写的 2600 和门执法的 3500×0.6=2100 构成"同一目标三个数"。这条测试若失败，
+  // 说明断链复发：写作契约会重新拿到一个不是规划者给的数字。
+  it("preserves targetWordCount from the payload row (otherwise the writer never sees the planned length)", () => {
+    const base = {
+      id: "chapter-1",
+      arc_id: "arc-1",
+      project_id: "project-1",
+      document_id: null,
+      title: "夜谈",
+      ordinal: 1,
+      status: "planned" as const,
+      source_artifact_id: null,
+      blueprint_revision: 0,
+    };
+    // 正向：补录值原样进入记录（写作契约、审核面、执法门三面同源）。
+    expect(chapterBlueprintFromRow({ ...base, payload: { targetWordCount: 2600 } }).targetWordCount).toBe(2600);
+    // 小数取整，与 parseStoryArcBundle 同口径。
+    expect(chapterBlueprintFromRow({ ...base, payload: { targetWordCount: 2799.6 } }).targetWordCount).toBe(2800);
+    // 反向：缺省不注入（回落 DEFAULT_TARGET_WORD_COUNT，历史章零回归）。
+    expect(chapterBlueprintFromRow({ ...base, payload: {} }).targetWordCount).toBeUndefined();
+    // 反向：非法值一律不注入——0/负数/非数/NaN 都不得被当成目标传播。
+    for (const bad of [0, -100, "2600", null, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(chapterBlueprintFromRow({ ...base, payload: { targetWordCount: bad } }).targetWordCount).toBeUndefined();
+    }
+  });
 });

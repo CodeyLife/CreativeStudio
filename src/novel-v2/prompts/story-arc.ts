@@ -1,7 +1,9 @@
-import { CHAPTER_NARRATIVE_FUNCTIONS, MAX_CHAPTER_HINTS, MAX_EXPECTED_CHAPTER_COUNT, storyArcAuthorityPaths, type StoryArcBundle, type StoryArcContextReceipt, type StoryArcPlotOutline, type StoryArcRebaseTarget } from "../application/story-arc";
+import { CHAPTER_NARRATIVE_FUNCTIONS, MAX_CHAPTER_HINTS, MAX_EXPECTED_CHAPTER_COUNT, inspectStoryArcEnsemble, storyArcAuthorityPaths, type StoryArcBundle, type StoryArcContextReceipt, type StoryArcPlotOutline, type StoryArcRebaseTarget } from "../application/story-arc";
 import type { StoryArcReviewOutput } from "../application/story-arc-review-policy";
 import { TEXT_REVIEW_PASSED_MARKER } from "../text-review";
 import type { NarrativeStateSnapshot } from "../protocol";
+// 线索静默账类型与窗口参数（叶子纯模块，无 node 依赖——workflow bundle 可安全引用）。
+import { DORMANCY_POLICY, type DormancyLedger } from "../narrative-dormancy";
 
 export type { StoryArcReviewOutput } from "../application/story-arc-review-policy";
 
@@ -29,10 +31,15 @@ const storyArcPlanSchema = {
   properties: {
     title: { type: "string", minLength: 1 }, objective: { type: "string", minLength: 1 }, entryState: { type: "string" }, centralConflict: { type: "string" },
     development: { type: "array", items: { type: "string" } }, resolution: { type: "string" }, exitState: { type: "string" },
-    threadResponsibilities: { type: "array", items: { type: "object", additionalProperties: false, required: ["threadRef", "responsibility", "nextAdvance"], properties: { threadRef: { type: "string", minLength: 1 }, responsibility: { type: "string", minLength: 1 }, nextAdvance: { type: "string", minLength: 1 } } } },
-    foreshadowingRefs: { type: "array", items: { type: "string" } },
+    // PL-2 修复①（引用字段形态门）：形如 `kind:token` 的 id 后不得拖尾其他文本——
+    // 历史上 "<threadId> <slug>" 复合串被逐轮复制放大成影子对象。中文登记名（无冒号
+    // 前缀）不受影响；确需新建用显式 new:<名称>（new: 前缀后是名称不是 id，形态合法）。
+    threadResponsibilities: { type: "array", items: { type: "object", additionalProperties: false, required: ["threadRef", "responsibility", "nextAdvance"], properties: { threadRef: { type: "string", minLength: 1, pattern: "^(?!\\S*:[\\w.-]+\\s)" }, responsibility: { type: "string", minLength: 1 }, nextAdvance: { type: "string", minLength: 1 } } } },
+    foreshadowingRefs: { type: "array", items: { type: "string", pattern: "^(?!\\S*:[\\w.-]+\\s)" } },
     expectedChapterCount: { type: "integer", minimum: 1, maximum: MAX_EXPECTED_CHAPTER_COUNT },
-    phases: { type: "array", items: { type: "object", additionalProperties: false, required: ["title", "objective"], properties: { title: { type: "string" }, objective: { type: "string" } } } },
+    // PL-6：阶段必须显式绑定弧内章节序号（1-based，覆盖本弧全部计划章节、互不重叠）——
+    // 阶段归属是规划事实，系统不再按期望章数等分推算（期望≠实际时静默失真）。
+    phases: { type: "array", items: { type: "object", additionalProperties: false, required: ["title", "objective", "chapterOrdinals"], properties: { title: { type: "string" }, objective: { type: "string" }, chapterOrdinals: { type: "array", minItems: 1, items: { type: "integer", minimum: 1 } } } } },
   },
 } as const;
 
@@ -45,10 +52,24 @@ const storyArcChaptersSchema = {
   type: "array", minItems: 1, maxItems: MAX_CHAPTER_HINTS,
   items: {
     type: "object", additionalProperties: false,
-    required: ["index", "title", "narrativeFunction", "povCharacterId", "stateTransition", "scenes", "continuityConstraints", "unresolvedAtClose"],
+    required: ["index", "title", "narrativeFunction", "povCharacterId", "targetWordCount", "stateTransition", "scenes", "continuityConstraints", "unresolvedAtClose"],
     properties: {
       index: { type: "integer", minimum: 1 }, title: { type: "string", minLength: 1 },
       narrativeFunction: { enum: [...CHAPTER_NARRATIVE_FUNCTIONS, "unspecified"] }, povCharacterId: { type: "string" },
+      // 2026-09-17 根因修复（docs/novel-v2/ai-taint-diagnosis-20260917.md F1/§四）：
+      // 本字段此前**只存在于 TypeScript 类型**（ChapterBlueprint.targetWordCount），
+      // 从未进入 schema。因为 additionalProperties:false 且不在 properties 里，规划模型
+      // 在结构上**不可能**输出它——实测 chapter_planning_contexts 226 行全为空，
+      // 与"制度补录"台账记载相反（补录写的是 chapters.payload，不是这里）。
+      //
+      // 后果是一条三方数字断裂（同一目标，三个数）：
+      //   · 正文写作契约读 planningContext.chapter.targetWordCount，缺字段回落到
+      //     DEFAULT_TARGET_WORD_COUNT = 3500，于是对模型说"本章目标篇幅约 3500 字"；
+      //   · 编排者在 instruction 里手写"2600-3000，硬底线 2600"补偿；
+      //   · 篇幅欠量门用 3500 × 0.6 = 2100 执法。
+      // 写作端拿不到权威数字，才会被等量段配额代偿——这正是 F1"节拍器呼吸"的上游。
+      // 补回字段后，规划者一次就把目标写进蓝图，三面同源。
+      targetWordCount: { type: "integer", minimum: 500, maximum: 12000, description: "本章建议目标篇幅（可见字符数）。按本章的信息量与场景数给出，允许章间有差异；安静章可低于推进章。缺省时系统回落默认值" },
       stateTransition: { type: "object", additionalProperties: false, required: ["before", "after", "evidence"], properties: { before: { type: "string", minLength: 1 }, after: { type: "string", minLength: 1 }, evidence: { type: "string", minLength: 1 } } },
       scenes: { type: "array", minItems: 1, items: sceneSchema },
       continuityConstraints: { type: "array", items: { type: "string" } }, unresolvedAtClose: { type: "array", items: { type: "string" } },
@@ -79,6 +100,13 @@ export type StoryArcPromptInput = {
   openThreads: Array<{ id: string; title: string; payload: Record<string, unknown> }>;
   openForeshadowings?: Array<{ id: string; description: string; triggerKeywords: string[]; expectedPayoffWindow: string; readerQuestion?: string; possiblePayoffs?: string[]; meaningDelta?: string; cost?: string; plantedRevisionId: string }>;
   openPromises?: Array<{ id: string; promiser: string; promisee: string; statement: string; sourceRevisionId: string }>;
+  /**
+   * 未揭示作者秘密（PL-8③，product-audit-20260910 B3）：从 plot-design
+   * informationBoundaries.hidden 规范对象（claim/未揭示窗口/载体）投影。规划侧据此把
+   * "提前消费秘密"变成可检查的边界，审核侧据此核对候选弧是否泄漏尚未揭示的真相。
+   * 只投影已对象化的秘密；散文式旧数据经别名迁移进入 claim，不发明新内容。
+   */
+  undisclosedSecrets?: Array<{ claim: string; revealWindow?: string; carrier?: string }>;
   planningFeedback?: Array<{ sourceChapterOrder?: number; targetId: string; underlyingMechanism: string; affectedInputClass: string; boundaries?: string; sourceArtifactId?: string }>;
   narrativeState?: NarrativeStateSnapshot;
   contextReceipt?: StoryArcContextReceipt;
@@ -91,6 +119,51 @@ export type StoryArcPromptInput = {
    * 时就能看到疲劳风险，主动轮换压力类型。只作描述性统计，不是短语黑名单。
    */
   serialFunctionRuns?: Array<{ narrativeFunction: string; narrativeOrders: number[] }>;
+  /**
+   * 人物登记表（2026-09-16 全书确诊的根因修复）：povCharacterId 出现四种漂移形态
+   * （char_chu_heng/chu-heng/char_chu/char_hu_cheng）的直接原因是规划上下文从未给出
+   * 合法 id 名册，模型只能幻觉；漂移让 POV 作用域的记忆召回与状态钉挂在部分章节
+   * 静默失效。名册同时是群像素材的供给面——规划者看得见有谁可用，才会把人写进场。
+   */
+  cast?: Array<{ id: string; name: string }>;
+  /**
+   * 近窗口群像信号（确定性统计，serialFunctionRuns 同型）：全部场景参与者≤1 的章
+   * 与最长独处游程。只呈现事实，配额判断走规划指引与审核契约，不做硬门。
+   *
+   * 注：第二意志（"人在场却无人交锋"）**没有**机器判据——两版正则实现都被实测
+   * 推翻（见 application/story-arc.ts 的负结果记录）。它是语义判断，只在生成面
+   * 以契约形式出现（本文件 buildStoryArcChaptersPrompt 与弧审核 prompt）。
+   */
+  ensembleSignal?: { soloOnlyOrders: number[]; longestSoloRun: number; windowSize: number };
+  /**
+   * 窗口上界已过的伏笔账（P1，2026-09-16 起，2026-09-18 修正语义）。
+   *
+   * 原名 overdue（超期），但实测 244 条"上界已过"中 238 条仍在活跃推进——对连载
+   * 而言，长线伏笔的兑现窗口上界过期而线索仍在跑是**常态，不是债务**。旧语义把
+   * 它报成欠账，指挥作者去处理 238 条不存在的问题。
+   *
+   * 故：`windowElapsedCount` = 窗口上界已过的可判定条目数（中性事实）；
+   * agedOpen = 埋设久远但窗口不可判定的汇总数（不发明 deadline）。
+   * 真正需要行动的"曾活跃→静默终止"由 dormancy 通道单独注入（见 narrativeDormancy）。
+   */
+  dueLedger?: { currentOrder: number; windowElapsedCount: number; agedOpenCount: number; items: Array<{ id: string; description: string; horizonOrder: number; plantedOrder: number | null }> };
+  /**
+   * 线索静默账（P1，2026-09-18）：曾活跃、现已静默的伏笔/线索。
+   *
+   * 这是"读者被欠但无人管"的真实形态——全书 427 条 open 中 66 条曾活跃后静默
+   * （占 15%），且 53/66 集中在末次提及 ch120-159，与人工逐章阅读独立发现的
+   * "齐姓人在 ch60 后再无戏份""树洞/蓝光在 ch34-42 后消失"吻合。
+   * 规划面据此决定：续线、兑现、或显式放弃（而不是继续静默）。
+   *
+   * 直接复用 DormancyLedger（单一真源，不投影成平行结构——平行结构会各自漂移）；
+   * silentWindow 由渲染侧从 DORMANCY_POLICY 取。
+   */
+  narrativeDormancy?: DormancyLedger;
+  /**
+   * 跨弧回报节奏（P5，2026-09-16 审核确诊"31 章结清 0 笔"的可见性落点）：近几弧
+   * 定稿章数 vs 兑付笔数。密度是题材判断不设硬门；连续零兑付必须成为规划数字。
+   */
+  payoffRhythm?: Array<{ arcOrdinal: number; title: string | null; finalChapters: number; payoffCount: number }>;
 };
 
 /**
@@ -117,6 +190,73 @@ export function renderStoryArcPlotOutline(outline: StoryArcPlotOutline): string 
   return lines.filter(Boolean).join("\n");
 }
 
+/** 人物登记表渲染（规划段与蓝图上下文共用，单一真源）。 */
+export function renderStoryArcCast(cast: StoryArcPromptInput["cast"]): string {
+  if (!cast?.length) return "";
+  return `人物登记表（POV 与场景参与者的权威名册）：povCharacterId 只能填下列 id 的精确值（单独一个值，不附名称、不自造变体、不截短）；场景 participants 填显示名；确需新 named 群演用具体称谓（如『守夜的老杂役』）但不作为 POV。登记表为空时 povCharacterId 填精确值需先补登人物。\n${cast.map((item) => `- id: ${item.id}\n  显示名: ${item.name}`).join("\n")}`;
+}
+
+/** 群像信号渲染（描述性统计+契约说明，不做审美硬门）。 */
+export function renderStoryArcEnsembleSignal(signal: StoryArcPromptInput["ensembleSignal"]): string {
+  if (!signal || signal.windowSize < 3) return "";
+  if (!signal.soloOnlyOrders.length) return `近 ${signal.windowSize} 章群像信号：全部章节都含两名及以上参与者的互动场景，无独处游程。`;
+  return `近 ${signal.windowSize} 章群像信号（确定性统计）：${signal.soloOnlyOrders.length} 章的全部场景参与者≤1（第${signal.soloOnlyOrders.join("、")}章），最长连续独处游程 ${signal.longestSoloRun} 章。连续独处不等于问题，但逐拍内心节目单式编排会把对白与对手戏挤出正文预算（实证：独处蓝图批次产出的正文对白密度崩落）——本批次若再整体独处将延续该失败形态；分配章节时保持每批≥1/3 章有两名及以上参与者互相施加代价的场景（对方有欲望、行动改变处境，不是道具或背景板）；纯独处章每批至多一章，且在该场景 planningRationale 写明这章的静在与不在场的谁对话。安静章两人同场依然合法——静≠独。`;
+}
+
+/**
+ * 窗口上界已过的伏笔账渲染（规划段与蓝图上下文共用，单一真源；空账不注入）。
+ *
+ * 措辞纪律（2026-09-18 P1 修正）：**不说"超期/欠债"**。实测 244 条上界已过中
+ * 238 条仍在活跃推进，长线伏笔越过自声明窗口上界而继续运行是连载常态。
+ * 本账只陈述"窗口上界已过"这一事实并要求作者**显式决定窗口是否续期**，
+ * 不再暗示这些线索都有兑现义务（那会指挥作者处理 238 条不存在的问题）。
+ */
+export function renderStoryArcDueLedger(ledger: StoryArcPromptInput["dueLedger"]): string {
+  if (!ledger) return "";
+  const lines = [
+    `窗口上界已过的伏笔账（确定性账期统计，当前第 ${ledger.currentOrder} 章）：${ledger.windowElapsedCount} 条 open 伏笔的兑现窗口上界已过${ledger.agedOpenCount ? `；另有 ${ledger.agedOpenCount} 条埋设 40+ 章但窗口不可判定（需作者把窗口定为可判定形态或分流）` : ""}。`,
+    "读法契约：窗口上界已过**不等于**欠债。长线伏笔越过自声明窗口而继续运行是连载常态（实测此类条目绝大多数仍在被正文持续推进）。本账要求的是**显式决定**：本弧确认继续持有的，在 threadResponsibilities 写明续期后的新窗口与触发条件；确认转入兑现的，安排进某章的场景因果与结果；确认不再承担的，经作者分流通道放弃。真正指示『读者被欠』的信号是静默账（下一段），不是本账。",
+  ];
+  if (ledger.items.length) lines.push(`窗口上界最早已过的清单（按上界升序，至多 12 条）：\n${ledger.items.map((item) => `- ${item.id}｜埋于第${item.plantedOrder ?? "?"}章｜窗口上界第${item.horizonOrder}章｜${item.description}`).join("\n")}`);
+  return lines.join("\n");
+}
+
+/**
+ * 线索静默账渲染（2026-09-18 P1）：曾活跃、现已静默的线索。
+ * 这是"读者被欠但无人管"的规格化形态——全书 427 条 open 中 66 条属此，
+ * 且 53/66 集中于末次提及 ch120-159（成片失线，更可能是规划层结构性遗漏）。
+ */
+export function renderStoryArcNarrativeDormancy(dormancy: StoryArcPromptInput["narrativeDormancy"]): string {
+  if (!dormancy) return "";
+  const silentCount = dormancy.silent.length;
+  const neverCount = dormancy.neverMentioned.length;
+  if (!silentCount && !neverCount) return "";
+  const lines = [
+    `线索静默账（确定性正文提及扫描，当前第 ${dormancy.currentOrder} 章；静默 = 末次提及距当前 ≥ ${DORMANCY_POLICY.silentWindow} 章）：${silentCount} 条线索**曾活跃、现已静默**${neverCount ? `；另有 ${neverCount} 条埋设后从未被正文再提及（抽取即孤儿，需核对是否误抽）` : ""}。对照：仍在推进 ${dormancy.running} 条。`,
+    "处置契约：静默线索是本弧必须显式处理的账——读者已经投入过注意力，静默终止即未兑现的读者契约。三选一：本弧安排续线（给出让读者重新记起它的具体场景钩子）或兑现（进入场景因果与结果）；经作者分流通道放弃（分流落账，从此不再注入）；暂缓也必须在 threadResponsibilities 写明预定释放点与触发条件。",
+  ];
+  if (dormancy.silentBands.length) {
+    lines.push(`静默带（按末次提及章分桶）：${dormancy.silentBands.map((band) => `第${band.fromOrder}-${band.toOrder}章 ${band.count}条`).join("；")}——某段之后集中断线比零散失线更可能是规划层的结构性遗漏，优先核对最集中的那一段。`);
+  }
+  if (dormancy.silent.length) {
+    lines.push(`静默最久的清单（按沉默章数降序，至多 12 条）：\n${dormancy.silent.slice(0, 12).map((item) => `- ${item.id}｜埋于第${item.plantedOrder ?? "?"}章｜末次提及第${item.lastMentionOrder ?? "?"}章｜已静默 ${item.silentFor ?? "?"} 章｜${item.description}`).join("\n")}`);
+  }
+  return lines.join("\n");
+}
+
+/** 跨弧回报节奏渲染（确定性账目；空账不注入）。 */
+export function renderStoryArcPayoffRhythm(rhythm: StoryArcPromptInput["payoffRhythm"]): string {
+  if (!rhythm?.length) return "";
+  const zeroStreak = (() => {
+    let streak = 0;
+    for (const arc of [...rhythm].reverse()) { if (arc.payoffCount === 0) streak += 1; else break; }
+    return streak;
+  })();
+  const lines = [`跨弧回报节奏（确定性账目：定稿章数→兑付笔数）：${rhythm.map((arc) => `弧${arc.arcOrdinal}${arc.title ? `《${arc.title.replace(/^弧\d+[:：]?/, "")}》` : ""} ${arc.finalChapters}章/${arc.payoffCount}笔兑付`).join("；")}。`];
+  if (zeroStreak >= 2) lines.push(`已连续 ${zeroStreak} 弧零兑付——兑付密度本身是题材判断，不设数值硬门；但读者在弧尺度上的契约已被静默透支：本弧应至少安排一次读者可感知的兑付（任意规模——旧账结清、阶段回报、认知落差兑现），或把长静默作为有意设计在 threadResponsibilities 登记理由与预定释放点。`);
+  return lines.join("\n");
+}
+
 function sourceRefs(receipt: StoryArcContextReceipt | undefined, section: string, fallback: string[] = []): string[] {
   const fingerprint = receipt?.sectionFingerprints[section];
   return [...fallback, ...(fingerprint ? [`story-arc-section:${section}:${fingerprint}`] : [])];
@@ -134,7 +274,9 @@ export function buildStoryArcPlanningContextSections(input: StoryArcPromptInput)
     `最近章节位置：${input.recentChapters.map((item) => `第${item.order}章 ${item.summary}；未解=${item.unresolvedThreads.join("、") || "无"}`).join("\n") || "无"}`,
   ].join("\n");
   const open = [
-    `开放剧情线：${input.openThreads.map((item) => `${item.id} ${item.title}${renderThreadPayload(item.payload)}`).join("\n") || "无"}`,
+    // PL-2 修复①（呈现面）：id 与显示名分行——同一行空格拼接的 "<id> <名>" 曾被模型
+    // 原样复制进引用字段并逐轮放大（复合串自我复制的源头）。
+    `开放剧情线（threadRef 只能填下列 id 的精确值、不带名称；确需新建剧情线用“new:<名称>”显式表达）：\n${input.openThreads.map((item) => `- id: ${item.id}\n  名称: ${item.title}${renderThreadPayload(item.payload)}`).join("\n") || "无"}`,
     `开放伏笔：${input.openForeshadowings?.map(renderOpenForeshadowing).join("\n") || "无"}`,
     `开放承诺：${input.openPromises?.map((item) => `${item.id} ${item.promiser}->${item.promisee}：${item.statement}`).join("\n") || "无"}`,
   ].join("\n");
@@ -147,6 +289,8 @@ export function buildStoryArcPlanningContextSections(input: StoryArcPromptInput)
   const serialSignals = input.serialFunctionRuns?.length
     ? `连续同类功能游程（近 N 章连续 ≥3 章同 narrativeFunction）：${input.serialFunctionRuns.map((run) => `${run.narrativeFunction}×${run.narrativeOrders.length}（第${run.narrativeOrders.join("、")}章）`).join("；")}；连续同类功能不等于问题，但如果本批次再分配相同功能会延续疲劳——检查是否需要轮换压力类型或在该功能内提供可感知的新回报。`
     : "连续同类功能游程：近 N 章无连续同类功能游程。";
+  // PL-8③：未揭示秘密清单——把"作者秘密"从散文变成规划/审核两侧可核对的结构边界。
+  const secretsText = renderUndisclosedSecrets(input.undisclosedSecrets);
   const receiptText = receipt
     ? `上下文收据：fingerprint=${receipt.fingerprint}；cutoff=${receipt.narrativeCutoff ?? "legacy"}；来源 artifacts=${receipt.sourceArtifactIds.join("、") || "无"}；来源 revisions=${receipt.sourceRevisionIds.join("、") || "无"}`
     : "上下文收据：legacy context，未提供独立来源收据";
@@ -160,12 +304,19 @@ export function buildStoryArcPlanningContextSections(input: StoryArcPromptInput)
       provenanceRefs: ["orchestrated-plot-outline"],
     }
     : undefined;
+  const castText = renderStoryArcCast(input.cast);
+  const dueLedgerText = renderStoryArcDueLedger(input.dueLedger);
+  const dormancyText = renderStoryArcNarrativeDormancy(input.narrativeDormancy);
   const base = [
+    ...(castText ? [{ id: "arc-context-cast" as const, kind: "fact" as const, title: "人物登记表（POV 与参与者的权威名册）", text: castText, priority: "required" as const, provenanceRefs: sourceRefs(receipt, "cast") }] : []),
     { id: "arc-context-macro", kind: "planning" as const, title: "故事弧宏观规划", text: macro, priority: "required" as const, provenanceRefs: sourceRefs(receipt, "macro", receipt?.sourceArtifactIds ?? []) },
     { id: "arc-context-recent", kind: "fact" as const, title: "已定稿章节与叙事截止点", text: recent, priority: "required" as const, provenanceRefs: sourceRefs(receipt, "recent", receipt?.sourceRevisionIds ?? []) },
+    ...(secretsText ? [{ id: "arc-context-secrets", kind: "planning" as const, title: "未揭示作者秘密", text: secretsText, priority: "required" as const, provenanceRefs: sourceRefs(receipt, "secrets") }] : []),
+    ...(dueLedgerText ? [{ id: "arc-context-due-ledger", kind: "planning" as const, title: "窗口上界已过的伏笔账", text: dueLedgerText, priority: "required" as const, provenanceRefs: sourceRefs(receipt, "due-ledger") }] : []),
+    ...(dormancyText ? [{ id: "arc-context-dormancy", kind: "planning" as const, title: "线索静默账（曾活跃、现已静默）", text: dormancyText, priority: "required" as const, provenanceRefs: sourceRefs(receipt, "dormancy") }] : []),
     { id: "arc-context-open-elements", kind: "planning" as const, title: "开放线索、伏笔与承诺候选", text: open, priority: "normal" as const, provenanceRefs: sourceRefs(receipt, "open-elements") },
     { id: "arc-context-feedback-state", kind: "review" as const, title: "机制反馈与叙事状态", text: feedback, priority: "normal" as const, provenanceRefs: sourceRefs(receipt, "feedback-state", receipt?.sourceRevisionIds ?? []) },
-    { id: "arc-context-serial-signals", kind: "review" as const, title: "跨章序列信号（连续同类功能游程）", text: serialSignals, priority: "normal" as const, provenanceRefs: sourceRefs(receipt, "serial-signals") },
+    { id: "arc-context-serial-signals", kind: "review" as const, title: "跨章序列信号（功能游程、群像独处游程与回报节奏）", text: [serialSignals, renderStoryArcEnsembleSignal(input.ensembleSignal), renderStoryArcPayoffRhythm(input.payoffRhythm)].filter(Boolean).join("\n\n"), priority: "normal" as const, provenanceRefs: sourceRefs(receipt, "serial-signals") },
     { id: "arc-context-receipt", kind: "background" as const, title: "上下文来源收据", text: receiptText, priority: "normal" as const, provenanceRefs: receipt ? [receipt.fingerprint] : ["legacy-context"] },
   ];
   return outlineSection ? [outlineSection, ...base] : base;
@@ -203,15 +354,27 @@ function renderThreadPayload(payload: Record<string, unknown>): string {
   return entries.length ? `（${entries.join("；")}）` : "";
 }
 
+/** 未揭示作者秘密清单渲染（PL-8③，规划段与蓝图上下文共用，单一真源）。 */
+function renderUndisclosedSecrets(items: StoryArcPromptInput["undisclosedSecrets"]): string {
+  if (!items?.length) return "";
+  return `未揭示作者秘密（以下内容尚未向读者揭示：本弧的 objective/exitState/阶段结论与各章要点不得消费这些论断；确需在本弧揭示某条时，必须在规划中显式写明揭示的触发事件与代价）：\n${items.map((item) => `- ${item.claim}${item.revealWindow ? `（揭示窗口：${item.revealWindow}）` : ""}${item.carrier ? `（载体：${item.carrier}）` : ""}`).join("\n")}`;
+}
+
 function context(input: StoryArcPromptInput): string {
   return [
     `项目：${input.projectTitle}`,
     input.authorIntent ? `作者要求：${input.authorIntent}` : "",
+    renderStoryArcCast(input.cast),
+    renderStoryArcEnsembleSignal(input.ensembleSignal),
+    renderStoryArcDueLedger(input.dueLedger),
+    renderStoryArcNarrativeDormancy(input.narrativeDormancy),
+    renderStoryArcPayoffRhythm(input.payoffRhythm),
     `全局规划引用：${input.macro.map((item) => `[${item.taskKey}] ${item.title}: ${item.summary}`).join("\n") || "无"}`,
     `最近章节位置：${input.recentChapters.map((item) => `第${item.order}章 ${item.summary}；未解=${item.unresolvedThreads.join("、") || "无"}`).join("\n") || "无"}`,
-    `开放剧情线：${input.openThreads.map((item) => `${item.id} ${item.title}${renderThreadPayload(item.payload)}`).join("\n") || "无"}`,
+    `开放剧情线（threadRef 只能填下列 id 的精确值、不带名称；确需新建剧情线用“new:<名称>”显式表达）：\n${input.openThreads.map((item) => `- id: ${item.id}\n  名称: ${item.title}${renderThreadPayload(item.payload)}`).join("\n") || "无"}`,
     `开放伏笔：${input.openForeshadowings?.map(renderOpenForeshadowing).join("\n") || "无"}`,
     `开放承诺：${input.openPromises?.map((item) => `${item.id} ${item.promiser}->${item.promisee}：${item.statement}`).join("\n") || "无"}`,
+    renderUndisclosedSecrets(input.undisclosedSecrets),
     input.planningFeedback?.length
       ? `近期可迁移的规划反馈（只作为风险信号，不是新增剧情要求）：${input.planningFeedback.map((item) => `${item.targetId}${item.sourceChapterOrder ? `/第${item.sourceChapterOrder}章` : ""}：机制=${item.underlyingMechanism}；影响输入类=${item.affectedInputClass}${item.boundaries ? `；边界=${item.boundaries}` : ""}`).join("\n")}`
       : "近期可迁移的规划反馈：无",
@@ -228,7 +391,9 @@ export function buildStoryArcPrompt(input: StoryArcPromptInput): string {
     "规划一个可滚动推进的故事弧及其第一批连续章节。全书规划只提供承诺、边界和长期方向；故事弧负责把当前状态转成阶段性因果链，章节蓝图只冻结当前因果、状态、事实边界和场景执行材料。",
     "输出必须是 schema 定义的规范蓝图对象：根对象只包含 arc、batch、chapters。场景的 situation、observableActions、opposition、decision、outcome、cost 只填写写作者可转化为现场的处境、动作、阻力、选择、结果和代价；规划器的技术模型、分析步骤或推演理由只能放入 planningRationale，不能混入可观察行动或结果。上下文中的持久化记录、执行状态、文档/修订标识、已批准或已提交的包装对象只是参考证据，不得原样复制到输出。",
     "先写清故事弧入口状态、主要欲望/压力、关键选择、代价、退出状态和新问题；每个阶段都要说明它改变了什么人物选择、关系状态、信息分布、资源条件或读者期待。",
+    "每个阶段（phase）用 chapterOrdinals 显式列出它覆盖的弧内章节序号（1-based，从 1 开始连续覆盖到 expectedChapterCount，阶段之间不重叠、不遗漏）：系统按这份绑定呈现章节所属阶段，不做任何等分推算。chapterOrdinals 只填弧内序号、绝不填全书流水章号——弧第一章=1，即使全书已连续八十多章也不例外。",
     "主线、支线、人物线、关系线和世界压力线要直接在 threadResponsibilities 中标明本弧责任、交汇/退出条件和未回收承诺，并写清下一推进条件。若某条线本弧暂缓，写清可验证的保持/观察责任和触发条件；没有剧情线时数组为空。不为了填满结构而制造无依据事件，也不提前消费后续答案。",
+    REFERENCE_FIELD_CONTRACT,
     "上下文优先级：已定稿事实、叙事状态账本和明确作者边界高于当前故事弧草案；开放线索是待判断的责任与素材，不是本批次必须兑现的事件；规划反馈只用于修复共享机制，不把某一章的表面问题复制成剧情规则。",
     "外部剧情编排（如有）是设计意图基线，不是逐字清单：规划器负责把它完善为规范蓝图——对照冻结事实与叙事状态账本做事实梳理，补全场景因果、章节状态转换、连续性约束与责任承接。编排与已定稿事实冲突时以已定稿事实为准；编排未覆盖的部分按本提示词其余规则生成；不得为了贴合编排而虚构事实、提前消费后续答案或改写人物知识边界。",
     "章节可以推进、停顿、相处、等待、恢复、内省或处理余波，不要求每章新增事件、压力、爽点、主题表达或固定结尾。未指定的表达层由作者自然发挥。",
@@ -241,12 +406,16 @@ export function buildStoryArcPrompt(input: StoryArcPromptInput): string {
   ].join("\n\n");
 }
 
+const REFERENCE_FIELD_CONTRACT = "引用字段契约：threadRef 与 foreshadowingRefs 只允许填上下文中给出的 id 精确值（单独一个值，不得附带名称、序号或说明文字）；确需新建剧情线或伏笔时填“new:<名称>”。正文、状态、责任等自由文本字段一律用人类可读名称，不得内嵌 id、hex 片段或内部编号——内部记号一旦进入创作文本就会被后续每一轮原样复制。";
+
 export function buildStoryArcPlanPrompt(input: StoryArcPromptInput, target?: StoryArcRebaseTarget): string {
   return [
     "只规划故事弧和当前批次，不展开章节。故事弧负责把当前状态转成阶段性因果链，批次只冻结当前章节窗口的位置和是否完成。",
     "输出根对象只包含 arc、batch；上下文中的持久化记录、执行状态、文档/修订标识、已批准或已提交的包装对象只是参考证据，不得原样复制到输出。",
     "先写清故事弧入口状态、主要欲望/压力、关键选择、代价、退出状态和新问题；每个阶段都要说明它改变了什么人物选择、关系状态、信息分布、资源条件或读者期待。",
+    "每个阶段（phase）用 chapterOrdinals 显式列出它覆盖的弧内章节序号（1-based，覆盖到 expectedChapterCount，阶段之间不重叠、不遗漏）：系统按这份绑定呈现章节所属阶段，不做任何等分推算。chapterOrdinals 只填弧内序号、绝不填全书流水章号——弧第一章=1，即使全书已连续八十多章也不例外。",
     "主线、支线、人物线、关系线和世界压力线要直接在 threadResponsibilities 中标明当前责任、交汇/退出条件和未回收承诺。没有剧情线时数组为空，不为了填满结构制造无依据事件，也不提前消费后续答案。",
+    REFERENCE_FIELD_CONTRACT,
     "上下文优先级：已定稿事实、叙事状态账本和明确作者边界高于当前故事弧草案；开放线索是待判断的责任与素材，不是本批次必须兑现的事件；规划反馈只用于修复共享机制。",
     "外部剧情编排（如有）是设计意图基线，不是逐字清单：规划器负责把它完善为规范蓝图——对照冻结事实与叙事状态账本做事实梳理，补全场景因果、章节状态转换、连续性约束与责任承接。编排与已定稿事实冲突时以已定稿事实为准；编排未覆盖的部分按本提示词其余规则生成；不得为了贴合编排而虚构事实、提前消费后续答案或改写人物知识边界。",
     `批次位置必须是 batch.batchIndex=${target?.batchIndex ?? 1}、batch.startChapterIndex=${target?.startChapterIndex ?? 1}；${target ? "这是重基线，不能改写目标批次窗口。" : "这是新规划，批次从当前输入上下文确定。"}`,
@@ -256,11 +425,30 @@ export function buildStoryArcPlanPrompt(input: StoryArcPromptInput, target?: Sto
   ].filter(Boolean).join("\n\n");
 }
 
-export function buildStoryArcChaptersPrompt(input: StoryArcPromptInput & { arc: StoryArcBundle["arc"]; batch: StoryArcBundle["batch"] }, target?: StoryArcRebaseTarget): string {
+export function buildStoryArcChaptersPrompt(input: StoryArcPromptInput & { arc: StoryArcBundle["arc"]; batch: StoryArcBundle["batch"]; windowChapters?: number }, target?: StoryArcRebaseTarget): string {
   return [
-    `依据故事弧“${input.arc.title}”生成第 ${input.batch.batchIndex} 批章节，叙事序号从 ${input.batch.startChapterIndex} 开始。输出根对象只包含 chapters。`,
+    target
+      // 重基线契约（根因修复）：此前 rebase 走本函数却只在尾部附只读 envelope，
+      // "只展开当前窗口"指令使模型合法地输出单章/子集，validate 的逐章对应硬门
+      // 必炸（arc2 重生成实证）。契约必须出现在生成面而非仅校验面。
+      ? `这是重基线，不是下一批次生成：chapters 必须与文末"重基线目标"逐章对应，数量必须等于 ${target.chapters.length}，序号按目标 chapters[].globalOrder 顺序完整覆盖（${target.chapters.map((chapter) => chapter.globalOrder).join("、")}），不得只输出单章或窗口子集。历史已定稿章节的蓝图会由系统按冻结版本保真，你仍须为其各返回一章对应条目。`
+      // 正常批次窗口契约（arc5 根因修复，与重基线同型）：窗口章数是系统分配的
+      // 事实（弧内剩余按窗口上限截断），模型无裁量权——"保留后续发展的空间"
+      // 曾使模型把 7 章弧的批次坍缩成单章，且校验面无拦截。
+      : [
+        `依据故事弧“${input.arc.title}”生成第 ${input.batch.batchIndex} 批章节，叙事序号从 ${input.batch.startChapterIndex} 开始。输出根对象只包含 chapters。`,
+        input.windowChapters ? `本批次窗口由系统定为 ${input.windowChapters} 章：chapters 必须完整覆盖序号 ${input.batch.startChapterIndex} 至 ${input.batch.startChapterIndex + input.windowChapters - 1}，每个序号各一条，不得少于或多于该窗口——"保留后续发展的空间"指叙事设计的余地，不是缩减本批次章节窗口。` : "",
+      ].filter(Boolean).join("\n\n"),
+    target ? "输出根对象只包含 chapters。" : "",
     "只展开当前窗口，不把整卷或整本书压缩成章节任务清单；保留后续发展的空间。每章填写起始状态、结束状态和可观察证据；状态保持稳定也是合法结果，但必须说明本章让读者获得了什么可感知的新东西——体验、关系、理解、条件、余波或情绪确认；确认规则的陈述若改变了角色后续选择或风险判断，即算功能；若只是认知登记且无后续影响，则并入相邻章节。",
-    "每章都必须完整返回 schema 声明的 index、title、narrativeFunction、povCharacterId、stateTransition、scenes、continuityConstraints、unresolvedAtClose；stateTransition 必须是包含 before、after、evidence 三个非空字符串的对象，不能省略、改名或用摘要替代。narrativeFunction 必须使用 schema 枚举值，不得自造同义标签。",
+    "每章都必须完整返回 schema 声明的 index、title、narrativeFunction、povCharacterId、stateTransition、scenes、continuityConstraints、unresolvedAtClose；stateTransition 必须是包含 before、after、evidence 三个非空字符串的对象，不能省略、改名或用摘要替代。narrativeFunction 必须使用 schema 枚举值，不得自造同义标签。povCharacterId 必须逐字使用『人物登记表』中的 id 精确值。",
+    // 2026-09-17：targetWordCount 此前只在 TS 类型里、不在 schema，规划模型结构上
+    // 无法输出——写作端因此拿不到权威篇幅，只能靠 instruction 手写等量段配额代偿，
+    // 产出全书段长趋同（cv 0.62，ch167 仅 0.07）。此契约要求**逐章给出并允许有差异**：
+    // 篇幅是本章信息量的函数，不是全弧的常数。
+    "目标篇幅契约：每章都要给出 targetWordCount（可见字符数，整数）。它是**本章**信息量与场景数的函数，不是全弧常数——推进章、对峙章、高潮章可以更长；安静章、余波章、过渡章可以更短。同一批次内若各章目标完全相等，说明没有按章估量，应重估。给出后，正文写作与提交门会共用这个数字（缺省才回落系统默认值），因此不要写明显偏离本章实际承载能力的数。",
+    target ? "" : "群像配额（蓝图结构契约，先于正文存在）：本批次章节窗口中至少三分之一（向上取整）的章节要包含两名及以上参与者互相作用的场景——对方有自己的欲望与代价、其行动改变彼此处境，不是道具或背景板；纯独处章每批至多一章，且该场景的 planningRationale 必须写明这章的静在与不在场的谁对话。安静、余波、内省章两人同场依然合法——静不等于独。",
+    target ? "" : "第二意志契约（2026-09-17 全量复扫确诊：参与者计数与\"有人可交锋\"是两个解耦事实——全书 108 章参与者≥2，其中 52 章的 opposition 全指向\"格法/旧例/环境/他自己的判断\"，人在场却只执行工序、彼此不索取任何东西，正文因此读成一个人对着制度做分析）：凡某章场景参与者≥2，该章至少一个场景的 opposition 必须写清**谁**（具名或具体差称）**想要什么**、**他的行动如何改变对方的可选集合**。只写\"格法不许\"\"旧例如此\"\"他不能问\"\"两人都不能明说\"不算第二意志——那仍是环境压力。对手的欲望可以是小的、日常的、甚至出于善意的（想早点收工、不想担责、想保一个人），但必须是他自己的、且与主角的意图不完全一致。单人静章不受此约束。",
     "每个场景填写处境、可观察行动和结果；阻力、选择、代价在自然承担时写清，不用标签代替过程。需要保留但不应进入正文的分析方法放入 planningRationale，不要写进 observableActions 或 outcome。没有真实连续性约束时使用空数组，不为了满足格式虚构内容。",
     "章节术语降噪（叙事语言）：章节标题、场景标题、处境/可观察行动/结果/决策/代价等设计字段一律使用题材通用表达，不得直接使用主角职业/专业黑话原词。主角的特殊认知是能力的设定来源，通过'发现规律''看出异常'这类可感观察体现，不通过章节设计里的专业术语表达；机制层面的专业概念如需向作者说明，放在 planningRationale（正文执行上下文不读取它）。",
     `当前故事弧：${JSON.stringify(input.arc)}`,
@@ -286,8 +474,13 @@ export function buildStoryArcBatchPrompt(input: StoryArcPromptInput & { arc: Sto
 }
 
 export function buildStoryArcReviewPrompt(bundle: StoryArcBundle, contextText: string, rebaseTarget?: StoryArcRebaseTarget): string {
+  const ensemble = inspectStoryArcEnsemble(bundle.chapters);
+  const ensembleReport = bundle.chapters.length >= 3
+    ? `群像结构信号（确定性统计，非审美判定）：本批 ${ensemble.ensembleChapterIndexes.length}/${bundle.chapters.length} 章含两名及以上参与者互动场景（配额 ≥${ensemble.ensembleQuota} 章）；纯独处章${ensemble.soloOnlyChapterIndexes.length ? `：第${ensemble.soloOnlyChapterIndexes.join("、")}章` : "无"}；最长连续独处游程 ${ensemble.longestSoloRun} 章。`
+    : "";
   return [
     "审核故事弧的结构可靠性，不替正文规定审美。先按整弧检查承诺、入口/退出状态、阶段边界、线索责任和终局空间，再逐章检查状态连续、场景因果、人物选择、世界规则压力、知识边界和章节功能。逐章逐项检查，不要抽样概括：当前批次共 " + bundle.chapters.length + " 章，每章都要覆盖状态连续、场景因果、章节功能与权威边界。",
+    ...(ensembleReport ? [`${ensembleReport}审核契约：独处编排是正文对白崩落的上游病灶（已实证），当配额未满足或最长独处游程≥4 时，检查是否复现"单人内心节目单"形态——本弧承诺的读者体验是否因缺对手戏而受损；受损则报告节奏问题，并指出最小修改：把哪一章的独处解码事件改造为一名有欲望有代价的第二意志进场的交锋。个别功能静章（planningRationale 已声明与谁对话）不构成问题。**第二意志缺口检查（独立于配额）**：凡某章场景参与者≥2，至少一个场景的 opposition 必须写清谁（具名或具体差称）想要什么、他的行动如何改变对方的可选集合；若该章的 opposition 全部指向"格法不许/旧例如此/环境/他自己的判断"，即使参与者数达标，也按 major 报告并给出最小修改：为哪一章补一名带着自身目的进场的对手（欲望可以小、可以善意，但必须是他自己的、且与主角意图不完全一致）。另核对每章 povCharacterId 是否精确命中『人物登记表』中的 id——变体名（截短、改拼、用显示名）会导致 POV 作用域的记忆召回静默失效，按 major 报告并给出登记表中的正确 id。`] : []),
     "把‘没有事件’与‘没有变化’区分开：安静章节可以通过关系温度、理解、信息分布、资源条件、心理方向或余波完成自身功能；只有在当前功能需要而正文/蓝图没有承载时才报告问题。",
     "检查节奏时看目标、阻力、期待、揭示、结果和余波的波形，以及重复冲突/反转造成的疲劳，不用固定章数、钩子密度、爽点数量或持续升级作为硬标准。同时按弧设计契约检查（契约是检查方向，不是必须全部成立的硬门）：development 各阶段是否呈承接的子问题链而非并列步骤，场景 outcome 是否成为下一场景 situation 的触发条件或承担独立体验/理解修正功能，安静章是否让读者获得可感知的新东西（关系温度/风险判断/物品易主/理解修正/情绪确认/余波承载），推进型弧的退出状态相对入口是否有身份、资源、知识、关系或威胁级别中的可感知变化。安静、关系、背景、铺垫和余波弧与行动弧同样合法，只要其功能有可感知证据；只有契约缺失且确实损害了本弧承诺功能的证据时才报告 major。",
     "以目标读者视角检查本弧的读者回报：entryState/objective 承诺了什么体验（解决问题、关系升温、世界揭秘、认知落差、情绪确认），exitState 与 development 是否真的交付了这种体验；若弧结束时读者只经历了过程而没有获得解决、成长、理解、情绪或新问题中的任何回报，报告为节奏问题。安静弧的回报可以是理解修正或关系温度，不要求每弧交付事件性高潮。",
@@ -295,6 +488,9 @@ export function buildStoryArcReviewPrompt(bundle: StoryArcBundle, contextText: s
     "对未知物质、装置、痕迹或局部反应执行同一证据边界：湿度、颜色、气味、声音、光亮或接触变化只能支持当下可观察现象，不能单凭一次反应推出用途、成分、机制、追踪/筛选/警示功能或排除某种用途。若蓝图把局部现象写成角色尚未获得的功能结论，必须列为问题并要求修订保留未知状态。",
     "逆向检查相邻章节的状态：任何跨章节持续的物件、伤势、资源、关系、知识或限制，都必须在前章结束、后章开始和中间转化之间保持同一身份；若后章出现‘没有/重新获得/已经知道’等状态跳变，却没有丢失、转移、消耗、恢复或新证据，按连续性重大问题报告。此规则只约束可验证的状态转化，不要求为每个普通名词建立清单。",
     "检查每个反转、回收和新答案是否有前置证据、行动代价和意义变化；检查每条重要线是否有交汇、退出、暂缓责任或转化原因，避免只在字段中挂名。",
+    "秘密边界检查（通用，不依赖特定措辞）：对照上下文中的『未揭示作者秘密』清单逐条核对——本弧 objective/exitState/阶段结论或某章要点若消费了清单中的论断，检查规划是否显式安排了该秘密的揭示（触发事件+代价）；显式揭示合法，无安排的泄漏报告为 major 并指出泄漏所在字段，修复方向是从字段剥离该论断而非改写秘密。清单为空时跳过本检查。",
+    "到期账处置检查（通用）：以上下文『到期与老化伏笔账』段为准（无该段时跳过）——清单中每条到期伏笔，核对本弧是否给出三选一处置：安排兑现（能指向承担兑现的场景因果/章节结果）、显式移交保持（threadResponsibilities 登记保持责任与触发条件）、或已由作者分流改窗/放弃。既无兑现安排又无保持登记的到期项，按线索责任缺失报告 major 并列出条目 id；不要要求本弧兑现全部到期账——不分担但已登记保持责任的条目合法。",
+    "悬念续费检查（通用，语义判断不逐字匹配）：跨章序列信号与逐章 unresolvedAtClose 中，同一未解问题（语义同一即算，换措辞不换账）连续多章挂起而既无一分推进、也无一寸代价或信息增量，本弧又未登记承担它的场景，读者体验为『高潮被挪用为悬念续费』（实证病例：铺垫数章的『看一眼』在兑现前一瞬断章、后续章永久回避所见内容）。检查本弧是否把此类高潮性悬念的兑现安排进窗口；确属长线合法等待（有保持责任与触发条件）不报，缺失推进且损害读者回报时按节奏问题报告。",
     "叙事语言降噪检查：章节标题、场景标题、处境/可观察行动/结果/决策/代价等读者可见字段若直接使用主角职业/专业黑话原词，属于叙事语言污染——它会把专业思维解说传导到正文。若蓝图把机制层概念以黑话原词写进读者可见字段，列为 major 并要求转译为题材通用表达；主角的独特认知只能通过'发现规律''看出异常'这类可感观察体现，不通过专业术语表达。",
     "对每章按其权威路径逐一核对证据边界（路径清单见下），确认状态转化、场景处境/行动/结果和未解事项是否由蓝图字段直接承载；只有蓝图断言超出其字段可蕴含的范围时才报告越界。",
     contextText,
@@ -321,6 +517,7 @@ export function buildStoryArcRevisionPrompt(bundle: StoryArcBundle, review: Stor
     `当前蓝图：${JSON.stringify(bundle)}`,
     `审核意见：${review.opinion}`,
     rebaseTarget ? `重基线：${JSON.stringify(rebaseTarget)}` : "",
+    rebaseTarget ? `修订后 chapters 仍必须与重基线目标逐章对应：数量等于 ${rebaseTarget.chapters.length}，序号按目标 chapters[].globalOrder 完整覆盖，不得缩减为子集（历史章节内容由系统按冻结版本保真）。` : "",
     "只输出完整 schema JSON。",
   ].filter(Boolean).join("\n\n");
 }

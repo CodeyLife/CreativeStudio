@@ -33,7 +33,7 @@ export async function startBookSynopsisGeneration(
   try {
     const handle = await temporal.workflow.start("bookSynopsisWorkflow", {
       args: [{ workflowId, projectId: input.projectId, sourceFingerprint }],
-      taskQueue: input.taskQueue ?? "novel-v2",
+      taskQueue: input.taskQueue ?? "creative-studio-novel-v2",
       workflowId,
     });
     return { workflowId, runId: handle.firstExecutionRunId, status: "accepted", sourceFingerprint, reused: false };
@@ -70,7 +70,7 @@ export async function startBookTitleCandidateGeneration(
   try {
     const handle = await temporal.workflow.start("bookTitleCandidatesWorkflow", {
       args: [{ workflowId, projectId: input.projectId, sourceFingerprint }],
-      taskQueue: input.taskQueue ?? "novel-v2",
+      taskQueue: input.taskQueue ?? "creative-studio-novel-v2",
       workflowId,
     });
     return { workflowId, runId: handle.firstExecutionRunId, status: "accepted", sourceFingerprint, reused: false };

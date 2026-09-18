@@ -1,0 +1,14 @@
+skillId: chapter-naming
+version: 1.0.0
+executionPoints:
+  - chapter.title
+capabilities:
+  - draft
+dependsOn: []
+conflicts: []
+requiredMemoryKinds: []
+qualityGates: []
+priority: required
+promptSections:
+  chapter.title: |
+    标题从本章实际发生的最独特一处取意：一个动作、一个物件、一句未说完的话或一次状态变化，命名"这一章"而不是"这一类情节"。判断标准：把标题换到相邻任何一章仍然成立，即为失败命名；只概括事件流水（"某事发生"）而无态度、悬念或温度的命名同样偏弱。可以点破已发生的转折但不得预告未发生的后果；不使用规划术语、内部编号或与正文内容无关的套话。简练优先，字数服从准确。

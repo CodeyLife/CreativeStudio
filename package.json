@@ -24,10 +24,12 @@
     "novel:v2:smoke": "node --import tsx scripts/novel-v2-smoke.ts",
     "novel:v2:memory:configure": "node --import tsx scripts/configure-local-vector-profile.ts",
     "novel:v2:memory:reindex": "node --import tsx scripts/reindex-novel-memory.ts",
+    "novel:v2:memory:backfill": "node --import tsx scripts/novel-v2-memory-governance-backfill.ts",
     "novel:skills:validate": "node --import tsx scripts/novel-v2-skills.ts validate",
     "novel:skills:sync": "node --import tsx scripts/novel-v2-skills.ts sync --target database",
     "novel:skills:check": "node --import tsx scripts/novel-v2-skills.ts check --target database",
-    "novel:skills:explain": "node --import tsx scripts/novel-v2-skills.ts explain"
+    "novel:skills:explain": "node --import tsx scripts/novel-v2-skills.ts explain",
+    "novel:skills:patch": "node --import tsx scripts/novel-v2-skills.ts patch"
   },
   "dependencies": {
     "@ant-design/icons": "^5.5.2",

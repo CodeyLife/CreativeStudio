@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { compileStageContext, StageContextBudgetError } from "../stage-context";
 import {
   SKILL_EXECUTION_POLICIES,
+  compareSkillVersions,
   createDatabaseSkillProvider,
   createWorkspaceSkillProvider,
   buildSkillContextSections,
@@ -56,6 +57,18 @@ describe("Skill runtime resolution", () => {
     }
   });
 
+  it("SK-5/C5 双向：标题轻量点只挂显式声明的命名 skill，蓝图契约不再出现在标题上下文", async () => {
+    const provider = createWorkspaceSkillProvider(path.resolve(process.cwd(), "skills", "novel-v2"));
+    const title = await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint: "chapter.title", role: "planner" });
+    const titleText = renderSkillInstruction(title, "chapter.title");
+    expect(titleText).toContain("这一章");
+    expect(titleText).not.toContain("本章目标、阻力、行动、选择、代价和结果"); // plot-causality 蓝图段
+    expect(title.skills.every((skill) => skill.executionPoints?.includes("chapter.title"))).toBe(true);
+    // 反向：蓝图执行点仍解析到蓝图契约（storyArcChapters 改绑后的真实供给面）。
+    const blueprint = await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint: "chapter.blueprint", role: "planner" });
+    expect(renderSkillInstruction(blueprint, "chapter.blueprint")).toContain("选择窗口");
+  });
+
   it("keeps workspace Skill execution points aligned with the live reviewer contract", async () => {
     const provider = createWorkspaceSkillProvider(path.resolve(process.cwd(), "skills", "novel-v2"));
     const descriptors = await provider.list("test-project");
@@ -85,7 +98,9 @@ describe("Skill runtime resolution", () => {
     const byId = new Map(descriptors.map((skill) => [skill.skillId, skill]));
 
     for (const skillId of ["prose-craft", "reader-emotion", "plot-causality"]) {
-      expect(byId.get(skillId)?.version).toBe(skillId === "prose-craft" ? "1.3.1" : "1.1.0");
+      // 守卫值随 workspace yaml 版本演进（prose-craft 曾升 1.4.0 未同步本守卫，属存量断链修复）；
+      // 断言的仍是"清单能解析出版本与指纹"这一契约，非具体措辞。
+      expect(byId.get(skillId)?.version).toBe(skillId === "prose-craft" ? "1.4.0" : "1.1.0");
       expect(byId.get(skillId)?.contentFingerprint).toBeTruthy();
     }
 
@@ -286,5 +301,16 @@ describe("Skill runtime resolution", () => {
     expect(result.instruction).toContain("required instruction");
     expect(result.instruction).not.toContain("optional instruction");
     expect(result.manifest.skillManifest?.injectedSkills?.map((skill) => skill.skillId)).toEqual(["test-drafting"]);
+  });
+});
+
+describe("skill 版本比较（SK-2 单一真源 sync 护栏）", () => {
+  it("数值段比较：晋升版本判为超前、seed 旧版不覆盖；等版本持平", () => {
+    expect(compareSkillVersions("1.4.0", "1.3.9")).toBeGreaterThan(0);
+    expect(compareSkillVersions("1.10.0", "1.9.0")).toBeGreaterThan(0); // 数值段不是字典序
+    expect(compareSkillVersions("2.0.0", "10.0.0")).toBeLessThan(0);
+    expect(compareSkillVersions("1.4.0", "1.4.0")).toBe(0);
+    expect(compareSkillVersions("1.4", "1.4.1")).toBeLessThan(0); // 缺段视为更旧
+    expect(compareSkillVersions("1.4.0-beta", "1.4.0-alpha")).toBeGreaterThan(0); // 非数值段退回字典序不崩溃
   });
 });

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { NovelPostgresRepository } from "../postgres-repository";
+import { isPostgresUnavailable } from "./test-db";
 import type { Artifact } from "../protocol";
 
 const TEST_DB_URL = process.env.TEST_DATABASE_URL ?? "postgresql://ymcp:ymcp@127.0.0.1:5432/ymcp_test";
@@ -28,11 +29,14 @@ describe("architecture health lifecycle", () => {
          VALUES($1,$4,$5,'审批前蓝图',1,'planned','{}'::jsonb),
                ($2,$6,$5,'批准后缺正文',2,'planned','{}'::jsonb),
                ($3,NULL,$5,'无弧章节',3,'planned','{}'::jsonb)`,
-        [`chapter-pending-${projectId}`, `chapter-approved-${projectId}`, `chapter-orphan-${projectId}`, projectId, projectId, `arc-approved-${projectId}`],
+        // $4 必须是 arc-pending 的弧 id：曾误传 projectId → FK 必违例，
+        // 异常被裸吞掩盖成整块假绿（接线守卫现形，审核 S4 第三例）。
+        [`chapter-pending-${projectId}`, `chapter-approved-${projectId}`, `chapter-orphan-${projectId}`, `arc-pending-${projectId}`, projectId, `arc-approved-${projectId}`],
       );
       available = true;
     } catch (error) {
-      console.warn(`[architecture-health.test] Postgres unavailable: ${(error as Error).message}`);
+      if (!isPostgresUnavailable(error)) throw error; // 审核 S4：吞 schema/seed 错误=整块假绿
+      console.warn("[architecture-health.test] Postgres unavailable:", (error as Error).message);
     }
   }, 30_000);
 

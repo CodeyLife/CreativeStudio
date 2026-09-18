@@ -32,7 +32,7 @@ export async function startChapterTitleGeneration(
   try {
     const handle = await temporal.workflow.start("chapterTitleWorkflow", {
       args: [{ workflowId, projectId: input.projectId, documentId: input.documentId, sourceFingerprint }],
-      taskQueue: input.taskQueue ?? "novel-v2",
+      taskQueue: input.taskQueue ?? "creative-studio-novel-v2",
       workflowId,
     });
     return { workflowId, runId: handle.firstExecutionRunId, status: "accepted", sourceFingerprint, reused: false };
