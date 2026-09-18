@@ -211,7 +211,7 @@ novel_receipt_get(receiptId)
 编排者消费面出现以下新事件/字段，均经 outbox 与既有查询工具暴露，工具总数保持 49：
 
 - **`workflow.progress.<stage>`**：任何带 `payload.stage` 的状态写入都追加 outbox 事件——轮询 run 时守卫历史可逐条回放（run payload 的 stage 仅是后写覆盖的展示位）。
-- **`payload.terminalOutcome`**：completed/failed/cancelled 终态必带固定键（`succeeded` / `business-revision-exhausted` / `external-wait-timed-out` / `abandoned-stale-run` / `infrastructure-failed` / `cancelled` 等）；业务性失败与基础设施失败自此可分流，重试策略不应再看 status 单字段。
+- **`payload.terminalOutcome`**：**全部终态**（`completed` / `failed` / `cancelled` / `abandoned` / `rejected`，集合以 `src/novel-v2/run-lifecycle.ts` 为准）写库时必带固定键（`succeeded` / `business-revision-exhausted` / `business-review-rejected` / `external-wait-timed-out` / `abandoned-stale-run` / `abandoned-by-author` / `infrastructure-failed` / `cancelled` 等）；业务性失败与基础设施失败自此可分流，重试策略不应再看 status 单字段。作者经人工门放弃/拒绝的两种结局也在覆盖内（此前漏覆盖，恰在最需要区分的"作者介入结果"上失明）。
 - **`model-task.expired`**：外部任务 15 分钟等待超时（无人认领）发事件；同 run 累计超时超过 `MAX_EXTERNAL_FALLBACK_ADVANCES`（=6）后 run 转 `manual-review-required`（reason `external-fallback-budget-exhausted`）——此时应调度执行者认领或改路由，而非等待自愈。外部租约现走显式 `task_attempts.model_task_id` 关联（claim/heartbeat/submit 全链路）。
 - **`workflow.reconciled-abandoned`**：`POST /v2/maintenance/reconcile-runs` 周期对账收编僵尸 run（running 超 6h / waiting-external 超 24h Temporal retention 窗；`manual-review-required`/`paused` 等人态不收编）。
 - **`craft-rule.candidate-aggregated` / `craft-rule.candidate-stale`**：候选聚合（同机制学习并入既有候选）与 30 天零证据停滞提醒；候选队列经 novel_rule_candidate 工具组演进，`aggregateToCandidateId` 为学习评估 candidate 的可选聚合引用。

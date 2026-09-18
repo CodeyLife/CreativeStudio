@@ -1,3 +1,4 @@
+import type { WorkflowRunStatus } from "./run-lifecycle";
 /**
  * V2 protocol shared by Web, MCP, CLI and durable workflow adapters.
  * This module intentionally has no database or provider dependency.
@@ -797,7 +798,8 @@ export interface WorkflowRunRecord {
   workflowType: string;
   projectId: string;
   temporalWorkflowId: string;
-  status: string;
+  /** 词表见 run-lifecycle.ts；写入侧受控，读取侧允许历史值原样透出。 */
+  status: WorkflowRunStatus;
   payload: Record<string, unknown>;
   createdAt: string;
   updatedAt: string;

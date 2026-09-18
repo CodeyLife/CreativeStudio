@@ -15,6 +15,8 @@
  * 边界：非终态（running/waiting-external/pending）不注入，避免中间态被误当结局；
  * 已有 terminalOutcome 不覆盖（幂等 + 尊重调用方显式判定）。
  */
+import { TERMINAL_WORKFLOW_RUN_STATUSES } from "./run-lifecycle";
+
 export type TerminalOutcome =
   | "succeeded"
   | "business-revision-exhausted"
@@ -23,13 +25,29 @@ export type TerminalOutcome =
   | "external-wait-timed-out"
   | "activity-timed-out"
   | "abandoned-stale-run"
+  | /** 作者经人工门主动放弃本次重建（区别于对账收编的 abandoned-stale-run） */ "abandoned-by-author"
   | "infrastructure-failed"
   | "cancelled";
 
-const TERMINAL_WORKFLOW_STATUSES: ReadonlySet<string> = new Set(["completed", "failed", "cancelled"]);
+/**
+ * 终态集合派生自 run 生命周期词表，不再自带第二份清单。
+ *
+ * 根因：此处曾手写 `["completed", "failed", "cancelled"]`，而词表里 `abandoned` 与
+ * `rejected` 同样是终态（人工门作者放弃/拒绝后工作流即返回，重驱动是新 run）。两份
+ * 清单分叉的直接后果是这两类终态落库时**没有 terminalOutcome 固定键**，与本文件开头
+ * 声明的"三种失败出口共享同一条终态必有 terminalOutcome 的规则"自相矛盾——审计要按
+ * 子类型区分结局时，恰恰在"作者放弃/拒绝"这两种业务结局上失明。
+ */
+const TERMINAL_DEFAULT_OUTCOME: Readonly<Record<(typeof TERMINAL_WORKFLOW_RUN_STATUSES)[number], TerminalOutcome>> = {
+  completed: "succeeded",
+  failed: "infrastructure-failed",
+  cancelled: "cancelled",
+  abandoned: "abandoned-by-author",
+  rejected: "business-review-rejected",
+};
 
-export function isTerminalWorkflowStatus(status: string): boolean {
-  return TERMINAL_WORKFLOW_STATUSES.has(status);
+export function isTerminalWorkflowStatus(status: string): status is (typeof TERMINAL_WORKFLOW_RUN_STATUSES)[number] {
+  return (TERMINAL_WORKFLOW_RUN_STATUSES as readonly string[]).includes(status);
 }
 
 /**
@@ -39,6 +57,5 @@ export function isTerminalWorkflowStatus(status: string): boolean {
 export function withTerminalOutcome(status: string, payload: Record<string, unknown> = {}): Record<string, unknown> {
   if (!isTerminalWorkflowStatus(status)) return payload;
   if (typeof payload.terminalOutcome === "string") return payload;
-  const derived: TerminalOutcome = status === "cancelled" ? "cancelled" : status === "failed" ? "infrastructure-failed" : "succeeded";
-  return { ...payload, terminalOutcome: derived };
+  return { ...payload, terminalOutcome: TERMINAL_DEFAULT_OUTCOME[status] };
 }

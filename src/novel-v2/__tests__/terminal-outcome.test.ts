@@ -12,7 +12,10 @@ describe("withTerminalOutcome（OR-A2 派生规则）", () => {
     expect(withTerminalOutcome("completed", { x: 1 })).toEqual({ x: 1, terminalOutcome: "succeeded" });
     expect(withTerminalOutcome("failed")).toEqual({ terminalOutcome: "infrastructure-failed" });
     expect(withTerminalOutcome("cancelled", {})).toEqual({ terminalOutcome: "cancelled" });
-    for (const nonTerminal of ["running", "waiting-external", "pending", "manual-review-required"]) {
+    // 词表里同为终态、但曾被本地清单漏掉的两种作者结局（漏掉的后果是审计缺固定键）。
+    expect(withTerminalOutcome("abandoned", {})).toEqual({ terminalOutcome: "abandoned-by-author" });
+    expect(withTerminalOutcome("rejected", {})).toEqual({ terminalOutcome: "business-review-rejected" });
+    for (const nonTerminal of ["running", "waiting-external", "pending", "manual-review-required", "regression-validation-required", "rebuild-requested", "accepted"]) {
       expect(withTerminalOutcome(nonTerminal, { a: 1 })).toEqual({ a: 1 });
       expect(isTerminalWorkflowStatus(nonTerminal)).toBe(false);
     }

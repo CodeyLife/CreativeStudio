@@ -5,6 +5,7 @@ import { buildContextManifest, buildMemoryBundle, compileExecutionBlueprint, com
 import { canonicalSha256 } from "../canonical-json";
 import { extractAssetMentions, groupAssetSpans, type AssetMention } from "../asset-ledger";
 import { NovelPostgresRepository } from "../postgres-repository";
+import type { WorkflowRunStatus } from "../run-lifecycle";
 import type { ModelGateway } from "../model-gateway";
 import { ExternalMcpRequiredError, type ModelExecutionProvenance, type ModelPurpose, type ModelRoutingSnapshot, type ModelTaskRecord, type ModelWorkPackage } from "../model-routing";
 import { ContentObjectStore } from "../object-store";
@@ -309,7 +310,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
   // 未来应由 model routing 配置或 blueprint budget 决定，而非硬编码。
   const REVISION_TEMPERATURE = 0.3;
   const api = {
-    updateWorkflowStatus: (input: { workflowId: string; status: string; payload?: Record<string, unknown> }) => deps.repository.updateWorkflowRunStatus(input.workflowId, input.status, input.payload),
+    updateWorkflowStatus: (input: { workflowId: string; status: WorkflowRunStatus; payload?: Record<string, unknown> }) => deps.repository.updateWorkflowRunStatus(input.workflowId, input.status, input.payload),
     recordWorkflowSignal: (input: { workflowId: string; taskId: string; signal: string; payload?: Record<string, unknown> }) => deps.repository.recordTaskSignal(input),
     updateTaskAttempt: (input: { id: string; workflowRunId?: string; taskId: string; status: TaskAttemptRecord["status"]; payload?: Record<string, unknown> }) => deps.repository.upsertTaskAttempt(input),
     loadProjectSnapshot: (input: { projectId: string; targetDocumentId?: string }) => deps.repository.getProjectSnapshot(input.projectId, input.targetDocumentId),

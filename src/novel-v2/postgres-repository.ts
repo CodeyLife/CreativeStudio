@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { foundationArtifactToMemoryClaim, foundationClaimId } from "./foundation-memory";
 import { CLAIM_PROJECTION_SET_SQL, retrievalVisibleClaimsSql, retiredByVisibleKillerSql } from "./memory-visibility";
+import { ACTIVE_WORKFLOW_RUN_STATUSES_SQL, WAITING_EXTERNAL_WORKFLOW_RUN_STATUS_SQL, toWorkflowRunStatus, type WorkflowRunStatus } from "./run-lifecycle";
 import { normalizeFoundationStructuredDataFlat, validateFoundationTaskContract } from "./application/foundation-contract";
 import { foundationContractFingerprint } from "./application/foundation-contract-fingerprint";
 import { assertCompleteChapterReviewEvidence } from "./application/chapter-approval";
@@ -222,7 +223,7 @@ function documentFromRow(row: DocumentRow): ManuscriptDocumentSummary {
   };
 }
 function workflowFromRow(row: WorkflowRunRow): WorkflowRunRecord {
-  return { id: row.id, workflowType: row.workflow_type, projectId: row.project_id, temporalWorkflowId: row.temporal_workflow_id, status: row.status, payload: row.payload ?? {}, createdAt: iso(row.created_at), updatedAt: iso(row.updated_at) };
+  return { id: row.id, workflowType: row.workflow_type, projectId: row.project_id, temporalWorkflowId: row.temporal_workflow_id, status: toWorkflowRunStatus(row.status), payload: row.payload ?? {}, createdAt: iso(row.created_at), updatedAt: iso(row.updated_at) };
 }
 function taskAttemptFromRow(row: TaskAttemptRow): TaskAttemptRecord {
   return { id: row.id, workflowRunId: row.workflow_run_id ?? undefined, taskId: row.task_id, leaseOwner: row.lease_owner ?? undefined, leaseExpiresAt: row.lease_expires_at ? iso(row.lease_expires_at) : undefined, heartbeatAt: row.heartbeat_at ? iso(row.heartbeat_at) : undefined, status: row.status, payload: row.payload ?? {} };
@@ -1767,8 +1768,8 @@ export class NovelPostgresRepository {
     const reconciledAt = new Date(input.nowMs).toISOString();
     const candidates = await this.pool.query<{ temporal_workflow_id: string; project_id: string; status: string }>(
       `SELECT temporal_workflow_id, project_id, status FROM workflow_runs
-       WHERE (status IN ('running','accepted') AND updated_at < $1::timestamptz)
-          OR (status='waiting-external' AND updated_at < $2::timestamptz)
+       WHERE (status IN (${ACTIVE_WORKFLOW_RUN_STATUSES_SQL}) AND updated_at < $1::timestamptz)
+          OR (status=${WAITING_EXTERNAL_WORKFLOW_RUN_STATUS_SQL} AND updated_at < $2::timestamptz)
        ORDER BY updated_at LIMIT 200`,
       [new Date(input.nowMs - maxRunningMs).toISOString(), new Date(input.nowMs - maxWaitingExternalMs).toISOString()],
     );
@@ -2720,7 +2721,7 @@ export class NovelPostgresRepository {
     return workflowFromRow(result.rows[0]);
   }
 
-  async updateWorkflowRunStatus(temporalWorkflowId: string, status: string, payload: Record<string, unknown> = {}) {
+  async updateWorkflowRunStatus(temporalWorkflowId: string, status: WorkflowRunStatus, payload: Record<string, unknown> = {}) {
     const result = await this.pool.query<WorkflowRunRow>("UPDATE workflow_runs SET status=$2,payload=payload || $3,updated_at=now() WHERE temporal_workflow_id=$1 RETURNING id,workflow_type,project_id,temporal_workflow_id,status,payload,created_at,updated_at", [temporalWorkflowId, status, withTerminalOutcome(status, payload)]);
     if (!result.rowCount) return undefined;
     const row = workflowFromRow(result.rows[0]);
