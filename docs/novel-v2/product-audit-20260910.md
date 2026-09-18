@@ -213,7 +213,7 @@
 | 907§五.4 伏笔账本卫生 | 部分：重复簇 16→1（残留簇修复面结构性看不见，见下"2026-09-19 复测"，本轮收口）；"超期 31→244"不成立为债务——09-18 P1 已把该字段语义改为中性事实"窗口上界已过"（238/244 仍在正文推进）；thread_id 0/717 未变，但根因已定位并收口（判据惰性→改线程显式认领，新弧起生效；存量 437 条仍需语义分流） | getArchitectureHealth 实跑 + 代码逐条 |
 | 907§五.5 学习闭环沉淀（两候选） | ❌ 排队现状不变（09-19 实测 proposed 23 / rejected 18 / promoted 1、promotion_receipts 1）→ 工程侧无可推进部分，promote 是作者裁决 | ledger-debt 只读实测 |
 | 908 六 Seam 问题 6 条 | 部分修复（ch1/ch2 资产已验）；星屑砂容器/ch11 装置/ch5→6 战利品仍在 | D 组 |
-| 9/9 治理 §8 六项 | 3 修复/3 部分（退役只管一径、方案A 仍 23 条漏出、配额未获生产检验） | FM §三逐条 |
+| 9/9 治理 §8 六项 | 09-19 复测后：4 项成立、2 项改判。① "退役只管一径"——Foundation 投影按可见集口径实测剩 5 行（每面 1 行、56 行经 supersedes 退役），不再成立；② "方案A 仍 23 条漏出"——09-09 之后新增的认知类 active 声明 1,035 条**全部**带非空 `knowledge_scope`（即全部出自 enrichment 单源），零漏出，不再成立；③ "配额未获生产检验"改判为**缺陷并已修**：400 份真实 manifest 里 `identity-slot-quota` 计数 0，而同槽位（主角"知晓"）检索可见声明 951 条、ranked-fill 回执 38,905 条——根因是 `searchMemory` 词法命中投影丢 `identity_hash`/`value_hash`（配额以 identityHash 为键），融合层又按先到轨保留字段使指纹存在与否取决于召回顺序；两处已修并各配真实读出路径回归（详见 workflow-map §4 勘误段）。④ 其余（身份归一、指纹统一、梳理通道）维持原结论 | getArchitectureHealth/memory_claims 实测 + 撤除反向对照 |
 | 9/9"Foundation 56→5 检索可见" | 属实但**不完整**：bundle/preflight 路径仍带 20–29 条 stale → 本轮 A2 | manifest 实算 |
 
 **2026-09-19 复测与根因（goal 迭代收口轮，读数取自 `getArchitectureHealth` 对运行库的实跑，非重算 SQL）**：total 717 / open 437 / fulfilled 63 / 窗口上界已过 244 / 未绑线程 437 / 兑现账缺失 0 / 弧孤儿 0 / 重复簇 1。四条结论（第 4 条是本轮顺带闭环的前序疑问，不属伏笔账本）：
@@ -231,7 +231,7 @@
 
 - 证据导出：`tmp/audit/db/`（44 份，psql→JSON）、`tmp/audit/text/`（21 章，REST 拉取）、`tmp/audit/extract*.sql`。
 - 复核脚本：正文层 `%TEMP%\fmem\*.js`（记忆层）、`tmp/audit/review-ch01-21-20260910.md`（正文层完整取证）。
-- 2026-09-19 复测取证面（对 `ymcp` 只读）：`tmp/ledger-debt.cjs`（账本与学习队列计数）、`tmp/health-recheck.ts`（直接实例化仓储跑 `getArchitectureHealth`，权威读数）、`tmp/dup-cluster.ts` 与 `tmp/null-order.ts`（重复簇成员与无锚点桶逐对相似度）、`tmp/foreshadow-recheck*.ts`（thread_id 绑定率与弧线程形态计数）、`tmp/gate-exposure.cjs` + `tmp/routing-audit*.cjs`（上下文预算门的部署面读数）。
+- 2026-09-19 复测取证面（对 `ymcp` 只读）：`tmp/ledger-debt.cjs`（账本与学习队列计数）、`tmp/health-recheck.ts`（直接实例化仓储跑 `getArchitectureHealth`，权威读数）、`tmp/dup-cluster.ts` 与 `tmp/null-order.ts`（重复簇成员与无锚点桶逐对相似度）、`tmp/foreshadow-recheck*.ts`（thread_id 绑定率与弧线程形态计数）、`tmp/gate-exposure.cjs` + `tmp/routing-audit*.cjs`（上下文预算门的部署面读数）、`tmp/fm-recheck3.cjs` + `tmp/quota-probe.cjs`（记忆治理三项部分修复的复测与单槽位压力读数）。
 - 关键统计口径：检索可见集=active∧authority∈{derived,approved,author}∧不被任何 active 行 supersedes；成本归属仅计 run→project 可 join 的 1523 次调用（73 次/章），禁止表总量÷章数。
 - 未决疑问（不立案）：76 倍估算/上报比值成因、弧审核意见是否见过标题污染、生产 database 模式真实消费、面板 7→3 收缩的变更记录缺失——见各分层报告"未验证的疑问"。
 - 规划层疑问 1（弧 2 completed 写入者）已闭环：audit_records 显示弧 2 于 08-08 由 external-reviewer 批准、生成审计即 `chapterCount:8` 与 `expectedChapterCount:15` 当场矛盾（审批时无"expected=计划章数"校验，PL-1 修复需同时补此入口）；completed 时刻 08-10 04:23:47 无任何 story-arc.* 动作，仅同秒的 ch15 commit `fact-approval.policy-applied`——即完成判定 SQL 在提交管线中静默翻转，零审计留痕。修复建议补充：弧完成状态变更必须写 `story-arc.completion-reconciled` 审计动作。
