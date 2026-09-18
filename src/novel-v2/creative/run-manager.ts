@@ -17,7 +17,7 @@
  */
 import { randomUUID } from "node:crypto";
 import type { CreativeRun, CreativeRunMode, CreativeRunPolicy, CreativeRunStatus } from "../protocol";
-import type { RepositoryQueryClient } from "../repository-capabilities";
+import type { QueryClient } from "../repository-capabilities";
 
 // ===== 行类型映射 =====
 
@@ -70,7 +70,7 @@ function mapRunRow(row: CreativeRunRow): CreativeRun {
  * 不返回事件 id（BIGSERIAL 由数据库生成，调用方一般不需要）。
  */
 async function writeRunEvent(
-  repository: RepositoryQueryClient,
+  repository: QueryClient,
   runId: string,
   eventType: string,
   payload: Record<string, unknown>,
@@ -92,7 +92,7 @@ async function writeRunEvent(
  * 同步写入 run.created 事件，payload 包含初始 policy/mode/payload 快照。
  */
 export async function createCreativeRun(
-  repository: RepositoryQueryClient,
+  repository: QueryClient,
   input: {
     projectId: string;
     mode: CreativeRunMode;
@@ -149,7 +149,7 @@ export async function createCreativeRun(
  * 查询单个 CreativeRun。不存在返回 null。
  */
 export async function getCreativeRun(
-  repository: RepositoryQueryClient,
+  repository: QueryClient,
   runId: string,
 ): Promise<CreativeRun | null> {
   const result = await repository.pool.query<CreativeRunRow>(
@@ -164,7 +164,7 @@ export async function getCreativeRun(
  * 列出项目的所有 CreativeRun（按 created_at DESC）。
  */
 export async function listCreativeRuns(
-  repository: RepositoryQueryClient,
+  repository: QueryClient,
   projectId: string,
 ): Promise<CreativeRun[]> {
   const result = await repository.pool.query<CreativeRunRow>(
@@ -180,7 +180,7 @@ export async function listCreativeRuns(
  * 写入 run.status-changed 事件，payload 包含 from/to。
  */
 export async function pauseCreativeRun(
-  repository: RepositoryQueryClient,
+  repository: QueryClient,
   runId: string,
 ): Promise<CreativeRun> {
   const result = await repository.pool.query<CreativeRunRow>(
@@ -207,7 +207,7 @@ export async function pauseCreativeRun(
  * 恢复 run。仅 paused 状态可 resume。
  */
 export async function resumeCreativeRun(
-  repository: RepositoryQueryClient,
+  repository: QueryClient,
   runId: string,
 ): Promise<CreativeRun> {
   const result = await repository.pool.query<CreativeRunRow>(
@@ -236,7 +236,7 @@ export async function resumeCreativeRun(
  * 先 SELECT 取原状态，再 UPDATE，确保事件 from 字段精确。
  */
 export async function cancelCreativeRun(
-  repository: RepositoryQueryClient,
+  repository: QueryClient,
   runId: string,
 ): Promise<CreativeRun> {
   const before = await getCreativeRun(repository, runId);
@@ -274,7 +274,7 @@ export async function cancelCreativeRun(
  * 注意：当 run 已 failed/cancelled/completed 时，不强制改回 running。
  */
 export async function updateRunStatusFromWork(
-  repository: RepositoryQueryClient,
+  repository: QueryClient,
   runId: string,
 ): Promise<CreativeRun> {
   const existing = await getCreativeRun(repository, runId);

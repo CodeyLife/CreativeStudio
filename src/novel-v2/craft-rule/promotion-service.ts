@@ -20,7 +20,7 @@
  * 回归验证由调用方负责，本服务只返回 receipt 供调用方决策。
  */
 import type { PromotionReceipt, SkillDescriptor } from "../protocol";
-import type { RepositoryQueryClient } from "../repository-capabilities";
+import type { QueryClient } from "../repository-capabilities";
 import type { CraftRuleCandidate } from "./index";
 import { mergeCraftRulePromptSections, parseCraftRulePromptPatch } from "./prompt-patch";
 import { renderPromotedSkillYaml } from "./skill-yaml-patch";
@@ -89,7 +89,7 @@ function splitPromptTargetId(targetId: string, fallbackProjectId: string): [stri
 // ===== 实现 =====
 
 class CraftRulePromotionServiceImpl implements CraftRulePromotionService {
-  constructor(private readonly repository: RepositoryQueryClient) {}
+  constructor(private readonly repository: QueryClient) {}
 
   async getReceipt(candidateId: string): Promise<PromotionReceipt | null> {
     const result = await this.repository.pool.query<ReceiptRow>(
@@ -412,6 +412,6 @@ class CraftRulePromotionServiceImpl implements CraftRulePromotionService {
 
 // ===== 工厂 =====
 
-export function createCraftRulePromotionService(repository: RepositoryQueryClient): CraftRulePromotionService {
+export function createCraftRulePromotionService(repository: QueryClient): CraftRulePromotionService {
   return new CraftRulePromotionServiceImpl(repository);
 }

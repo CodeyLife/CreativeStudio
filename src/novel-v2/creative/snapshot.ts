@@ -22,7 +22,7 @@ import type {
   CreativeWorkStatus,
   ReviewIssue,
 } from "../protocol";
-import type { RepositoryQueryClient } from "../repository-capabilities";
+import type { QueryClient } from "../repository-capabilities";
 import { getCreativeRun } from "./run-manager";
 
 // ===== 行类型映射 =====
@@ -114,7 +114,7 @@ function mapEventRow(row: EventRow): CreativeRunSnapshot["events"][number] {
  * run 不存在时返回 null。
  */
 export async function getRunSnapshot(
-  repository: RepositoryQueryClient,
+  repository: QueryClient,
   runId: string,
   afterSequence?: number,
 ): Promise<CreativeRunSnapshot | null> {

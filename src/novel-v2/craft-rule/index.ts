@@ -8,7 +8,7 @@
  * 回归验证：promote 后用 evidenceCases 重跑，对比 qualityScore 不回退；失败自动 rollback。
  */
 import { randomUUID } from "node:crypto";
-import type { RepositoryQueryClient } from "../repository-capabilities";
+import type { QueryClient } from "../repository-capabilities";
 import type { ModelGateway } from "../model-gateway";
 import type { PromotionReceipt } from "../protocol";
 import type { ModelRoutingSnapshot } from "../model-routing";
@@ -181,7 +181,7 @@ function latestEvidenceCases(cases: CraftRuleEvidenceCase[]): CraftRuleEvidenceC
 }
 
 async function fetchCandidate(
-  repository: RepositoryQueryClient, projectId: string, candidateId: string,
+  repository: QueryClient, projectId: string, candidateId: string,
 ): Promise<CraftRuleCandidate> {
   const result = await repository.pool.query<CandidateRow>(
     `SELECT ${CANDIDATE_COLUMNS} FROM craft_rule_candidates WHERE id = $1 AND project_id = $2`,
@@ -214,7 +214,7 @@ function splitPromptTargetId(targetId: string, fallbackProjectId: string): [stri
 // ===== 1. createCraftRuleCandidate =====
 
 export async function createCraftRuleCandidate(
-  repository: RepositoryQueryClient,
+  repository: QueryClient,
   input: {
     projectId: string; targetKind: "skill" | "system-prompt"; targetId: string;
     afterText: string; rationale: string; scope: CraftRuleScopeAnalysis;
@@ -318,7 +318,7 @@ export async function createCraftRuleCandidate(
 // ===== 2. inspectCraftRuleCandidate =====
 
 export async function inspectCraftRuleCandidate(
-  repository: RepositoryQueryClient, projectId: string, candidateId: string,
+  repository: QueryClient, projectId: string, candidateId: string,
 ): Promise<CraftRuleCandidate | null> {
   const result = await repository.pool.query<CandidateRow>(
     `SELECT ${CANDIDATE_COLUMNS} FROM craft_rule_candidates WHERE id = $1 AND project_id = $2`,
@@ -329,7 +329,7 @@ export async function inspectCraftRuleCandidate(
 
 /** 项目级候选队列查询，供作者看板和 API 复用同一份字段映射。 */
 export async function listCraftRuleCandidates(
-  repository: RepositoryQueryClient,
+  repository: QueryClient,
   projectId: string,
   limit = 100,
 ): Promise<CraftRuleCandidate[]> {
@@ -351,7 +351,7 @@ export async function listCraftRuleCandidates(
  * 不应被误当成正式库 creative_work_items，也不应绕过实验结果写入正式候选。
  */
 export async function recordCraftRuleExperimentEvidence(
-  repository: RepositoryQueryClient,
+  repository: QueryClient,
   input: {
     projectId: string;
     candidateId: string;
@@ -403,7 +403,7 @@ export async function recordCraftRuleExperimentEvidence(
 // ===== 3. recordCraftRuleEvidence =====
 
 export async function recordCraftRuleEvidence(
-  repository: RepositoryQueryClient,
+  repository: QueryClient,
   input: {
     projectId: string; candidateId: string; scenarioClass: string;
     scenarioRole: "source-failure" | "cross-scenario";
@@ -515,7 +515,7 @@ async function runFoundationTaskWithPrompt(params: {
 }
 
 export async function evaluateCraftRuleOnFoundation(
-  repository: RepositoryQueryClient,
+  repository: QueryClient,
   model: ModelGateway,
   input: {
     projectId: string; candidateId: string;
@@ -587,7 +587,7 @@ export async function evaluateCraftRuleOnFoundation(
 // ===== 5. submitCraftRuleReview =====
 
 export async function submitCraftRuleReview(
-  repository: RepositoryQueryClient,
+  repository: QueryClient,
   input: {
     projectId: string; candidateId: string; role: string; reviewerId: string; reviewRunId: string;
     model: string; provider?: string; promptFingerprint?: string;
@@ -643,7 +643,7 @@ export async function submitCraftRuleReview(
 const REGRESSION_TOLERANCE = 5; // TODO: 迁移到项目质量策略；仅用于旧 foundation 评估的模型方差容忍。
 
 async function runRegressionVerification(params: {
-  repository: RepositoryQueryClient;
+  repository: QueryClient;
   model: ModelGateway;
   candidate: CraftRuleCandidate;
 }): Promise<{ passed: boolean; reasons: string[]; details: Array<{ scenarioClass: string; candidateScore: number; newScore: number; delta: number }> }> {
@@ -699,7 +699,7 @@ async function runRegressionVerification(params: {
 }
 
 export async function promoteCraftRuleCandidate(
-  repository: RepositoryQueryClient,
+  repository: QueryClient,
   model: ModelGateway,
   input: {
     projectId: string;
@@ -787,7 +787,7 @@ export async function promoteCraftRuleCandidate(
 // ===== 7. rollbackCraftRuleCandidate =====
 
 export async function rollbackCraftRuleCandidate(
-  repository: RepositoryQueryClient,
+  repository: QueryClient,
   _model: ModelGateway,
   input: { projectId: string; candidateId: string },
 ): Promise<{ candidate: CraftRuleCandidate; receiptId: string }> {

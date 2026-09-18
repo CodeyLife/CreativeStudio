@@ -15,10 +15,22 @@
  * - 能力类型是将来物理拆分的切线：同一批方法反复出现在多个类型里，就是那一片该独立成
  *   仓储的 signal（例如 workflow run 写入面同时出现在三个工作流应用能力里）。
  */
+import type { Pool } from "pg";
 import type { NovelPostgresRepository } from "./postgres-repository";
 
-/** 连接面：只要一条 SQL 通道，不依赖任何领域方法。 */
-export type RepositoryQueryClient = Pick<NovelPostgresRepository, "pool">;
+/**
+ * 连接面：只要一条 SQL 通道，不依赖任何领域方法。
+ *
+ * 这里**故意不从仓储派生**（原先是 `Pick<NovelPostgresRepository, "pool">`）。度量过收口
+ * 的波及面：这 7 个消费方的入口函数在仓外有 268 处调用（含约百处测试造桩），逐个改签名
+ * 不成比例；而 `Pick<..., "pool">` 仍然把这批文件在类型上钉在 god-object 上——只要
+ * `pool` 的形态将来要变（换成受控查询入口、或收为私有），这 268 处就要一起动。
+ * 改成结构类型后：消费方声明的真实需求（"给我一个 Pool"）与仓储的实现彻底解耦，
+ * 传完整 repository 仍由结构化类型自动满足（零调用点改动）。
+ */
+export interface QueryClient {
+  readonly pool: Pool;
+}
 
 /**
  * 模型运行时装配：路由配置读取 + 调用/提示留痕 + 嵌入缓存端口。

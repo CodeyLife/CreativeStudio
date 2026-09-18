@@ -43,6 +43,9 @@ const NARROWED = [
 const CAPABILITIES = "src/novel-v2/repository-capabilities.ts";
 const read = (relative: string) => readFileSync(join(process.cwd(), relative), "utf8");
 
+/** 只看代码本体：注释里解释"为什么不再是某种写法"不能被负向锁判成违规。 */
+const codeOnly = (source: string) => source.split("\n").filter((line) => !/^\s*(\/\/|\/\*|\*)/u.test(line)).join("\n");
+
 describe("仓储 slice 切线守卫", () => {
   it("连接面消费方只用 pool，不碰任何领域方法", () => {
     for (const file of CONNECTION_ONLY) {
@@ -50,7 +53,7 @@ describe("仓储 slice 切线守卫", () => {
       // 只认"方法调用"，避免把散文里的 `repository.ts` 之类文件名当成越界。
       const offenders = [...source.matchAll(/\b(?:repository|repo)\.(?!pool\b)([a-zA-Z_]\w*)\s*\(/g)].map((match) => match[1]);
       expect(offenders, `${file} 通过连接面调用了领域方法`).toEqual([]);
-      expect(source, file).toContain("RepositoryQueryClient");
+      expect(source, file).toContain("QueryClient");
     }
   });
 
@@ -60,9 +63,15 @@ describe("仓储 slice 切线守卫", () => {
     }
   });
 
-  it("RepositoryQueryClient 永远只有 pool 一个成员", () => {
+  it("连接面是结构类型，不再从仓储派生", () => {
     const source = read(CAPABILITIES);
-    expect(source).toMatch(/export type RepositoryQueryClient = Pick<NovelPostgresRepository, "pool">;/);
+    expect(source).toMatch(/export interface QueryClient \{\s*readonly pool: Pool;\s*\}/);
+    // 反向：回到 Pick<..., "pool"> 就等于把这 7 个文件在类型上重新钉回 god-object。
+    // 判据只看代码本体——文件头注释里正当提及了这一写法的历史形态。
+    expect(codeOnly(source)).not.toMatch(/Pick<NovelPostgresRepository, "pool">/);
+    for (const file of CONNECTION_ONLY) {
+      expect(read(file), file).toContain("QueryClient");
+    }
   });
 
   it("能力类型不得长成第二个 god-object（每个 ≤14 个成员）", () => {
@@ -78,8 +87,12 @@ describe("仓储 slice 切线守卫", () => {
 
   it("每条能力都有消费方（无人的能力=拆分开采前的噪声，要么接线要么删）", () => {
     const source = read(CAPABILITIES);
-    const names = [...source.matchAll(/export type (\w+) = Pick</g)].map((match) => match[1]);
+    const names = [
+      ...[...source.matchAll(/export type (\w+) = Pick</g)].map((match) => match[1]),
+      ...[...source.matchAll(/export interface (\w+) \{/g)].map((match) => match[1]),
+    ];
     const consumers = NARROWED.map((file) => read(file));
+    expect(names.length).toBeGreaterThanOrEqual(14);
     for (const name of names) {
       expect(consumers.some((text) => text.includes(name)), `${name} 无消费方`).toBe(true);
     }

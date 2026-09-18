@@ -30,7 +30,7 @@ import type {
   SkillDescriptor,
 } from "../protocol";
 import { canonicalSha256 } from "../canonical-json";
-import type { RepositoryQueryClient } from "../repository-capabilities";
+import type { QueryClient } from "../repository-capabilities";
 
 // ===== 行类型映射 =====
 
@@ -264,7 +264,7 @@ export function computeSnapshotHash(payload: ProjectSnapshotBundle["payload"]): 
  * @throws 若项目不存在
  */
 export async function computeProjectHead(
-  repository: RepositoryQueryClient,
+  repository: QueryClient,
   projectId: string,
 ): Promise<ProjectHead> {
   const projectResult = await repository.pool.query<{ current_revision: string }>(
@@ -303,7 +303,7 @@ export async function computeProjectHead(
  * @throws 若项目不存在
  */
 export async function captureProjectSnapshot(
-  repository: RepositoryQueryClient,
+  repository: QueryClient,
   projectId: string,
 ): Promise<ProjectSnapshotBundle> {
   // 校验项目存在
