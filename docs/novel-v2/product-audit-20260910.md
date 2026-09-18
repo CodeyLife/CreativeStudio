@@ -210,11 +210,17 @@
 |---|---|---|
 | 907§五.1 ch1 时间线 blocker | ✅ 已修复并验证 | 现稿尾段仅剩例供旧账 |
 | 907§五.2 弧 3 承接 resolution 缺口 | ✅ 已兑现（ch16–19 闭环）；但暴露真根因=PL-1 弧 2 提前 completed（本轮新证） | batch/代码实查 |
-| 907§五.4 伏笔账本卫生 | ❌ 未做（9/9 文档记"随下一弧梳理"，弧 3 已过仍 16 簇重复/31 超期/thread_id 0） | PL-5 实测 |
-| 907§五.5 学习闭环沉淀（两候选） | ❌ 未 promote，仍在排队 → 本轮升为 C1/3.13 | proposed 25 实测 |
+| 907§五.4 伏笔账本卫生 | 部分：重复簇 16→1（残留簇修复面结构性看不见，见下"2026-09-19 复测"，本轮收口）；"超期 31→244"不成立为债务——09-18 P1 已把该字段语义改为中性事实"窗口上界已过"（238/244 仍在正文推进）；thread_id 0/717 未变 | getArchitectureHealth 实跑 + 代码逐条 |
+| 907§五.5 学习闭环沉淀（两候选） | ❌ 排队现状不变（09-19 实测 proposed 23 / rejected 18 / promoted 1、promotion_receipts 1）→ 工程侧无可推进部分，promote 是作者裁决 | ledger-debt 只读实测 |
 | 908 六 Seam 问题 6 条 | 部分修复（ch1/ch2 资产已验）；星屑砂容器/ch11 装置/ch5→6 战利品仍在 | D 组 |
 | 9/9 治理 §8 六项 | 3 修复/3 部分（退役只管一径、方案A 仍 23 条漏出、配额未获生产检验） | FM §三逐条 |
 | 9/9"Foundation 56→5 检索可见" | 属实但**不完整**：bundle/preflight 路径仍带 20–29 条 stale → 本轮 A2 | manifest 实算 |
+
+**2026-09-19 复测与根因（goal 迭代收口轮，读数取自 `getArchitectureHealth` 对运行库的实跑，非重算 SQL）**：total 717 / open 437 / fulfilled 63 / 窗口上界已过 244 / 未绑线程 437 / 兑现账缺失 0 / 弧孤儿 0 / 重复簇 1。三条结论：
+
+1. **重复簇 16→1，残留 1 簇暴露"检测面-修复面判据不对称"**。检测面（`getArchitectureHealth`）跨全部行、按 `narrativeTextKey` 归一后字符二元组 Dice≥0.85 聚簇；修复面（`repairForeshadowingLedgerDuplicates`，migrate 尾）`WHERE status='open' AND narrative_order IS NOT NULL` 且按章分桶、CJK-only 归一、阈值 0.24。两条差异叠加使残留簇**结构性不可达**：其实质是 2 条 `narrative_order IS NULL` 的规划期伏笔（"宗门高层（玄机子）对外门异常迹象的例行忽视"与去括注版，Dice 0.92），修复面 SQL 把它们整批排除在外。同桶共 10 条 NULL 序 open 行，用修复面同一判据（0.24 并查集）实测只成两簇（该对 0.92 + 经脉感知对 0.56）、七条单例，无传递闭包吞并——故本轮把 NULL 序行纳入修复面（独立桶，不伪装成"第 0 章"），warning 由机制清零而非人工删行。
+2. **thread_id 全表 0 绑定是判据惰性，不是漏接线**。PL-5④ 的写入口确在（`postgres-repository.ts:3451`），但判据要求"本弧**恰好一条**线程责任"才绑（多线弧不从共现推断归属，宁缺毋伪）；实测本项目 24 条弧的 `threadResponsibilities` 全部为 4–7 条线程 ⇒ eligible 弧 0 条，机制永不触发。根因不在 binder 而在**契约没有归属表达**：`threadResponsibilities` 只有 threadRef/responsibility/nextAdvance 三字段，弧级 `foreshadowingRefs` 是扁平账，模型即便心里有线也没有可写的位置（现在只被 prompt 要求把续线/保持责任写进自由文本 `responsibility`，机器不可判定）。修复形态=弧蓝图线程责任增加可选 `foreshadowingRefs`（**必须是弧级同名字段的子集**，越界即 blocking 回流，禁止发明关联），binder 按线程落 `thread_id`。它要同时改契约类型/两处解析/生成面 schema/外部编排 tool schema/编排技能文档五面（教训③：spec-工具-技能同批登记），且会变更故事弧规划请求的 schema→指纹，对在飞外部任务 re-key。**本项目正被并行会话按弧连载（09-15 后已推进至 168 章定稿），故本项列为重启窗口的契约变更，不在并行生成中落地**；437 条存量 open 未绑无论如何都需要语义判定（文本等值命中 0、plot_threads 仅 7 条、伏笔 payload 无线程键——机械回填等于伪造），维持"随弧分流"现状。
+3. **学习闭环排队不变**：proposed 23 / rejected 18 / promoted 1、promotion_receipts 1。候选生成与拒绝留痕两条通道均在正常工作，卡点是作者的 promote 裁决；工程侧本轮无可推进部分（不新增自动晋升，晋升门必须是人的判断）。
 
 **方法论教训（沉淀候选，走闭环）**：① 修复声明的验证必须覆盖**全部消费路径**（退役只验检索侧、"候选不泄入"只验字面契约都会漏掉真洞）；② 一次性人工收割不产生机制（zombie 收割 9 天复发）；③ 文档不声明的工具面无人使用、无人踩雷（坏 SQL 存活）——spec/工具/技能三者要同批登记。
 
