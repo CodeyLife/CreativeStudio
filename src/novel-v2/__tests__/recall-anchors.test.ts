@@ -12,10 +12,31 @@ describe("回述对照诊断（D2 只读投影）", () => {
   });
 
   it("跨题材泛化：现代口语样本同样触发，触发词表不含专名或题材词", () => {
-    const text = "她记得三年前那次面试，评委只问了一个问题。之前她也想过要不要说实话。";
-    expect(extractRecallSentences(text).map((item) => item.cue)).toEqual(["记得", "之前"]);
+    const text = "她记得三年前那次面试，评委只问了一个问题。先前她也想过要不要说实话。";
+    expect(extractRecallSentences(text).map((item) => item.cue)).toEqual(["记得", "先前"]);
     const vocabulary = new Set(RECALL_CUES);
     for (const cue of ["云纹草", "灵石", "楚衡", "宗门", "修为"]) expect(vocabulary.has(cue as never)).toBe(false);
+  });
+
+  it("前瞻性的「之前」不算回述（真实正文实测的假阳性面，词表已不收）", () => {
+    // 运行库正文实测样本型："即使被发现了行踪，他也要在被人抓住之前把自己彻底洗清"——
+    // 语法上是前瞻连接词，不是回忆；若收进词表，审校者会拿到成批无效对照。
+    const text = "他要在被人抓住之前把自己彻底洗清，那扇侧门之前也有人推开过。";
+    expect(extractRecallSentences(text)).toEqual([]);
+  });
+
+  it("对照指向正确来源章：回忆所指的那一章排在候选首位", () => {
+    const anchors = buildRecallAnchors({
+      text: "膝部的隐痛随着走动一下一下地传来，每一步都让他想起昨夜灵气撞开经脉的那套走法。",
+      priorChapters: [
+        { narrativeOrder: 2, text: "他想起昨夜自己尝试的那套灵气运行路线——绕开淤塞的主经脉，走细支。" },
+        { narrativeOrder: 3, text: "账房把册子合上，说例供欠着便要排守夜，无人替他说话。" },
+      ],
+    });
+    expect(anchors).toHaveLength(1);
+    expect(anchors[0]!.sources[0]).toMatchObject({ narrativeOrder: 2 });
+    // 无关章零重叠被过滤，不会以低分候选充数
+    expect(anchors[0]!.sources.every((source) => source.narrativeOrder === 2)).toBe(true);
   });
 
   it("给对照：近窗最相似原句按相似度降序，附章号；逐字复述保留，零相似不输出", () => {
