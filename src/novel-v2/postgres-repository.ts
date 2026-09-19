@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { foundationArtifactToMemoryClaim, foundationClaimId } from "./foundation-memory";
 import { CLAIM_PROJECTION_SET_SQL, retrievalVisibleClaimsSql, retiredByVisibleKillerSql } from "./memory-visibility";
-import { ACTIVE_WORKFLOW_RUN_STATUSES_SQL, WAITING_EXTERNAL_WORKFLOW_RUN_STATUS_SQL, type WorkflowRunStatus } from "./run-lifecycle";
+import { ACTIVE_WORKFLOW_RUN_STATUSES_SQL, HUMAN_GATE_RESUME_WORKFLOW_RUN_STATUS, WAITING_EXTERNAL_WORKFLOW_RUN_STATUS_SQL, terminalOverwriteGuardSql, type WorkflowRunStatus } from "./run-lifecycle";
 import { normalizeFoundationStructuredDataFlat, validateFoundationTaskContract } from "./application/foundation-contract";
 import { foundationContractFingerprint } from "./application/foundation-contract-fingerprint";
 import { serialContextFingerprint } from "./application/serial-context-fingerprint";
@@ -2526,11 +2526,15 @@ export class NovelPostgresRepository {
         return undefined;
       }
       await client.query(
+        // 与 workflow-run-slice 的门态回写同一条终态判据（同一 vocabulary，不另立第二份
+        // "谁能改状态"规则）：消费裁决时若 run 已被 reject/abandon 短路径写成终态，
+        // 这里不得把它覆回 running——否则一次成功裁决最终以僵尸 running 等收编。
         `UPDATE workflow_runs
-         SET status='running',payload=payload-'pendingHumanDecision',updated_at=now()
+         SET status=$3,payload=payload-'pendingHumanDecision',updated_at=now()
          WHERE temporal_workflow_id=$1
-           AND payload->'pendingHumanDecision'->>'approvalEvidenceId'=$2`,
-        [workflowId, evidenceId],
+           AND payload->'pendingHumanDecision'->>'approvalEvidenceId'=$2
+           ${terminalOverwriteGuardSql("$3")}`,
+        [workflowId, evidenceId, HUMAN_GATE_RESUME_WORKFLOW_RUN_STATUS],
       );
       await client.query("COMMIT");
       return evidence;

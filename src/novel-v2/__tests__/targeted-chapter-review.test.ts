@@ -203,6 +203,35 @@ describe("targeted chapter review issues", () => {
     await expect(repository.claimApprovalEvidence({ workflowId, artifactId, decision: "abandon", actorSource: "interactive-web", actorId: "web-author" })).resolves.toBeDefined();
   });
 
+  it("does not resurrect a terminal run when its approval evidence gets consumed", async () => {
+    if (!available) return;
+    // F5 回归：消费裁决那一步曾无条件写 status='running'。reject/abandon 短路径可能在
+    // 回写落地前已把 run 写成终态，此时覆回 running 后工作流不再自写终态，只能等对账
+    // 把僵尸 running 收编成 failed——一次成功的裁决最终以失败收场。现与漏斗同判据。
+    const workflowId = `terminal-gate-consume-${suffix}`;
+    const artifactId = `terminal-gate-candidate-${suffix}`;
+    await repository.recordArtifact({ id: artifactId, projectId, taskId: `${workflowId}:draft`, attemptId: `${workflowId}:attempt`, kind: "revision", contentHash, baseRevision: 1, fingerprint: `terminal-gate-fingerprint-${suffix}`, createdAt: Date.now() });
+    await repository.putWorkflowRun({ id: workflowId, workflowType: "chapter-review", projectId, temporalWorkflowId: workflowId, status: "manual-review-required", payload: { documentId, artifactId, reasonCode: "quality-gate-not-passed" } });
+    const claim = await repository.claimApprovalEvidence({ workflowId, artifactId, decision: "revise", actorSource: "interactive-web", actorId: "web-author" });
+    expect(claim).toBeDefined();
+
+    await repository.updateWorkflowRunStatus(workflowId, "completed", { artifactId });
+    // 裁决仍可被读到（消费是幂等读），但状态权归工作流：终态不得被覆回 running。
+    await expect(repository.getApprovalEvidence(workflowId, claim!.evidence.id)).resolves.toMatchObject({ decision: "revise" });
+    expect((await repository.getWorkflowRunByTemporalId(workflowId))?.status).toBe("completed");
+
+    // 正向对照：门态内的裁决消费照常恢复 running。
+    const activeId = `gate-consume-active-${suffix}`;
+    const activeArtifact = `gate-consume-candidate-${suffix}`;
+    await repository.recordArtifact({ id: activeArtifact, projectId, taskId: `${activeId}:draft`, attemptId: `${activeId}:attempt`, kind: "revision", contentHash, baseRevision: 1, fingerprint: `gate-consume-fingerprint-${suffix}`, createdAt: Date.now() });
+    await repository.putWorkflowRun({ id: activeId, workflowType: "chapter-review", projectId, temporalWorkflowId: activeId, status: "manual-review-required", payload: { documentId, artifactId: activeArtifact, reasonCode: "quality-gate-not-passed" } });
+    const activeClaim = await repository.claimApprovalEvidence({ workflowId: activeId, artifactId: activeArtifact, decision: "revise", actorSource: "interactive-web", actorId: "web-author" });
+    await repository.getApprovalEvidence(activeId, activeClaim!.evidence.id);
+    const resumed = await repository.getWorkflowRunByTemporalId(activeId);
+    expect(resumed?.status).toBe("running");
+    expect(resumed?.payload.pendingHumanDecision).toBeUndefined();
+  });
+
   it("allows automation to approve the fact gate without allowing a manuscript override", async () => {
     if (!available) return;
     const workflowId = `fact-gate-automation-${suffix}`;

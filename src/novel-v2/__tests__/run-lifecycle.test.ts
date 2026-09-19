@@ -111,12 +111,14 @@ describe("run 状态写入面接线锁", () => {
     expect(terminalOutcome).not.toMatch(/new Set\(\["completed"/);
   });
 
-  it("workflow_runs.status 写入者仍只有三个：slice 漏斗、slice 门态回写、仓储乐观守卫对账", () => {
-    // 拆片后写入面分散在两个文件，锁必须一起扫——否则"再开第四个写入者"不会被发现。
-    const combined = `${repository}${slice}`;
-    expect([...combined.matchAll(/UPDATE workflow_runs SET status/g)].length).toBe(3);
-    expect([...repository.matchAll(/UPDATE workflow_runs SET status/g)].length).toBe(1);
-    expect([...slice.matchAll(/UPDATE workflow_runs SET status/g)].length).toBe(2);
+  it("workflow_runs 的 status 写入者恰为五处，每处各自带守卫", () => {
+    // 判据扫"折叠空白后的 SQL"而不是源码原文：多行模板串写成
+    // `UPDATE workflow_runs\n  SET status=...` 时，同行正则一律看不见——
+    // 本锁此前断言"恰三个写入者"却漏掉两处（消费人工裁决的 gate→running、
+    // 弧强制删除的 →cancelled），即"再开第四个写入者"根本不会被发现（2026-09-19 实测）。
+    const scan = (source: string) => [...source.replace(/\s+/g, " ").matchAll(/UPDATE workflow_runs SET status/g)].length;
+    expect(scan(repository)).toBe(3);
+    expect(scan(slice)).toBe(2);
     // 对账那条必须自带乐观并发守卫（WHERE status=旧快照），否则会用过期判据覆写新鲜事实。
     expect(repository).toContain("WHERE temporal_workflow_id=$1 AND status=$2");
     // 漏斗的状态参数必须是词表类型，不是宽 string；仓储侧只允许委托。
@@ -128,7 +130,15 @@ describe("run 状态写入面接线锁", () => {
     expect(slice).toMatch(/WHERE temporal_workflow_id=\$1 \$\{terminalOverwriteGuardSql\("\$2"\)\}/);
     // 守卫挡下时不得静默：留一条 refusal 事件供审计发现覆写尝试。
     expect(slice).toContain('"workflow.transition-refused"');
-    // 反向：仓储里不得再留第二份状态 SQL。
+    // 消费人工裁决的 gate→running 与漏斗同判据（同一 vocabulary，不另立第二份规则）：
+    // reject/abandon 短路径已把 run 写成终态时，裁决消费不得把它覆回 running。
+    expect(repository).toContain('terminalOverwriteGuardSql("$3")');
+    expect([...repository.matchAll(/terminalOverwriteGuardSql\(/g)].length).toBe(1);
+    expect(repository).not.toMatch(/SET status='running'/);
+    // 强制删除弧 →cancelled 是"终态→终态"的收编写入，指向本项目自有谓词（弧+章集合），
+    // 不借漏斗；它必须留下可审计的动机键，否则覆写completed成cancelled无从解释。
+    expect(repository).toMatch(/SET status='cancelled',[\s\S]{0,220}cancelledBy: "story-arc\.force-delete"/);
+    // 反向：仓储里不得再留第二份"参数化状态"SQL（那意味着绕过 slice 漏斗）。
     expect(repository).not.toMatch(/UPDATE workflow_runs SET status=\$2/);
   });
 
