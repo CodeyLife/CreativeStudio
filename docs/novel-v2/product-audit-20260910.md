@@ -231,7 +231,7 @@
 
 - 证据导出：`tmp/audit/db/`（44 份，psql→JSON）、`tmp/audit/text/`（21 章，REST 拉取）、`tmp/audit/extract*.sql`。
 - 复核脚本：正文层 `%TEMP%\fmem\*.js`（记忆层）、`tmp/audit/review-ch01-21-20260910.md`（正文层完整取证）。
-- 2026-09-19 复测取证面（对 `ymcp` 只读）：`tmp/ledger-debt.cjs`（账本与学习队列计数）、`tmp/health-recheck.ts`（直接实例化仓储跑 `getArchitectureHealth`，权威读数）、`tmp/dup-cluster.ts` 与 `tmp/null-order.ts`（重复簇成员与无锚点桶逐对相似度）、`tmp/foreshadow-recheck*.ts`（thread_id 绑定率与弧线程形态计数）、`tmp/gate-exposure.cjs` + `tmp/routing-audit*.cjs`（上下文预算门的部署面读数）、`tmp/fm-recheck3.cjs` + `tmp/quota-probe.cjs`（记忆治理三项部分修复的复测与单槽位压力读数）。
+- 2026-09-19 复测取证面（对 `ymcp` 只读）：`tmp/ledger-debt.cjs`（账本与学习队列计数）、`tmp/health-recheck.ts`（直接实例化仓储跑 `getArchitectureHealth`，权威读数）、`tmp/dup-cluster.ts` 与 `tmp/null-order.ts`（重复簇成员与无锚点桶逐对相似度）、`tmp/foreshadow-recheck*.ts`（thread_id 绑定率与弧线程形态计数）、`tmp/gate-exposure.cjs` + `tmp/routing-audit*.cjs`（上下文预算门的部署面读数）、`tmp/fm-recheck3.cjs` + `tmp/quota-probe.cjs`（记忆治理三项部分修复的复测与单槽位压力读数）、`tmp/emc-path.cjs` + `tmp/emc-live.ts`（情感契约在 section payload 的实形路径与 D5 判据的运行库现形分布）。
 - 关键统计口径：检索可见集=active∧authority∈{derived,approved,author}∧不被任何 active 行 supersedes；成本归属仅计 run→project 可 join 的 1523 次调用（73 次/章），禁止表总量÷章数。
 - 未决疑问（不立案）：76 倍估算/上报比值成因、弧审核意见是否见过标题污染、生产 database 模式真实消费、面板 7→3 收缩的变更记录缺失——见各分层报告"未验证的疑问"。
 - 规划层疑问 1（弧 2 completed 写入者）已闭环：audit_records 显示弧 2 于 08-08 由 external-reviewer 批准、生成审计即 `chapterCount:8` 与 `expectedChapterCount:15` 当场矛盾（审批时无"expected=计划章数"校验，PL-1 修复需同时补此入口）；completed 时刻 08-10 04:23:47 无任何 story-arc.* 动作，仅同秒的 ch15 commit `fact-approval.policy-applied`——即完成判定 SQL 在提交管线中静默翻转，零审计留痕。修复建议补充：弧完成状态变更必须写 `story-arc.completion-reconciled` 审计动作。
@@ -343,3 +343,22 @@
 | **方法论教训（追加）** | **DB 集成套件禁空过**：`TEST_DATABASE_URL` 缺失即整批 skip 曾被两次用于"全绿"证据（vacuous pass 事故：evaluation 31 用例实跑 20 skip 11）。修正=test-db.ts 响亮失败纪律 + 汇报必须区分"skip≠green"；**测试不得依赖人工外部 sync 的库内容**——v2 技能种子自举进 `migrate()`（`seedWorkspaceSkills`，SK-2 同护栏），evaluation fixture 改为动态选取库内绑定 `chapter.revision` 的启用技能（迭代产物须真正驱动回归对比，旧 fixture 写死 082 已停用的 `longform-continuity` 属腐化） | 全量真跑（TEST_DATABASE_URL 在场）：109 files / 974 passed / 31 skipped（skip 均为显式非 DB 门） |
 | **ch20 教训（时长断言须有正文事实背书）** | 弧 3 蓝图 ch20 场景 situation 写"楚衡已用**两夜**想清楚怎么回答"，而正文定稿的章节内时间链（首访→限期→答复日）可数出的夜数与之不合——这是 D3"时间线三套账"在**规划输入面**的表现：读者可追踪的时长断言与账目日期各自漂移，三审只核正文互证从未对照蓝图 situation，蓝图成为第四套隐性时间账。处置：ch20 正式修订轮按正文实际过夜数改写 duration 措辞（走工作流非直改），B7 的"蓝图字段夹带执行/事实断言"边界登记扩展到时长类断言——planningRationale 只解释、situation 措辞不得夹带未经正文背书的计数 | 修订工作流留痕；D3/B7 交叉引用 |
 | 剩余（PL-6 / E4-changeScope / E5-采样与比值报表） | ✅ 已于 2026-09-11 全部实施（作者裁决项④），见"Batch 4 补账与偏离更正"表与 workflow-map §3/§4/§6 | 全量真跑绿 + 运行库实测 |
+
+## 八、本轮整体迭代台账（2026-09-19，goal；自 `63b94ef` 起共 22 个提交，末端 `cd4a0c8`）
+
+本轮的输入是本文件 §四 优先级清单与 §五 对账行的**当前实形**（不照记忆做），每一项都要求：机制在最低共享层、双向测试、撤除反向对照、运行库实测、spec 同步。
+
+| 项 | 实现 | 验证与实测 | 遗留（含前置条件） |
+| --- | --- | --- | --- |
+| E5 token 口径单源 | 7 处实现 / 3 条口径收敛为 1 个估算器 + 3 条具名口径（`token-estimate.ts`）；`selectionReceipts[].tokenCost` 双写者同式 | 逐口径数值等价测试（中/英/混排）+ 接线锁；重标定 attempt 被 426 行实测否证——口径与 `computeTokenBudget` 共标定，换口径即作废这轮标定 | **按实测偏差重标预算常数未做**：前置=新部署后积累的双口径样本（仪表 `estimatedInputTokensAuditBasis` 已落在指纹之外，740ea63） |
+| run 状态词表与写入守卫 | `run-lifecycle.ts` 单源词表 + 三分类派生 SQL；人工门→running 加门态守卫（43d6940）；终态吸收拒写集 + `transition-refused` 留痕 | 取证替代猜测：513 run / 3,725 事件 → 12 条迁移边；`manual-review-required→running` 354 次＝守卫踩在热路径；终态→running 历史零观测 | **完整合法转移表判定为不做**（未观测状态零历史，正集=禁止首用，写失败只退化成静默 no-op） |
+| 092 主链路索引 | 四条 `(project_id,workflow_type,created_at)`/`(project_id,updated_at)`/`(status,updated_at)`/`artifacts(project_id)` | 只读 `EXPLAIN` 六热形状原为全表扫；索引存在 + `indisvalid` + 重复 migrate 幂等 + 迁移文本守卫（注释剥离后判） | 运行库由下一次正常 `migrate()` 应用；payload 表达式索引/outbox 谓词/status partial 三项刻意不建（判据已写进头注释） |
+| 仓储拆分与接口 | 13 条具名能力 + 结构 `QueryClient` + 3 个物理 slice（workflow_runs / model_tasks / telemetry），同签名委托 + lazy getter | 度量决定边界：写集并查集闭包 + 协作者计数；能力/接线锁与不变量测试齐备；268 个调用点零改动 | 剩余是**设计改造而非搬运**：`pool` 受控查询入口、多步提交的事务边界——无缺陷证据不动，且明令禁止"杂项片"式拆分（93ac6fb） |
+| 伏笔账本卫生 | 归并修复面对齐检测面：分桶键加 `project_id`（原全局按章分桶=跨项目归并的潜伏面）+ 无锚点行独立成桶（340d2b4） | 检测面/修复面判据差异取证（残留 1 簇=两条无锚点规划期行，Dice 0.92）；无锚点桶同判据实测只成两簇不吞并；两项各自撤除均判红 | 437 条 open 未绑线程仍需语义分流（无机械绑定键，回填=伪造） |
+| 伏笔归属（thread_id 惰性） | `threadResponsibilities[].foreshadowingRefs` + 纯函数判"必须弧账内"；账外 blocking 回流、多线认领不猜并留审计痕；五面同批登记（a364c1e） | 根因实测：24 弧全并行 4–7 线程 ⇒ 旧"单线程才绑"判据 eligible 弧 0；DB 集成走真实归一路径（绑/拒/歧义三态）+ 三面 schema 接线锁 | 部署代价=弧规划 schema→prompt 指纹→在飞外部任务 re-key，落位选无在飞弧规划任务时；新弧起生效 |
+| 记忆检索配额惰性 | `searchMemory` 词法命中投影补 `identityHash`/`valueHash`；融合合并按"任一带得到就用"保留指纹（cbd69e8） | 产线取证：400 份真实 manifest 中 `identity-slot-quota` 计数 0，而单槽（主角"知晓"）951 条可见声明、ranked-fill 38,905 条；回归走真实读出路径 | **副作用需知**：配额自此真生效，同槽位记忆截到 3 条（9/9 治理原意），装配指纹随之变 |
+| 前序疑问闭环 | §五 六行逐条复测并改判（c838f14 / 1172c6f / 05d1688 / 837590c） | ① "退役只管一径"②"方案A 漏出 23 条"③"Foundation 不完整"三条**不再成立**（实测每面 1 行、1,035 条认知声明零漏出、600 份 manifest foundation 段至多 1 条）；④"配额未检验"定性为缺陷并已修；⑤ 截断硬门保证在三处显式抛错、死导出系进程内 Map 空转（建议删，待批准） | 正文/prompt 正文在对象存储且 `serialContext` 不入库的项，状态如实记为"已接线、产线触发未证"，不写成已验证 |
+| D5 情感契约承载 | `auditEmotionalContractCarriage`：整弧无 payoff/aftermath 章时报 `emotional-carrier-missing` warning；不新增模型可随口填写的字段（7086f68） | 夹具照运行库实形写（契约值在 `structuredData`，顶层无——首版取错位置会静默空转而同形夹具照绿）；真实 health 消费面双向；撤接线即红 | 运行库现形 24 弧中 3 弧无承载章＝作者/弧审核议题，非工程待办 |
+| 验证基线 | — | `npm run lint`（tsc 双项目）干净；真库全量 **125 files / 1150 tests** 全绿；本轮每处机制改动都做过"撤除即红"的反向对照 | 未推送：push 从未获授权，本地领先远端 22 个提交 |
+
+**本轮不做的事（避免把迭代写成搬运）**：不删任何代码（死导出/依赖去留属破坏性动作，待作者批准）；不向 `ymcp` 写入（只读取证，DDL/回填由应用启动的 `migrate()` 自己完成）；不为凑绿而新增杂项切片、case-specific 规则或自动晋升；不改正文（正文 seam 属作者/编排会话的修订面）。
