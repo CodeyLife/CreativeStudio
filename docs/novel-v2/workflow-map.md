@@ -186,6 +186,8 @@ Story Arc 的规划输入使用结构化反馈投影，而不是把 narrative st
 
 **外部事实梳理审核通道（2026-09-09，`memory-grooming.ts` + MCP `novel_memory_grooming_report`）**：只读诊断投影——把 active、未被 supersedes 退役、非 rejected 且有谓词的声明按（规范化主体 × 规范谓词）身份槽位分组（Foundation 投影 predicate 为空不参与），组内以字符二元组 Dice 系数（纯 TS，不依赖 pg_trgm 等环境扩展）给出近重复候选对排序。外部编排 LLM 作为**事实梳理审核者**消费报告：通过时单行 `PASSED`，不通过时输出可执行梳理意见（哪对是语义重复应 supersedes、哪对是状态演化应保留为 update、哪对是误提取应 rejected），意见经作者确认后走既有 claim 生命周期——机械层不做语义等价判定，不提供绕过质量门的直接改库工具。阈值与分组上限为魔法值，标注 TODO 可配置意图。
 
+**情感契约承载核对（D5，2026-09-19）**：`positioning.emotionalContract` 此前只作为常驻提示行进入每章 draft prompt（"情感契约：…"），弧尺度上从不核对"有没有哪一章被指派交付它"——契约可以是全书无人兑现的口号。落地不新增可由模型随口填写的字段：章节蓝图的 `narrativeFunction` 本身就是一次规划期指派，缺的只是核对，故 `auditEmotionalContractCarriage`（`story-arc-integrity.ts`）对既有事实做确定性判定——承载章 = 章功能 ∈ {payoff, aftermath}（`EMOTIONAL_CONTRACT_CARRIER_FUNCTIONS`，显式选择而非"全部非过渡章"兜底，且有接线锁要求它是规范枚举的子集），整弧无承载章则报 `emotional-carrier-missing` warning。刻意不检查三种输入：整书未声明契约、作者显式 `notApplicable`（合法退出不是漏写）、弧尚无投影章节（未开写不是违约）；只报 warning 不立硬门（安静弧合法，硬门会把它们判死）。**取值位置是踩出来的**：只认 `structuredData.emotionalContract`（foundation 契约校验与 `validateNotApplicableAnnotation` 都读这里）；首版按 section payload 顶层键取值，运行库实测该键在顶层**不存在**（实形在 `structuredData` 与 `creativeBrief` 两处），于是判据在真实项目上静默空转，而照实现同形自造夹具的测试照样全绿——修正后同一份真实数据立刻现形 3 条（24 弧中 3 弧无承载章，21 弧正常，非满屏噪声）。教训入档：**夹具照库内实形写，不照实现的假设写**；新判据上线前必须在运行库跑一遍看现形分布。回归面双向（无承载报、有 payoff/aftermath 不报、章功能缺失按"未指定"仍报、未声明/空弧不报）+ 真实 health 消费面（种实形载荷→报警→改一章章功能→消警）。
+
 ### 架构体检与引用边界
 
 `GET /v2/projects/:projectId/architecture/health` 是只读诊断入口。它汇总 Foundation 批准状态、故事弧批次区间、章节定稿状态，以及剧情线/伏笔引用的规范 ID、兼容别名、未知项和歧义项；同时返回独立的 `fullBookArchitecture` 结构审计。章节 `planned` 表示蓝图尚未关联正文，或已关联但正文仍为 planned；`orphaned` 只表示无故事弧、关联正文不存在，或已批准故事弧仍缺正文。审批前故事弧下的正常蓝图不计为 orphaned。诊断不会改变正文或章节蓝图。
