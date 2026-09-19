@@ -1,5 +1,8 @@
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { chapterBlueprintFromRow, isTransientPostgresStartupError } from "../postgres-repository";
+import { chapterBlueprintFromRow, isTransientPostgresStartupError, NovelPostgresRepository, buildNarrativeRhythmSnapshotQuery, PROJECTABLE_FINAL_DOCUMENT_SQL } from "../postgres-repository";
+import { DEFAULT_TARGET_WORD_COUNT } from "../word-count";
 
 describe("postgres repository startup errors", () => {
   it("retries Postgres startup and recovery errors", () => {
@@ -83,5 +86,88 @@ describe("chapter blueprint row projection", () => {
     for (const bad of [0, -100, "2600", null, Number.NaN, Number.POSITIVE_INFINITY]) {
       expect(chapterBlueprintFromRow({ ...base, payload: { targetWordCount: bad } }).targetWordCount).toBeUndefined();
     }
+  });
+});
+
+describe("提交面有效目标篇幅（与 lifecycle 三面同尺）", () => {
+  function repositoryWithChapterRow(row: { payload: Record<string, unknown> } | undefined) {
+    const statements: string[] = [];
+    const repository = Object.create(NovelPostgresRepository.prototype) as NovelPostgresRepository;
+    Object.defineProperty(repository, "pool", {
+      value: { query: async (sql: string) => { statements.push(sql); return { rows: row ? [row] : [], rowCount: row ? 1 : 0 }; } },
+    });
+    return { repository, statements };
+  }
+
+  it("无章节蓝图 ⇒ undefined：门不施，也不从没承载过该章的场合发明目标", async () => {
+    const { repository } = repositoryWithChapterRow(undefined);
+    await expect(repository.getChapterTargetWordCount("p1", "d1")).resolves.toBeUndefined();
+  });
+
+  it("有蓝图但未声明目标 ⇒ 回落默认值（与 draft prompt 播报同一个数）", async () => {
+    const { repository } = repositoryWithChapterRow({ payload: {} });
+    await expect(repository.getChapterTargetWordCount("p1", "d1")).resolves.toBe(DEFAULT_TARGET_WORD_COUNT);
+    const { repository: dirty } = repositoryWithChapterRow({ payload: { targetWordCount: "2600" } });
+    await expect(dirty.getChapterTargetWordCount("p1", "d1")).resolves.toBe(DEFAULT_TARGET_WORD_COUNT);
+    const { repository: declared } = repositoryWithChapterRow({ payload: { targetWordCount: 2799.6 } });
+    await expect(declared.getChapterTargetWordCount("p1", "d1")).resolves.toBe(2800);
+  });
+
+  it("有无蓝图的判据与 lifecycle 的 planningContext 同形（chapters JOIN arcs）", async () => {
+    // lifecycle 侧 planningContext 为 undefined 的形态就是这条 join 拿不到行；提交面若只查
+    // chapters，同一章会在一个面施门、另一个面不施（09-19 复核轮两把尺子的成因）。
+    const { repository, statements } = repositoryWithChapterRow(undefined);
+    await repository.getChapterTargetWordCount("p1", "d1");
+    expect(statements[0].replace(/\s+/g, " ")).toMatch(/FROM chapters c JOIN arcs a ON a\.id=c\.arc_id/);
+  });
+});
+
+describe("目标篇幅量纲与回落表达式单源", () => {
+  const sourceFiles = (dir: string): string[] => readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+    const abs = join(dir, entry.name);
+    if (entry.isDirectory()) return entry.name === "__tests__" ? [] : sourceFiles(abs);
+    return entry.name.endsWith(".ts") && !entry.name.endsWith(".d.ts") ? [abs] : [];
+  });
+
+  it("回落表达式只允许出现在 word-count 内，量纲判据只允许出现在 normalizeTargetWordCount", () => {
+    const offenders: string[] = [];
+    const predicateOffenders: string[] = [];
+    for (const file of sourceFiles("src/novel-v2")) {
+      if (file.endsWith("word-count.ts")) continue;
+      const source = readFileSync(file, "utf8");
+      // 剥注释行：负向锁只判代码本体（同仓既有口径——注释里引用被禁写法是"为什么禁"的说明）。
+      const code = source.split(/\r?\n/).filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line)).join("\n");
+      if (/\?\?\s*DEFAULT_TARGET_WORD_COUNT/.test(code)) offenders.push(file);
+      if (/targetWordCount\s*===\s*"number"/.test(code)) predicateOffenders.push(file);
+    }
+    expect(offenders).toEqual([]);
+    expect(predicateOffenders).toEqual([]);
+  });
+});
+
+describe("序列证据目标判据同形", () => {
+  // 判据取仓储导出的那一份（断言的是"两侧都吃到它"）；常量自身的字面量由下一条锁守住。
+  const PREDICATE = PROJECTABLE_FINAL_DOCUMENT_SQL;
+
+  it("解析侧与投影侧读同一段判据，不是两处巧合同文", async () => {
+    // 同形一旦断裂，形态就是"目标解析成功 → 快照查询 0 行 → 整块字段静默缺席"（F2 的成因）。
+    expect(buildNarrativeRhythmSnapshotQuery()).toContain(PREDICATE);
+    const statements: string[] = [];
+    const repository = Object.create(NovelPostgresRepository.prototype) as NovelPostgresRepository;
+    Object.defineProperty(repository, "pool", { value: { query: async (sql: string) => { statements.push(sql); return { rows: [], rowCount: 0 }; } } });
+    await repository.getLatestFinalChapterTarget("p1");
+    expect(statements[0].replace(/\s+/g, " ")).toContain(PREDICATE);
+  });
+
+  it("判据字面量在仓储里只出现一次（常量定义处）", () => {
+    const code = readFileSync("src/novel-v2/postgres-repository.ts", "utf8")
+      .split(/\r?\n/)
+      .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+      // 折叠空白：这条判据原本就有三处是换行分写的，逐行匹配对那种形态天然失明
+      // （与 run-lifecycle 的写入者计数锁同一课）。
+      .join(" ")
+      .replace(/\s+/g, " ");
+    expect([...code.matchAll(/d\.status='final' AND d\.current_revision_id IS NOT NULL/g)].length).toBe(1);
+    expect([...code.matchAll(/PROJECTABLE_FINAL_DOCUMENT_SQL/g)].length).toBeGreaterThan(6);
   });
 });

@@ -114,9 +114,10 @@ export function memoryClaimPriority(memory: MemoryBundle, claim: MemoryHit): Sta
  */
 
 /** 单章建议性目标篇幅（字符数）；蓝图可经 targetWordCount 覆盖，正文产出时作为创作指引而非硬性上限。
- *  唯一定义在 ../word-count（workflow bundle 安全叶子模块，见该文件注释），此处 re-export 兼容 prompt 侧引用。 */
-export { DEFAULT_TARGET_WORD_COUNT } from "../word-count";
-import { DEFAULT_TARGET_WORD_COUNT } from "../word-count";
+ *  唯一定义在 ../word-count（workflow bundle 安全叶子模块，见该文件注释）。回落表达式也只在
+ *  那里（`effectiveTargetWordCount`）：提交门的尺子与本行播报的数是同一个表达式，
+ *  09-19 复核轮把此前散在 5 处的 `?? DEFAULT_TARGET_WORD_COUNT` 收了进来。 */
+import { effectiveTargetWordCount } from "../word-count";
 
 export function renderChapterExecutionContract(context: ChapterPlanningContext): string {  const chapter = context.chapter;
   const projection = projectChapterForExecution(chapter);
@@ -139,7 +140,7 @@ export function renderChapterExecutionContract(context: ChapterPlanningContext):
     `目标章：第 ${chapter.globalOrder} 章《${chapter.title}》`,
     `叙事功能：${projection.narrativeFunction ?? "由正文自然形成"}`,
     `POV：${projection.povCharacterId || "未限定"}`,
-    `目标篇幅：约 ${chapter.targetWordCount ?? DEFAULT_TARGET_WORD_COUNT} 字（建议性目标：以情节完整为优先，不因凑字或压字牺牲内容，也不设硬性上限）`,
+    `目标篇幅：约 ${effectiveTargetWordCount(chapter.targetWordCount)} 字（建议性目标：以情节完整为优先，不因凑字或压字牺牲内容，也不设硬性上限）`,
     `起始状态：${projection.stateTransition.before}`,
     `结束状态：${projection.stateTransition.after}`,
     `状态证据：${projection.stateTransition.evidence}`,

@@ -111,14 +111,24 @@ describe("run 状态写入面接线锁", () => {
     expect(terminalOutcome).not.toMatch(/new Set\(\["completed"/);
   });
 
-  it("workflow_runs 的 status 写入者恰为五处，每处各自带守卫", () => {
+  it("workflow_runs 的 status 写入者恰为六处，每处各自带守卫", () => {
     // 判据扫"折叠空白后的 SQL"而不是源码原文：多行模板串写成
     // `UPDATE workflow_runs\n  SET status=...` 时，同行正则一律看不见——
     // 本锁此前断言"恰三个写入者"却漏掉两处（消费人工裁决的 gate→running、
     // 弧强制删除的 →cancelled），即"再开第四个写入者"根本不会被发现（2026-09-19 实测）。
-    const scan = (source: string) => [...source.replace(/\s+/g, " ").matchAll(/UPDATE workflow_runs SET status/g)].length;
+    // 第二类失明是"无字面量的写入形态"：注册面写的是
+    // `ON CONFLICT DO UPDATE SET status=EXCLUDED.status`，按 UPDATE…SET status 数永远数不到
+    // 它（F5′，现计入第六处）。该形态必须绑定表名匹配——`runtime_services` 有一条形同样的
+    // `DO UPDATE SET status=EXCLUDED.status`，只按片段数会把别的表的写入者算进本账（实测）。
+    const scan = (source: string) => {
+      // 先剥注释：本锁数的是"代码里的写入形态"，而解释这段历史的文档注释本身就引用了
+      // `UPDATE workflow_runs SET status` 这个写法（不剥则计数虚高，且改注释会改断言结果）。
+      const sql = source.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/^\s*\/\/.*$/gm, " ").replace(/\s+/g, " ");
+      return [...sql.matchAll(/UPDATE workflow_runs SET status/g)].length
+        + [...sql.matchAll(/INSERT INTO workflow_runs\([^)]*\) VALUES\([^)]*\) ON CONFLICT\(temporal_workflow_id\) DO UPDATE SET status=EXCLUDED\.status/g)].length;
+    };
     expect(scan(repository)).toBe(3);
-    expect(scan(slice)).toBe(2);
+    expect(scan(slice)).toBe(3);
     // 对账那条必须自带乐观并发守卫（WHERE status=旧快照），否则会用过期判据覆写新鲜事实。
     expect(repository).toContain("WHERE temporal_workflow_id=$1 AND status=$2");
     // 漏斗的状态参数必须是词表类型，不是宽 string；仓储侧只允许委托。
@@ -130,6 +140,17 @@ describe("run 状态写入面接线锁", () => {
     expect(slice).toMatch(/WHERE temporal_workflow_id=\$1 \$\{terminalOverwriteGuardSql\("\$2"\)\}/);
     // 守卫挡下时不得静默：留一条 refusal 事件供审计发现覆写尝试。
     expect(slice).toContain('"workflow.transition-refused"');
+    // 注册面（第六处写入者）：无字面量的 upsert 同样要挂终态吸收守卫，且挡住时走同一条
+    // refusal 留痕与同一份事件口径（各自实现一份"怎么记账"迟早漂移）。upsert 的 WHERE 里
+    // 目标表与 EXCLUDED 同列同名，旧态引用必须限定表名（真库报 ambiguous）。
+    expect(slice).toMatch(/DO UPDATE SET status=EXCLUDED\.status[^\n]*\n\s*WHERE \$\{terminalOverwriteGuardPredicateSql\("EXCLUDED\.status", "workflow_runs\.status"\)\}/);
+    // 判据只有一份：两种拼接形态（AND 形式与前缀无的独立谓词）都由同一函数族导出。
+    expect([...slice.matchAll(/terminalOverwriteGuard(?:Sql|PredicateSql)\(/g)].length).toBe(2);
+    expect([...slice.matchAll(/recordTransitionRefusal\(/g)].length).toBe(3);
+    expect(slice).toMatch(/return this\.announceStatus\(result\.rows\[0\], input\.status/);
+    // 注册面的状态参数同属词表：宽 string 意味着任何调用方都能申报一个不在词表里的态。
+    expect(slice).toMatch(/async put\(input: \{[^}]*status: WorkflowRunStatus/);
+    expect(repository).toMatch(/async putWorkflowRun\(input: \{[^}]*status: WorkflowRunStatus/);
     // 消费人工裁决的 gate→running 与漏斗同判据（同一 vocabulary，不另立第二份规则）：
     // reject/abandon 短路径已把 run 写成终态时，裁决消费不得把它覆回 running。
     expect(repository).toContain('terminalOverwriteGuardSql("$3")');
@@ -254,5 +275,27 @@ describe("人工门守卫回写（落库）", () => {
     // 放行面②：重申业务结局（终态→终态）；放行面①：重驱动（终态→accepted）。
     expect((await repo.updateWorkflowRunStatus(doneId, "failed", { error: "restated" }))?.status).toBe("failed");
     expect((await repo.updateWorkflowRunStatus(doneId, "accepted", { redrive: true }))?.status).toBe("accepted");
+  });
+
+  it("注册面（put）也是终态吸收的受控写入者：复活被挡且 payload 不并，重申终态照旧放行", async () => {
+    if (!available) return;
+    // 这一写入形态此前对计数锁与守卫双向不可见：`DO UPDATE SET status=EXCLUDED.status` 里
+    // 没有一个状态字面量（F5′）。真库双向，且要连 payload 一起看——upsert 被挡住时整条
+    // DO UPDATE 都不执行，否则"复活失败"仍会污染展示位（与漏斗同一口径）。
+    const doneId = `put-absorb-${randomUUID()}`;
+    await repo.putWorkflowRun({ id: `run-${randomUUID()}`, workflowType: "chapter-review", projectId, temporalWorkflowId: doneId, status: "completed", payload: { outcome: "first" } });
+    const resurrected = await repo.putWorkflowRun({ id: `run-${randomUUID()}`, workflowType: "chapter-review", projectId, temporalWorkflowId: doneId, status: "running", payload: { outcome: "resurrect" } });
+    expect(resurrected.status).toBe("completed");
+    const row = await repo.pool.query<{ payload: Record<string, unknown> }>("SELECT payload FROM workflow_runs WHERE temporal_workflow_id=$1", [doneId]);
+    expect(row.rows[0].payload.outcome).toBe("first");
+    const refused = await repo.pool.query<{ payload: Record<string, unknown> }>(
+      "SELECT payload FROM outbox_events WHERE aggregate_type='workflow-run' AND aggregate_id=$1 AND event_type='workflow.transition-refused'",
+      [doneId],
+    );
+    expect(refused.rowCount).toBe(1);
+    expect(refused.rows[0].payload).toMatchObject({ from: "completed", to: "running", rule: "terminal-absorbing-except-redrive" });
+    const restated = await repo.putWorkflowRun({ id: `run-${randomUUID()}`, workflowType: "chapter-review", projectId, temporalWorkflowId: doneId, status: "failed", payload: { outcome: "restated" } });
+    expect(restated.status).toBe("failed");
+    expect(restated.payload.outcome).toBe("restated");
   });
 });

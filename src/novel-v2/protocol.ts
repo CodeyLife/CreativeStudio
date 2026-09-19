@@ -631,12 +631,11 @@ export interface ExecutionBlueprint {
   createdAt: number;
 }
 
-/**
- * 章节生成前置的"全书规划必填"约束由**批准面**单一表达：
- * `application/project-plan.ts` 的 `REQUIRED_APPROVED_PLAN_TASK_KEYS`。
- * 此处曾另存一份同名清单并声明"handler 与 workflow 据此拒绝启动"，但全仓无引用——
- * 那份声明是虚构的第二权威（2026-09-19 复核确认），已删除以免有人误以为门在预检侧生效。
- */
+// 墓碑注（不属于下面的 `Artifact`，故用行注释而非 JSDoc——`/** */` 会被读成 Artifact 的文档）：
+// 章节生成前置的"全书规划必填"约束由**批准面**单一表达：
+// `application/project-plan.ts` 的 `REQUIRED_APPROVED_PLAN_TASK_KEYS`。
+// 此处曾另存一份同名清单并声明"handler 与 workflow 据此拒绝启动"，但全仓无引用——
+// 那份声明是虚构的第二权威（2026-09-19 复核确认），已删除以免有人误以为门在预检侧生效。
 
 export interface Artifact {
   id: string;

@@ -150,6 +150,17 @@ describe("MCP 只读工具 smoke 契约（OR-E1，需 Postgres）", () => {
       // 反向：无对象存储时不静默给空账本，而是记一条可见降级。
       const withoutStore = await executeTool("novel_context_get", { projectId: arcProject }, { repository });
       expect(JSON.parse(withoutStore.content[0].text).enhancementErrors).toEqual([expect.stringContaining("assetSpans")]);
+
+      // F1′：`novel_memory_query` 曾直取 repository 拿序列证据 ⇒ 账本恒空，而 compact 摘要里
+      // 就有一个 assetSpanCount 字段（读得到字段、读不到账）。同一 fixture 上两面必须同账。
+      // cutoff 显式给 2：资产账本的判据是"同一实体 ≥2 章"（groupAssetSpans 与 subjectSpans
+      // 同口径），按文档推得的 cutoff=1 只剩单章窗口，账本为空是设计行为、不能当断言面。
+      const memory = JSON.parse((await executeTool("novel_memory_query", { projectId: arcProject, documentId: "smoke-doc-2", compact: true, narrativeCutoff: 2 }, { repository, objects })).content[0].text);
+      expect(memory.serialContextSummary.assetSpanCount).toBeGreaterThan(0);
+      expect(memory.enhancementErrors).toBeUndefined();
+      const memoryNoStore = JSON.parse((await executeTool("novel_memory_query", { projectId: arcProject, documentId: "smoke-doc-2", narrativeCutoff: 2 }, { repository })).content[0].text);
+      expect(memoryNoStore.enhancementErrors).toEqual([expect.stringContaining("assetSpans")]);
+      expect(memoryNoStore.serialContext.assetSpans).toEqual([]);
     } finally {
       await repository.deleteProject(arcProject).catch(() => undefined);
     }

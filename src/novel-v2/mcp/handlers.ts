@@ -25,7 +25,7 @@
 import { randomUUID } from "node:crypto";
 import type { ToolHandler, ToolContext } from "./types";
 import { buildRecallAnchors, RECALL_REPORT_POLICY } from "../recall-anchors";
-import { withAssetSpans } from "../application/serial-context-assets";
+import { serialContextWithAssets } from "../application/serial-context-assets";
 import type {
   CreativeCommand,
   CreativeReviewInput,
@@ -1077,7 +1077,20 @@ const novel_memory_query: ToolHandler = async (args, ctx) => {
   const narrativeCutoff = asNumber(args.narrativeCutoff);
   const targetNarrativeOrder = documentId ? await ctx.repository.getDocumentNarrativeOrder(projectId, documentId) : undefined;
   const cutoff = narrativeCutoff ?? (targetNarrativeOrder !== undefined && targetNarrativeOrder > 1 ? targetNarrativeOrder - 1 : undefined);
-  const serialContext = cutoff !== undefined && documentId ? await ctx.repository.getSerialContextSnapshot(projectId, documentId, cutoff) : undefined;
+  const serialContextLoaded = cutoff !== undefined && documentId ? await ctx.repository.getSerialContextSnapshot(projectId, documentId, cutoff) : undefined;
+  // 与 novel_context_get、生成链路同一份账本生产者：此前本面直取 repository，assetSpans
+  // 恒为空账本，而 compact 摘要里偏偏有一个 `assetSpanCount` 字段——读得到字段、读不到账。
+  // 降级回报沿用 novel_context_get 的 `enhancementErrors` 通道名，两面同键。
+  const enhancementErrors: string[] = [];
+  let serialContext = serialContextLoaded;
+  if (serialContextLoaded) {
+    const attached = await serialContextWithAssets(serialContextLoaded, projectId, {
+      getChapterContentRefs: (id, orders) => ctx.repository.getChapterContentRefsByOrders(id, orders),
+      getText: ctx.objects ? (key) => ctx.objects!.getText(key) : undefined,
+    });
+    if (attached.degradation) enhancementErrors.push(attached.degradation);
+    serialContext = attached.snapshot;
+  }
   const memories = await ctx.repository.getChapterMemories({ projectId, narrativeCutoff: cutoff, limit: 8 });
   const claims = await ctx.repository.getOpenForeshadowingAndPromises(projectId, cutoff);
   if (compact) {
@@ -1087,9 +1100,17 @@ const novel_memory_query: ToolHandler = async (args, ctx) => {
       openForeshadowings: claims.foreshadowings.map((f) => ({ id: f.id, description: f.description.slice(0, 100) })),
       openPromises: claims.promises.map((p) => ({ id: p.id, statement: p.statement.slice(0, 100) })),
       serialContextSummary: serialContext ? { window: serialContext.window, characterSpanCount: serialContext.characterSpans.length, subjectSpanCount: serialContext.subjectSpans.length, openPromiseCount: serialContext.openPromises?.length ?? 0, assetSpanCount: serialContext.assetSpans?.length ?? 0 } : null,
+      ...(enhancementErrors.length ? { enhancementErrors } : {}),
     };
   }
-  return { narrativeCutoff: cutoff ?? null, chapterMemories: memories, openForeshadowings: claims.foreshadowings, openPromises: claims.promises, serialContext: serialContext ?? null };
+  return {
+    narrativeCutoff: cutoff ?? null,
+    chapterMemories: memories,
+    openForeshadowings: claims.foreshadowings,
+    openPromises: claims.promises,
+    serialContext: serialContext ?? null,
+    ...(enhancementErrors.length ? { enhancementErrors } : {}),
+  };
 };
 
 const novel_memory_grooming_report: ToolHandler = async (args, ctx) => {
@@ -1412,13 +1433,12 @@ const novel_context_get: ToolHandler = async (args, ctx) => {
       const loaded = await ctx.repository.getSerialContextSnapshot(projectId, target.documentId, target.narrativeOrder);
       if (loaded) {
         // 资产账本要读正文：与生成链路同一份实现，避免 MCP 侧另起一径又留下空账本。
-        const serialContext = ctx.objects
-          ? await withAssetSpans(loaded, projectId, {
-              getChapterContentRefs: (id, orders) => ctx.repository.getChapterContentRefsByOrders(id, orders),
-              getText: (key) => ctx.objects!.getText(key),
-            })
-          : loaded;
-        if (!ctx.objects && !loaded.assetSpans.length) enhancementErrors.push("serialContext.assetSpans: 对象存储不可用，未做资产数量扫描");
+        const attached = await serialContextWithAssets(loaded, projectId, {
+          getChapterContentRefs: (id, orders) => ctx.repository.getChapterContentRefsByOrders(id, orders),
+          getText: ctx.objects ? (key) => ctx.objects!.getText(key) : undefined,
+        });
+        if (attached.degradation) enhancementErrors.push(attached.degradation);
+        const serialContext = attached.snapshot;
         all.serialContext = {
           window: serialContext.window,
           openPromises: serialContext.openPromises ?? [],

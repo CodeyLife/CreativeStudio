@@ -56,8 +56,10 @@ export class CommitService {
 
   async commit(input: CommitRequest & { text: string } & CommitDerivedData): Promise<CommitResult & { chapterMemory?: ChapterMemory }> {
     // 目标篇幅是蓝图里的已冻结事实，由本服务自取而非由调用方申报（"可推导事实不留裁量权"，
-    // 与 evaluateCommitGate 的篇幅判据同因：两次重出的骨架稿曾全绿过审）。读不到目标时
-    // 不施该门——门不替系统发明目标；能力接口外的桩缺此方法时显式 warn，不静默放宽门。
+    // 与 evaluateCommitGate 的篇幅判据同因：两次重出的骨架稿曾全绿过审）。仓储返回的是
+    // **有效目标**（蓝图声明优先、缺省回落 DEFAULT，与 draft prompt 播报同一个数）；只有
+    // 本章无章节蓝图或读取失败才是 undefined——门不替系统从没承载过该章的场合发明目标。
+    // 能力接口外的桩缺此方法时显式 warn，不静默放宽门。
     const reader = this.repository.getChapterTargetWordCount;
     let targetWordCount: number | undefined;
     if (typeof reader === "function") {

@@ -3,7 +3,7 @@ import type { ApprovalEvidence, Artifact, CommitResult, ContextManifest, Creativ
 import type { ChapterPlanningContext, StoryArcBundle, StoryArcPlotOutline } from "../application/story-arc";
 import type { ManuscriptStructuralReport } from "../application/manuscript-structure";
 import { storyArcReviewStrategy, type StoryArcReviewOutput } from "../application/story-arc-review-policy";
-import { DEFAULT_TARGET_WORD_COUNT, ENDING_RITUAL_POLICY } from "../word-count";
+import { effectiveTargetWordCount, ENDING_RITUAL_POLICY } from "../word-count";
 import type { DormancyLedger } from "../narrative-dormancy";
 import { opinionToReviewIssue } from "../text-review";
 import type { ReviewerRole } from "../prompts/chapter-review";
@@ -425,7 +425,9 @@ export async function novelIntentWorkflow(intent: NovelIntent, workflowId = `nov
       changeScope: blueprint.changeScope,
       // 篇幅欠量门：生成路径才是短稿骨架的出生地（ch52 1222 字静默定稿实证首轮接线
       // 只覆盖了 review 流）。与 draft prompt 同一有效目标：蓝图声明优先、缺省 DEFAULT。
-      targetWordCount: (planningContext?.chapter?.targetWordCount ?? DEFAULT_TARGET_WORD_COUNT) as number,
+      // 回落表达式单源（effectiveTargetWordCount）：本文件三处门输入与两处 prompt 播报此前
+      // 各写一份 `?? DEFAULT_TARGET_WORD_COUNT`，改任一处即"门的尺子≠播报的数"。
+      targetWordCount: effectiveTargetWordCount(planningContext?.chapter?.targetWordCount),
     });
 
     // P0 #1: opt-in 人工事实审批门。factApprovalBlocked 仅在 commitGate 已通过、但存在 pending 事实时出现。
@@ -499,7 +501,7 @@ export async function novelIntentWorkflow(intent: NovelIntent, workflowId = `nov
           reviewBeforeDirectedRevision: preserveDirectedRevisionCandidate && !directedBaseline,
           preserveDirectedRevisionCandidate,
           changeScope: blueprint.changeScope,
-          targetWordCount: (planningContext?.chapter?.targetWordCount ?? DEFAULT_TARGET_WORD_COUNT) as number,
+          targetWordCount: effectiveTargetWordCount(planningContext?.chapter?.targetWordCount),
         });
         continue;
       }
@@ -1565,7 +1567,7 @@ export async function chapterReviewWorkflow(params: {
         // 篇幅欠量门输入：与写作契约同一有效目标（章蓝图声明优先，缺省回落
         // DEFAULT_TARGET_WORD_COUNT——draft prompt 对模型说的就是这个数，门与指引
         // 必须同一账，否则拦的是模型没见过的标准）。
-        targetWordCount: planningContext?.chapter ? (planningContext.chapter.targetWordCount ?? DEFAULT_TARGET_WORD_COUNT) : undefined,
+        targetWordCount: planningContext?.chapter ? effectiveTargetWordCount(planningContext.chapter.targetWordCount) : undefined,
         directedRevision: directedIssues ? { issues: directedIssues, requireManuscriptApproval: true, baseline: compareDirectedRevisionCandidates ? comparableDirectedBaseline : undefined } : undefined,
         reviewBeforeDirectedRevision: replayLegacyDirectedOrder || Boolean(compareDirectedRevisionCandidates && directedIssues && directedBaseline && !comparableDirectedBaseline),
         preserveDirectedRevisionCandidate: compareDirectedRevisionCandidates,

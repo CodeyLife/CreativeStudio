@@ -124,8 +124,24 @@ export function isForbiddenTerminalOverwrite(from: string, to: string): boolean 
  * 值在 SQL 里出现第二份字面量。
  */
 export function terminalOverwriteGuardSql(toStatusParam: string): string {
+  return `AND ${terminalOverwriteGuardPredicateSql(toStatusParam)}`;
+}
+
+/**
+ * 同一判据的**独立谓词**形态（不带动词关键字前缀），供没有既有 WHERE 子句可拼接的写入形态使用。
+ *
+ * 为什么要有这一份而不是在调用点 `WHERE true AND (...)`：注册面写的是
+ * `INSERT … ON CONFLICT DO UPDATE … WHERE <判据>`，那里没有前导条件可拼 `AND`（拼上去就是
+ * `WHERE AND (…)` 语法错）。两种形态若各写一份判据，漏斗改了注册面不会跟着改——正是本仓
+ * "同一 vocabulary 不另立第二份规则" 要挡的分裂。
+ *
+ * `fromStatusRef` 是"账上旧态"的列引用：UPDATE 里裸 `status` 无歧义，而 upsert 的 WHERE 里
+ * 目标表与 `EXCLUDED` 伪表同列同名，裸引用直接报 `column reference "status" is ambiguous`
+ * （真库实测），故那里必须传 `workflow_runs.status`。
+ */
+export function terminalOverwriteGuardPredicateSql(toStatusParam: string, fromStatusRef = "status"): string {
   const redrive = TERMINAL_REDRIVE_WORKFLOW_RUN_STATUS;
-  return `AND (status NOT IN (${TERMINAL_WORKFLOW_RUN_STATUSES_SQL}) OR ${toStatusParam} IN (${TERMINAL_WORKFLOW_RUN_STATUSES_SQL}) OR ${toStatusParam}='${redrive}')`;
+  return `(${fromStatusRef} NOT IN (${TERMINAL_WORKFLOW_RUN_STATUSES_SQL}) OR ${toStatusParam} IN (${TERMINAL_WORKFLOW_RUN_STATUSES_SQL}) OR ${toStatusParam}='${redrive}')`;
 }
 
 /**

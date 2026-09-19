@@ -1,6 +1,7 @@
 import type { Artifact, ExecutionBlueprint, MemoryBundle, NovelIntent, SkillBundle, StagePromptPackage } from "../protocol";
 import type { ChapterPlanningContext } from "../application/story-arc";
-import { dedupeNarrativeRhythmMemory, DEFAULT_TARGET_WORD_COUNT, memoryClaimPriority, renderChapterExecutionContract, renderExecutionMemoryClaim, renderNarrativeRhythm, renderSerialContext } from "./chapter-planning-context";
+import { dedupeNarrativeRhythmMemory, memoryClaimPriority, renderChapterExecutionContract, renderExecutionMemoryClaim, renderNarrativeRhythm, renderSerialContext } from "./chapter-planning-context";
+import { effectiveTargetWordCount } from "../word-count";
 import { buildBlueprintSummary } from "./chapter-review";
 import { compileStageContext } from "../stage-context";
 import { buildSkillContextSections } from "../skill-runtime";
@@ -86,7 +87,7 @@ function buildWritingContract(targetWordCount?: number): string {
     // 完全合法的语汇，替读者把"为什么非得这样做"论证一整段。词汇表可以全是中文且承担
     // 世界观信息，仍读成讲解腔。因此判据必须落在动作上，与词汇表无关。
     "叙述者不替读者论证：人物的选择、规矩或手法，其正当性由行动的过程与后果承担，不由叙述者解释'为什么要这样做'。若一段文字主要在回答'他为什么非得这样'（逐条说明某动作的必要性、某条规矩为何成立、某个数目的最优性、某处失误的机理），而不是'他正在这样做'，就把它改写为该选择被执行的现场——手、眼、物、时间、对方的反应——理由留给读者从后果中推得。判据是删除测试：删掉论证句后，读者对'人物在做什么、他为此付出什么代价'的理解没有减少，那它只是解释，不是叙事。允许制度、行话、术语作为语汇出现并承担世界观信息；本条限制的是叙述者代替人物论证这个**动作**，不是词汇表。",
-    `本章目标篇幅约 ${targetWordCount ?? DEFAULT_TARGET_WORD_COUNT} 字（建议性目标：按情节完整自然展开，不因凑字或压字牺牲内容，也不设硬性上限）。`,
+    `本章目标篇幅约 ${effectiveTargetWordCount(targetWordCount)} 字（建议性目标：按情节完整自然展开，不因凑字或压字牺牲内容，也不设硬性上限）。`,
     "在体验自然完成的位置收束，保留必要的铺陈、内省和余波，不按固定字数、段落数量、钩子类型或节奏公式停笔。",
   ].join("\n");
 }

@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 
 import { MAX_CHAPTER_HINTS, MAX_EXPECTED_CHAPTER_COUNT, MAX_STORY_ARC_BATCH_WINDOW } from "./story-arc-limits";
+// 叶子纯模块（零导入），不会把 node 依赖拖进任何 bundle 链；目标篇幅量纲判据全仓单源。
+import { normalizeTargetWordCount } from "../word-count";
 
 // 浏览器安全叶子模块 story-arc-limits 持有常量；这里 re-export 维持既有引用方兼容。
 export { MAX_CHAPTER_HINTS, MAX_EXPECTED_CHAPTER_COUNT, MAX_STORY_ARC_BATCH_WINDOW } from "./story-arc-limits";
@@ -679,7 +681,7 @@ export function parseStoryArcBundle(value: unknown): StoryArcBundle {
       stateTransition: stateTransition ?? { before: "", after: "", evidence: "" },
       narrativeFunction: enumValue(chapter.narrativeFunction, CHAPTER_NARRATIVE_FUNCTIONS),
       povCharacterId: typeof chapter.povCharacterId === "string" && chapter.povCharacterId.trim() ? chapter.povCharacterId : undefined,
-      targetWordCount: typeof chapter.targetWordCount === "number" && Number.isFinite(chapter.targetWordCount) && chapter.targetWordCount > 0 ? Math.round(chapter.targetWordCount) : undefined,
+      targetWordCount: normalizeTargetWordCount(chapter.targetWordCount),
       scenes: rawScenes.map((scene, sceneIndex) => {
         const item = scene && typeof scene === "object" && !Array.isArray(scene) ? scene as Record<string, unknown> : {};
         return {

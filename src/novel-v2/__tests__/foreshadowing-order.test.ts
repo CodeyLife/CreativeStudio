@@ -28,40 +28,61 @@ describe("foreshadowing narrative visibility", () => {
     await repository.close();
   });
 
-  it("splits recorded payoffs at the cutoff: past ones are fulfilled nodes, future ones forbid early consumption", async () => {
+  it("splits recorded payoffs by the chapter that fulfilled them, not the chapter that planted them", async () => {
     if (!available) return;
-    // 回归 F4：未来侧原先读 chapters.payload->>'payoffRefs'，而 041 迁移已剥离该键且
-    // 无人再写 ⇒ prohibitedEarlyConsumption 恒只剩弧退出状态。现按同一账本分侧取。
-    const documentId = `early-doc-${randomUUID()}`;
-    const contentHash = `early-content-${randomUUID()}`;
-    const revisionId = `early-revision-${randomUUID()}`;
-    await repository.pool.query("INSERT INTO manuscript_documents(id,project_id,title,narrative_order,status) VALUES($1,$2,'第七章',7,'final')", [documentId, projectId]);
-    await repository.pool.query("INSERT INTO content_blobs(content_hash,object_key,byte_length) VALUES($1,$2,0)", [contentHash, `test/${contentHash}`]);
-    await repository.pool.query("INSERT INTO manuscript_revisions(id,project_id,document_id,revision,base_revision,content_hash) VALUES($1,$2,$3,1,0,$4)", [revisionId, projectId, documentId, contentHash]);
-    await repository.pool.query("UPDATE manuscript_documents SET current_revision_id=$1 WHERE id=$2", [revisionId, documentId]);
+    // F4′ 回归：判据必须读"兑现章"。埋设序（foreshadowing.narrative_order）在兑现时不变，
+    // 按它分侧会把"埋设在前、兑现在后"归进已兑现侧——正是要挡的提前消费形态。
+    // 两条支都要覆盖：v1 存量只有 payoff_revision_id，新数据两样都有。
+    const pastDoc = `f4-past-doc-${randomUUID().slice(0, 8)}`;
+    const futureDoc = `f4-future-doc-${randomUUID().slice(0, 8)}`;
+    const targetDoc = `f4-target-doc-${randomUUID().slice(0, 8)}`;
+    const pastRev = `f4-past-rev-${randomUUID().slice(0, 8)}`;
+    const futureRev = `f4-future-rev-${randomUUID().slice(0, 8)}`;
+    const targetRev = `f4-target-rev-${randomUUID().slice(0, 8)}`;
+    async function seedChapter(documentId: string, revisionId: string, order: number) {
+      const contentHash = `${documentId}-content`;
+      await repository.pool.query("INSERT INTO manuscript_documents(id,project_id,title,narrative_order,status) VALUES($1,$2,$3,$4,'final')", [documentId, projectId, `第${order}章`, order]);
+      await repository.pool.query("INSERT INTO content_blobs(content_hash,object_key,byte_length) VALUES($1,$2,0)", [contentHash, `test/${contentHash}`]);
+      await repository.pool.query("INSERT INTO manuscript_revisions(id,project_id,document_id,revision,base_revision,content_hash) VALUES($1,$2,$3,1,0,$4)", [revisionId, projectId, documentId, contentHash]);
+      await repository.pool.query("UPDATE manuscript_documents SET current_revision_id=$1 WHERE id=$2", [revisionId, documentId]);
+    }
+    await seedChapter(pastDoc, pastRev, 51);
+    await seedChapter(targetDoc, targetRev, 52);
+    await seedChapter(futureDoc, futureRev, 53);
+    const plantedEarly = `f4-plant-early-${randomUUID().slice(0, 8)}`;
+    const legacyOnly = `f4-legacy-only-${randomUUID().slice(0, 8)}`;
     await repository.pool.query(
-      `INSERT INTO foreshadowing(id,project_id,planted_revision_id,status,payload,narrative_order)
-       VALUES($1,$2,$3,'fulfilled',$4,2),($5,$2,$3,'fulfilled',$6,9)`,
+      `INSERT INTO foreshadowing(id,project_id,planted_revision_id,status,payload,narrative_order,payoff_revision_id)
+       VALUES($1,$2,$3,'fulfilled',$4,51,$7),($5,$2,$3,'fulfilled',$6,51,NULL)`,
       [
-        `fulfilled-past-${randomUUID()}`, projectId, revisionId, { description: "井底铜镜已被取走" },
-        `fulfilled-future-${randomUUID()}`, { description: "古钟在祭夜鸣响" },
+        plantedEarly, projectId, pastRev, { description: "井底铜镜已被取走（埋设在前、兑现在后）" },
+        legacyOnly, { description: "只有兑现修订的旧存量行（埋设在前、兑现在前）" }, futureRev,
       ],
     );
+    // 旧存量支：payoff_revision_id 指回埋设章 ⇒ 应归已兑现侧
+    await repository.pool.query("UPDATE foreshadowing SET payoff_revision_id=$2 WHERE id=$1", [legacyOnly, pastRev]);
+    // payoffs 支：兑现记录挂在后一章的修订上
+    await repository.pool.query(
+      "INSERT INTO payoffs(id,promise_id,foreshadowing_id,revision_id,evidence) VALUES($1,NULL,$2,$3,$4)",
+      [`f4-payoff-${randomUUID().slice(0, 8)}`, plantedEarly, futureRev, { description: "古钟在后一章鸣响（兑现登记在后章）" }],
+    );
+
     const snapshot = await repository.recordNarrativeStateSnapshot({
       projectId,
-      documentId,
-      revisionId,
-      narrativeOrder: 7,
+      documentId: targetDoc,
+      revisionId: targetRev,
+      narrativeOrder: 52,
       chapterMemory: {
-        id: `early-memory-${randomUUID()}`, projectId, documentId, revisionId,
-        narrativeRange: { start: 7, end: 7 }, summary: "立档", keyEvents: [], characterStates: [],
-        unresolvedThreads: [], fingerprint: "early-memory-fingerprint", createdAt: Date.now(),
+        id: `f4-memory-${randomUUID()}`, projectId, documentId: targetDoc, revisionId: targetRev,
+        narrativeRange: { start: 52, end: 52 }, summary: "本章", keyEvents: [], characterStates: [],
+        unresolvedThreads: [], fingerprint: "f4-memory-fp", createdAt: Date.now(),
       },
     });
-    expect(snapshot.fulfilledNodes).toContain("井底铜镜已被取走");
-    expect(snapshot.fulfilledNodes).not.toContain("古钟在祭夜鸣响");
-    expect(snapshot.prohibitedEarlyConsumption).toContain("古钟在祭夜鸣响");
-    expect(snapshot.prohibitedEarlyConsumption).not.toContain("井底铜镜已被取走");
+    expect(snapshot.fulfilledNodes).toContain("只有兑现修订的旧存量行（埋设在前、兑现在前）");
+    expect(snapshot.fulfilledNodes).not.toContain("古钟在后一章鸣响（兑现登记在后章）");
+    expect(snapshot.prohibitedEarlyConsumption).toContain("古钟在后一章鸣响（兑现登记在后章）");
+    expect(snapshot.prohibitedEarlyConsumption).toContain("井底铜镜已被取走（埋设在前、兑现在后）");
+    expect(snapshot.prohibitedEarlyConsumption).not.toContain("只有兑现修订的旧存量行（埋设在前、兑现在前）");
   });
 
   it("shows only known past foreshadowing when a narrative cutoff is active", async () => {

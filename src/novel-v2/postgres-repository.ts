@@ -68,7 +68,7 @@ import { ModelTaskSlice } from "./repository/model-task-slice";
 import { TelemetrySlice } from "./repository/telemetry-slice";
 import type { ModelRoutingConfig, ModelRoutingSnapshot, ModelTaskRecord, ModelWorkPackage } from "./model-routing";
 import type { ObjectStoreAdapter } from "./object-store";
-import { countNovelCharacters } from "./word-count";
+import { countNovelCharacters, effectiveTargetWordCount, normalizeTargetWordCount } from "./word-count";
 import type { ObjectStoreIdentity } from "./object-store";
 import { normalizeManuscriptStructuralReview } from "./application/manuscript-structure";
 import { arcCompletionPredicateSql, auditEmotionalContractCarriage, auditNamedReferences, auditStoryArcBatchRanges, canonicalReferenceId, findEmbeddedInternalIdentifiers, normalizeThreadResponsibilityReferences, parseExplicitNewReference, planThreadForeshadowingBindings, resolveNamedReference, sanitizeReferenceToken, type NamedReferenceCandidate, type StoryArcIntegrityIssue } from "./application/story-arc-integrity";
@@ -178,13 +178,25 @@ type ChapterBlueprintRow = {
 };
 type StoryArcBatchRow = { id: string; arc_id: string; project_id: string; batch_index: string | number; start_chapter_index: string | number; end_chapter_index: string | number; status: StoryArcBatchRecord["status"]; entry_fingerprint: string; source_artifact_id: string | null; payload: Record<string, unknown>; approved_at: Date | string | null };
 
+/**
+ * "已定稿、可投影的章文档"判据（`d` = `manuscript_documents` 的别名），九处 SQL 共用：序列证据 rhythm 的
+ * 窗口过滤、最新定稿章目标解析、序列窗口章行、弧内定稿章计数、前章末段装载，以及三条"章行仍 planned 而
+ * 文档已 final"的态收口/对账谓词。
+ *
+ * 分成多份字面量写是本仓最难归因的静默缺席形态之一（F2）：解析目标的一侧放宽（例如只认
+ * `status='final'` 而漏掉 `current_revision_id`），就会出现"目标解析成功 → 快照查询 0 行 → 字段整块
+ * 缺席"，两侧各自看都像对的。同一判据在九段 SQL 里靠巧合同文（其中三份还是换行分写的）维持一致，
+ * 等于没有约束——锁见 `postgres-repository.test.ts` 的"字面量只出现一次"。
+ */
+export const PROJECTABLE_FINAL_DOCUMENT_SQL = "d.status='final' AND d.current_revision_id IS NOT NULL";
+
 export function buildNarrativeRhythmSnapshotQuery(): string {
   return `SELECT d.id AS document_id,d.current_revision_id AS revision_id,d.narrative_order,d.title,c.arc_id,c.payload AS chapter_payload
        FROM chapters target
        JOIN chapters c ON c.arc_id=target.arc_id AND c.project_id=target.project_id
        JOIN manuscript_documents d ON d.id=c.document_id AND d.project_id=c.project_id
        WHERE target.project_id=$1 AND target.document_id=$2
-         AND d.status='final' AND d.current_revision_id IS NOT NULL AND d.narrative_order<=$3
+         AND ${PROJECTABLE_FINAL_DOCUMENT_SQL} AND d.narrative_order<=$3
        ORDER BY d.narrative_order`;
 }
 
@@ -323,8 +335,9 @@ export function chapterBlueprintFromRow(row: ChapterBlueprintRow): ChapterBluepr
     // 在这一步被静默丢弃——chapter_planning_contexts 因此 226 行全空，正文写作契约回落到
     // DEFAULT_TARGET_WORD_COUNT(3500)，与编排者手写的 2600、门执法的 3500×0.6=2100
     // 构成"同一目标三个数"。这是 F1（等量段配额代偿→节拍器呼吸）的直接上游。
-    // 量纲与 parseStoryArcBundle 同源：正整数才收，非法/缺省一律不注入（回落默认值）。
-    targetWordCount: typeof payload.targetWordCount === "number" && Number.isFinite(payload.targetWordCount) && payload.targetWordCount > 0 ? Math.round(payload.targetWordCount) : undefined,
+    // 量纲判据单源（normalizeTargetWordCount，与 parseStoryArcBundle 同一函数）：
+    // 正整数才收，非法/缺省一律不注入（回落默认值由 effectiveTargetWordCount 表达）。
+    targetWordCount: normalizeTargetWordCount(payload.targetWordCount),
     scenes: Array.isArray(payload.scenes) ? payload.scenes.flatMap<ChapterSceneBlueprint>((value, index) => {
       if (!value || typeof value !== "object" || Array.isArray(value)) return [];
       const scene = value as Record<string, unknown>;
@@ -345,6 +358,13 @@ export function chapterBlueprintFromRow(row: ChapterBlueprintRow): ChapterBluepr
     unresolvedAtClose: Array.isArray(payload.unresolvedAtClose) ? payload.unresolvedAtClose.filter((value): value is string => typeof value === "string") : [],
   };
 }
+
+/**
+ * 架构健康度里投影失败明细的取数上限。它只约束**明细页**（整账真数走窗口函数），
+ * 取最旧优先——卡得越久的账越需要先处理。
+ * TODO 可配置：报表页/运维面板若上线，这个数应与那边的分页参数同源。
+ */
+const HEALTH_PROJECTION_FAILURE_PAGE = 20;
 
 export class NovelPostgresRepository {
   readonly pool: Pool;
@@ -368,8 +388,7 @@ export class NovelPostgresRepository {
          AND c.document_id=$2
          AND d.id=c.document_id
          AND d.project_id=c.project_id
-         AND d.status='final'
-         AND d.current_revision_id IS NOT NULL
+         AND ${PROJECTABLE_FINAL_DOCUMENT_SQL}
          AND c.status<>'final'`,
       [projectId, documentId],
     );
@@ -651,8 +670,7 @@ export class NovelPostgresRepository {
        FROM manuscript_documents d
        WHERE c.project_id=d.project_id
          AND c.document_id=d.id
-         AND d.status='final'
-         AND d.current_revision_id IS NOT NULL
+         AND ${PROJECTABLE_FINAL_DOCUMENT_SQL}
          AND c.status<>'final'`,
     );
     return result.rowCount ?? 0;
@@ -1974,13 +1992,19 @@ export class NovelPostgresRepository {
     `, [artifactId]);
     const target = subject.rows[0];
     if (!target?.document_id) return false;
+    let resolvedRevisionId = revisionId ?? null;
     if (!revisionId) {
-      const current = await client.query<{ content_hash: string | null }>(`
-        SELECT mr.content_hash FROM manuscript_documents d
+      // 未显式给修订时，从文档的当前修订同时取"可比对的内容哈希"与"快照该挂的修订归属"。
+      // 此前这里只验哈希却不回填 revision_id，于是启动投影出的快照 revision_id 恒为 null，
+      // 而实时评审路径（调用方传 revisionId）落的是真值——同名字段两种形态，回填账答不出
+      // "这份快照对应哪一修订"，对账与追溯都要靠 content_hash 反查。
+      const current = await client.query<{ content_hash: string | null; current_revision_id: string | null }>(`
+        SELECT mr.content_hash, d.current_revision_id FROM manuscript_documents d
         LEFT JOIN manuscript_revisions mr ON mr.id=d.current_revision_id
         WHERE d.id=$1 AND d.project_id=$2
       `, [target.document_id, target.project_id]);
       if (!current.rows[0]?.content_hash || current.rows[0].content_hash !== target.content_hash) return false;
+      resolvedRevisionId = current.rows[0].current_revision_id ?? null;
     }
 
     const rows = await client.query<{
@@ -2016,7 +2040,7 @@ export class NovelPostgresRepository {
         artifact_fingerprint=EXCLUDED.artifact_fingerprint,source_workflow_id=EXCLUDED.source_workflow_id,verdict=EXCLUDED.verdict,
         complete=TRUE,overall_score=EXCLUDED.overall_score,dimension_scores=EXCLUDED.dimension_scores,reviewer_roles=EXCLUDED.reviewer_roles,
         reviewed_at=EXCLUDED.reviewed_at,updated_at=now()
-    `, [snapshotId, target.document_id, target.project_id, revisionId ?? null, target.content_hash, target.fingerprint, target.workflow_id, snapshot.verdict, snapshot.overallScore ?? null, JSON.stringify({}), snapshot.reviewerRoles, reviewedAt]);
+    `, [snapshotId, target.document_id, target.project_id, resolvedRevisionId, target.content_hash, target.fingerprint, target.workflow_id, snapshot.verdict, snapshot.overallScore ?? null, JSON.stringify({}), snapshot.reviewerRoles, reviewedAt]);
     await client.query("DELETE FROM chapter_review_snapshot_issues WHERE snapshot_id=$1", [snapshotId]);
     for (const issue of snapshot.issues) {
       // P0-C4: evidence 正文包含性软校验——审校 issue 的 evidence 在正文零命中时
@@ -2437,7 +2461,7 @@ export class NovelPostgresRepository {
 
   // ---- workflow_runs 生命周期：实现住在 repository/workflow-run-slice.ts，本层只委托。
   // 拆片的可验证性正在于此：公开面与 SQL 行为逐字不变，slice 可独立测、独立推演。
-  async putWorkflowRun(input: { id: string; workflowType: string; projectId: string; temporalWorkflowId: string; status: string; payload?: Record<string, unknown> }) {
+  async putWorkflowRun(input: { id: string; workflowType: string; projectId: string; temporalWorkflowId: string; status: WorkflowRunStatus; payload?: Record<string, unknown> }) {
     return this.workflowRuns.put(input);
   }
 
@@ -3088,8 +3112,7 @@ export class NovelPostgresRepository {
            AND c.arc_id=$2
            AND c.document_id=d.id
            AND d.project_id=c.project_id
-           AND d.status='final'
-           AND d.current_revision_id IS NOT NULL
+           AND ${PROJECTABLE_FINAL_DOCUMENT_SQL}
            AND c.status<>'final'`,
         [input.projectId, input.arcId],
       );
@@ -3148,8 +3171,13 @@ export class NovelPostgresRepository {
       // F3 可见性：投影失败登记面（commit 链路吞下的叙事元素/快照投影失败）此前**只进不出**
       // ——全仓无任何 SELECT 消费者，于是"可重放"的提示语掩盖了账本永久丢项。健康度先把
       // pending 数量与类型暴露出来；重放通道要按 payload 重建投影，属独立一步，不在观测面里偷做。
-      this.pool.query<{ projection_type: string; aggregate_id: string; error_message: string | null; attempts: string | number; updated_at: Date }>(
-        "SELECT projection_type,aggregate_id,error_message,attempts,updated_at FROM projection_failures WHERE project_id=$1 AND status='pending' ORDER BY updated_at DESC LIMIT 20",
+      // 明细取一页（常量见下），但 `pending` 必须是整账真数：用 rowCount 会把"页"当"账"，
+      // >20 条时静默截断，且 DESC 序先隐藏的正是要修的最陈旧卡死账。
+      this.pool.query<{ projection_type: string; aggregate_id: string; error_message: string | null; attempts: string | number; updated_at: Date; total: string }>(
+        `SELECT projection_type,aggregate_id,error_message,attempts,updated_at,
+                COUNT(*) OVER()::text AS total
+         FROM projection_failures WHERE project_id=$1 AND status='pending'
+         ORDER BY updated_at ASC LIMIT ${HEALTH_PROJECTION_FAILURE_PAGE}`,
         [projectId],
       ),
     ]);
@@ -3398,7 +3426,11 @@ export class NovelPostgresRepository {
       references: referenceReports,
       foreshadowingLedger,
       serialization: { gaps: serializationGaps, planningRunStatuses },
-      projectionFailures: { pending: projectionFailures.rowCount ?? 0, byType: projectionFailures.rows.reduce<Record<string, number>>((acc, row) => ({ ...acc, [row.projection_type]: (acc[row.projection_type] ?? 0) + 1 }), {}) },
+      projectionFailures: {
+        pending: Number(projectionFailures.rows[0]?.total ?? 0),
+        oldestAt: projectionFailures.rows[0] ? iso(projectionFailures.rows[0].updated_at) : undefined,
+        details: projectionFailures.rows.map((row) => ({ projectionType: row.projection_type, aggregateId: row.aggregate_id, attempts: Number(row.attempts) })),
+      },
       fullBookArchitecture,
       issues,
     };
@@ -4191,7 +4223,7 @@ export class NovelPostgresRepository {
         `SELECT d.narrative_order, c.payload->>'narrativeFunction' AS narrative_function, c.payload->'scenes' AS scenes
          FROM chapters c
          JOIN manuscript_documents d ON d.id=c.document_id AND d.project_id=c.project_id
-         WHERE c.project_id=$1 AND d.status='final' AND d.current_revision_id IS NOT NULL
+         WHERE c.project_id=$1 AND ${PROJECTABLE_FINAL_DOCUMENT_SQL}
            AND d.narrative_order <= $2
          ORDER BY d.narrative_order DESC
          LIMIT $3`,
@@ -4266,7 +4298,7 @@ export class NovelPostgresRepository {
        FROM chapters c
        JOIN arcs a ON a.id=c.arc_id
        JOIN manuscript_documents d ON d.id=c.document_id AND d.project_id=c.project_id
-       WHERE c.project_id=$1 AND d.status='final' AND d.current_revision_id IS NOT NULL
+       WHERE c.project_id=$1 AND ${PROJECTABLE_FINAL_DOCUMENT_SQL}
        GROUP BY a.id, a.ordinal, a.title`,
       [projectId],
     );
@@ -4525,35 +4557,66 @@ export class NovelPostgresRepository {
     chapterMemory: ChapterMemory;
     narrativeElements?: FactExtractionOutput["narrativeElements"];
   }, connection: Pool | PoolClient = this.pool): Promise<NarrativeStateSnapshot> {
-    const [open, threads, planning, arcPosition, fulfillments] = await Promise.all([
-      this.getOpenForeshadowingAndPromises(input.projectId, input.narrativeOrder, connection),
-      connection.query<{ id: string; title: string; payload: Record<string, unknown> }>(
-        "SELECT id,title,payload FROM plot_threads WHERE project_id=$1 AND status='open' ORDER BY id",
-        [input.projectId],
-      ),
-      this.getChapterPlanningContext(input.projectId, input.documentId, true).catch(() => undefined),
-      connection.query<{ current_order: string | number; first_order: string | number }>(
-        `SELECT c.ordinal AS current_order,MIN(peer.ordinal) AS first_order
-         FROM chapters c JOIN chapters peer ON peer.arc_id=c.arc_id
-         WHERE c.project_id=$1 AND c.document_id=$2 GROUP BY c.ordinal`,
-        [input.projectId, input.documentId],
-      ),
-      // 一条查询同时供"已兑现"与"未来才该兑现"两侧（旧实现另取
-      // chapters.payload.payoffRefs 作未来侧，而该键已由 041 迁移剥离且无生产者 ⇒
-      // prohibitedEarlyConsumption 恒只剩退出状态）。同表同判据、按 cutoff 分侧，
-      // 两侧不会再各自漂移。
-      connection.query<{ description: string | null; narrative_order: string | number | null }>(
-        `SELECT evidence->>'description' AS description, d.narrative_order
+    if (connection === this.pool) {
+      // 与 recordNarrativeElements 同族：提交链路默认面若逐条 autocommit，快照与它的
+      // outbox/来源行会出现"有快照无事件"或反之的半提交形态，且这类偏差只在事后对账时
+      // 才看得见。调用方传入 client 时沿用其事务边界，不在此嵌套 BEGIN。
+      const client = await this.pool.connect();
+      try {
+        await client.query("BEGIN");
+        const result = await this.recordNarrativeStateSnapshot(input, client);
+        await client.query("COMMIT");
+        return result;
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => undefined);
+        throw error;
+      } finally {
+        client.release();
+      }
+    }
+    // 五条读依次取而非 Promise.all：本方法的两条路径（默认面自管事务、调用方传入 client）
+    // 都在单个 PoolClient 上跑，pg 已废弃"同一 client 并发 query"（pg@9 直接抛），并发只
+    // 能靠串行保证。这里读的是账本输入，串行多四次本地往返，换两条路径共用一段可判定代码。
+    const open = await this.getOpenForeshadowingAndPromises(input.projectId, input.narrativeOrder, connection);
+    const threads = await connection.query<{ id: string; title: string; payload: Record<string, unknown> }>(
+      "SELECT id,title,payload FROM plot_threads WHERE project_id=$1 AND status='open' ORDER BY id",
+      [input.projectId],
+    );
+    // 规划上下文只用于取 arcId/阶段，读失败降级为无阶段而非打断账本：它走 this.pool 的独立
+    // 连接（签名不接 connection），因此在事务内看不到本事务未提交的写——默认面调用时前置事务
+    // 已提交，不受影响；调用方持事务路径的口径差已登记为待办。
+    const planning = await this.getChapterPlanningContext(input.projectId, input.documentId, true).catch(() => undefined);
+    const arcPosition = await connection.query<{ current_order: string | number; first_order: string | number }>(
+      `SELECT c.ordinal AS current_order,MIN(peer.ordinal) AS first_order
+       FROM chapters c JOIN chapters peer ON peer.arc_id=c.arc_id
+       WHERE c.project_id=$1 AND c.document_id=$2 GROUP BY c.ordinal`,
+      [input.projectId, input.documentId],
+    );
+    // "已兑现"与"未来才该兑现"两侧共用这一条查询，按 cutoff 分侧，两侧不会各自漂移。
+    // 列语义是判据的关键（09-19 复核自纠）：`foreshadowing.narrative_order` 是**埋设章**序，
+    // 兑现动作只写 status='fulfilled' + payoff_revision_id，所以兑现章序必须走
+    // payoff_revision_id→revision→document；按埋设序分侧会把"建立≤cutoff、兑现在未来"
+    // 误归进已兑现侧——恰是"不可提前消费"要挡的形态，且顺序推进时未来侧恒空。
+    // 上限 120 是明细页不是账：payoffs 支已含伏笔兑现行，foreshadowing.payoff_revision_id
+    // 支只补 v1 时代无 payoffs 行的存量，按兑现章倒序取最近一页（同 openPromises LIMIT 40 取舍）。
+    const fulfillments = await connection.query<{ description: string | null; narrative_order: string | number | null }>(
+      `SELECT * FROM (
+         SELECT p.evidence->>'description' AS description, d.narrative_order
          FROM payoffs p
          JOIN manuscript_revisions r ON r.id=p.revision_id AND r.project_id=$1
-         JOIN manuscript_documents d ON d.id=r.document_id AND d.project_id=$1
+         JOIN manuscript_documents d ON d.id=r.document_id AND d.project_id=r.project_id
          WHERE p.revision_id IS NOT NULL
          UNION ALL
-         SELECT payload->>'description' AS description, narrative_order FROM foreshadowing
-         WHERE project_id=$1 AND status='fulfilled'`,
-        [input.projectId],
-      ),
-    ]);
+         SELECT f.payload->>'description', d2.narrative_order
+         FROM foreshadowing f
+         JOIN manuscript_revisions r2 ON r2.id=f.payoff_revision_id AND r2.project_id=$1
+         JOIN manuscript_documents d2 ON d2.id=r2.document_id AND d2.project_id=r2.project_id
+         WHERE f.project_id=$1 AND f.status='fulfilled' AND f.payoff_revision_id IS NOT NULL
+       ) recorded
+       ORDER BY narrative_order DESC NULLS LAST
+       LIMIT 120`,
+      [input.projectId],
+    );
     const recordedPayoffs = fulfillments.rows
       .filter((row): row is { description: string; narrative_order: string | number } => Boolean(row.description) && row.narrative_order !== null);
     const futurePayoffRefs = recordedPayoffs
@@ -4857,7 +4920,7 @@ export class NovelPostgresRepository {
       `SELECT d.id AS document_id, d.narrative_order
        FROM chapters target
        JOIN manuscript_documents d ON d.id=target.document_id AND d.project_id=target.project_id
-       WHERE target.project_id=$1 AND d.status='final' AND d.current_revision_id IS NOT NULL
+       WHERE target.project_id=$1 AND ${PROJECTABLE_FINAL_DOCUMENT_SQL}
        ORDER BY d.narrative_order DESC LIMIT 1`,
       [projectId],
     );
@@ -5344,7 +5407,7 @@ export class NovelPostgresRepository {
        FROM manuscript_documents d
        JOIN manuscript_revisions mr ON mr.id=d.current_revision_id
        JOIN content_blobs cb ON cb.content_hash=mr.content_hash
-       WHERE d.project_id=$1 AND d.status='final' AND d.current_revision_id IS NOT NULL
+       WHERE d.project_id=$1 AND ${PROJECTABLE_FINAL_DOCUMENT_SQL}
          AND d.narrative_order < $2
        ORDER BY d.narrative_order DESC, d.id DESC
        LIMIT $3`,
@@ -5437,17 +5500,27 @@ export class NovelPostgresRepository {
   }
 
   /**
-   * 本章蓝图**声明**的目标篇幅（定稿门的篇幅判据用）。缺蓝图、缺字段或值非正有限数一律
-   * undefined——门只在系统已知的可推导事实上执法，不替调用方或模型发明目标；归一规则与
-   * `chapterBlueprintFromRow` 同一条（09-17 那次断链就是因为两处各写一份量纲）。
+   * 提交面的**有效**目标篇幅（篇幅欠量门判据），与 lifecycle 三面同源同尺：
+   * `planningContext?.chapter ? chapter.targetWordCount ?? DEFAULT : undefined`。
+   *
+   * 三条口径都对齐到该式：
+   * - "有无蓝图"用 `chapters JOIN arcs` 同一形状——lifecycle 的 planningContext 正是这条
+   *   join 拿不到行时抛错为 undefined 的，判据不同形就会一个面施门、另一个面不施；
+   * - 有蓝图但未声明目标 ⇒ 回落 `DEFAULT_TARGET_WORD_COUNT`，因为 draft prompt 播报的
+   *   就是这个回落值（门与指引一本账；09-17 的"同一目标三个数"即两侧各自回落的前一次现形）；
+   * - 无蓝图 ⇒ undefined，门不施——门不替系统从没承载过该章的场合发明目标。
+   * 归一判据单源见 `normalizeTargetWordCount`。
    */
   async getChapterTargetWordCount(projectId: string, documentId: string): Promise<number | undefined> {
     const result = await this.pool.query<{ payload: Record<string, unknown> | null }>(
-      "SELECT payload FROM chapters WHERE project_id=$1 AND document_id=$2 LIMIT 1",
+      "SELECT c.payload FROM chapters c JOIN arcs a ON a.id=c.arc_id WHERE c.project_id=$1 AND c.document_id=$2 LIMIT 1",
       [projectId, documentId],
     );
-    const value = result.rows[0]?.payload?.targetWordCount;
-    return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.round(value) : undefined;
+    const row = result.rows[0];
+    if (!row) return undefined;
+    // 量纲与回落各自单源（normalizeTargetWordCount 与 chapterBlueprintFromRow 同一判据，
+    // effectiveTargetWordCount 与 draft prompt 播报同一回落）。
+    return effectiveTargetWordCount(normalizeTargetWordCount(row.payload?.targetWordCount));
   }
 
   async getLatestMemoryBundle(projectId: string): Promise<MemoryBundle | undefined> {

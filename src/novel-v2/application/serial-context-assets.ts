@@ -42,3 +42,34 @@ export async function withAssetSpans(
     return snapshot;
   }
 }
+
+/**
+ * `withAssetSpans` 的调用门面：把"没有对象存储"这一形态也纳入降级回报。
+ *
+ * 单开一层的原因：`objects` 缺失时 `withAssetSpans` 根本没被调用，账本为空却是"未扫描"
+ * 而非"无资产"——两者对读账本的人含义相反（前者要去接对象存储，后者是正文里确实没提资产）。
+ * 各调用点此前各自判一次 `ctx.objects ? … : …`，于是 MCP 只读诊断面漏掉了这层回报。
+ * 回报统一由返回值给出（不写死目标字段名），调用方把自己的降级通道（enhancementErrors 等）接上。
+ */
+export async function serialContextWithAssets(
+  snapshot: SerialContextSnapshot,
+  projectId: string,
+  ports: {
+    getChapterContentRefs: (projectId: string, narrativeOrders: number[]) => Promise<Array<{ narrativeOrder: number; objectKey: string }>>;
+    getText?: (objectKey: string) => Promise<string>;
+  },
+): Promise<{ snapshot: SerialContextSnapshot; degradation?: string }> {
+  if (!ports.getText) {
+    // 已有账本（生成链路回填过的快照）即便本面无对象存储也照样读得到，不报降级。
+    return snapshot.assetSpans.length
+      ? { snapshot }
+      : { snapshot, degradation: "serialContext.assetSpans: 对象存储不可用，未做资产数量扫描" };
+  }
+  const reasons: string[] = [];
+  const next = await withAssetSpans(snapshot, projectId, {
+    getChapterContentRefs: ports.getChapterContentRefs,
+    getText: ports.getText,
+    onDegrade: (reason) => reasons.push(reason),
+  });
+  return { snapshot: next, ...(reasons.length ? { degradation: reasons.join("；") } : {}) };
+}

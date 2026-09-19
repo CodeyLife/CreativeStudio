@@ -37,6 +37,9 @@ describe("migrate 尾启动修复路径", () => {
       if (!isPostgresUnavailable(error)) throw error;
       console.warn(`[migrate-tail-repairs] Postgres 不可用：${(error as Error).message}`);
     }
+    // 60s：本套件的 beforeAll 跑整条 `migrate()`（92 个迁移文件 + 启动修复尾），而共享测试库
+    // `ymcp_test` 随并行会话单调增长，vitest 默认 5s 与相邻套件的 30s 都不够用。越过该上限的
+    // 正确处置是查 migrate 里新加的启动写路径，而不是继续加时。
   }, 60_000);
 
   afterAll(async () => {
@@ -84,10 +87,12 @@ describe("migrate 尾启动修复路径", () => {
     expect(rows.rows[1].word_count).toBeNull();
 
     // 重放：已回填的行不再进入选择集（该查询是全库扫描，故只断言自己这行没被再动，
-    // 不断言全局 updated/failed 计数——别的套件的数据也在同一库里）。
+    // 不断言全局 updated/failed 计数——别的套件的数据也在同一库里）。判据用 xmin 而不是
+    // 再读一次字数：同值重写读起来一模一样，只有行版本能证明"根本没再碰过"（与 books 那条同一判据）。
+    const blobVersionOf = async () => (await repository.pool.query<{ v: string }>("SELECT xmin::text::bigint AS v FROM content_blobs WHERE content_hash=$1", [goodHash])).rows[0].v;
+    const versionAfterFirst = await blobVersionOf();
     await repository.backfillMissingContentWordCounts(objects);
-    const reread = await repository.pool.query<{ word_count: string | null }>("SELECT word_count FROM content_blobs WHERE content_hash=$1", [goodHash]);
-    expect(Number(reread.rows[0].word_count)).toBe(countNovelCharacters(text));
+    expect(await blobVersionOf()).toBe(versionAfterFirst);
   });
 
   it("定稿文档下的章行收口为 final，重复启动不再改写", async () => {
@@ -135,6 +140,48 @@ describe("migrate 尾启动修复路径", () => {
     await repository.repairFoundationClaimSingletons();
     const count = await repository.pool.query<{ n: number }>("SELECT count(*)::int AS n FROM memory_claims WHERE project_id=$1", [projectId]);
     expect(count.rows[0].n).toBe(1);
+  });
+
+  it("当前修订无快照时回填真修一次，重放不再改写行（xmin 作证）", async () => {
+    if (!available) return;
+    // 三向的第二向：上一条只证"已在场不重复物化"，那等于只测了选择判据的反面。若回填
+    // 永远修不好任何东西，同一批测试依然全绿——而启动回填的实际职责就是给历史项目补账。
+    const projectId = await newProject("快照真修");
+    const documentId = `fix-doc-${suffix}`;
+    const revisionId = `fix-rev-${suffix}`;
+    const contentHash = `fix-content-${suffix}`;
+    const artifactId = `fix-artifact-${suffix}`;
+    await repository.recordArtifact({ id: artifactId, projectId, taskId: `${artifactId}:draft`, attemptId: `${artifactId}:attempt`, kind: "draft", contentHash, baseRevision: 0, fingerprint: `fp-${artifactId}`, createdAt: Date.now() });
+    await repository.pool.query("INSERT INTO manuscript_documents(id,project_id,title,narrative_order,status) VALUES($1,$2,'第一章',1,'final')", [documentId, projectId]);
+    await repository.pool.query("INSERT INTO content_blobs(content_hash,object_key,byte_length) VALUES($1,$2,0)", [contentHash, `tail/${contentHash}`]);
+    await repository.pool.query("INSERT INTO manuscript_revisions(id,project_id,document_id,revision,base_revision,content_hash,artifact_id) VALUES($1,$2,$3,1,0,$4,$5)", [revisionId, projectId, documentId, contentHash, artifactId]);
+    await repository.pool.query("UPDATE manuscript_documents SET current_revision_id=$1 WHERE id=$2", [revisionId, documentId]);
+    // 完整三审（narrative 全量期望集）——快照的完整性判据与实际评审面同源，缺一份就不该物化。
+    for (const [role, identity] of [["structure-reviewer", "internal"], ["character-reviewer", "independent"], ["prose-reviewer", "independent"]] as const) {
+      await repository.pool.query(
+        "INSERT INTO reviews(id,project_id,artifact_id,reviewer_id,identity,verdict,issues,score,role,dimension_scores,artifact_fingerprint,created_at) VALUES($1,$2,$3,$4,$5,'passed','[]'::jsonb,4.0,$6,'{}'::jsonb,$7,now())",
+        [`rev-${role}-${suffix}`, projectId, artifactId, `reviewer-${role}`, identity, role, `fp-${artifactId}`],
+      );
+    }
+
+    await repository.backfillCurrentChapterReviewSnapshots();
+    const created = await repository.pool.query<{ n: number; complete: boolean; revision_id: string }>(
+      "SELECT count(*)::int AS n, bool_and(complete) AS complete, min(revision_id) AS revision_id FROM chapter_review_snapshots WHERE document_id=$1",
+      [documentId],
+    );
+    expect(created.rows[0]).toMatchObject({ n: 1, complete: true, revision_id: revisionId });
+    const roles = await repository.pool.query<{ r: string }>(
+      "SELECT DISTINCT unnest(reviewer_roles) AS r FROM chapter_review_snapshots WHERE document_id=$1",
+      [documentId],
+    );
+    expect(roles.rows.map((row) => row.r)).toEqual(expect.arrayContaining(["structure-reviewer", "character-reviewer", "prose-reviewer"]));
+
+    // 重放：选择判据（当前修订且无匹配 hash 的快照）此刻已不成立，行必须根本没被再碰过——
+    // 只重读值会放过"同值重写"（抬 xmin、翻 updated_at、给审计流灌噪声）。
+    const versionOf = async () => (await repository.pool.query<{ v: string }>("SELECT xmin::text::bigint AS v FROM chapter_review_snapshots WHERE document_id=$1", [documentId])).rows[0].v;
+    const afterFirst = await versionOf();
+    await repository.backfillCurrentChapterReviewSnapshots();
+    expect(await versionOf()).toBe(afterFirst);
   });
 
   it("当前修订已有快照时启动回填不再改写它", async () => {

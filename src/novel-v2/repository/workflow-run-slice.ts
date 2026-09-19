@@ -19,7 +19,7 @@
  */
 import type { Pool } from "pg";
 import type { WorkflowRunRecord } from "../protocol";
-import { HUMAN_GATE_RESUME_WORKFLOW_RUN_STATUS, HUMAN_GATE_WORKFLOW_RUN_STATUSES_SQL, isForbiddenTerminalOverwrite, terminalOverwriteGuardSql, type WorkflowRunStatus } from "../run-lifecycle";
+import { HUMAN_GATE_RESUME_WORKFLOW_RUN_STATUS, HUMAN_GATE_WORKFLOW_RUN_STATUSES_SQL, isForbiddenTerminalOverwrite, terminalOverwriteGuardPredicateSql, terminalOverwriteGuardSql, type WorkflowRunStatus } from "../run-lifecycle";
 import { withTerminalOutcome } from "../terminal-outcome";
 import { workflowFromRow, type OutboxWriter, type WorkflowRunRow } from "./shared";
 
@@ -39,13 +39,30 @@ export class WorkflowRunSlice {
     this.appendOutbox = deps.appendOutbox;
   }
 
-  async put(input: { id: string; workflowType: string; projectId: string; temporalWorkflowId: string; status: string; payload?: Record<string, unknown> }) {
+  /**
+   * run 注册（按 `temporal_workflow_id` 幂等）。
+   *
+   * 它同样是 `workflow_runs.status` 的一个写入者，而且此前对计数锁完全不可见：SQL 里没有
+   * 状态字面量，写的是 `DO UPDATE SET status=EXCLUDED.status`，按 `UPDATE workflow_runs SET status`
+   * 形态数写入者的锁自然放过它（F5′）。同一道终态吸收守卫因此也必须挂在这里——Temporal 重放
+   * 或同名重启会把已 `completed` 的 run 覆回 `running`，而覆写之后工作流不再写自己的终态，
+   * 该 run 只能等对账把"僵尸 running"收编成 `failed`：一次成功的运行以失败入账。
+   * 守卫挡住时不静默：沿用漏斗的 refusal 事件口径留痕，并把既有行原样返回（注册方拿到的
+   * 是账上真实状态，不是它申报的那个）。
+   */
+  async put(input: { id: string; workflowType: string; projectId: string; temporalWorkflowId: string; status: WorkflowRunStatus; payload?: Record<string, unknown> }) {
     const result = await this.pool.query<WorkflowRunRow>(`INSERT INTO workflow_runs(id,workflow_type,project_id,temporal_workflow_id,status,payload)
       VALUES($1,$2,$3,$4,$5,$6)
       ON CONFLICT(temporal_workflow_id) DO UPDATE SET status=EXCLUDED.status,payload=workflow_runs.payload || EXCLUDED.payload,updated_at=now()
+      WHERE ${terminalOverwriteGuardPredicateSql("EXCLUDED.status", "workflow_runs.status")}
       RETURNING ${RUN_COLUMNS}`, [input.id, input.workflowType, input.projectId, input.temporalWorkflowId, input.status, withTerminalOutcome(input.status, input.payload ?? {})]);
-    await this.appendOutbox("workflow-run", input.temporalWorkflowId, `workflow.${input.status}`, { projectId: input.projectId, workflowId: input.temporalWorkflowId, runId: input.id });
-    return workflowFromRow(result.rows[0]);
+    if (!result.rowCount) {
+      const existing = await this.getByTemporalId(input.temporalWorkflowId);
+      if (!existing) throw new Error(`workflow run 注册未落库且目标行不存在（并发删除？）：${input.temporalWorkflowId}`);
+      await this.recordTransitionRefusal(input.temporalWorkflowId, existing.status, input.status);
+      return existing;
+    }
+    return this.announceStatus(result.rows[0], input.status, input.payload ?? {});
   }
 
   async updateStatus(temporalWorkflowId: string, status: WorkflowRunStatus, payload: Record<string, unknown> = {}) {
@@ -100,10 +117,14 @@ export class WorkflowRunSlice {
   private async diagnoseRefusedStatusUpdate(temporalWorkflowId: string, status: WorkflowRunStatus) {
     const current = await this.pool.query<{ status: string }>("SELECT status FROM workflow_runs WHERE temporal_workflow_id=$1", [temporalWorkflowId]);
     const from = current.rows[0]?.status;
-    if (from && isForbiddenTerminalOverwrite(from, status)) {
-      await this.appendOutbox("workflow-run", temporalWorkflowId, "workflow.transition-refused", { from, to: status, rule: "terminal-absorbing-except-redrive" });
-    }
+    if (from) await this.recordTransitionRefusal(temporalWorkflowId, from, status);
     return undefined;
+  }
+
+  /** 覆写尝试的留痕（漏斗与注册面共用一条事件口径）：只有确属被禁的终态覆写才记账。 */
+  private async recordTransitionRefusal(temporalWorkflowId: string, from: string, to: WorkflowRunStatus) {
+    if (!isForbiddenTerminalOverwrite(from, to)) return;
+    await this.appendOutbox("workflow-run", temporalWorkflowId, "workflow.transition-refused", { from, to, rule: "terminal-absorbing-except-redrive" });
   }
 
   /** 状态写入后的事件面：run 状态变更与有语义 progress 事件双写（两条写入路径共用，避免口径分叉）。 */

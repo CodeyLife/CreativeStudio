@@ -511,22 +511,29 @@ describe("story arc reference normalization integration (PL-2)", () => {
     }
   });
 
-  it("health 消费面：pending 投影失败可见、账清即消（F3）", async () => {
+  it("health 消费面：pending 投影失败按整账计数、明细只取最旧一页（F3）", async () => {
     if (!available || !repository) return;
     // 提交链路把投影失败记进 projection_failures 后继续走；这张账此前无任何 SELECT 消费者，
-    // "可重放"因此等于"永久静默丢账"。健康度先让它可见（重放通道是独立一步，不在观测面里偷做）。
-    const aggregateId = `revision-projection-${randomUUID().slice(0, 8)}`;
-    const clear = () => repository!.pool.query("DELETE FROM projection_failures WHERE project_id=$1 AND aggregate_id=$2", [projectId, aggregateId]);
-    await repository.recordProjectionFailure({ projectId, projectionType: "narrative-elements", aggregateId, payload: { marker: "health-facet" }, error: "stub：投影失败" });
+    // "可重放"因此等于"永久静默丢账"。可见性判据要同时满足两件事：整账真数、明细不截断计数。
+    const marker = randomUUID().slice(0, 8);
+    const aggregateIds = Array.from({ length: 21 }, (_, index) => `projection-${marker}-${index}`);
+    const clear = () => repository!.pool.query("DELETE FROM projection_failures WHERE project_id=$1 AND aggregate_id = ANY($2::text[])", [projectId, aggregateIds]);
+    for (const [index, aggregateId] of aggregateIds.entries()) {
+      await repository.recordProjectionFailure({ projectId, projectionType: "narrative-elements", aggregateId, payload: { marker }, error: `stub 失败 ${index}` });
+    }
     try {
       const reported = async () => (await repository!.getArchitectureHealth(projectId)).issues
-        .some((issue: { code: string; reference?: string }) => issue.code === "projection-failure-pending" && issue.reference === `narrative-elements:${aggregateId}`);
+        .some((issue: { code: string; reference?: string }) => issue.code === "projection-failure-pending" && issue.reference === `narrative-elements:${aggregateIds[0]}`);
       expect(await reported()).toBe(true);
       const health = await repository.getArchitectureHealth(projectId);
-      expect(health.projectionFailures.pending).toBeGreaterThanOrEqual(1);
-      expect(health.projectionFailures.byType["narrative-elements"]).toBeGreaterThanOrEqual(1);
+      // 21 条 > 明细页 20 ⇒ pending 必须是 21（把页当账时这里是 20），且明细取最旧优先
+      expect(health.projectionFailures.pending).toBe(21);
+      expect(health.projectionFailures.details).toHaveLength(20);
+      expect(health.projectionFailures.details[0].aggregateId).toBe(aggregateIds[0]);
+      expect(health.projectionFailures.oldestAt).toBeDefined();
       await clear();
       expect(await reported()).toBe(false);
+      expect((await repository.getArchitectureHealth(projectId)).projectionFailures.pending).toBe(0);
     } finally {
       await clear();
     }

@@ -80,8 +80,27 @@ describe("workflow-run slice（假连接）", () => {
     const { slice, sqls, events } = makeSlice([{ rows: [row], rowCount: 1 }]);
     const record = await slice.put({ id: "r1", workflowType: "chapter-review", projectId: "p1", temporalWorkflowId: "wf1", status: "accepted" });
     expect(sqls[0].sql).toContain("ON CONFLICT(temporal_workflow_id) DO UPDATE");
+    // 注册面同样是 status 写入者：无字面量的 upsert 形态此前对计数锁隐形（F5′），
+    // 终态吸收守卫必须与漏斗同挂——裸 status 是账上旧值、EXCLUDED.status 是申报的新值。
+    expect(sqls[0].sql).toMatch(/WHERE \(workflow_runs\.status NOT IN \(/);
+    expect(sqls[0].sql).toContain("OR EXCLUDED.status IN (");
     expect(sqls[0].params[5]).toEqual({});
     expect(record?.status).toBe("running");
     expect(events.map((event) => event.type)).toEqual(["workflow.accepted"]);
+  });
+
+  it("注册撞上终态账时不复活 run：返回账上真实状态并留 refusal 事件", async () => {
+    // 反向对照的另一半：守卫挡住时 upsert 零行，旧实现会把 undefined 喂给 mapper（注册方
+    // 拿到崩溃或脏记录），且覆写尝试无痕。现按漏斗同一条 refusal 口径留痕。
+    const terminalRow = { ...row, status: "completed" };
+    const { slice, events } = makeSlice([
+      { rows: [], rowCount: 0 },
+      { rows: [terminalRow], rowCount: 1 },
+    ]);
+    const record = await slice.put({ id: "r1", workflowType: "chapter-review", projectId: "p1", temporalWorkflowId: "wf1", status: "running", payload: { stage: "draft" } });
+    expect(record.status).toBe("completed");
+    expect(events).toEqual([
+      { type: "workflow.transition-refused", payload: { from: "completed", to: "running", rule: "terminal-absorbing-except-redrive" } },
+    ]);
   });
 });

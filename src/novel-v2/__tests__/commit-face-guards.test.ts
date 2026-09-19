@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import type { Pool } from "pg";
 import { NovelPostgresRepository } from "../postgres-repository";
@@ -68,6 +69,29 @@ describe("默认面的账本投影原子性（F3）", () => {
     await repository.recordNarrativeElements(ledgerInput, outer as never);
     expect(probe.transactions).toEqual([]);
   });
+
+  it("快照投影走同一条包装：默认面先 BEGIN，失败即整组 ROLLBACK", async () => {
+    // 行为向覆盖 F3′ 的新接线：第一条读语句失败时必须已经开过事务，否则快照/outbox
+    // 仍是逐条 autocommit，回滚路径无从发生。
+    const { repository, probe } = stubRepository({ failWhen: () => true });
+    await expect(repository.recordNarrativeStateSnapshot({
+      projectId: "p1", documentId: "doc-1", revisionId: "revision-1", narrativeOrder: 3, chapterMemory: {} as never,
+    })).rejects.toThrow("stub：该语句失败");
+    expect(probe.transactions).toEqual(["BEGIN", "ROLLBACK"]);
+  });
+
+  it("默认面自管事务的两处投影都受锁：不得再有第三条 autocommit 账本投影", async () => {
+    const source = readFileSync("src/novel-v2/postgres-repository.ts", "utf8");
+    // 快照投影的递归调用必须传 client（传 this.pool 会自嵌套并绕过回滚），此处锁接线形状。
+    expect([...source.matchAll(/if \(connection === this\.pool\) \{/g)].length).toBe(2);
+    for (const method of ["async recordNarrativeElements(", "async recordNarrativeStateSnapshot("]) {
+      const start = source.indexOf(method);
+      expect(start, method).toBeGreaterThan(-1);
+      const wrapper = source.slice(source.indexOf("if (connection === this.pool) {", start), start + 2000);
+      expect(wrapper, method).toContain("await client.query(\"BEGIN\")");
+      expect(wrapper, method).toContain(`await this.${method.slice(6, -1)}(input, client)`);
+    }
+  });
 });
 
 describe("提交面篇幅门（F6）", () => {
@@ -112,13 +136,14 @@ describe("提交面篇幅门（F6）", () => {
 
   it("目标篇幅由服务自行从蓝图取，短文在提交面即被拦（此前只有 lifecycle 三面传参）", async () => {
     const { service, calls } = stubCommitService({ target: 2600 });
-    await expect(service.commit(request() as never)).rejects.toThrow(/length-under-target/);
+    // 失败原因必须在报错文本里现形（此前只说"缺 reviewer 证据"，短稿被拦时运维无从归因）。
+    await expect(service.commit(request() as never)).rejects.toThrow(/质量失败=length-under-target/);
     expect(calls).toEqual([["p1", "doc-1"]]);
   });
 
-  it("蓝图未声明目标时不施篇幅门——门不替系统发明目标", async () => {
+  it("无章节蓝图（仓储给 undefined）时不施篇幅门——门不替系统发明目标", async () => {
     const { service } = stubCommitService({ target: undefined });
-    // 反向对照：三份通过证据 + 无声明目标 ⇒ 门放过，走到落库桩才报错，
+    // 反向对照：三份通过证据 + 无有效目标 ⇒ 门放过，走到落库桩才报错，
     // 说明确实是"篇幅门未触发"而不是别的原因拦下。
     await expect(service.commit(request() as never)).rejects.toThrow(/门若放过才会走到落库/);
   });
@@ -126,5 +151,22 @@ describe("提交面篇幅门（F6）", () => {
   it("目标读取失败时降级为跳过篇幅门，不把提交打死", async () => {
     const { service } = stubCommitService({ readerFails: true });
     await expect(service.commit(request() as never)).rejects.toThrow(/门若放过才会走到落库/);
+  });
+
+  it("第三向：仓储未提供读取能力时显式告警并按未施门处理（生产装配缺失不可静默）", async () => {
+    // 与"读取失败"同属降级，但要区分得开：前者是 DB 抖动，后者是装配漏接线——
+    // 静默放行会让整道门在生产里消失而测试全绿（F6 的原始形态即"少一个调用点"）。
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...args: unknown[]) => { warnings.push(args.join(" ")); };
+    try {
+      const repository = { commitRevision: async () => { throw new Error("stub：门若放过才会走到落库"); } };
+      const objects = { putText: async (value: string) => ({ key: `obj-${value.length}`, hash: `hash-${value.length}` }) };
+      const service = new CommitService(repository as never, objects as never, undefined);
+      await expect(service.commit(request() as never)).rejects.toThrow(/门若放过才会走到落库/);
+    } finally {
+      console.warn = originalWarn;
+    }
+    expect(warnings.some((line) => /生产装配缺失/.test(line))).toBe(true);
   });
 });

@@ -19,6 +19,32 @@ export function countNovelCharacters(text: string): number {
 export const DEFAULT_TARGET_WORD_COUNT = 3500;
 
 /**
+ * 章蓝图 `targetWordCount` 的量纲判据（唯一事实源）。
+ *
+ * 此前同一判据在三处各自内联（`chapterBlueprintFromRow`、`parseStoryArcBundle`、
+ * `getChapterTargetWordCount`）：正整数 ∧ 有限 ∧ >0 ∧ Math.round。复制三份的后果不是
+ * 风格问题——任何一处放宽（例如把 `> 0` 写成 `>= 0`）只会让**那一条路径**读到脏目标，
+ * 而"蓝图声明的目标 → 写作契约播报 → 提交门执法"是三跳链路，中间任一跳判据不同，
+ * 门拦的就是模型没见过的标准（09-17 的"同一目标三个数"即该形态的前一次现形）。
+ *
+ * 住 leaf 模块的理由同 `DEFAULT_TARGET_WORD_COUNT`：规划解析轨（application/story-arc）
+ * 在 Temporal bundle 的导入链上，不能为一个大仓储文件把 node:crypto 拖进来。
+ */
+export function normalizeTargetWordCount(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.round(value) : undefined;
+}
+
+/**
+ * 有效目标篇幅：门与写作契约共用的那一个数（蓝图声明优先，缺省回落系统默认）。
+ *
+ * 单源的理由：draft prompt 对模型播报的就是这个数，而篇幅欠量门按它的 60% 执法。两侧
+ * 各自写 `?? DEFAULT_TARGET_WORD_COUNT` 时，"回落值"与"播报值"是两处裁量，改一处即分裂。
+ */
+export function effectiveTargetWordCount(declared: number | undefined): number {
+  return declared ?? DEFAULT_TARGET_WORD_COUNT;
+}
+
+/**
  * 章末仪式化判据（manuscript.ending-ritual）的跨章校准值，唯一事实源。
  *
  * 住叶子纯模块的理由同 DEFAULT_TARGET_WORD_COUNT：workflows.ts 需要引用窗口值
