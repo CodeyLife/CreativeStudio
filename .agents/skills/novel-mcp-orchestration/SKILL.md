@@ -19,7 +19,7 @@ metadata:
 
 # 小说创作 MCP 编排流程（外部大模型作为治理者）
 
-> 当前工具面：49（= 代码 `TOOL_COUNT`，由 `src/novel-v2/__tests__/mcp-tool-face-single-source.test.ts` 校验本文件与 spec 的声明）。本文出现的一切工具名都必须真实存在于注册表——外部编排者按本文行动，写到不存在的工具会直接造成调用失败与重试死循环。
+> 当前工具面：50（= 代码 `TOOL_COUNT`，由 `src/novel-v2/__tests__/mcp-tool-face-single-source.test.ts` 校验本文件与 spec 的声明）。本文出现的一切工具名都必须真实存在于注册表——外部编排者按本文行动，写到不存在的工具会直接造成调用失败与重试死循环。
 
 ## 你是谁：外部编排者
 
@@ -163,6 +163,8 @@ novel_story_arc_orchestrate(projectId, plotOutline, reviewPolicy=auto)
   的开放伏笔 id）中已出现的引用。系统据此写 `foreshadowing.thread_id`，让到期账与静默账
   可按线追责。一条伏笔只能归一条线（多线同时认领=归属不可判定，系统留空并在审计
   `threadBindingAmbiguous` 里留痕）；无人承担的宁可留空交作者分流，不要为清空而摊派。
+- **回述漂移自查用只读诊断**：`novel_chapter_recall_report(projectId, narrativeOrder)` 把本章"想起/那日/上次"类回述句与近窗各章原句成对给出（含章号与相似度），
+  矛盾与"回述无据"的判定仍归你与作者——机械层不代替下结论，也不设阈值替你筛掉候选。
 - 编排权威顺序：已定稿事实 / 叙事状态账本 / 作者边界 > 你的编排 > 模型自行发挥。
   编排与事实冲突时系统以事实为准，你不需要预先消化全部事实——但**先调用
   `novel_context_get` 做事实梳理**，能显著减少修订轮次。

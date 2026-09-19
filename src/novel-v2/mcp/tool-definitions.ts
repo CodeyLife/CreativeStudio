@@ -21,7 +21,7 @@
  * - Workflow 查询（2）
  * - Workflow 决策（1）
  * - 上下文与产物查询（2，novel_context_get / novel_artifact_list）
- * - 外部 LLM 深度参与（8，记忆查询/梳理报告/候选队列/裁决/skill 查询/prompt 审计/
+ * - 外部 LLM 深度参与（9，记忆查询/梳理报告/回述对照/候选队列/裁决/skill 查询/prompt 审计/
  *   调用审计/模型调度；明细见 tool-metadata.ts 的 TOOL_GROUPS）
  */
 import type { ToolDefinition } from "./types";
@@ -223,6 +223,7 @@ export const TOOL_NAMES = [
   // 外部 LLM 深度参与：上下文查询与子 agent 调度（6，2026-09-08；梳理报告 2026-09-09）
   "novel_memory_query",
   "novel_memory_grooming_report",
+  "novel_chapter_recall_report",
   "novel_skill_query",
   "novel_prompt_inspect",
   "novel_invocation_list",
@@ -979,6 +980,20 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     },
   },
 
+  {
+    name: "novel_chapter_recall_report",
+    description: "回述对照诊断（只读）：抽出本章\"他想起/那日/上次\"类回述句，按字符二元组相似度给出近窗各章最可能的被引原句（含章号与相似度）。机械层不判定是否矛盾、不下\"回述无据\"结论——把「凭印象回忆」变成「有原文可 diff」，判定与后续修订指令仍由审校者/作者经正式通道做。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectId: { type: "string", minLength: 1 },
+        narrativeOrder: { type: "integer", minimum: 1, description: "被检章的叙事序（manuscript_documents.narrative_order）" },
+        window: { type: "integer", minimum: 1, maximum: 40, description: "向前对照的章数，默认 12" },
+      },
+      required: ["projectId", "narrativeOrder"],
+      additionalProperties: false,
+    },
+  },
   {
     name: "novel_memory_grooming_report",
     description: "生成记忆梳理诊断报告：把 active 事实账本按（规范化主体 × 规范谓词）身份槽位分组，组内给出近重复候选对（字符二元组 Dice 相似度排序）。外部编排 LLM 作为事实梳理审核者消费本报告，按文本意见契约输出梳理意见（通过=单行 PASSED；不通过=指出哪对是语义重复、哪对是状态演化需 supersedes、哪对是误提取），意见经作者确认后走既有 claim 生命周期，本工具不提供任何改库能力。只读。",

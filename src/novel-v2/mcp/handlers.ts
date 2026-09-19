@@ -24,6 +24,7 @@
  */
 import { randomUUID } from "node:crypto";
 import type { ToolHandler, ToolContext } from "./types";
+import { buildRecallAnchors, RECALL_REPORT_POLICY } from "../recall-anchors";
 import type {
   CreativeCommand,
   CreativeReviewInput,
@@ -1098,6 +1099,39 @@ const novel_memory_grooming_report: ToolHandler = async (args, ctx) => {
   return await buildMemoryGroomingReport(ctx.repository.pool, projectId);
 };
 
+const novel_chapter_recall_report: ToolHandler = async (args, ctx) => {
+  // 只读回述对照诊断（product-audit-20260910 §四 19 / D2）：机械层只把回述句与近窗
+  // 各章原句按相似度成对呈现，是否矛盾由审校者/外部编排者判，"回述无据"不由本工具下结论。
+  const projectId = asString(args.projectId);
+  if (!projectId) throw new Error("projectId 必填且非空");
+  const narrativeOrder = asNumber(args.narrativeOrder);
+  if (!narrativeOrder || narrativeOrder < 1) throw new Error("narrativeOrder 必填且为正整数（本章叙事序）");
+  if (!ctx.objects) throw new Error("对象存储不可用：回述对照需要读取章节正文，缺正文时不输出猜测");
+  const window = Math.max(1, Math.min(asNumber(args.window) ?? RECALL_REPORT_POLICY.window, 40));
+  const priorOrders = Array.from({ length: window }, (_, index) => narrativeOrder - index - 1).filter((order) => order >= 1);
+  const refs = await ctx.repository.getChapterContentRefsByOrders(projectId, [narrativeOrder, ...priorOrders]);
+  const target = refs.find((ref) => ref.narrativeOrder === narrativeOrder);
+  if (!target) throw new Error(`第 ${narrativeOrder} 章没有当前正文快照，无法做回述对照`);
+  const text = await ctx.objects.getText(target.objectKey);
+  const priorChapters: Array<{ narrativeOrder: number; documentId?: string; text: string }> = [];
+  for (const ref of refs) {
+    if (ref.narrativeOrder === narrativeOrder) continue;
+    try {
+      priorChapters.push({ narrativeOrder: ref.narrativeOrder, documentId: ref.documentId, text: await ctx.objects!.getText(ref.objectKey) });
+    } catch {
+      // 单章正文不可得就跳过：宁可少给对照材料，也不让缺文伪装成"无相似内容"。
+    }
+  }
+  return {
+    projectId,
+    narrativeOrder,
+    documentId: target.documentId,
+    window,
+    chaptersCompared: priorChapters.length,
+    anchors: buildRecallAnchors({ text, priorChapters }),
+  };
+};
+
 const novel_fact_candidate_queue: ToolHandler = async (args, ctx) => {
   const projectId = asString(args.projectId);
   if (!projectId) throw new Error("projectId 必填且非空");
@@ -1681,6 +1715,7 @@ export const TOOL_HANDLERS: Record<string, ToolHandler> = {
   // 外部 LLM 深度参与：上下文查询与子 agent 调度（6，2026-09-08；梳理报告 2026-09-09）
   novel_memory_query,
   novel_memory_grooming_report,
+  novel_chapter_recall_report,
   novel_fact_candidate_queue,
   novel_fact_candidate_decide,
   novel_skill_query,

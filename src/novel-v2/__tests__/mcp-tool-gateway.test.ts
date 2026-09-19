@@ -38,17 +38,18 @@ const mockCtx = {
 // ===== A. 纯函数：validateToolArgs（无 Postgres 依赖）=====
 
 describe("validateToolArgs pure function", () => {
-  it("TOOL_NAMES has exactly 49 tools", () => {
+  it("TOOL_NAMES has exactly 50 tools", () => {
     // 47 → 49：2026-09-10 新增 novel_fact_candidate_queue/novel_fact_candidate_decide（FM-2）。
     // 49 → 50：2026-09-12 弧6 新增 novel_story_arc_decision。
     // 50 → 52：2026-09-12 弧6 新增 novel_foreshadowing_list/triage。
     // 52 → 59：2026-09-17 短剧创作台新增 7 个创作台/素材工具（后来被浏览器化移除）。
     // 59 → 49：2026-09-17 独立短剧改浏览器本地存储，移除 10 个独立短剧工具（short_script_h3/brainstorm/submit + 创作台/素材）。
-    expect(TOOL_NAMES).toHaveLength(49);
+    // 49 → 50：2026-09-19 回述对照只读诊断 novel_chapter_recall_report（审计 §四 19 的 D2 项）。
+    expect(TOOL_NAMES).toHaveLength(50);
   });
 
-  it("TOOL_DEFINITIONS has 49 defs, each with name/description/inputSchema", () => {
-    expect(TOOL_DEFINITIONS).toHaveLength(49);
+  it("TOOL_DEFINITIONS has 50 defs, each with name/description/inputSchema", () => {
+    expect(TOOL_DEFINITIONS).toHaveLength(50);
     for (const def of TOOL_DEFINITIONS) {
       expect(typeof def.name).toBe("string");
       expect(def.name.length).toBeGreaterThan(0);

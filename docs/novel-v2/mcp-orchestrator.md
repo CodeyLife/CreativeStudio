@@ -2,7 +2,7 @@
 
 > 活动契约：2026-08-06。本文定义「外部大模型作为任务编排、审核、推进、编辑与迭代优化者」参与小说创作全流程的 MCP 工作流。代码行为以 [workflow-map.md](./workflow-map.md) 与源码为准，本文是流程与工具映射参考。
 >
-> 当前工具面：49（真值 `src/novel-v2/mcp/tool-metadata.ts` 的 `TOOL_COUNT`；本文与各 skill 声明的数字由 `src/novel-v2/__tests__/mcp-tool-face-single-source.test.ts` 强制对齐，改工具必须同批改这里）。
+> 当前工具面：50（真值 `src/novel-v2/mcp/tool-metadata.ts` 的 `TOOL_COUNT`；本文与各 skill 声明的数字由 `src/novel-v2/__tests__/mcp-tool-face-single-source.test.ts` 强制对齐，改工具必须同批改这里）。
 
 ## 1. 核心设计
 
@@ -181,7 +181,7 @@ novel_receipt_get(receiptId)
 8. **编排权威顺序**：已定稿事实 / 叙事状态账本 / 作者边界 > 外部剧情编排 > 模型自行发挥；编排只给方向，不给假事实。
 9. **外部编排模型直接参与编辑**：外部编排模型既是审核者也是编辑者，不是纯守门人。对**证据明确、修法无争议**的问题（错字/标点混用、账本可查证的跨章时序矛盾、与冻结契约直接冲突的违例段落），直接走完整编辑闭环：`novel_chapter_review_issue_add` → `novel_chapter_review(mode=targeted)` → 核对候选稿实际改动 → `novel_chapter_review_decision(approve, feedback=证据链)`，不必逐条请示作者；**修法涉及取舍**（剧情走向、人物命运、弧级 resolution、风格偏好）时不擅自决定，登记意见并给作者选项。批准 feedback 必须写清目标达成证据、范围外遗留登记与命名漂移警告的核实结论（删除引语/复述段导致的短语频次下降是常见假阳性，≠实体漂移）；命名漂移警告必须人工核对后再批准或打回。
 
-## 4. 工具清单（当前工具面：49 个）
+## 4. 工具清单（当前工具面：50 个）
 
 | 组 | 工具 |
 | --- | --- |
@@ -194,7 +194,7 @@ novel_receipt_get(receiptId)
 | Workflow 查询（2） | novel_workflow_get、novel_workflow_list |
 | Workflow 决策（1） | novel_chapter_review_decision |
 | 上下文与产物查询（2） | novel_context_get、novel_artifact_list |
-| 外部 LLM 深度参与（8，2026-09-08；梳理报告 2026-09-09；候选队列 2026-09-10） | novel_memory_query、novel_memory_grooming_report、novel_fact_candidate_queue、novel_fact_candidate_decide、novel_skill_query、novel_prompt_inspect、novel_invocation_list、novel_model_dispatch |
+| 外部 LLM 深度参与（9，2026-09-08；梳理报告 2026-09-09；候选队列 2026-09-10；回述对照 2026-09-19） | novel_memory_query、novel_memory_grooming_report、novel_chapter_recall_report、novel_fact_candidate_queue、novel_fact_candidate_decide、novel_skill_query、novel_prompt_inspect、novel_invocation_list、novel_model_dispatch |
 
 ## 4.1 外部 LLM 深度参与策略
 
@@ -211,7 +211,7 @@ novel_receipt_get(receiptId)
 
 ### 观测与恢复事件契约（2026-09-10 审计整改 Batch 3/4，无新增工具）
 
-编排者消费面出现以下新事件/字段，均经 outbox 与既有查询工具暴露，工具总数保持 49：
+编排者消费面出现以下新事件/字段，均经 outbox 与既有查询工具暴露，工具总数当时保持不变：
 
 - **`workflow.progress.<stage>`**：任何带 `payload.stage` 的状态写入都追加 outbox 事件——轮询 run 时守卫历史可逐条回放（run payload 的 stage 仅是后写覆盖的展示位）。
 - **`payload.terminalOutcome`**：**全部终态**（`completed` / `failed` / `cancelled` / `abandoned` / `rejected`，集合以 `src/novel-v2/run-lifecycle.ts` 为准）写库时必带固定键（`succeeded` / `business-revision-exhausted` / `business-review-rejected` / `external-wait-timed-out` / `abandoned-stale-run` / `abandoned-by-author` / `infrastructure-failed` / `cancelled` 等）；业务性失败与基础设施失败自此可分流，重试策略不应再看 status 单字段。作者经人工门放弃/拒绝的两种结局也在覆盖内（此前漏覆盖，恰在最需要区分的"作者介入结果"上失明）。
@@ -236,6 +236,7 @@ novel_receipt_get(receiptId)
 - 正文创作前：novel_memory_query(chapter.drafting) → novel_skill_query(chapter.drafting) → novel_model_dispatch(writing.draft, 自组装 prompt) → 预生成草稿 → novel_chapter_generate 启动正式工作流
 - 审核后：novel_invocation_list → 诊断模型调用情况 → novel_prompt_inspect → 审计 prompt 质量
 - 弧批次边界（记忆治理）：novel_memory_grooming_report → 输出梳理意见 → 作者确认后走 claim 生命周期
+- 章定稿前后（回述漂移，product-audit-20260910 §四 19 / D2）：`novel_chapter_recall_report(projectId, narrativeOrder, window?)` → 返回本章每条回述句（"想起/那日/上次/当初"…）与近窗各章最相似的原句（章号 + 相似度降序，默认至多 3 条候选）→ 由你判"是否矛盾/是否无据"，冲突时按章号给定向修订指令或投 `novel_chapter_review_issue_add`。机械层不判语义、不设相似度门槛、不改正文；候选列表为空只说明近窗无可比对内容，不等于回述一定无据（也可能超出对照窗）。
 - 弧批次边界（候选清账）：novel_fact_candidate_queue → 证据明确的批量 novel_fact_candidate_decide → 存疑条目回报作者
 
 ## 5. 与 skill 的关系

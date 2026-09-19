@@ -22,7 +22,7 @@ metadata:
 
 # 短剧创作自主编排协议（autopilot）
 
-> 当前工具面：49（= 代码 `TOOL_COUNT`，由 `src/novel-v2/__tests__/mcp-tool-face-single-source.test.ts` 校验）。独立短剧已于 2026-09-17 浏览器化：`novel_short_script_h3` / `_brainstorm` / `_submit` 均不在 MCP 工具面内，本文件的短剧生成一律走 `POST /v2/short-script-h3`（stateless，产物存浏览器 IndexedDB）。
+> 当前工具面：50（= 代码 `TOOL_COUNT`，由 `src/novel-v2/__tests__/mcp-tool-face-single-source.test.ts` 校验）。独立短剧已于 2026-09-17 浏览器化：`novel_short_script_h3` / `_brainstorm` / `_submit` 均不在 MCP 工具面内，本文件的短剧生成一律走 `POST /v2/short-script-h3`（stateless，产物存浏览器 IndexedDB）。
 
 ## 定位与加载顺序
 

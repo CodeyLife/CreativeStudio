@@ -14,7 +14,7 @@ export interface ToolGroup {
 export const TOOL_GROUPS: ToolGroup[] = [
   { key: "run-action", title: "Run / Action 主体", tools: ["novel_run_create", "novel_run_get", "novel_action_list", "novel_action_execute", "novel_artifact_get", "novel_review_submit", "novel_run_complete"] },
   { key: "catalog", title: "Catalog / Receipt", tools: ["novel_catalog_get", "novel_receipt_get", "novel_rule_target_get"] },
-  { key: "external-llm", title: "外部 LLM 深度参与：上下文查询与子 agent 调度", tools: ["novel_memory_query", "novel_memory_grooming_report", "novel_fact_candidate_queue", "novel_fact_candidate_decide", "novel_skill_query", "novel_prompt_inspect", "novel_invocation_list", "novel_model_dispatch"] },
+  { key: "external-llm", title: "外部 LLM 深度参与：上下文查询与子 agent 调度", tools: ["novel_memory_query", "novel_memory_grooming_report", "novel_chapter_recall_report", "novel_fact_candidate_queue", "novel_fact_candidate_decide", "novel_skill_query", "novel_prompt_inspect", "novel_invocation_list", "novel_model_dispatch"] },
 { key: "craft-rule", title: "Craft Rule 候选演进", tools: ["novel_rule_candidate_create", "novel_rule_candidate_get", "novel_rule_evidence_submit", "novel_rule_foundation_evaluate", "novel_rule_review_submit", "novel_rule_promote", "novel_rule_rollback"] },
   { key: "project", title: "项目生命周期", tools: ["novel_project_create", "novel_project_list", "novel_project_delete"] },
   { key: "bootstrap", title: "规划与创作", tools: ["novel_bootstrap_run", "novel_story_arc_start", "novel_story_arc_get", "novel_story_arc_review", "novel_story_arc_decision", "novel_story_arc_batch_start", "novel_story_arc_orchestrate", "novel_foreshadowing_list", "novel_foreshadowing_triage", "novel_chapter_review", "novel_chapter_review_issue_add", "novel_chapter_generate", "novel_chapter_script_h3", "novel_skill_get", "novel_chapter_script_h3_submit"] },
@@ -67,6 +67,7 @@ const SHORT_LABELS: Partial<Record<ToolName, string>> = {
   novel_context_get: "获取创作上下文",
   novel_artifact_list: "列出创作产物",
   novel_memory_grooming_report: "记忆梳理诊断报告",
+  novel_chapter_recall_report: "回述对照诊断报告",
   novel_fact_candidate_queue: "事实候选积压面板",
   novel_fact_candidate_decide: "裁决事实候选",
 };

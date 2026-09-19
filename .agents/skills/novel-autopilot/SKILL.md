@@ -17,7 +17,7 @@ metadata:
 
 # 小说创作自主推进协议（autopilot）
 
-> 当前工具面：49（= 代码 `src/novel-v2/mcp/tool-metadata.ts` 的 `TOOL_COUNT`，由 `src/novel-v2/__tests__/mcp-tool-face-single-source.test.ts` 校验本文件与 spec 声明一致）。阶段/工具映射的细则在 novel-mcp-orchestration，本文件只写决策规则；改工具面后两处都要跟上。
+> 当前工具面：50（= 代码 `src/novel-v2/mcp/tool-metadata.ts` 的 `TOOL_COUNT`，由 `src/novel-v2/__tests__/mcp-tool-face-single-source.test.ts` 校验本文件与 spec 声明一致）。阶段/工具映射的细则在 novel-mcp-orchestration，本文件只写决策规则；改工具面后两处都要跟上。
 
 ## 定位与加载顺序
 
