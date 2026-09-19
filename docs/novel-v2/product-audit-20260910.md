@@ -356,7 +356,7 @@
 
 | 项 | 实现 | 验证与实测 | 遗留（含前置条件） |
 | --- | --- | --- | --- |
-| E5 token 口径单源 | 7 处实现 / 3 条口径收敛为 1 个估算器 + 3 条具名口径（`token-estimate.ts`）；`selectionReceipts[].tokenCost` 双写者同式 | 逐口径数值等价测试（中/英/混排）+ 接线锁；重标定 attempt 被 426 行实测否证——口径与 `computeTokenBudget` 共标定，换口径即作废这轮标定 | **按实测偏差重标预算常数未做**：前置=新部署后积累的双口径样本（仪表 `estimatedInputTokensAuditBasis` 已落在指纹之外，740ea63） |
+| E5 token 口径单源 | 7 处实现 / 3 条口径收敛为 1 个估算器 + 3 条具名口径（`token-estimate.ts`）；`selectionReceipts[].tokenCost` 双写者同式 | 逐口径数值等价测试（中/英/混排）+ 接线锁；重标定 attempt 被 426 行实测否证——口径与 `computeTokenBudget` 共标定，换口径即作废这轮标定；2026-09-19 换走"存量 provider 上报"这条路再核，全量按 purpose×model 判否（可测样本 93% 是不消费预算常数的 embed；消费常数的文本 purpose 可测率 0.2%–40%；rerank 偏差属请求形状而非乘性系数，详见 workflow-map §4 E5） | **按实测偏差重标预算常数＝数据前置未满足，非分析未做**：不动任何常数；需新部署后 `estimatedInputTokensAuditBasis` 双口径样本 + 文本 purpose 可测上报一同积累（仪表已落在指纹之外，740ea63） |
 | run 状态词表与写入守卫 | `run-lifecycle.ts` 单源词表 + 三分类派生 SQL；人工门→running 加门态守卫（43d6940）；终态吸收拒写集 + `transition-refused` 留痕 | 取证替代猜测：513 run / 3,725 事件 → 12 条迁移边；`manual-review-required→running` 354 次＝守卫踩在热路径；终态→running 历史零观测 | **完整合法转移表判定为不做**（未观测状态零历史，正集=禁止首用，写失败只退化成静默 no-op） |
 | 092 主链路索引 | 四条 `(project_id,workflow_type,created_at)`/`(project_id,updated_at)`/`(status,updated_at)`/`artifacts(project_id)` | 只读 `EXPLAIN` 六热形状原为全表扫；索引存在 + `indisvalid` + 重复 migrate 幂等 + 迁移文本守卫（注释剥离后判） | 运行库由下一次正常 `migrate()` 应用；payload 表达式索引/outbox 谓词/status partial 三项刻意不建（判据已写进头注释） |
 | 仓储拆分与接口 | 13 条具名能力 + 结构 `QueryClient` + 3 个物理 slice（workflow_runs / model_tasks / telemetry），同签名委托 + lazy getter | 度量决定边界：写集并查集闭包 + 协作者计数；能力/接线锁与不变量测试齐备；268 个调用点零改动 | 剩余是**设计改造而非搬运**：`pool` 受控查询入口、多步提交的事务边界——无缺陷证据不动，且明令禁止"杂项片"式拆分（93ac6fb） |
