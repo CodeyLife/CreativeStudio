@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
-import { auditNamedReferences, auditStoryArcBatchRanges, canonicalReferenceId, findEmbeddedInternalIdentifiers, normalizeThreadResponsibilityReferences, parseExplicitNewReference, planThreadForeshadowingBindings, resolveNamedReference, sanitizeReferenceToken } from "../application/story-arc-integrity";
+import { auditEmotionalContractCarriage, auditNamedReferences, auditStoryArcBatchRanges, canonicalReferenceId, EMOTIONAL_CONTRACT_CARRIER_FUNCTIONS, findEmbeddedInternalIdentifiers, normalizeThreadResponsibilityReferences, parseExplicitNewReference, planThreadForeshadowingBindings, resolveNamedReference, sanitizeReferenceToken } from "../application/story-arc-integrity";
 import { parseStoryArcBundle, parseStoryArcPlan, parseStoryArcPlotOutline, resolveArcPhase } from "../application/story-arc";
 import { renderStoryArcPlotOutline, storyArcBundleSchema } from "../prompts/story-arc";
 import { TOOL_DEFINITIONS } from "../mcp/tool-definitions";
@@ -481,6 +481,36 @@ describe("story arc reference normalization integration (PL-2)", () => {
     await resetBindings();
   });
 
+  it("health 消费面：声明情感契约而整弧无承载章时报警，补一章 payoff 即消（D5）", async () => {
+    if (!available || !repository) return;
+    // 载荷形态照运行库实形：契约字段在 structuredData 下（foundation 契约校验的位置），
+    // 简报投影另有一份；顶层没有。曾按顶层键取值 ⇒ 真实项目上 declared 恒 false，
+    // 判据静默空转，而同形自造夹具的测试照样绿——夹具照实现写不照库写，就是这个坑。
+    const sectionPayload = { creativeBrief: { emotionalContract: "让读者在每一次退让里看见他没退的那部分" }, structuredData: { emotionalContract: "让读者看见他没退的那部分" } };
+    await repository.pool.query(
+      "INSERT INTO project_plan_sections(project_id,task_key,status,payload) VALUES($1,'project-positioning','approved',$2)",
+      [projectId, sectionPayload],
+    );
+    const chapterIds = [`ch-emc-a-${randomUUID().slice(0, 8)}`, `ch-emc-b-${randomUUID().slice(0, 8)}`];
+    const functions = ["development", "confrontation"];
+    for (const [index, id] of chapterIds.entries()) {
+      await repository.pool.query(
+        "INSERT INTO chapters(id,arc_id,project_id,title,ordinal,status,payload) VALUES($1,$2,$3,$4,$5,'planned',$6)",
+        [id, arcId, projectId, `契约核对章 ${index + 1}`, 900 + index, { narrativeFunction: functions[index] }],
+      );
+    }
+    try {
+      const carrierMissing = async () => (await repository!.getArchitectureHealth(projectId)).issues
+        .some((issue: { code: string; reference?: string }) => issue.code === "emotional-carrier-missing" && issue.reference === arcId);
+      expect(await carrierMissing()).toBe(true);
+      await repository.pool.query(`UPDATE chapters SET payload=jsonb_set(payload,'{narrativeFunction}','"payoff"') WHERE id=$1`, [chapterIds[1]]);
+      expect(await carrierMissing()).toBe(false);
+    } finally {
+      await repository.pool.query("DELETE FROM chapters WHERE id = ANY($1::text[])", [chapterIds]);
+      await repository.pool.query("DELETE FROM project_plan_sections WHERE project_id=$1 AND task_key='project-positioning'", [projectId]);
+    }
+  });
+
   it("flags thread titles carrying embedded machine identifiers so health stops blessing shadows", async () => {
     if (!available || !repository) return;
     await repository.pool.query(
@@ -806,6 +836,46 @@ describe("PL-6 连载健康度与阶段绑定", () => {
     expect(parsed.phases[0]).toMatchObject({ title: "起", chapterOrdinals: [1, 2] });
     expect(parsed.phases[1]?.chapterOrdinals).toBeUndefined();
     expect(parsed.phases[2]?.chapterOrdinals).toBeUndefined();
+  });
+});
+
+describe("情感契约承载核对（D5，Batch 5）", () => {
+  const arc = (chapters: Array<{ ordinal: number; narrativeFunction?: string }>) => [{ id: "arc-1", ordinal: 3, chapters }];
+
+  it("声明了契约但整弧无 payoff/aftermath 章 → warning；有承载章或未声明则不报", () => {
+    const escalated = auditEmotionalContractCarriage({
+      emotionalContractDeclared: true,
+      arcs: arc([{ ordinal: 21, narrativeFunction: "development" }, { ordinal: 22, narrativeFunction: "confrontation" }]),
+    });
+    expect(escalated).toHaveLength(1);
+    expect(escalated[0]).toMatchObject({ code: "emotional-carrier-missing", severity: "warning", reference: "arc-1" });
+    expect(escalated[0]!.message).toContain("第 3 弧");
+
+    expect(auditEmotionalContractCarriage({
+      emotionalContractDeclared: true,
+      arcs: arc([{ ordinal: 21, narrativeFunction: "development" }, { ordinal: 22, narrativeFunction: "payoff" }]),
+    })).toEqual([]);
+    expect(auditEmotionalContractCarriage({
+      emotionalContractDeclared: true,
+      arcs: arc([{ ordinal: 21, narrativeFunction: "aftermath" }]),
+    })).toEqual([]);
+    // 不发明要求：未声明契约、作者显式不适用（declared 由调用方按 notApplicable 折成 false）、
+    // 弧尚未投影章节，三种输入一律不报。
+    expect(auditEmotionalContractCarriage({ emotionalContractDeclared: false, arcs: arc([{ ordinal: 21, narrativeFunction: "setup" }]) })).toEqual([]);
+    expect(auditEmotionalContractCarriage({ emotionalContractDeclared: true, arcs: arc([]) })).toEqual([]);
+    // 章功能缺失（旧蓝图未填该字段）按"未指定"参与判定，不误判为已承载。
+    const unspecified = auditEmotionalContractCarriage({ emotionalContractDeclared: true, arcs: arc([{ ordinal: 21 }]) });
+    expect(unspecified).toHaveLength(1);
+    expect(unspecified[0]!.message).toContain("未指定");
+  });
+
+  it("接线锁：承载判据用的章功能必须是规范枚举成员，且规范枚举新增不得自动成为承载章", async () => {
+    const { CHAPTER_NARRATIVE_FUNCTIONS } = await import("../application/story-arc");
+    for (const fn of EMOTIONAL_CONTRACT_CARRIER_FUNCTIONS) {
+      expect(CHAPTER_NARRATIVE_FUNCTIONS).toContain(fn);
+    }
+    // 承载集合是显式选择（交付/承接两类），不是"全部非过渡章"的兜底：
+    expect(EMOTIONAL_CONTRACT_CARRIER_FUNCTIONS.length).toBeLessThan(CHAPTER_NARRATIVE_FUNCTIONS.length);
   });
 });
 

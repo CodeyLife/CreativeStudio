@@ -70,7 +70,7 @@ import type { ObjectStoreAdapter } from "./object-store";
 import { countNovelCharacters } from "./word-count";
 import type { ObjectStoreIdentity } from "./object-store";
 import { normalizeManuscriptStructuralReview } from "./application/manuscript-structure";
-import { arcCompletionPredicateSql, auditNamedReferences, auditStoryArcBatchRanges, canonicalReferenceId, findEmbeddedInternalIdentifiers, normalizeThreadResponsibilityReferences, parseExplicitNewReference, planThreadForeshadowingBindings, resolveNamedReference, sanitizeReferenceToken, type NamedReferenceCandidate, type StoryArcIntegrityIssue } from "./application/story-arc-integrity";
+import { arcCompletionPredicateSql, auditEmotionalContractCarriage, auditNamedReferences, auditStoryArcBatchRanges, canonicalReferenceId, findEmbeddedInternalIdentifiers, normalizeThreadResponsibilityReferences, parseExplicitNewReference, planThreadForeshadowingBindings, resolveNamedReference, sanitizeReferenceToken, type NamedReferenceCandidate, type StoryArcIntegrityIssue } from "./application/story-arc-integrity";
 import { auditFullBookArchitecture } from "./application/full-book-architecture";
 import { CHAPTER_NARRATIVE_FUNCTIONS, canGenerateNextStoryArcBatch, inspectStoryArcEnsemble, MAX_STORY_ARC_BATCH_WINDOW, normalizeChapterPlanningContext, parseStoryArcBundle, parseStoryArcPlan, planningContextFingerprint, resolveArcPhase, validateStoryArcPlanContracts, type ArcPlanningStatus, type ChapterBlueprint, type ChapterBlueprintRecord, type ChapterPlanningContext, type ChapterSceneBlueprint, type NarrativeArcPlan, type StoryArcBatchRecord, type StoryArcBundle, type StoryArcContextReceipt, type StoryArcPlotOutline, type StoryArcRebaseTarget, type StoryArcRecord } from "./application/story-arc";
 import type { StoryArcReviewOutput } from "./prompts/story-arc";
@@ -3130,8 +3130,8 @@ export class NovelPostgresRepository {
       this.pool.query<{ task_key: string; status: ProjectPlanStatus; payload: Record<string, unknown> }>("SELECT task_key,status,payload FROM project_plan_sections WHERE project_id=$1 ORDER BY task_key", [projectId]),
       this.pool.query<{ id: string; ordinal: string | number; planning_status: StoryArcRecord["planningStatus"]; execution_status: StoryArcRecord["executionStatus"]; payload: NarrativeArcPlan; approved_at: Date | null; completed_at: Date | null }>("SELECT id,ordinal,planning_status,execution_status,payload,approved_at,completed_at FROM arcs WHERE project_id=$1 ORDER BY ordinal", [projectId]),
       this.pool.query<StoryArcBatchRow>("SELECT * FROM story_arc_batches WHERE project_id=$1 ORDER BY arc_id,batch_index", [projectId]),
-      this.pool.query<{ arc_id: string | null; ordinal: string | number; batch_id: string | null; batch_index: string | number | null; document_id: string | null; document_status: string | null; current_revision_id: string | null }>(
-        `SELECT c.arc_id,c.ordinal,c.batch_id,c.batch_index,c.document_id,d.status AS document_status,d.current_revision_id
+      this.pool.query<{ arc_id: string | null; ordinal: string | number; batch_id: string | null; batch_index: string | number | null; document_id: string | null; document_status: string | null; current_revision_id: string | null; narrative_function: string | null }>(
+        `SELECT c.arc_id,c.ordinal,c.batch_id,c.batch_index,c.document_id,d.status AS document_status,d.current_revision_id,c.payload->>'narrativeFunction' AS narrative_function
          FROM chapters c LEFT JOIN manuscript_documents d ON d.id=c.document_id AND d.project_id=c.project_id
          WHERE c.project_id=$1 ORDER BY c.ordinal`,
         [projectId],
@@ -3308,6 +3308,28 @@ export class NovelPostgresRepository {
       const bound = new Set(phases.flatMap((phase: { chapterOrdinals?: number[] }) => phase.chapterOrdinals ?? []));
       return bound.size === 0;
     }).map((arc) => ({ code: "phase-binding-missing" as const, severity: "warning" as const, reference: arc.id, message: `弧 ${arc.id} 有 ${Array.isArray(arc.payload?.phases) ? arc.payload.phases.length : 0} 个阶段但均未绑定 chapterOrdinals：章节所属阶段不可判定（等分推算已删除），需 rebase 或作者回写绑定` }));
+    // D5 情感契约承载核对（product-audit-20260910 Batch 5）：整书声明了情绪回报契约，
+    // 却没有任何一章按章功能被指派交付它＝口号账。判据只用既有规划事实（章节蓝图的
+    // narrativeFunction 投影），不新增可由模型随口填写的字段；作者的 notApplicable
+    // 是合法退出而非漏写，不报。
+    // 取值只认 `structuredData.emotionalContract`——那是 foundation 契约校验的字段位置
+    //（foundation-contract.ts 的 section schema 与 validateNotApplicableAnnotation 都读这里）。
+    // 运行库实测：同一份 payload 里该值还出现在 `creativeBrief.emotionalContract`（简报投影），
+    // 顶层则没有；曾按顶层键取值得到 declared=false，判据在真实项目上静默空转，
+    // 而自造同形夹具的测试照样全绿——夹具必须照库内实形写，不能照实现的假设写。
+    const positioningSection = sections.rows.find((section) => section.task_key === "project-positioning");
+    const emotionalContractValue = (positioningSection?.payload?.structuredData as Record<string, unknown> | undefined)?.emotionalContract;
+    const emotionalContractDeclared = typeof emotionalContractValue === "string"
+      ? emotionalContractValue.trim().length > 0
+      : Boolean(emotionalContractValue && typeof emotionalContractValue === "object" && (emotionalContractValue as Record<string, unknown>).notApplicable !== true);
+    const emotionalCarrierIssues = auditEmotionalContractCarriage({
+      emotionalContractDeclared,
+      arcs: arcs.rows.map((arc) => ({
+        id: arc.id,
+        ordinal: Number(arc.ordinal),
+        chapters: chapters.rows.filter((chapter) => chapter.arc_id === arc.id).map((chapter) => ({ ordinal: Number(chapter.ordinal), narrativeFunction: chapter.narrative_function ?? undefined })),
+      })),
+    });
     const issues: StoryArcIntegrityIssue[] = [
       ...hygieneIssues,
       ...completionIssues,
@@ -3315,6 +3337,7 @@ export class NovelPostgresRepository {
       ...contractIssues,
       ...serializationIssues,
       ...phaseBindingIssues,
+      ...emotionalCarrierIssues,
       ...batchReports.flatMap((report) => report.issues.map((issue) => ({ ...issue, message: `${report.arcId}: ${issue.message}` }))),
       ...referenceReports.flatMap((report) => [
         ...report.plotThreads.issues.map((issue) => ({ ...issue, message: `${report.arcId}: 剧情线${issue.message}` })),

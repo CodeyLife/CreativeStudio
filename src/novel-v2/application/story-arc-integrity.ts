@@ -10,7 +10,7 @@ import { createHash } from "node:crypto";
 export type StoryArcIntegritySeverity = "blocking" | "warning";
 
 export interface StoryArcIntegrityIssue {
-  code: "invalid-range" | "duplicate-batch" | "overlapping-batch" | "unknown-reference" | "ambiguous-reference" | "embedded-identifier" | "completion-count-mismatch" | "ledger-inconsistency" | "foreshadowing-duplicate" | "foreshadowing-arc-orphan" | "stale-foundation-contract" | "serialization-gap" | "arc-planning-failures" | "phase-binding-missing";
+  code: "invalid-range" | "duplicate-batch" | "overlapping-batch" | "unknown-reference" | "ambiguous-reference" | "embedded-identifier" | "completion-count-mismatch" | "ledger-inconsistency" | "foreshadowing-duplicate" | "foreshadowing-arc-orphan" | "stale-foundation-contract" | "serialization-gap" | "arc-planning-failures" | "phase-binding-missing" | "emotional-carrier-missing";
   severity: StoryArcIntegritySeverity;
   message: string;
   batchIndex?: number;
@@ -228,6 +228,43 @@ export function planThreadForeshadowingBindings(input: {
     byThread.set(threadId, [...(byThread.get(threadId) ?? []), foreshadowingId]);
   }
   return { bindings: [...byThread].map(([threadId, foreshadowingIds]) => ({ threadId, foreshadowingIds })), violations, ambiguous: ambiguous.sort() };
+}
+
+/**
+ * 情感契约的承载章判据（D5，product-audit-20260910 §四 Batch 5）。
+ *
+ * 根因：`positioning.emotionalContract` 只作为常驻提示行进入每章 prompt（"情感契约：…"），
+ * 系统在弧尺度上从不核对"有没有哪一章被指派交付它"——契约可以是全书无人兑现的口号。
+ * 章节蓝图的 `narrativeFunction` 本身就已经是一次指派（规划期定下的章功能），缺的只是
+ * "指派结果被核对"这一步，所以这里**不新增任何可由模型随口填写的字段**，只对既有规划
+ * 事实做确定性判定。
+ *
+ * 承载章 = narrativeFunction ∈ {payoff, aftermath}（交付回报与承接后果的章功能；推进、
+ * 铺垫、发现（discovery）等章功能同样合法，但不构成兑现）。刻意不检查的三种输入：整书未声明
+ * 情感契约、作者显式 `notApplicable`（那是合法退出，不是漏写）、弧还没有投影章节
+ * （未开写不是违约）。判据只报 warning：承载与否是创作判断，硬门会把安静弧判死。
+ */
+export const EMOTIONAL_CONTRACT_CARRIER_FUNCTIONS = ["payoff", "aftermath"] as const;
+
+export function auditEmotionalContractCarriage(input: {
+  emotionalContractDeclared: boolean;
+  arcs: Array<{ id: string; ordinal: number; chapters: Array<{ ordinal: number; narrativeFunction?: string }> }>;
+}): StoryArcIntegrityIssue[] {
+  if (!input.emotionalContractDeclared) return [];
+  const carriers: readonly string[] = EMOTIONAL_CONTRACT_CARRIER_FUNCTIONS;
+  const issues: StoryArcIntegrityIssue[] = [];
+  for (const arc of input.arcs) {
+    if (!arc.chapters.length) continue;
+    if (arc.chapters.some((chapter) => carriers.includes(chapter.narrativeFunction ?? ""))) continue;
+    const functions = [...new Set(arc.chapters.map((chapter) => chapter.narrativeFunction || "未指定"))].sort().join("、");
+    issues.push({
+      code: "emotional-carrier-missing",
+      severity: "warning",
+      reference: arc.id,
+      message: `情感契约在第 ${arc.ordinal} 弧无承载章：该弧 ${arc.chapters.length} 章的章功能为 ${functions}，没有 payoff/aftermath 章——读者被承诺的情绪回报在本弧没有任何一章被指派交付（安静弧合法，但需在弧审核意见里说明回报以何种形式兑现）`,
+    });
+  }
+  return issues;
 }
 
 export function canonicalReferenceId(kind: "thread" | "foreshadowing", projectId: string, input: string): string {
