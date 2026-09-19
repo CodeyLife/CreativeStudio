@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { NovelPostgresRepository } from "../postgres-repository";
+import { serialContextFingerprint } from "../application/serial-context-fingerprint";
 import type { ChapterMemory } from "../protocol";
 
 const EXPLICIT_TEST_DB_URL = process.env.TEST_DATABASE_URL;
@@ -106,6 +107,17 @@ describe("serial context snapshot (L1)", () => {
     const span = serial!.characterSpans.find((item) => item.characterId === "陈渊");
     expect(span?.states.length).toBeGreaterThanOrEqual(2);
     expect(span?.states.map((state) => state.narrativeOrder)).toContain(8);
+  });
+
+  it("repository 侧指纹由共享算式产出，且资产账本如实留给上层回填", async () => {
+    if (!available) return;
+    const serial = await repository.getSerialContextSnapshot(projectId, "serial-doc-12", 12, 6);
+    expect(serial).toBeDefined();
+    // 两侧必须共用 serialContextFingerprint：任何一侧私自改算式即红
+    // （修复前 repository 内联一份 canonicalSha256，上层回填账本后指纹无人重算）。
+    expect(serial!.fingerprint).toBe(serialContextFingerprint(serial!));
+    // repository 无对象存储访问权 ⇒ 它给的账本恒为空，非空只能来自上层回填（见 producer 测试）。
+    expect(serial!.assetSpans).toEqual([]);
   });
 
   it("detects subject spans from active memory claims", async () => {

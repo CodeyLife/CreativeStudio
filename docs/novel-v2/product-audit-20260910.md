@@ -200,7 +200,7 @@
 19. 审校面新增三维度（依赖 Batch 1 供给修复后才有弹药）：条款/物品/回述一致性 diff、章尾类型强制枚举、喻体词域结构判定（D1/D2/D3/D5/D6）。
     **验收**：死路由墙钟归零；守卫触发可查询；外部链路首次真实 claim→heartbeat→submit 演练；新审校维度在异构题材反例上双向测试（prose 报告§五的 10 项抽查清单为验收用例）。
     **09-19 逐维核对（照代码实形，不照本文记忆）**：
-    - 物品账 ✅ `asset-ledger.ts` 确定性扫描 → `serialContext.assetSpans` → draft/review/revision 四处 prompt（`chapter-planning-context.ts:58` 对照指令）。
+    - 物品账 ✅ 但**曾断链**：`asset-ledger.ts` 确定性扫描 → `serialContext.assetSpans` → `chapter-planning-context.ts:57` 对照指令（渲染点四处都在）。09-19 复核推翻本行原判：扫描当时只挂在审校路径，repository 侧 `assetSpans` 恒为 `[]` ⇒ draft/revision 两面实际拿不到账本，旧测试手工构造 `assetSpans` 掩盖了断链；已把回填下沉到共享装载层并按共用算式重算指纹（见 workflow-map「可数资产数量账本」段与 `serial-context-asset-producer.test.ts`）。
     - 章尾 ✅ 但**形态已改**：未按原议做"强制枚举"，而是 09-18 校准出的确定性观察（`manuscript-structure.ts:367` 近窗末句短促断句占比 + `ENDING_RITUAL_POLICY`）与文风契约维度 `closureRhythm`；prose reviewer 明示"不用章尾形式判定"（避免把形式当质量）。原议作废，按实形记账。
     - 比喻 ✅ 密度维度存在（`style-contract` 的 `metaphorDensity`、`measureVariety`）；**喻体词域结构判定：确定性路线已被实测否证，本项不做机械机制**。09-19 试过"比较虚词抽喻体 + 跨章字面重复登记"的只读诊断（与回述对照同一形态），在本项目 21 章真实导出正文上实测：喻体抽取本身可用（第 6/12/20 章各抽出 8 个左右，如"灌了铅""口井被彻底抽干后""烟雾一样消散"），但**近窗 12 章内字面同一喻体的跨章回声为 0**（窗口内不同喻体 99–193 个，几乎不重复）。也就是说这个本子的疲劳问题从来不是"同一个喻体说了三遍"，而是**域级重复**（水/刀/光/账一类的意象域反复登场）——域归类是语义判断，机械层要么建词表硬门（违背泛化红线，且把作者有意的意象系统一并报成缺陷）要么不设阈值只报计数（=一个永远为空的报告）。故按"不为没信号的指标建机制"停手，代码未落地，判据归属审校者与外部编排（现有 `metaphorDensity` 维度与 prose reviewer 的"跨章重复命名"指令是唯一入口）。若将来要做，正确形态是给外部模型的**喻体清单**（各章抽出后交它归域），不是新的数值门。
     - 条款一致性 ✅ 走 Batch 1 的账本单源 + `openPromises` 建立章对照（引用不得早于建立章）；独立"条款互斥 diff"未做，其根因（账本被删改后喂错）已由 A1/E1 消除。
@@ -219,7 +219,7 @@
 | 907§五.2 弧 3 承接 resolution 缺口 | ✅ 已兑现（ch16–19 闭环）；但暴露真根因=PL-1 弧 2 提前 completed（本轮新证） | batch/代码实查 |
 | 907§五.4 伏笔账本卫生 | 部分：重复簇 16→1（残留簇修复面结构性看不见，见下"2026-09-19 复测"，本轮收口）；"超期 31→244"不成立为债务——09-18 P1 已把该字段语义改为中性事实"窗口上界已过"（238/244 仍在正文推进）；thread_id 0/717 未变，但根因已定位并收口（判据惰性→改线程显式认领，新弧起生效；存量 437 条仍需语义分流） | getArchitectureHealth 实跑 + 代码逐条 |
 | 907§五.5 学习闭环沉淀（两候选） | ❌ 排队现状不变（09-19 实测 proposed 23 / rejected 18 / promoted 1、promotion_receipts 1）→ 工程侧无可推进部分，promote 是作者裁决 | ledger-debt 只读实测 |
-| 908 六 Seam 问题 6 条 | 机制面已闭合（09-19 核对）：D2 要求的物品账已落地为 `asset-ledger.ts` 确定性扫描 + `serialContext.assetSpans` 投影进 draft/review/revision 对照指令，并有独立单测与降级路径；正文面三条（星屑砂容器、ch11 装置、ch5→6 战利品）属作者/编排会话的正文修订面，本审计不代改正文。**如实登记的取证边界**：该投影不入库（`serialContext` 无持久化列）、正文与 prompt 正文在对象存储，故"产线上是否真的触发过资产对照"无法从 SQL 面证明——状态记为"已接线、产线触发未证" | 代码与测试逐条 + 226 行 planning contexts 键检索（0 命中＝不入库，非未生效） |
+| 908 六 Seam 问题 6 条 | 机制面已闭合（09-19 核对，物品账一条当日复核后改判）：D2 要求的物品账落地为 `asset-ledger.ts` 确定性扫描 + `serialContext.assetSpans` 对照指令并有降级路径，但**扫描当时只挂审校路径**（draft/revision 拿空账本，单测手工构造账本故照绿）——同日下沉为共享装载层唯一生产者并重算指纹，见 §四 19 物品账行与 workflow-map 同段；正文面三条（星屑砂容器、ch11 装置、ch5→6 战利品）属作者/编排会话的正文修订面，本审计不代改正文。**如实登记的取证边界**：该投影不入库（`serialContext` 无持久化列）、正文与 prompt 正文在对象存储，故"产线上是否真的触发过资产对照"无法从 SQL 面证明——状态记为"已接线、产线触发未证" | 代码与测试逐条 + 226 行 planning contexts 键检索（0 命中＝不入库，非未生效） |
 | 9/9 治理 §8 六项 | 09-19 复测后：4 项成立、2 项改判。① "退役只管一径"——Foundation 投影按可见集口径实测剩 5 行（每面 1 行、56 行经 supersedes 退役），不再成立；② "方案A 仍 23 条漏出"——09-09 之后新增的认知类 active 声明 1,035 条**全部**带非空 `knowledge_scope`（即全部出自 enrichment 单源），零漏出，不再成立；③ "配额未获生产检验"改判为**缺陷并已修**：400 份真实 manifest 里 `identity-slot-quota` 计数 0，而同槽位（主角"知晓"）检索可见声明 951 条、ranked-fill 回执 38,905 条——根因是 `searchMemory` 词法命中投影丢 `identity_hash`/`value_hash`（配额以 identityHash 为键），融合层又按先到轨保留字段使指纹存在与否取决于召回顺序；两处已修并各配真实读出路径回归（详见 workflow-map §4 勘误段）。④ 其余（身份归一、指纹统一、梳理通道）维持原结论 | getArchitectureHealth/memory_claims 实测 + 撤除反向对照 |
 | 9/9"Foundation 56→5 检索可见" | 09-19 复测：属实且**已完整**——库内按可见集口径 5 行（每面 1 行，56 行退役），消费面 600 份真实 manifest 扫描中 foundation 派生段每份至多 1 条（多例 0 次），旧的"bundle/preflight 仍带 20–29 条 stale"已由 A2（段级单例 id + `repairFoundationClaimSingletons` 幂等回填）收口 | 只读实测：memory_claims 可见集 + prompt_executions.context_manifest 逐份计数 |
 
@@ -374,3 +374,11 @@
 | §四 19 审校维度逐维核对 | 先核实现形再动手：物品/条款/章尾/比喻密度四项**已存在**（章尾已改为确定性观察而非原议强制枚举）；本轮补上回述一致性诊断 `recall-anchors.ts` + MCP `novel_chapter_recall_report`（工具面 49→50，`mcp-tool-face-single-source.test.ts` 强制代码/注册表/两份 spec/三份 skill 五面同批） | 纯函数双向测试 5 例（含现代口语泛化反例、逐字复述保留、零相似不输出、体量上限）；全量真库 126 files / 1156 tests 绿 | **喻体词域结构判定：确定性路线实测否证，不建机制**（21 章真实正文：喻体抽取可用但近窗字面跨章回声为 0，真正的重复是域级＝语义判断；建词表硬门违泛化红线、只报计数则是永空报告）→ 判据留给 `metaphorDensity` 维度与 reviewer 指令，未来正确形态是"喻体清单交外部模型归域"；回述对照注入生成链路属可延后第二步（接线点与代价已记 §四 19） |
 
 **本轮不做的事（避免把迭代写成搬运）**：不删任何代码（死导出/依赖去留属破坏性动作，待作者批准）；不向 `ymcp` 写业务数据或 DDL（只读取证；schema 回填由应用自己的 `migrate()` 完成）；不为凑绿而新增杂项切片、case-specific 规则或自动晋升；不改正文（正文 seam 属作者/编排会话的修订面）。**本条的自纠（2026-09-19）**：`skills check`/`explain` 经核实并非只读——它们调 `migrate()`，而 migrate 尾会回写技能 seed，故修 SK-4 过程中由该路径向 `ymcp` 的 `skill_definitions` 落了一次内容变更（无业务数据、无 DDL，见上表"skills check 自毁守卫"行）。该命令的写入面已摘除，"只读取证"这条约束自此对 skills CLI 成立；先前以 check 输出作为"库码对齐"证据的地方已就地标注作废。
+
+## 九、复核轮台账（2026-09-19 续：审核未提交改动 → 新发现的机制断链）
+
+§八 收口后再做一轮"照代码实形"复核（两条来源：未提交内容审核 + 主动找 inert 机制）。本轮每一条都要求：症状可指认、判据在最低共享层、双向测试、撤除反向对照实测、spec 同步，并显式记部署代价（是否给在飞外部任务换幂等键）。
+
+| 项 | 症状与根因 | 修法 | 验证与代价 |
+| --- | --- | --- | --- |
+| F1 资产账本断链 | `assetSpans` 扫描只挂 `retrieveMemoryForReview`，repository 恒返回 `[]` ⇒ draft/revision 两面渲染点在场但账本为空；回填后无人重算指纹 ⇒ bundle 指纹漏记账本（"输入指纹一致才交付"这条不变式被架空）。旧单测手工构造 `assetSpans`，属自形夹具，断链期间照绿 | 扫描下沉为 `loadSerialContext` 固有步骤（四面同一生产者）；指纹算式抽成 `application/serial-context-fingerprint.ts` 两侧同调，回填后按新内容重算；无资产/取文失败时逐字节保持原指纹 | `serial-context-asset-producer.test.ts` 五向 + `serial-context-db.test.ts` 锁两侧同算式与"repository 交空账本"契约；撤除回填实测判红。**代价**：有资产漂移信号的项目其 draft/revision prompt 文本变化⇒在飞写作类外部任务部署时换幂等键；无信号项目指纹不变 |

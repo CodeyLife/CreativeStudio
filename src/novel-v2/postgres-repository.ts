@@ -8,6 +8,7 @@ import { CLAIM_PROJECTION_SET_SQL, retrievalVisibleClaimsSql, retiredByVisibleKi
 import { ACTIVE_WORKFLOW_RUN_STATUSES_SQL, WAITING_EXTERNAL_WORKFLOW_RUN_STATUS_SQL, type WorkflowRunStatus } from "./run-lifecycle";
 import { normalizeFoundationStructuredDataFlat, validateFoundationTaskContract } from "./application/foundation-contract";
 import { foundationContractFingerprint } from "./application/foundation-contract-fingerprint";
+import { serialContextFingerprint } from "./application/serial-context-fingerprint";
 import { assertCompleteChapterReviewEvidence } from "./application/chapter-approval";
 import { ChapterStateRebuildConflictError } from "./application/chapter-state-rebuild-conflict";
 import {
@@ -4815,9 +4816,10 @@ export class NovelPostgresRepository {
       functionRuns,
       subjectSpans,
       openPromises,
-      // assetSpans 由 activities 层按窗口正文做确定性扫描后回填（repository 无 object store 访问权）。
+      // assetSpans 由 activities 层按窗口正文做确定性扫描后回填并**重算指纹**
+      // （repository 无 object store 访问权）。两侧共用 serialContextFingerprint 算式。
       assetSpans: [],
-      fingerprint: canonicalSha256({ window, chapters: windowChapters, characterSpans, functionRuns, subjectSpans, openPromises, assetSpans: [] }),
+      fingerprint: serialContextFingerprint({ window, chapters: windowChapters, characterSpans, functionRuns, subjectSpans, openPromises, assetSpans: [] }),
     };
   }
 

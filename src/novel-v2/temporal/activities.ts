@@ -4,6 +4,7 @@ import type { Artifact, ChapterChangeScope, ContextManifest, CreativeReview, Cre
 import { buildContextManifest, buildMemoryBundle, compileExecutionBlueprint, computeTokenBudget, createPreflightPlan, isMemoryClaimVisibleAtCutoff, matchedFacetsOf } from "../cognition";
 import { canonicalSha256 } from "../canonical-json";
 import { extractAssetMentions, groupAssetSpans, type AssetMention } from "../asset-ledger";
+import { serialContextFingerprint } from "../application/serial-context-fingerprint";
 import { NovelPostgresRepository } from "../postgres-repository";
 import type { WorkflowRunStatus } from "../run-lifecycle";
 import { estimateBudgetTokens } from "../token-estimate";
@@ -298,13 +299,40 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       return undefined;
     }
   };
+  /**
+   * 跨章序列证据装载（draft/review/revision/learning 四面的**唯一**生产者）。
+   *
+   * 资产数量账本在这里回填：repository 取不到正文（无对象存储访问权），而回填若
+   * 只挂在审校路径上，正文与修订侧的对照指令就永远拿到空账本（2026-09-19 实测的
+   * 断链）。回填后必须重算指纹——prompt 渲染的是新内容，指纹不得停在旧内容。
+   * 失败一律降级为"无资产对照"，不阻塞装载。
+   */
   const loadSerialContext = async (projectId: string, documentId: string, narrativeCutoff: number) => {
     if (typeof deps.repository.getSerialContextSnapshot !== "function") return undefined;
+    let snapshot;
     try {
-      return await deps.repository.getSerialContextSnapshot(projectId, documentId, narrativeCutoff);
+      snapshot = await deps.repository.getSerialContextSnapshot(projectId, documentId, narrativeCutoff);
     } catch (error) {
       console.warn(`[serial-context] 跨章序列证据快照加载失败，继续使用既有记忆：${(error as Error).message}`);
       return undefined;
+    }
+    if (!snapshot || snapshot.assetSpans.length) return snapshot;
+    try {
+      const orders = snapshot.chapters.map((chapter) => chapter.narrativeOrder);
+      const refs = await deps.repository.getChapterContentRefsByOrders(projectId, orders);
+      const perChapter: Array<{ narrativeOrder: number; mentions: AssetMention[] }> = [];
+      for (const ref of refs) {
+        try {
+          perChapter.push({ narrativeOrder: ref.narrativeOrder, mentions: extractAssetMentions(await objects.getText(ref.objectKey)) });
+        } catch { /* 单章正文不可得时跳过该章，账本如实只含可得章 */ }
+      }
+      const assetSpans = groupAssetSpans(perChapter);
+      if (!assetSpans.length) return snapshot;
+      const withAssets = { ...snapshot, assetSpans };
+      return { ...withAssets, fingerprint: serialContextFingerprint(withAssets) };
+    } catch (error) {
+      console.warn(`[asset-ledger] 资产数量扫描失败，降级为无资产对照：${(error as Error).message}`);
+      return snapshot;
     }
   };
   // TODO P2: 修订 temperature 应可配置——当前 0.3 是创作多样性与指令遵循的折中值，
@@ -1356,23 +1384,6 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
             loadSerialContext(input.projectId, input.documentId, narrativeCutoff),
           ])
         : [undefined, undefined];
-      // 资产数量账本（确定性扫描）：对窗口各章正文提取「数字+量词+名词」提及，
-      // 同一实体 ≥2 章出现时生成漂移对照信号（见 asset-ledger.ts）。失败降级不阻塞审校。
-      if (serialContext && !serialContext.assetSpans?.length) {
-        try {
-          const orders = serialContext.chapters.map((chapter) => chapter.narrativeOrder);
-          const refs = await deps.repository.getChapterContentRefsByOrders(input.projectId, orders);
-          const perChapter: Array<{ narrativeOrder: number; mentions: AssetMention[] }> = [];
-          for (const ref of refs) {
-            try {
-              perChapter.push({ narrativeOrder: ref.narrativeOrder, mentions: extractAssetMentions(await objects.getText(ref.objectKey)) });
-            } catch { /* 单章正文不可得时跳过 */ }
-          }
-          serialContext.assetSpans = groupAssetSpans(perChapter);
-        } catch (error) {
-          console.warn(`[asset-ledger] 资产数量扫描失败，降级为无资产对照：${(error as Error).message}`);
-        }
-      }
       const latestBundle = await deps.repository.getLatestMemoryBundle(input.projectId);
       if (!latestBundle) {
         // 即使没有历史记忆，也持久化不可变空快照；按引用执行不能依赖只存在于 workflow 内存的对象。
