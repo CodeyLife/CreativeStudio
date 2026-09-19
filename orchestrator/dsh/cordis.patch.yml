@@ -1,0 +1,78 @@
+# dsh 创作编排项目级配置（llm provider 声明 + novel-v2 MCP 桥接）
+#
+# 本文件只负责「基础设施层」：声明可用 provider 路由 + MCP 插件，不钉默认模型。
+# 编排模型的选择放独立选择层 patches/model-*.patch.yml，叠加在后面（--patch 可
+# 重复，后者覆盖前者）：
+#   dsh --profile headless --patch orchestrator/dsh/cordis.patch.yml `
+#       --patch orchestrator/dsh/patches/model-gpt-relay.patch.yml "<任务>"
+# 不带 model patch 时回落 headless profile 的默认模型（deepseek-official）。
+# 也可用启动脚本（自动预检 + 后台运行 + 日志）：
+#   pwsh orchestrator/dsh/run-task.ps1 -Task "<任务>" [-Model gpt|glm]
+#
+# Web 常驻形态（推荐）已迁移到 $DSH_HOME 用户层，无需本文件：
+#   - MCP 桥接：$DSH_HOME/profiles/web/cordis.patch.yml（同步本文件 mcp-novel 段）
+#   - 编排模型 provider：$DSH_HOME/settings.yaml 的 llm-pi-ai.providers（GUI 选择器切换）
+#   本文件继续服务 headless 无人值守运行。
+#
+# 前置：
+#   1. novel-v2 MCP server 以 HTTP 模式运行：npm run novel:mcp:v2:http（默认端口 7654）
+#   2. 设置环境变量 GPT_RELAY_API_KEY（sub2api 中转密钥，同 config/model-providers.local.yaml 的 prof-f74824e9）
+#      备用路由 glm-relay 需 GLM_RELAY_API_KEY 且 stream-bridge 运行（见路由注释）
+#
+# 设计依据：docs/orchestrator/dsh-integration.md。
+# 安全契约：编排 agent 的所有落库动作必须走 MCP 工具（正式工作流与质量门），
+# 本配置不涉及文件系统/shell 工具授权，防止绕过质量门直改产物。
+
+# ---- 编排模型路由 ----
+# 主路由 gpt-relay：gpt-5.6-sol @ sub2api（流式 tool calling 实测稳定，直连无需桥接）。
+# 备用路由 glm-relay：glm-5.2 @ glm2 中转——其流式 tool calling 有 DSML 泄漏缺陷，
+# 必须经 stream-bridge（17890）降级为非流式；切回时 baseURL 用
+# http://127.0.0.1:17890/v1 并启动 node orchestrator/dsh/stream-bridge.mjs。
+- id: llm-pi-ai
+  config:
+    providers:
+      gpt-relay:
+        displayName: 我的中转站（创作编排）
+        apiKeyEnv: GPT_RELAY_API_KEY
+        api: openai-completions
+        baseURL: https://sub2api.yujin8.top/v1
+        # 该中转为 GPT web 逆向通道（resp_web_*），间歇性 502 故障窗口为分钟级；
+        # 默认 normal 重试（5 次/约 30s 窗口）扛不住，须 always 无限重试 + 30s 退避上限。
+        retryPolicy:
+          mode: always
+          backoff:
+            initialDelayMs: 2000
+            maxDelayMs: 30000
+            jitterRatio: 0.2
+        models:
+          - id: gpt-5.6-sol
+      glm-relay:
+        displayName: GLM 中转（创作编排备用）
+        apiKeyEnv: GLM_RELAY_API_KEY
+        api: openai-completions
+        baseURL: http://127.0.0.1:17890/v1
+        models:
+          - id: glm-5.2
+
+# ---- 默认模型：不在本文件钉死。----
+# 由选择层 patches/model-*.patch.yml 提供（agent-default-model 覆盖条目），
+# 换模型 = 换一个 patch 文件，无需改基础设施层。
+
+# ---- novel-v2 MCP 桥接：40 工具注册为 mcp__novel__<toolName> ----
+# 注意：新增插件必须用 insert 列表语法；顶层 id 定位条目只能覆盖 dsh-base 已有 row
+# （如上面 llm-pi-ai / agent-default-model），对不存在的 id 无效。
+- insert:
+    - id: mcp-novel
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: novel
+        transport: streamable-http
+        url: http://127.0.0.1:7654/mcp
+        # 单工具调用超时：novel-v2 部分工具触发 Temporal workflow（如章节生成、审校），
+        # 耗时可达数分钟，高于 dsh 默认 60s。
+        # TODO: 迁移到自定义插件后按工具分级设置（读类 60s / 触发生成类 600s）
+        toolCallTimeoutMs: 600000
+        failOnStartupError: false
+        reconnect:
+          enabled: true
+          maxAttempts: 10

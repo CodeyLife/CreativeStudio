@@ -1,0 +1,16 @@
+# 编排模型选择层：备用路由 glm-relay（glm-5.2，经 stream-bridge 降级流式）
+#
+# 用法（叠加在 cordis.patch.yml 之上，--patch 后者覆盖前者）：
+#   dsh --profile headless --patch orchestrator/dsh/cordis.patch.yml `
+#       --patch orchestrator/dsh/patches/model-glm-relay.patch.yml "<任务>"
+#
+# 前置（缺一不可）：
+#   1. node orchestrator/dsh/stream-bridge.mjs   （端口 17890）
+#   2. $env:GLM_RELAY_API_KEY 已设置
+#
+# glm2 中转流式 tool calling 有 DSML 泄漏缺陷（见 docs/orchestrator/dsh-integration.md
+# 「关键发现 2」），必须走桥接；禁止把 glm-relay 的 baseURL 直指中转。
+- id: agent-default-model
+  config:
+    provider: glm-relay
+    model: glm-5.2

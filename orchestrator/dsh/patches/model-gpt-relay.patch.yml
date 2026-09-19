@@ -1,0 +1,11 @@
+# 编排模型选择层：主路由 gpt-relay（gpt-5.6-sol @ sub2api）
+#
+# 用法（叠加在 cordis.patch.yml 之上，--patch 后者覆盖前者）：
+#   dsh --profile headless --patch orchestrator/dsh/cordis.patch.yml `
+#       --patch orchestrator/dsh/patches/model-gpt-relay.patch.yml "<任务>"
+# 前置：$env:GPT_RELAY_API_KEY 已设置（provider 声明见 cordis.patch.yml）。
+# 切换备选：同目录 model-glm-relay.patch.yml（需另起 stream-bridge:17890 并设 GLM_RELAY_API_KEY）。
+- id: agent-default-model
+  config:
+    provider: gpt-relay
+    model: gpt-5.6-sol

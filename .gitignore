@@ -44,3 +44,6 @@ scripts/tmp-*.mts
 
 # SK-2 路线二：晋升待审 yaml patch 工件（sidecar，审阅应用后自动删除）
 skills/**/*.promoted.yaml
+
+# 生成产物：短剧脚本导出（scripts/export-short-script.ts 的输出面），不入库
+outputs/novel-v2-short-scripts/

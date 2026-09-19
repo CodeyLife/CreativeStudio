@@ -1,0 +1,43 @@
+# dsh 编排模型 provider 配置模板
+#
+# 用途：复制/合并到 $DSH_HOME/settings.yaml（默认 ~/.dsh/settings.yaml），
+# 或在 dsh Web UI 的 Settings → Models → Add a custom provider 中等效配置。
+#
+# 设计依据：docs/orchestrator/dsh-integration.md（PoC 计划）。
+# dsh 编排引擎只承担「治理」职责（编排/审核/推进/编辑/迭代优化），
+# 产出（规划/正文/审核/修订）由 novel-v2 系统内部模型负责（config/model-providers.local.yaml）。
+#
+# 安全：本文件不写入明文密钥。apiKeyEnv 指向环境变量名，运行前需设置对应环境变量。
+# 可复用 config/model-providers.local.yaml 中已有端点的密钥（来源见该文件）。
+#
+# 注意：dsh 处于 Developer Preview（0.1.0-rc.x），字段契约以安装版本 docs/config-catalog.md 为准。
+
+llm-pi-ai:
+  providers:
+    # 主编排模型：DeepSeek 官方端点（便宜、稳定）
+    # 密钥来源：config/model-providers.local.yaml 的 prof-c80ce95c（label: deepseek）
+    deepseek:
+      apiKeyEnv: DEEPSEEK_API_KEY
+      api: openai-completions
+      baseURL: https://api.deepseek.com/v1
+      models:
+        - id: deepseek-v4-flash
+          # TODO: 编排高频调用建议开启上下文缓存时关注计费说明
+        - id: deepseek-v4-pro
+
+    # 备选：GLM 中转端点
+    # 密钥来源：config/model-providers.local.yaml 的 prof-d3efb69f（label: glm）
+    # 注意：glm-5.3 在该中转上流式 tool calling 有缺陷（DSML 文本泄漏），固定用 glm-5.2
+    glm-relay:
+      apiKeyEnv: GLM_RELAY_API_KEY
+      api: openai-completions
+      baseURL: https://glm2.yujin8.top/v1
+      models:
+        - id: glm-5.2
+
+    # 备选：本地 Ollama（完全免费，治理质量依赖本地模型能力，仅建议轻量任务使用）
+    ollama-local:
+      api: openai-completions
+      baseURL: http://127.0.0.1:11434/v1
+      models:
+        - id: qwen3:14b
