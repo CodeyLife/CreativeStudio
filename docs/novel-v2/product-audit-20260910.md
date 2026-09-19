@@ -212,9 +212,9 @@
 | 907§五.2 弧 3 承接 resolution 缺口 | ✅ 已兑现（ch16–19 闭环）；但暴露真根因=PL-1 弧 2 提前 completed（本轮新证） | batch/代码实查 |
 | 907§五.4 伏笔账本卫生 | 部分：重复簇 16→1（残留簇修复面结构性看不见，见下"2026-09-19 复测"，本轮收口）；"超期 31→244"不成立为债务——09-18 P1 已把该字段语义改为中性事实"窗口上界已过"（238/244 仍在正文推进）；thread_id 0/717 未变，但根因已定位并收口（判据惰性→改线程显式认领，新弧起生效；存量 437 条仍需语义分流） | getArchitectureHealth 实跑 + 代码逐条 |
 | 907§五.5 学习闭环沉淀（两候选） | ❌ 排队现状不变（09-19 实测 proposed 23 / rejected 18 / promoted 1、promotion_receipts 1）→ 工程侧无可推进部分，promote 是作者裁决 | ledger-debt 只读实测 |
-| 908 六 Seam 问题 6 条 | 部分修复（ch1/ch2 资产已验）；星屑砂容器/ch11 装置/ch5→6 战利品仍在 | D 组 |
+| 908 六 Seam 问题 6 条 | 机制面已闭合（09-19 核对）：D2 要求的物品账已落地为 `asset-ledger.ts` 确定性扫描 + `serialContext.assetSpans` 投影进 draft/review/revision 对照指令，并有独立单测与降级路径；正文面三条（星屑砂容器、ch11 装置、ch5→6 战利品）属作者/编排会话的正文修订面，本审计不代改正文。**如实登记的取证边界**：该投影不入库（`serialContext` 无持久化列）、正文与 prompt 正文在对象存储，故"产线上是否真的触发过资产对照"无法从 SQL 面证明——状态记为"已接线、产线触发未证" | 代码与测试逐条 + 226 行 planning contexts 键检索（0 命中＝不入库，非未生效） |
 | 9/9 治理 §8 六项 | 09-19 复测后：4 项成立、2 项改判。① "退役只管一径"——Foundation 投影按可见集口径实测剩 5 行（每面 1 行、56 行经 supersedes 退役），不再成立；② "方案A 仍 23 条漏出"——09-09 之后新增的认知类 active 声明 1,035 条**全部**带非空 `knowledge_scope`（即全部出自 enrichment 单源），零漏出，不再成立；③ "配额未获生产检验"改判为**缺陷并已修**：400 份真实 manifest 里 `identity-slot-quota` 计数 0，而同槽位（主角"知晓"）检索可见声明 951 条、ranked-fill 回执 38,905 条——根因是 `searchMemory` 词法命中投影丢 `identity_hash`/`value_hash`（配额以 identityHash 为键），融合层又按先到轨保留字段使指纹存在与否取决于召回顺序；两处已修并各配真实读出路径回归（详见 workflow-map §4 勘误段）。④ 其余（身份归一、指纹统一、梳理通道）维持原结论 | getArchitectureHealth/memory_claims 实测 + 撤除反向对照 |
-| 9/9"Foundation 56→5 检索可见" | 属实但**不完整**：bundle/preflight 路径仍带 20–29 条 stale → 本轮 A2 | manifest 实算 |
+| 9/9"Foundation 56→5 检索可见" | 09-19 复测：属实且**已完整**——库内按可见集口径 5 行（每面 1 行，56 行退役），消费面 600 份真实 manifest 扫描中 foundation 派生段每份至多 1 条（多例 0 次），旧的"bundle/preflight 仍带 20–29 条 stale"已由 A2（段级单例 id + `repairFoundationClaimSingletons` 幂等回填）收口 | 只读实测：memory_claims 可见集 + prompt_executions.context_manifest 逐份计数 |
 
 **2026-09-19 复测与根因（goal 迭代收口轮，读数取自 `getArchitectureHealth` 对运行库的实跑，非重算 SQL）**：total 717 / open 437 / fulfilled 63 / 窗口上界已过 244 / 未绑线程 437 / 兑现账缺失 0 / 弧孤儿 0 / 重复簇 1。四条结论（第 4 条是本轮顺带闭环的前序疑问，不属伏笔账本）：
 
