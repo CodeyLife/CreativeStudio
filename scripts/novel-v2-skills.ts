@@ -1,6 +1,6 @@
 import { compareSkillVersions, createConfiguredSkillProvider, normalizeSkillDescriptor, createWorkspaceSkillProvider, listCurrentSkillDescriptors, resolveStageSkillBundle, SKILL_EXECUTION_POLICIES } from "../src/novel-v2/skill-runtime";
 import path from "node:path";
-import { formatSkillHygieneFindings, inspectSkillProjection } from "../src/novel-v2/skill-hygiene";
+import { formatSkillHygieneFindings, inspectSkillProjection, compareSkillProjections } from "../src/novel-v2/skill-hygiene";
 import { NovelPostgresRepository } from "../src/novel-v2/postgres-repository";
 import type { SkillExecutionPoint, SkillPriority } from "../src/novel-v2/protocol";
 
@@ -19,9 +19,14 @@ function print(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
 }
 
+/**
+ * 观测面专用装载：**不得 `migrate()`**。migrate 尾的 `seedWorkspaceSkills` 会把
+ * workspace seed 写进 `skill_definitions`，于是"比对"发生在"写入"之后——seed 领先的
+ * 漂移被命令自己抹平（check 恒 print ok），且一个名为 check 的命令实际改了运行库
+ * （2026-09-19 在运行库上实证）。写库只属于 sync/patch 的显式语义。
+ */
 async function loadDatabase(): Promise<{ repository: NovelPostgresRepository; skills: Awaited<ReturnType<NovelPostgresRepository["listSkills"]>> }> {
   const repository = new NovelPostgresRepository();
-  await repository.migrate();
   return { repository, skills: await listCurrentSkillDescriptors({ source: "database", list: (projectId) => repository.listSkills(projectId) }, option("--project") ?? "skill-cli") };
 }
 
@@ -85,7 +90,6 @@ async function checkDatabase(): Promise<void> {
   const workspace = await listCurrentSkillDescriptors(createWorkspaceSkillProvider(option("--root")), option("--project") ?? "skill-cli");
   const loaded = await loadDatabase();
   try {
-    const database = new Map(loaded.skills.map((skill) => [skill.skillId, skill]));
     const invalidExecutionPoints = loaded.skills.flatMap((skill) => skill.invalidExecutionPoints?.length
       ? [{ skillId: skill.skillId, version: skill.version, invalidExecutionPoints: skill.invalidExecutionPoints }]
       : []);
@@ -93,17 +97,13 @@ async function checkDatabase(): Promise<void> {
       print({ target: "database", status: "invalid-execution-points", invalidExecutionPoints });
       throw new Error(`Skill database 包含未知 execution point：${JSON.stringify(invalidExecutionPoints)}`);
     }
-    const promotionAhead = workspace.flatMap((skill) => {
-      const current = database.get(skill.skillId);
-      return current && compareSkillVersions(current.version, skill.version) > 0 ? [{ skillId: skill.skillId, workspace: skill.version, database: current.version }] : [];
-    });
-    const mismatches = workspace.flatMap((skill) => {
-      const current = database.get(skill.skillId);
-      if (!current) return [{ skillId: skill.skillId, reason: "missing-in-database" }];
-      if (compareSkillVersions(current.version, skill.version) > 0) return []; // SK-2：学习闭环晋升领先 seed = 预期状态（promotion-ahead），不是漂移
-      if (current.contentFingerprint !== skill.contentFingerprint || current.version !== skill.version) return [{ skillId: skill.skillId, reason: "content-or-version-drift", workspace: { version: skill.version, contentFingerprint: skill.contentFingerprint }, database: { version: current.version, contentFingerprint: current.contentFingerprint } }];
-      return [];
-    });
+    const projection = compareSkillProjections(
+      workspace.map((skill) => ({ skillId: skill.skillId, version: skill.version, contentFingerprint: skill.contentFingerprint })),
+      loaded.skills.map((skill) => ({ skillId: skill.skillId, version: skill.version, contentFingerprint: skill.contentFingerprint })),
+      compareSkillVersions,
+    );
+    const mismatches = projection.drift;
+    const promotionAhead = projection.promotionAhead;
     if (mismatches.length) throw new Error(`Skill database drift:\n${JSON.stringify(mismatches, null, 2)}`);
     if (promotionAhead.length) print({ target: "database", status: "promotion-ahead", promotionAhead, note: "skill_definitions 版本高于 workspace yaml（学习闭环晋升）；把晋升内容回写 yaml 并提交后消失" });
     // Reverse check: the forward drift check only compares workspace rows; without
@@ -129,7 +129,6 @@ async function explain(): Promise<void> {
   const source = target();
   const projectId = option("--project") ?? "skill-cli";
   const repository = source === "database" ? new NovelPostgresRepository() : undefined;
-  if (repository) await repository.migrate();
   try {
     const provider = source === "workspace"
       ? createWorkspaceSkillProvider(option("--root"))
