@@ -281,8 +281,7 @@ novel_chapter_script_h3(projectId, documentId, instruction?)
   自行编排（节拍完整优先，段数硬顶 36、每段仍 10-15s），产物 `targetDurationSeconds`
   回填实际总时长；`projectId` 可选——缺省为独立短剧
   （完全不需要小说项目），填写时产物关联该作品作衍生短剧。
-- 产物存 `short_scripts` 独立表（契约 v2），经 REST `GET /v2/short-script-h3/:scriptId`
-  读取（详情含 creativeStrategy 回显）；同作用域同创意输入幂等复用。
+- 产物**只存浏览器 IndexedDB**（`ymcp-short-drama-db` 的 workspaces/materials/scripts 三个 store）：服务端零持久化，旧服务端表与 13 行存量已随迁移 093 删除。生成走无状态 `POST /v2/short-script-h3`，前端按本地幂等键（localKey）去重，同作用域同创意输入复用既有剧本；详情与列表都在本地读（`GET /v2/short-script-h3/:scriptId`、`/list` 与项目级端点自 09-17 起已移除）。
 - 两条路径共享六段式结构与结构特征校验；创意模式专属指引：节拍为设计而非
   穷举、末段切在钩子/记忆镜头上（开场即冲突等冲突导向规则仅对主引擎 conflict
   生效）。

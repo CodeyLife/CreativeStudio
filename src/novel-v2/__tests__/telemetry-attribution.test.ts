@@ -116,9 +116,11 @@ describe("telemetry project attribution (migration 083)", () => {
       SELECT pt.table_name FROM proj_tables pt LEFT JOIN fk ON fk.tbl=pt.table_name
       WHERE coalesce(fk.deltype,'N') <> 'c' AND pt.table_name <> 'novel_projects'
     `);
-    // short_scripts detaches (SET NULL) by design: scripts outlive their workspace project.
-    // short_drama_workspaces 同形（090 明文 ON DELETE SET NULL，创作台可独立于小说项目存在）。
-    const EXEMPT = new Set(["short_scripts", "short_drama_workspaces"]);
-    expect(result.rows.map((row) => row.table_name).filter((name) => !EXEMPT.has(name))).toEqual([]);
+    // 每张带 project_id 的基表必须级联删除或登记豁免。豁免集现为空：此前唯一的两个条目
+    // （short_scripts、short_drama_workspaces，090 明文 ON DELETE SET NULL）是"创作台可独立于
+    // 小说项目存在"的旧服务端方案遗留，随 093 删除零引用表一起消失——留着空豁免会把
+    // "这张表还该不该级联"的问题伪装成已裁决。新增豁免必须在此写理由，且理由要能被上面
+    // 的 SQL 判据独立检验（非级联 + 带 project_id），不能只写"特殊设计"。
+    expect(result.rows.map((row) => row.table_name)).toEqual([]);
   });
 });

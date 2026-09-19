@@ -8,7 +8,8 @@
  *
  * 独立性（契约 v2 起）：创作不依赖任何小说项目——projectId 可选，缺省为
  * 独立短剧；填写时产物关联该作品（衍生短剧），仅用于项目标题注入 prompt
- * 与列表过滤。产物落 short_scripts 独立表（迁移 050），不再走 artifacts。
+ * 与列表过滤。产物**不落服务端库**（stateless：无 repository/objects 依赖），由前端存本地
+ *  IndexedDB；曾用的服务端表已随迁移 093 删除。
  *
  * 流程：
  * 1. 校验创意输入与时长模式（fixed=固定目标时长预算，按预算推导分段数上下限，
@@ -18,7 +19,7 @@
  * 3. 复用 normalizeChapterScriptOutput 做零阻断组装（2026-08-31 起，用户指令：
  *    产物不做任何校验直接显示）——节拍覆盖、呈现手段、标签、时序、对白标记
  *    与总时长窗口全部降级为 hints 供人工复核，不回灌 repair、不阻止落库
- * 4. 六段按固定顺序组装成最终提示词，落 short_scripts 表
+ * 4. 六段按固定顺序组装成最终提示词，直接回传给调用方（服务端零持久化）
  *
  * 幂等键：作用域（projectId ?? "independent"）+ idea + instruction + 时长维度
  * （fixed=目标时长数值，auto="auto" 占位）+ 契约版本，同输入重放复用既有产物；
@@ -86,7 +87,7 @@ export {
   type ShortScriptHookEngine,
 } from "./staged-script-generation";
 
-/** 短剧产物类型标识（语义标签；独立短剧本版本存储于浏览器 IndexedDB，不再落 short_scripts 表）。 */
+/** 短剧产物类型标识（语义标签；独立短剧本版本存浏览器 IndexedDB，服务端不留行）。 */
 export const SHORT_SCRIPT_KIND = "short-script";
 export const SHORT_SCRIPT_EXECUTION_POINT = "short.script" as const;
 
@@ -168,7 +169,8 @@ export interface ShortScriptRecord {
 
 /**
  * 创意短剧本契约版本：与章节剧本契约独立演进。
- * v2 = 独立存储契约（short_scripts 表、projectId 可选、幂等作用域含 independent 占位）；
+ * v2 = 独立存储契约（projectId 可选、幂等作用域含 independent 占位；当时产物落服务端表，
+ *      该表与 13 行存量已随迁移 093 删除，现由前端 IndexedDB 承担）；
  * v3 = 描述体量契约（skill v1.4.0 体量要求 + schema 描述下限抬升），旧简短产物指纹失效重生成；
  * v4 = 时长与语言契约（片段上限 10s→15s、描述字段放开中文、skill v1.4.2 冲击场面细节指引）；
  * v5 = 片段时长分布契约（skill v1.4.3：时长按信息密度取值，宏大/战斗片段取上沿

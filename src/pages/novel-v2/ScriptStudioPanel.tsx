@@ -2,7 +2,7 @@
  * 剧本创作板块（MiniMax H3 · Ref2VA · 独立短剧 · 浏览器本地存储）
  *
  * 独立短剧板块（不含小说派生章节短剧）数据全部存浏览器 IndexedDB：
- * - 创作台（short_drama_workspaces）：公用素材库 + 多剧情容器
+ * - 创作台（IndexedDB store `workspaces`）：公用素材库 + 多剧情容器
  * - 公用素材（materials）：参考图片 Blob + 简短描述，同创作台可被多部剧情复用
  * - 剧情（scripts）：每次生成的剧本记录
  * 生成仍走后端 stateless 端点（POST /v2/short-script-h3，不落库），返回的产物存

@@ -79,12 +79,10 @@ metadata:
 
 ### 3. 读回与自检
 
-生成返回 scriptId 后读回产物核对（REST，novel-v2 API 服务默认端口 4770）：
-
-```
-GET http://127.0.0.1:4770/v2/short-script-h3/<scriptId>
-GET http://127.0.0.1:4770/v2/short-script-h3/list   # 历史清单
-```
+生成返回的产物**就地核对响应体**即可：独立短剧自 2026-09-17 起服务端零持久化，
+`GET /v2/short-script-h3/<scriptId>`、`/list` 与项目级读回端点均已移除（服务端表也随迁移 093 删除），
+历史清单与详情都在浏览器 IndexedDB（`ymcp-short-drama-db` 的 scripts store，按 localKey 去重）里读，不是 REST 面。
+在跑的只有 stateless 生成端点 `POST http://127.0.0.1:4770/v2/short-script-h3`。
 
 自检清单（全部通过才算完成）：
 

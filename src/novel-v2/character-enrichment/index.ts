@@ -95,7 +95,7 @@ export async function loadCharacterIdentityRegistry(projectId: string, repositor
  * 设计原则（AGENTS.md「reusable contracts over case-specific examples」）：
  * - 本模块只做编排，提取规则在 prompt.ts 中独立维护
  * - voiceAnchor 四维是题材无关的语言特征，不内置网文套路
- * - 知识边界用 MemoryClaim（knowledgeScope={characterId}）而非 v1 character_knowledge 表（v1 facts 表已废弃）
+ * - 知识边界用 MemoryClaim（knowledgeScope={characterId}）而非 v1 的人物知识表（该表已随 093 删除）
  */
 
 // PL-4 谓词受控的写入侧兜底：schema 枚举（同一白名单单一真源）在第三方中转不执行

@@ -30,6 +30,11 @@
       "version": "088_task_attempt_workflow_run_fk.sql",
       "checksum": "735f7e1159b1d167cf68428f7e122f61228a7d5c379115362f734423594477fc",
       "reason": "088 审核 N8 修正：去掉内嵌 BEGIN/COMMIT（migrate 按文件包事务）、加漂移预修正与残行诊断 RAISE；生产库 440/440 行 id===temporal 无漂移可修，新语义对已应用库幂等重放安全，归档旧 checksum"
+    },
+    {
+      "version": "093_drop_zero_reference_tables.sql",
+      "checksum": "0cdff4a6d91922caa46b83f7a52b9f49e06c5c3c3f9df9974c0fdd48dc6902fc",
+      "reason": "093 首版已在集成测试库应用：它靠 DROP SCHEMA … CASCADE 清「登记表的即时状态里没有的」实验沙箱来解开序列归属链。复核判该写法不可接受——登记行在 schema 之后才插入，迁移落在窗口内会删掉在飞实验，且单事务内 CASCADE 打爆共享锁表（SQLSTATE 53200，实测）。现形版本只解序列归属（OWNED BY NONE）再删表，DDL 净效果同为删除这 8 张零引用表，故测试库无需重放，归档首版 checksum。"
     }
   ],
   "schemaSubtractions": [
