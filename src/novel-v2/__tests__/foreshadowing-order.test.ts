@@ -28,6 +28,42 @@ describe("foreshadowing narrative visibility", () => {
     await repository.close();
   });
 
+  it("splits recorded payoffs at the cutoff: past ones are fulfilled nodes, future ones forbid early consumption", async () => {
+    if (!available) return;
+    // 回归 F4：未来侧原先读 chapters.payload->>'payoffRefs'，而 041 迁移已剥离该键且
+    // 无人再写 ⇒ prohibitedEarlyConsumption 恒只剩弧退出状态。现按同一账本分侧取。
+    const documentId = `early-doc-${randomUUID()}`;
+    const contentHash = `early-content-${randomUUID()}`;
+    const revisionId = `early-revision-${randomUUID()}`;
+    await repository.pool.query("INSERT INTO manuscript_documents(id,project_id,title,narrative_order,status) VALUES($1,$2,'第七章',7,'final')", [documentId, projectId]);
+    await repository.pool.query("INSERT INTO content_blobs(content_hash,object_key,byte_length) VALUES($1,$2,0)", [contentHash, `test/${contentHash}`]);
+    await repository.pool.query("INSERT INTO manuscript_revisions(id,project_id,document_id,revision,base_revision,content_hash) VALUES($1,$2,$3,1,0,$4)", [revisionId, projectId, documentId, contentHash]);
+    await repository.pool.query("UPDATE manuscript_documents SET current_revision_id=$1 WHERE id=$2", [revisionId, documentId]);
+    await repository.pool.query(
+      `INSERT INTO foreshadowing(id,project_id,planted_revision_id,status,payload,narrative_order)
+       VALUES($1,$2,$3,'fulfilled',$4,2),($5,$2,$3,'fulfilled',$6,9)`,
+      [
+        `fulfilled-past-${randomUUID()}`, projectId, revisionId, { description: "井底铜镜已被取走" },
+        `fulfilled-future-${randomUUID()}`, { description: "古钟在祭夜鸣响" },
+      ],
+    );
+    const snapshot = await repository.recordNarrativeStateSnapshot({
+      projectId,
+      documentId,
+      revisionId,
+      narrativeOrder: 7,
+      chapterMemory: {
+        id: `early-memory-${randomUUID()}`, projectId, documentId, revisionId,
+        narrativeRange: { start: 7, end: 7 }, summary: "立档", keyEvents: [], characterStates: [],
+        unresolvedThreads: [], fingerprint: "early-memory-fingerprint", createdAt: Date.now(),
+      },
+    });
+    expect(snapshot.fulfilledNodes).toContain("井底铜镜已被取走");
+    expect(snapshot.fulfilledNodes).not.toContain("古钟在祭夜鸣响");
+    expect(snapshot.prohibitedEarlyConsumption).toContain("古钟在祭夜鸣响");
+    expect(snapshot.prohibitedEarlyConsumption).not.toContain("井底铜镜已被取走");
+  });
+
   it("shows only known past foreshadowing when a narrative cutoff is active", async () => {
     if (!available) return;
     const documentId = `document-${randomUUID()}`;

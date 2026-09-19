@@ -4504,40 +4504,40 @@ export class NovelPostgresRepository {
     chapterMemory: ChapterMemory;
     narrativeElements?: FactExtractionOutput["narrativeElements"];
   }, connection: Pool | PoolClient = this.pool): Promise<NarrativeStateSnapshot> {
-    const [open, threads, planning, futureChapters, arcPosition, fulfilled] = await Promise.all([
+    const [open, threads, planning, arcPosition, fulfillments] = await Promise.all([
       this.getOpenForeshadowingAndPromises(input.projectId, input.narrativeOrder, connection),
       connection.query<{ id: string; title: string; payload: Record<string, unknown> }>(
         "SELECT id,title,payload FROM plot_threads WHERE project_id=$1 AND status='open' ORDER BY id",
         [input.projectId],
       ),
       this.getChapterPlanningContext(input.projectId, input.documentId, true).catch(() => undefined),
-      connection.query<{ payload: Record<string, unknown> }>(
-        `SELECT c.payload FROM chapters c
-         JOIN chapters current ON current.project_id=c.project_id AND current.arc_id=c.arc_id AND current.document_id=$3
-         WHERE c.project_id=$1 AND c.ordinal>$2
-         ORDER BY c.ordinal ASC LIMIT 24`,
-        [input.projectId, input.narrativeOrder, input.documentId],
-      ),
       connection.query<{ current_order: string | number; first_order: string | number }>(
         `SELECT c.ordinal AS current_order,MIN(peer.ordinal) AS first_order
          FROM chapters c JOIN chapters peer ON peer.arc_id=c.arc_id
          WHERE c.project_id=$1 AND c.document_id=$2 GROUP BY c.ordinal`,
         [input.projectId, input.documentId],
       ),
-      connection.query<{ description: string }>(
-        `SELECT evidence->>'description' AS description FROM payoffs p
+      // 一条查询同时供"已兑现"与"未来才该兑现"两侧（旧实现另取
+      // chapters.payload.payoffRefs 作未来侧，而该键已由 041 迁移剥离且无生产者 ⇒
+      // prohibitedEarlyConsumption 恒只剩退出状态）。同表同判据、按 cutoff 分侧，
+      // 两侧不会再各自漂移。
+      connection.query<{ description: string | null; narrative_order: string | number | null }>(
+        `SELECT evidence->>'description' AS description, d.narrative_order
+         FROM payoffs p
          JOIN manuscript_revisions r ON r.id=p.revision_id AND r.project_id=$1
          JOIN manuscript_documents d ON d.id=r.document_id AND d.project_id=$1
-         WHERE p.revision_id IS NOT NULL AND d.narrative_order<=$2
+         WHERE p.revision_id IS NOT NULL
          UNION ALL
-         SELECT payload->>'description' AS description FROM foreshadowing
-         WHERE project_id=$1 AND status='fulfilled' AND narrative_order<=$2`,
-        [input.projectId, input.narrativeOrder],
+         SELECT payload->>'description' AS description, narrative_order FROM foreshadowing
+         WHERE project_id=$1 AND status='fulfilled'`,
+        [input.projectId],
       ),
     ]);
-    const futurePayoffRefs = futureChapters.rows.flatMap((row) =>
-      Array.isArray(row.payload?.payoffRefs) ? row.payload.payoffRefs.filter((item): item is string => typeof item === "string") : [],
-    );
+    const recordedPayoffs = fulfillments.rows
+      .filter((row): row is { description: string; narrative_order: string | number } => Boolean(row.description) && row.narrative_order !== null);
+    const futurePayoffRefs = recordedPayoffs
+      .filter((row) => Number(row.narrative_order) > input.narrativeOrder)
+      .map((row) => row.description);
     const phases = planning?.arc.phases ?? [];
     const position = arcPosition.rows[0];
     const arcLocalOrdinal = position ? Math.max(1, Number(position.current_order) - Number(position.first_order) + 1) : 0;
@@ -4560,7 +4560,7 @@ export class NovelPostgresRepository {
       openForeshadowings: open.foreshadowings.map((item) => ({ id: item.id, description: item.description, expectedPayoffWindow: item.expectedPayoffWindow, readerQuestion: item.readerQuestion, possiblePayoffs: item.possiblePayoffs, meaningDelta: item.meaningDelta, cost: item.cost })),
       openPromises: open.promises.map((item) => ({ id: item.id, promiser: item.promiser, promisee: item.promisee, statement: item.statement })),
       fulfilledNodes: [...new Set([
-        ...fulfilled.rows.map((row) => row.description).filter(Boolean),
+        ...recordedPayoffs.filter((row) => Number(row.narrative_order) <= input.narrativeOrder).map((row) => row.description),
         ...(input.narrativeElements?.payoffs ?? []).map((item) => item.description),
       ])],
       prohibitedEarlyConsumption: [...new Set([
