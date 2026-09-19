@@ -511,6 +511,27 @@ describe("story arc reference normalization integration (PL-2)", () => {
     }
   });
 
+  it("health 消费面：pending 投影失败可见、账清即消（F3）", async () => {
+    if (!available || !repository) return;
+    // 提交链路把投影失败记进 projection_failures 后继续走；这张账此前无任何 SELECT 消费者，
+    // "可重放"因此等于"永久静默丢账"。健康度先让它可见（重放通道是独立一步，不在观测面里偷做）。
+    const aggregateId = `revision-projection-${randomUUID().slice(0, 8)}`;
+    const clear = () => repository!.pool.query("DELETE FROM projection_failures WHERE project_id=$1 AND aggregate_id=$2", [projectId, aggregateId]);
+    await repository.recordProjectionFailure({ projectId, projectionType: "narrative-elements", aggregateId, payload: { marker: "health-facet" }, error: "stub：投影失败" });
+    try {
+      const reported = async () => (await repository!.getArchitectureHealth(projectId)).issues
+        .some((issue: { code: string; reference?: string }) => issue.code === "projection-failure-pending" && issue.reference === `narrative-elements:${aggregateId}`);
+      expect(await reported()).toBe(true);
+      const health = await repository.getArchitectureHealth(projectId);
+      expect(health.projectionFailures.pending).toBeGreaterThanOrEqual(1);
+      expect(health.projectionFailures.byType["narrative-elements"]).toBeGreaterThanOrEqual(1);
+      await clear();
+      expect(await reported()).toBe(false);
+    } finally {
+      await clear();
+    }
+  });
+
   it("flags thread titles carrying embedded machine identifiers so health stops blessing shadows", async () => {
     if (!available || !repository) return;
     await repository.pool.query(

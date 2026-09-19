@@ -10,7 +10,7 @@ import { createHash } from "node:crypto";
 export type StoryArcIntegritySeverity = "blocking" | "warning";
 
 export interface StoryArcIntegrityIssue {
-  code: "invalid-range" | "duplicate-batch" | "overlapping-batch" | "unknown-reference" | "ambiguous-reference" | "embedded-identifier" | "completion-count-mismatch" | "ledger-inconsistency" | "foreshadowing-duplicate" | "foreshadowing-arc-orphan" | "stale-foundation-contract" | "serialization-gap" | "arc-planning-failures" | "phase-binding-missing" | "emotional-carrier-missing";
+  code: "invalid-range" | "duplicate-batch" | "overlapping-batch" | "unknown-reference" | "ambiguous-reference" | "embedded-identifier" | "completion-count-mismatch" | "ledger-inconsistency" | "foreshadowing-duplicate" | "foreshadowing-arc-orphan" | "stale-foundation-contract" | "serialization-gap" | "arc-planning-failures" | "phase-binding-missing" | "emotional-carrier-missing" | "projection-failure-pending";
   severity: StoryArcIntegritySeverity;
   message: string;
   batchIndex?: number;

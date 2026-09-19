@@ -55,7 +55,7 @@ export type CharacterEnrichmentRepositoryAccess = Pick<NovelPostgresRepository, 
 /** 提交链路：修订落库、叙事面记录，以及提交后同步章节记忆（向 chapter-memory 透传）。 */
 export type CommitServiceRepositoryAccess = Pick<
   NovelPostgresRepository,
-  "commitRevision" | "createChapterMemory" | "getApprovalEvidenceById" | "getChapterMemories" | "getDocumentNarrativeOrder" | "recordLearningAssessment" | "recordNarrativeElements" | "recordNarrativeStateSnapshot" | "recordProjectionFailure" | "refreshChapterMemoryRollup"
+  "commitRevision" | "createChapterMemory" | "getApprovalEvidenceById" | "getChapterMemories" | "getChapterTargetWordCount" | "getDocumentNarrativeOrder" | "recordLearningAssessment" | "recordNarrativeElements" | "recordNarrativeStateSnapshot" | "recordProjectionFailure" | "refreshChapterMemoryRollup"
 >;
 
 /** 作品简介工作流。 */

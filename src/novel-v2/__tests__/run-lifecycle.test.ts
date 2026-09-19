@@ -135,9 +135,11 @@ describe("run 状态写入面接线锁", () => {
     expect(repository).toContain('terminalOverwriteGuardSql("$3")');
     expect([...repository.matchAll(/terminalOverwriteGuardSql\(/g)].length).toBe(1);
     expect(repository).not.toMatch(/SET status='running'/);
-    // 强制删除弧 →cancelled 是"终态→终态"的收编写入，指向本项目自有谓词（弧+章集合），
-    // 不借漏斗；它必须留下可审计的动机键，否则覆写completed成cancelled无从解释。
-    expect(repository).toMatch(/SET status='cancelled',[\s\S]{0,220}cancelledBy: "story-arc\.force-delete"/);
+    // 强制删除弧 →cancelled 是"终态→终态"的收编写入，指向本项目自有谓词（项目内章集合），
+    // 不借漏斗；但它必须留下可审计的动机键，否则把 completed 覆成 cancelled 无从解释。
+    // 两条断言分开写：动机键在 SQL 模板之后的参数里，按"相隔多少字符"锁会随无关编辑漂移。
+    expect(repository).toMatch(/SET status='cancelled',[\s\S]{0,160}WHERE project_id=\$1 AND id=ANY\(\$2::text\[\]\)/);
+    expect(repository).toContain('cancelledBy: "story-arc.force-delete"');
     // 反向：仓储里不得再留第二份"参数化状态"SQL（那意味着绕过 slice 漏斗）。
     expect(repository).not.toMatch(/UPDATE workflow_runs SET status=\$2/);
   });

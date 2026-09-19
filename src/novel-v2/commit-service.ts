@@ -9,6 +9,7 @@ import { createChapterMemoryFromRevision } from "./chapter-memory";
 import { evaluateCommitGate } from "./temporal/revision-policy";
 import type { FactExtractionOutput } from "./prompts/schemas";
 import { inspectManuscript, type ManuscriptStructuralReport } from "./application/manuscript-structure";
+import { countNovelCharacters } from "./word-count";
 
 type CommitDerivedData = {
   structuralReport: ManuscriptStructuralReport;
@@ -54,8 +55,22 @@ export class CommitService {
   ) {}
 
   async commit(input: CommitRequest & { text: string } & CommitDerivedData): Promise<CommitResult & { chapterMemory?: ChapterMemory }> {
-    const gate = evaluateCommitGate(input.reviews, input.artifact.fingerprint, input.structuralReport, input.changeScope);
-    if (!gate.passed) throw new Error(`正式提交必须具备当前 artifact 的完整三类 reviewer 通过证据（changeScope=${input.changeScope ?? "narrative"} 档位）；缺失角色：${gate.missingRoles.join("、") || "无"}`);
+    // 目标篇幅是蓝图里的已冻结事实，由本服务自取而非由调用方申报（"可推导事实不留裁量权"，
+    // 与 evaluateCommitGate 的篇幅判据同因：两次重出的骨架稿曾全绿过审）。读不到目标时
+    // 不施该门——门不替系统发明目标；能力接口外的桩缺此方法时显式 warn，不静默放宽门。
+    const reader = this.repository.getChapterTargetWordCount;
+    let targetWordCount: number | undefined;
+    if (typeof reader === "function") {
+      try {
+        targetWordCount = await reader.call(this.repository, input.projectId, input.documentId);
+      } catch (error) {
+        console.warn(`[commit-service] 本章目标篇幅读取失败，本轮跳过篇幅门：${error instanceof Error ? error.message : String(error)}`);
+      }
+    } else {
+      console.warn("[commit-service] 仓储未提供 getChapterTargetWordCount，篇幅门未施加（生产装配缺失，须修接线）");
+    }
+    const gate = evaluateCommitGate(input.reviews, input.artifact.fingerprint, input.structuralReport, input.changeScope, { plainTextLength: countNovelCharacters(input.text), targetWordCount });
+    if (!gate.passed) throw new Error(`正式提交必须具备当前 artifact 的完整三类 reviewer 通过证据（changeScope=${input.changeScope ?? "narrative"} 档位，质量失败=${gate.qualityFailure ?? "无"}）；缺失角色：${gate.missingRoles.join("、") || "无"}`);
     if (!inspectManuscript({ text: input.text }).passed) throw new Error("正式提交正文未通过确定性结构复检");
     return this.persistApprovedRevision(input);
   }
@@ -100,7 +115,7 @@ export class CommitService {
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        console.warn(`[commit-service] 叙事元素写入失败（正文 revision 已提交，可重放）：${message}`);
+        console.warn(`[commit-service] 叙事元素写入失败（正文 revision 已提交）：${message}`);
         await this.repository.recordProjectionFailure({
           projectId: input.projectId,
           projectionType: "narrative-elements",

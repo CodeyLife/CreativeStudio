@@ -6,13 +6,16 @@ const artifact: Artifact = { id: "a1", projectId: "p1", taskId: "t1", attemptId:
 
 describe("narrative projection revision ownership", () => {
   it("fails explicitly before projection when revision is absent or belongs to another document", async () => {
-    const queries: string[] = [];
+    const statements: string[] = [];
+    const client = { query: async (sql: string) => { statements.push(sql); return { rows: [], rowCount: 0 }; }, release: () => undefined };
     const repository = Object.create(NovelPostgresRepository.prototype) as NovelPostgresRepository;
-    Object.defineProperty(repository, "pool", { value: { query: async (sql: string) => { queries.push(sql); return { rows: [], rowCount: 0 }; } } });
+    // 默认面自管事务，因此桩连接必须像真 Pool 一样可 connect()
+    Object.defineProperty(repository, "pool", { value: { query: client.query, connect: async () => client } });
     await expect(repository.recordNarrativeElements({
       projectId: "p1", documentId: "d1", revisionId: "r-other", artifact, narrativeElements: { foreshadowings: [], promises: [], payoffs: [] },
     })).rejects.toThrow(/已提交且归属匹配/);
-    expect(queries).toHaveLength(1);
-    expect(queries[0]).toContain("project_id=$2 AND document_id=$3");
+    // 归属校验之前不发出任何写语句；失败必走 ROLLBACK（半提交账本的形态之一）
+    expect(statements.map((sql) => sql.trim().split(/\s+/)[0].toUpperCase())).toEqual(["BEGIN", "SELECT", "ROLLBACK"]);
+    expect(statements[1]).toContain("project_id=$2 AND document_id=$3");
   });
 });

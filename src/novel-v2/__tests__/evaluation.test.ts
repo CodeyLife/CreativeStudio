@@ -58,11 +58,17 @@ const TEST_DB_URL = process.env.TEST_DATABASE_URL ?? "postgresql://ymcp:ymcp@127
  * 与 workflow-map 记录的"收集期求值恒 skip"同一族缺陷的第二个实例。
  */
 let integrationAvailable = false;
+// 真库用例给显式上限而不是吃 vitest 的 5s 默认值：本文件每条 integrationIt 都要先
+// seed 一篇定稿章（文档/修订/产物/技能绑定）再跑评估或闭环，实测 dryRun 闭环一条
+// 在共享测试库上就要 5.9s——5s 默认值没有来由，且该库随并行会话单调增长，
+// 用默认值等于把"数据量变大"误报成功能失败。上限给 30s；越过它应按"用例该拆分/
+// 该隔离夹具"处理，而不是继续加时。
+const INTEGRATION_TEST_TIMEOUT_MS = 30_000;
 const integrationIt = (name: string, fn: () => Promise<void>) =>
   it(name, async (ctx) => {
     if (!integrationAvailable) return ctx.skip();
     await fn();
-  });
+  }, INTEGRATION_TEST_TIMEOUT_MS);
 
 function makeSkill(overrides: Partial<SkillDescriptor> = {}): SkillDescriptor {
   return {

@@ -3130,7 +3130,7 @@ export class NovelPostgresRepository {
    * imposing literary requirements on chapters or changing persisted data.
    */
   async getArchitectureHealth(projectId: string) {
-    const [project, sections, arcs, batches, chapters, threads, foreshadowing, arcPlanningRuns] = await Promise.all([
+    const [project, sections, arcs, batches, chapters, threads, foreshadowing, arcPlanningRuns, projectionFailures] = await Promise.all([
       this.pool.query<{ id: string; title: string; current_revision: string | number }>("SELECT id,title,current_revision FROM novel_projects WHERE id=$1", [projectId]),
       this.pool.query<{ task_key: string; status: ProjectPlanStatus; payload: Record<string, unknown> }>("SELECT task_key,status,payload FROM project_plan_sections WHERE project_id=$1 ORDER BY task_key", [projectId]),
       this.pool.query<{ id: string; ordinal: string | number; planning_status: StoryArcRecord["planningStatus"]; execution_status: StoryArcRecord["executionStatus"]; payload: NarrativeArcPlan; approved_at: Date | null; completed_at: Date | null }>("SELECT id,ordinal,planning_status,execution_status,payload,approved_at,completed_at FROM arcs WHERE project_id=$1 ORDER BY ordinal", [projectId]),
@@ -3145,6 +3145,13 @@ export class NovelPostgresRepository {
       this.pool.query<{ id: string; payload: Record<string, unknown> }>("SELECT id,payload FROM foreshadowing WHERE project_id=$1 ORDER BY id", [projectId]),
       // PL-6 连载健康度：弧规划工作流的终态分布（失败重试数是规划稳定性指标）。
       this.pool.query<{ status: string; count: string }>("SELECT status, count(*)::text AS count FROM workflow_runs WHERE project_id=$1 AND workflow_type='story-arc-planning' GROUP BY status", [projectId]),
+      // F3 可见性：投影失败登记面（commit 链路吞下的叙事元素/快照投影失败）此前**只进不出**
+      // ——全仓无任何 SELECT 消费者，于是"可重放"的提示语掩盖了账本永久丢项。健康度先把
+      // pending 数量与类型暴露出来；重放通道要按 payload 重建投影，属独立一步，不在观测面里偷做。
+      this.pool.query<{ projection_type: string; aggregate_id: string; error_message: string | null; attempts: string | number; updated_at: Date }>(
+        "SELECT projection_type,aggregate_id,error_message,attempts,updated_at FROM projection_failures WHERE project_id=$1 AND status='pending' ORDER BY updated_at DESC LIMIT 20",
+        [projectId],
+      ),
     ]);
     if (!project.rowCount) throw new Error("项目不存在");
 
@@ -3335,9 +3342,18 @@ export class NovelPostgresRepository {
         chapters: chapters.rows.filter((chapter) => chapter.arc_id === arc.id).map((chapter) => ({ ordinal: Number(chapter.ordinal), narrativeFunction: chapter.narrative_function ?? undefined })),
       })),
     });
+    // F3：pending 投影失败必须自己出现在健康度里。提交链路对它的处理是"warn + 记账后继续"，
+    // 账若无人读，丢掉的伏笔/承诺/快照就是永久静默损失。
+    const projectionFailureIssues: StoryArcIntegrityIssue[] = projectionFailures.rows.map((row) => ({
+      code: "projection-failure-pending" as const,
+      severity: "warning" as const,
+      reference: `${row.projection_type}:${row.aggregate_id}`,
+      message: `${row.projection_type} 投影失败待处理（已试 ${Number(row.attempts)} 次，${iso(row.updated_at)}）：${row.error_message ?? "无错误文本"}`,
+    }));
     const issues: StoryArcIntegrityIssue[] = [
       ...hygieneIssues,
       ...completionIssues,
+      ...projectionFailureIssues,
       ...ledgerIssues,
       ...contractIssues,
       ...serializationIssues,
@@ -3382,6 +3398,7 @@ export class NovelPostgresRepository {
       references: referenceReports,
       foreshadowingLedger,
       serialization: { gaps: serializationGaps, planningRunStatuses },
+      projectionFailures: { pending: projectionFailures.rowCount ?? 0, byType: projectionFailures.rows.reduce<Record<string, number>>((acc, row) => ({ ...acc, [row.projection_type]: (acc[row.projection_type] ?? 0) + 1 }), {}) },
       fullBookArchitecture,
       issues,
     };
@@ -5419,6 +5436,20 @@ export class NovelPostgresRepository {
     return result.rows[0] ? Number(result.rows[0].narrative_order) : undefined;
   }
 
+  /**
+   * 本章蓝图**声明**的目标篇幅（定稿门的篇幅判据用）。缺蓝图、缺字段或值非正有限数一律
+   * undefined——门只在系统已知的可推导事实上执法，不替调用方或模型发明目标；归一规则与
+   * `chapterBlueprintFromRow` 同一条（09-17 那次断链就是因为两处各写一份量纲）。
+   */
+  async getChapterTargetWordCount(projectId: string, documentId: string): Promise<number | undefined> {
+    const result = await this.pool.query<{ payload: Record<string, unknown> | null }>(
+      "SELECT payload FROM chapters WHERE project_id=$1 AND document_id=$2 LIMIT 1",
+      [projectId, documentId],
+    );
+    const value = result.rows[0]?.payload?.targetWordCount;
+    return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.round(value) : undefined;
+  }
+
   async getLatestMemoryBundle(projectId: string): Promise<MemoryBundle | undefined> {
     const result = await this.pool.query<{ payload: MemoryBundle }>("SELECT payload FROM memory_bundles WHERE project_id=$1 ORDER BY created_at DESC LIMIT 1", [projectId]);
     return result.rows[0]?.payload;
@@ -5832,6 +5863,25 @@ export class NovelPostgresRepository {
     /** 当前章节的叙事顺序（1-based）。用于让未兑现伏笔按叙事顺序过滤，避免剧透未来章节。 */
     narrativeOrder?: number;
   }, connection: Pool | PoolClient = this.pool): Promise<{ foreshadowings: number; promises: number; payoffs: number }> {
+    if (connection === this.pool) {
+      // 默认面（提交链路）此前把整组投影当 autocommit 语句序列跑：`payoffs` 插入与
+      // `promises.status='fulfilled'` 翻转分属两条语句，中途失败就留下"已兑现账在、承诺仍
+      // 开放"的可二次兑现账本；调用方的补偿记录（projection_failures）至今无人重放，半提交
+      // 状态因此是永久的。默认面自此自管事务——整组投影要么全成要么全回滚；调用方已持事务
+      // 时（传入 client）继续沿用其边界，不在此嵌套 BEGIN。
+      const client = await this.pool.connect();
+      try {
+        await client.query("BEGIN");
+        const result = await this.recordNarrativeElements(input, client);
+        await client.query("COMMIT");
+        return result;
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => undefined);
+        throw error;
+      } finally {
+        client.release();
+      }
+    }
     const { projectId, documentId, artifact, revisionId, narrativeElements, narrativeOrder } = input;
     const revision = await connection.query<{ id: string }>(
       "SELECT id FROM manuscript_revisions WHERE id=$1 AND project_id=$2 AND document_id=$3",
