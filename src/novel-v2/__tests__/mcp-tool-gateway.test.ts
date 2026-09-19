@@ -98,6 +98,57 @@ describe("validateToolArgs pure function", () => {
     expect(body.byChapter[0].chapterIndex).toBe(6);
   });
 
+  it("novel_chapter_recall_report pairs recall sentences with prior-chapter originals and never feeds the target chapter to itself", async () => {
+    const readKeys: string[] = [];
+    const bodies: Record<string, string> = {
+      "key-9": "昨夜他试着让灵气撞开淤塞的经脉，那套走法后来再没用过。",
+      "key-10": "他想起昨夜灵气撞开经脉的那套走法，膝上的旧伤跟着跳了一下。",
+    };
+    const ctx = {
+      repository: {
+        getChapterContentRefsByOrders: async (_projectId: string, orders: number[]) => orders.map((order) => ({
+          documentId: `doc-${order}`,
+          narrativeOrder: order,
+          objectKey: order === 10 ? "key-10" : order === 9 ? "key-9" : `missing-${order}`,
+        })),
+      },
+      objects: {
+        getText: async (objectKey: string) => {
+          readKeys.push(objectKey);
+          if (bodies[objectKey]) return bodies[objectKey];
+          throw new Error("对象不存在");
+        },
+      },
+    } as never;
+    const response = await executeTool("novel_chapter_recall_report", { projectId: "p1", narrativeOrder: 10, window: 2 }, ctx);
+    expect(response.isError).toBeFalsy();
+    const body = JSON.parse(response.content[0].text);
+    expect(body).toMatchObject({ narrativeOrder: 10, documentId: "doc-10", window: 2 });
+    expect(body.anchors).toHaveLength(1);
+    expect(body.anchors[0]).toMatchObject({ cue: "想起" });
+    // 第 9 章正文与回述句共享"灵气/经脉/走法"，是对照的真实来源；缺文的第 8 章被尝试读取后
+    // 跳过（不计入 chaptersCompared），既不让缺文伪装成"无相似内容"，也不因此整批失败。
+    expect(body.anchors[0].sources[0]).toMatchObject({ narrativeOrder: 9 });
+    expect(typeof body.anchors[0].sources[0].similarity).toBe("number");
+    expect(body.chaptersCompared).toBe(1);
+    expect(readKeys).toContain("missing-8");
+  });
+
+  it("novel_chapter_recall_report fails loudly instead of guessing when inputs or object storage are missing", async () => {
+    const withoutStore = { repository: { getChapterContentRefsByOrders: async () => [] } } as never;
+    expect((await executeTool("novel_chapter_recall_report", { projectId: "p1", narrativeOrder: 3 }, withoutStore)).isError).toBe(true);
+    const missingSnapshot = {
+      repository: { getChapterContentRefsByOrders: async () => [] },
+      objects: { getText: async () => "" },
+    } as never;
+    const response = await executeTool("novel_chapter_recall_report", { projectId: "p1", narrativeOrder: 3 }, missingSnapshot);
+    expect(response.isError).toBe(true);
+    expect(response.content[0].text).toContain("没有当前正文快照");
+    // schema 层就挡住缺参/非法值，不把手写校验当唯一防线。
+    expect((await executeTool("novel_chapter_recall_report", { projectId: "p1" }, missingSnapshot)).isError).toBe(true);
+    expect((await executeTool("novel_chapter_recall_report", { projectId: "p1", narrativeOrder: 0 }, missingSnapshot)).isError).toBe(true);
+  });
+
   it("novel_fact_candidate_decide is idempotent per claim and syncs the approved point once", async () => {
     const decided: string[] = [];
     const upserted: string[] = [];
