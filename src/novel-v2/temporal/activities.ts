@@ -3,8 +3,7 @@ import Ajv from "ajv";
 import type { Artifact, ChapterChangeScope, ContextManifest, CreativeReview, CreativeRun, CreativeWorkItem, ExecutionBlueprint, MemoryBundle, MemoryClaim, MemoryHit, MemoryProvider, NovelIntent, PreflightPlan, PreflightProjectSnapshot, PromptContextManifest, Review, ReviewIssue, RuntimeLearningAssessmentV2, SkillBundle, SkillExecutionPoint, SkillProvider, StageContextSection, StageGoalContract, TaskAttemptRecord } from "../protocol";
 import { buildContextManifest, buildMemoryBundle, compileExecutionBlueprint, computeTokenBudget, createPreflightPlan, isMemoryClaimVisibleAtCutoff, matchedFacetsOf } from "../cognition";
 import { canonicalSha256 } from "../canonical-json";
-import { extractAssetMentions, groupAssetSpans, type AssetMention } from "../asset-ledger";
-import { serialContextFingerprint } from "../application/serial-context-fingerprint";
+import { withAssetSpans } from "../application/serial-context-assets";
 import { NovelPostgresRepository } from "../postgres-repository";
 import type { WorkflowRunStatus } from "../run-lifecycle";
 import { estimateBudgetTokens } from "../token-estimate";
@@ -316,24 +315,12 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       console.warn(`[serial-context] 跨章序列证据快照加载失败，继续使用既有记忆：${(error as Error).message}`);
       return undefined;
     }
-    if (!snapshot || snapshot.assetSpans.length) return snapshot;
-    try {
-      const orders = snapshot.chapters.map((chapter) => chapter.narrativeOrder);
-      const refs = await deps.repository.getChapterContentRefsByOrders(projectId, orders);
-      const perChapter: Array<{ narrativeOrder: number; mentions: AssetMention[] }> = [];
-      for (const ref of refs) {
-        try {
-          perChapter.push({ narrativeOrder: ref.narrativeOrder, mentions: extractAssetMentions(await objects.getText(ref.objectKey)) });
-        } catch { /* 单章正文不可得时跳过该章，账本如实只含可得章 */ }
-      }
-      const assetSpans = groupAssetSpans(perChapter);
-      if (!assetSpans.length) return snapshot;
-      const withAssets = { ...snapshot, assetSpans };
-      return { ...withAssets, fingerprint: serialContextFingerprint(withAssets) };
-    } catch (error) {
-      console.warn(`[asset-ledger] 资产数量扫描失败，降级为无资产对照：${(error as Error).message}`);
-      return snapshot;
-    }
+    if (!snapshot) return undefined;
+    return withAssetSpans(snapshot, projectId, {
+      getChapterContentRefs: (id, orders) => deps.repository.getChapterContentRefsByOrders(id, orders),
+      getText: (key) => objects.getText(key),
+      onDegrade: (reason) => console.warn(`[asset-ledger] 资产数量扫描失败，降级为无资产对照：${reason}`),
+    });
   };
   // TODO P2: 修订 temperature 应可配置——当前 0.3 是创作多样性与指令遵循的折中值，
   // 未来应由 model routing 配置或 blueprint budget 决定，而非硬编码。

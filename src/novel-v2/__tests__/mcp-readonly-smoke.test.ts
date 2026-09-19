@@ -106,6 +106,55 @@ describe("MCP 只读工具 smoke 契约（OR-E1，需 Postgres）", () => {
     expect(payload.enhancementErrors).toBeUndefined();
   });
 
+  it("novel_context_get 的序列证据在真实定稿章上可达，且与生成链路同一份资产账本生产者", async () => {
+    if (!postgresAvailable) return;
+    // 断链回归（2026-09-19）：增强块原先拿 max(narrative_order) 却传 documentId=""，
+    // rhythm 查询绑该值必 0 行 ⇒ serialContext 恒缺且不报错；而本文件的空项目 smoke
+    // 看不出差别（无定稿章时"字段缺席"本就合法），所以可达性必须在有章的 fixture 上测。
+    const arcProject = `mcp-smoke-serial-${randomUUID().slice(0, 8)}`;
+    const arcId = `mcp-smoke-arc-${arcProject}`;
+    try {
+      await repository.ensureProject(arcProject, "MCP Serial Smoke");
+      await repository.pool.query("INSERT INTO books(id,project_id,title) VALUES($1,$2,$3) ON CONFLICT DO NOTHING", [`book-${arcProject}`, arcProject, "书名"]);
+      await repository.pool.query("INSERT INTO volumes(id,book_id,title,ordinal) VALUES($1,$2,'正文',1) ON CONFLICT DO NOTHING", [`volume-${arcProject}`, `book-${arcProject}`]);
+      await repository.pool.query(
+        `INSERT INTO arcs(id,volume_id,project_id,title,ordinal,planning_status,execution_status,payload)
+         VALUES($1,$2,$3,'arc',1,'approved','active',$4::jsonb)`,
+        [arcId, `volume-${arcProject}`, arcProject, JSON.stringify({ title: "arc", objective: "x" })],
+      );
+      const prose: Record<string, string> = {};
+      for (const order of [1, 2]) {
+        const documentId = `smoke-doc-${order}`;
+        const revisionId = `smoke-rev-${order}`;
+        const contentHash = `smoke-content-${arcProject}-${order}`;
+        prose[`test/${contentHash}`] = order === 1 ? "他数了数，怀里两块灵石。" : "账房伸出指头，要三块灵石。";
+        await repository.pool.query("INSERT INTO manuscript_documents(id,project_id,title,narrative_order,status) VALUES($1,$2,$3,$4,'final')", [documentId, arcProject, `第${order}章`, order]);
+        await repository.pool.query("INSERT INTO content_blobs(content_hash,object_key,byte_length) VALUES($1,$2,1)", [contentHash, `test/${contentHash}`]);
+        await repository.pool.query("INSERT INTO manuscript_revisions(id,project_id,document_id,revision,base_revision,content_hash) VALUES($1,$2,$3,1,0,$4)", [revisionId, arcProject, documentId, contentHash]);
+        await repository.pool.query("UPDATE manuscript_documents SET current_revision_id=$1 WHERE id=$2", [revisionId, documentId]);
+        await repository.pool.query(
+          `INSERT INTO chapters(id,arc_id,project_id,document_id,title,ordinal,status,payload)
+           VALUES($1,$2,$3,$4,$5,$6,'final',$7::jsonb)`,
+          [`smoke-chapter-${order}`, arcId, arcProject, documentId, `第${order}章`, order, JSON.stringify({ index: order, title: `第${order}章`, narrativeFunction: "development", scenes: [] })],
+        );
+      }
+      const objects = { getText: async (key: string) => prose[key] ?? "" } as never;
+      const result = await executeTool("novel_context_get", { projectId: arcProject }, { repository, objects });
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.enhancementErrors, JSON.stringify(payload.enhancementErrors)).toBeUndefined();
+      expect(typeof payload.serialContext?.window).toBe("number");
+      expect(Array.isArray(payload.serialContext.characterSpans)).toBe(true);
+      // 资产账本必须在只读诊断面同样现形（同一个 withAssetSpans 生产者）。
+      expect(payload.serialContext.assetSpans.map((span: { subject: string }) => span.subject)).toContain("灵石");
+
+      // 反向：无对象存储时不静默给空账本，而是记一条可见降级。
+      const withoutStore = await executeTool("novel_context_get", { projectId: arcProject }, { repository });
+      expect(JSON.parse(withoutStore.content[0].text).enhancementErrors).toEqual([expect.stringContaining("assetSpans")]);
+    } finally {
+      await repository.deleteProject(arcProject).catch(() => undefined);
+    }
+  });
+
   it("novel_prompt_inspect / novel_invocation_list 空 run 查询给出业务错误而非 schema 漂移", async () => {
     if (!postgresAvailable) return;
     const inspect = await executeTool("novel_prompt_inspect", { workflowId: "smoke-missing-run", taskId: "smoke-missing-task" }, { repository });

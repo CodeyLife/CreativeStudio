@@ -4824,6 +4824,28 @@ export class NovelPostgresRepository {
   }
 
   /**
+   * 序列证据的可用目标章——"哪一章能被 getSerialContextSnapshot 当 target 用"的唯一口径。
+   *
+   * 判据与 `buildNarrativeRhythmSnapshotQuery` 的 target 条件同形（chapters 行存在、
+   * document.status='final'、已挂 current_revision_id）。不同形就会给出"解析成功但
+   * 快照恒空"的目标：本应可见的字段静默缺失（`novel_context_get` 的序列证据块即因传空
+   * documentId 长期恒缺，而 smoke 测试跑在没有章节的空项目上，看不出差别）。
+   */
+  async getLatestFinalChapterTarget(projectId: string): Promise<{ documentId: string; narrativeOrder: number } | undefined> {
+    const result = await this.pool.query<{ document_id: string; narrative_order: string | number }>(
+      `SELECT d.id AS document_id, d.narrative_order
+       FROM chapters target
+       JOIN manuscript_documents d ON d.id=target.document_id AND d.project_id=target.project_id
+       WHERE target.project_id=$1 AND d.status='final' AND d.current_revision_id IS NOT NULL
+       ORDER BY d.narrative_order DESC LIMIT 1`,
+      [projectId],
+    );
+    const row = result.rows[0];
+    if (!row) return undefined;
+    return { documentId: row.document_id, narrativeOrder: Number(row.narrative_order) };
+  }
+
+  /**
    * 近 N 章审核 issue 按规则类聚类（learning 跨章聚合输入）。
    *
    * 设计依据：AGENTS.md「review-stage → learning 通路」——单章 issue 构不成"持续模式"，

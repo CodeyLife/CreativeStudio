@@ -25,6 +25,7 @@
 import { randomUUID } from "node:crypto";
 import type { ToolHandler, ToolContext } from "./types";
 import { buildRecallAnchors, RECALL_REPORT_POLICY } from "../recall-anchors";
+import { withAssetSpans } from "../application/serial-context-assets";
 import type {
   CreativeCommand,
   CreativeReviewInput,
@@ -1404,11 +1405,20 @@ const novel_context_get: ToolHandler = async (args, ctx) => {
   // 此前合并成单个裸 catch 全吞，坏 SQL（不存在的列）曾借此"恒静默丢字段"长期无人发现。
   const enhancementErrors: string[] = [];
   try {
-    const maxOrder = await ctx.repository.pool.query("SELECT max(narrative_order)::int AS max_order FROM manuscript_documents WHERE project_id=$1", [projectId]);
-    const maxO = maxOrder.rows[0]?.max_order;
-    if (maxO !== null && maxO !== undefined && maxO > 1) {
-      const serialContext = await ctx.repository.getSerialContextSnapshot(projectId, "", maxO);
-      if (serialContext) {
+    // target 必须是"真能被序列证据当锚点用"的定稿章。此前这里传 documentId=""（想当然按
+    // max(narrative_order) 取 cutoff），rhythm 查询绑该值必 0 行 ⇒ 整个增强块恒缺且不报错。
+    const target = await ctx.repository.getLatestFinalChapterTarget(projectId);
+    if (target) {
+      const loaded = await ctx.repository.getSerialContextSnapshot(projectId, target.documentId, target.narrativeOrder);
+      if (loaded) {
+        // 资产账本要读正文：与生成链路同一份实现，避免 MCP 侧另起一径又留下空账本。
+        const serialContext = ctx.objects
+          ? await withAssetSpans(loaded, projectId, {
+              getChapterContentRefs: (id, orders) => ctx.repository.getChapterContentRefsByOrders(id, orders),
+              getText: (key) => ctx.objects!.getText(key),
+            })
+          : loaded;
+        if (!ctx.objects && !loaded.assetSpans.length) enhancementErrors.push("serialContext.assetSpans: 对象存储不可用，未做资产数量扫描");
         all.serialContext = {
           window: serialContext.window,
           openPromises: serialContext.openPromises ?? [],
@@ -1416,6 +1426,9 @@ const novel_context_get: ToolHandler = async (args, ctx) => {
           characterSpans: serialContext.characterSpans.slice(0, 5),
           subjectSpans: serialContext.subjectSpans.slice(0, 8),
         };
+      } else {
+        // 解析得到目标章却拿不到快照＝断链，必须可见；旧实现这里静默缺字段无人知。
+        enhancementErrors.push(`serialContext: 目标章 ${target.documentId}（第${target.narrativeOrder}章）已解析但序列证据快照为空`);
       }
     }
   } catch (error) {
