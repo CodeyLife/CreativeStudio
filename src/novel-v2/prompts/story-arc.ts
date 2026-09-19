@@ -476,10 +476,6 @@ export function buildStoryArcRebasePrompt(input: StoryArcPromptInput & { target:
   ].join("\n\n");
 }
 
-export function buildStoryArcBatchPrompt(input: StoryArcPromptInput & { arc: StoryArcBundle["arc"]; batchIndex: number; startChapterIndex: number }): string {
-  return buildStoryArcChaptersPrompt({ ...input, batch: { batchIndex: input.batchIndex, startChapterIndex: input.startChapterIndex, complete: false } });
-}
-
 export function buildStoryArcReviewPrompt(bundle: StoryArcBundle, contextText: string, rebaseTarget?: StoryArcRebaseTarget): string {
   const ensemble = inspectStoryArcEnsemble(bundle.chapters);
   const ensembleReport = bundle.chapters.length >= 3

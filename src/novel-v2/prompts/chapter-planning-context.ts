@@ -160,16 +160,3 @@ export function renderChapterExecutionContract(context: ChapterPlanningContext):
     "以上是因果和事实边界，不是正文措辞、节拍清单或固定篇幅要求。规划器内部的分析方法不属于正文执行材料；未指定的表达、场景细节、节奏和情绪承载由作者根据人物与处境自然展开。",
   ].join("\n\n");
 }
-
-export function renderChapterPlanningContext(context: ChapterPlanningContext, options: { includeMacro?: boolean } = {}): string {
-  if (options.includeMacro === false) return renderChapterExecutionContract(context);
-  return [
-    renderChapterExecutionContract(context),
-    "## 故事弧参考",
-    `故事弧：${context.arc.title}`,
-    `目标：${context.arc.objective}`,
-    `核心冲突：${context.arc.centralConflict || "未指定"}`,
-    `发展：${context.arc.development.join("；") || "未指定"}`,
-    `离场状态：${context.arc.exitState || "未指定"}`,
-  ].join("\n\n");
-}

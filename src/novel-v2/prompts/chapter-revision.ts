@@ -386,20 +386,6 @@ export const authorRevisionAlignmentSchema = {
   },
 } as const;
 
-export function buildAuthorRevisionAlignmentPrompt(input: { original: string; candidate: string; authorInstruction: string }): string {
-  return [
-    "判断候选正文是否实质响应了作者本轮修改要求。作者要求是自然语言目标，需要结合原文和候选的实际阅读效果判断，不做关键词匹配，也不把意见机械解释成绝对禁令。",
-    "只有候选在相关叙事选择、人物呈现或表达效果上出现可感知变化，才可判定 satisfied=true；仅修复无关审校问题、删除一处重复或做同义替换不算完成。",
-    "若未满足，unmetRequirements 要说明仍未落实的目标及其在候选中的具体表现；evidence 引用或概括可核对的文本证据。",
-    "## 作者要求",
-    input.authorInstruction.trim(),
-    "## 修订前正文",
-    input.original,
-    "## 候选正文",
-    input.candidate,
-  ].join("\n\n");
-}
-
 function renderAuthorRevisionRepairPrompt(input: {
   original: string;
   candidate: string;

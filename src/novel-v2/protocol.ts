@@ -632,31 +632,11 @@ export interface ExecutionBlueprint {
 }
 
 /**
- * 全书规划必填 taskKey 清单。
- *
- * 设计依据:AGENTS.md「root-cause analysis」——v2 重构后 novel_bootstrap_run 产出 foundation
- * artifacts 但未被章节生成消费,导致章节生成不基于全书规划。此清单是章节生成的前置硬约束:
- * 缺失任何一项,novel_chapter_generate handler 与 novelIntentWorkflow 均拒绝启动章节生成。
- *
- * 选择这 5 个 taskKey 的理由(对应全书规划的核心方向):
- * - project-positioning:读者承诺、主题问题与主角核心矛盾是后续所有规划的解释边界
- * - architecture:叙事结构/章节布局,章节生成必须知道章节在全书中的位置
- * - characters:人物档案/动机,章节生成必须知道人物声部与动机
- * - worldview:世界观规则,章节生成必须遵守设定约束
- * - plot-design:长程叙事战略,章节生成前必须有全书方向、终局边界与提前消费护栏
- * - 单章直接蓝图由当前已批准 NarrativeArc 的 ChapterBlueprint 提供
- *
- * 其余 taskKey(relations/plot-threads/foreshadowing/timeline/story-control)
- * 不在必填清单:它们是重要参考但非阻塞——例如 foreshadowing 可能在章节生成过程中逐步建立,
- * timeline 可由滚动故事弧与已定稿状态继续校准。它们仍会作为软参考注入,只是不阻塞章节生成启动。
+ * 章节生成前置的"全书规划必填"约束由**批准面**单一表达：
+ * `application/project-plan.ts` 的 `REQUIRED_APPROVED_PLAN_TASK_KEYS`。
+ * 此处曾另存一份同名清单并声明"handler 与 workflow 据此拒绝启动"，但全仓无引用——
+ * 那份声明是虚构的第二权威（2026-09-19 复核确认），已删除以免有人误以为门在预检侧生效。
  */
-export const REQUIRED_FOUNDATION_TASK_KEYS = [
-  "project-positioning",
-  "architecture",
-  "characters",
-  "worldview",
-  "plot-design",
-] as const;
 
 export interface Artifact {
   id: string;
