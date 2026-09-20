@@ -3,9 +3,9 @@ import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Pool } from "pg";
+import { isPostgresUnavailable } from "./test-db";
 
-const EXPLICIT_TEST_DB_URL = process.env.TEST_DATABASE_URL;
-const TEST_DB_URL = EXPLICIT_TEST_DB_URL ?? "postgresql://ymcp:ymcp@127.0.0.1:5432/ymcp_test";
+const TEST_DB_URL = process.env.TEST_DATABASE_URL ?? "postgresql://ymcp:ymcp@127.0.0.1:5432/ymcp_test";
 
 describe("memory claim revision lifecycle migration", () => {
   const schemaName = `migration_claim_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
@@ -23,7 +23,7 @@ describe("memory claim revision lifecycle migration", () => {
       for (const file of legacyMigrations) await isolated.query(readFileSync(join(migrationsDir, file), "utf8"));
       available = true;
     } catch (error) {
-      if (EXPLICIT_TEST_DB_URL) throw error;
+      if (!isPostgresUnavailable(error)) throw error;
       console.warn(`[memory-claim-migration-compatibility.test] Postgres unavailable: ${(error as Error).message}`);
     }
   }, 30_000);

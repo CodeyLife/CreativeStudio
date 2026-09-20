@@ -5,9 +5,9 @@ import { Pool } from "pg";
 import { describe, expect, it } from "vitest";
 import { afterAll, beforeAll } from "vitest";
 import { isTransientPostgresStartupError, NovelPostgresRepository, V1_MIGRATED_SKILL_IDS, hasCompatibleV1SkillSet } from "../postgres-repository";
+import { isPostgresUnavailable } from "./test-db";
 
-const EXPLICIT_TEST_DB_URL = process.env.TEST_DATABASE_URL;
-const TEST_DB_URL = EXPLICIT_TEST_DB_URL ?? "postgresql://ymcp:ymcp@127.0.0.1:5432/ymcp_test";
+const TEST_DB_URL = process.env.TEST_DATABASE_URL ?? "postgresql://ymcp:ymcp@127.0.0.1:5432/ymcp_test";
 
 describe("017 migrated Skill compatibility marker", () => {
   it("requires every canonical V1 Skill ID instead of trusting total row count", () => {
@@ -64,7 +64,7 @@ describe("017 migration replay", () => {
       available = true;
     } catch (error) {
       const cause = error instanceof Error && error.cause ? error.cause : error;
-      if (EXPLICIT_TEST_DB_URL || !isTransientPostgresStartupError(cause)) throw error;
+      if (!isPostgresUnavailable(cause) && !isTransientPostgresStartupError(cause)) throw error;
       console.warn(`[migration-compatibility.test] Postgres unavailable: ${(error as Error).message}`);
     }
   }, 30_000);

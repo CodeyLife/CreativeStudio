@@ -1,10 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { NovelPostgresRepository } from "../postgres-repository";
+import { isPostgresUnavailable } from "./test-db";
 import type { Artifact, Review } from "../protocol";
 
-const EXPLICIT_TEST_DB_URL = process.env.TEST_DATABASE_URL;
-const TEST_DB_URL = EXPLICIT_TEST_DB_URL ?? "postgresql://ymcp:ymcp@127.0.0.1:5432/ymcp_test";
+const TEST_DB_URL = process.env.TEST_DATABASE_URL ?? "postgresql://ymcp:ymcp@127.0.0.1:5432/ymcp_test";
 
 describe("targeted chapter review issues", () => {
   const suffix = randomUUID().slice(0, 8);
@@ -34,7 +34,7 @@ describe("targeted chapter review issues", () => {
               ($3,$2,'fingerprint-ignored','major','重复解释','他知道自己明白了',3,'[{"start":3,"end":3}]','改为行动','ignored')`, [pendingIssueId, snapshotId, ignoredIssueId]);
       available = true;
     } catch (error) {
-      if (EXPLICIT_TEST_DB_URL) throw error;
+      if (!isPostgresUnavailable(error)) throw error;
       console.warn(`[targeted-chapter-review.test] Postgres unavailable: ${(error as Error).message}`);
     }
   }, 30_000);

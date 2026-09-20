@@ -1,11 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { NovelPostgresRepository } from "../postgres-repository";
+import { isPostgresUnavailable } from "./test-db";
 import { serialContextFingerprint } from "../application/serial-context-fingerprint";
 import type { ChapterMemory } from "../protocol";
 
-const EXPLICIT_TEST_DB_URL = process.env.TEST_DATABASE_URL;
-const TEST_DB_URL = EXPLICIT_TEST_DB_URL ?? "postgresql://ymcp:ymcp@127.0.0.1:5432/ymcp_test";
+const TEST_DB_URL = process.env.TEST_DATABASE_URL ?? "postgresql://ymcp:ymcp@127.0.0.1:5432/ymcp_test";
 
 function chapterMemory(overrides: Partial<ChapterMemory> & { id: string; projectId: string; documentId: string; revisionId: string; order: number }): ChapterMemory {
   return {
@@ -84,7 +84,7 @@ describe("serial context snapshot (L1)", () => {
       }
       available = true;
     } catch (error) {
-      if (EXPLICIT_TEST_DB_URL) throw error;
+      if (!isPostgresUnavailable(error)) throw error;
       console.warn(`[serial-context.test] Postgres unavailable: ${(error as Error).message}`);
     }
   }, 30_000);

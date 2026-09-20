@@ -470,8 +470,20 @@ describe("evaluation integration", () => {
     }
   }, 30000);
 
+  /**
+   * 本文件创建过的实验工作区 id 在此登记，afterAll 兜底 delete。
+   * 根因：`close()` 只把 status 翻成 'closed'，克隆的 60+ 张表与登记行永久留在共享测试库
+   * （实测本文件所在库已积到 105 个在册沙箱）；而零登记观测面只报"无登记行"的孤儿，
+   * 对这类"在册但没人再用的 closed 沙箱"不报警 ⇒ 泄漏只有靠用例自己清。
+   */
+  const createdExperimentIds: string[] = [];
+
   afterAll(async () => {
     if (postgresAvailable && repository) {
+      for (const experimentId of createdExperimentIds) {
+        const handle = await getExperimentWorkspace(repository, experimentId).catch(() => null);
+        await handle?.delete().catch(() => undefined);
+      }
       await repository.close();
     }
   });
@@ -652,7 +664,9 @@ describe("evaluation integration", () => {
       const receipt2 = await promotionService.promote(candidate, decision);
       expect(receipt2.id).toBe(receipt1.id);
       expect(receipt2.status).toBe("promoted");
-      await workspace.close();
+      // delete 而非 close：close 只翻 status，克隆的 60+ 张表与登记行留在库里（本文件所在
+      // 的共享测试库已因此积到 105 个在册沙箱）。close 语义自有用例覆盖，不在这里顺带漏账。
+      await workspace.delete();
     });
 
     integrationIt("promote rejects on stale baseline", async () => {
@@ -857,6 +871,8 @@ describe("evaluation integration", () => {
       });
 
       expect(result.experimentId).toMatch(/^exp-/);
+      // 闭环自己建的工作区没有句柄在本用例作用域内（dryRun 不 promote），交 afterAll 兜底删。
+      createdExperimentIds.push(result.experimentId);
       expect(result.snapshotId).toMatch(/^[0-9a-f-]{36}$/u);
       expect(result.candidateBundle).toBeDefined();
       expect(result.promotionReceipt).toBeUndefined();

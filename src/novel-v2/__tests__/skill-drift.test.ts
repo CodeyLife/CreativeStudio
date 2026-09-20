@@ -67,6 +67,8 @@ describe("skills CLI 的读写面分离", () => {
   const source = readFileSync("scripts/novel-v2-skills.ts", "utf8");
   const body = (name: string) => {
     const start = source.indexOf(`async function ${name}(`);
+    // 找不到函数头时 slice(-1) 只有尾字符，not.toContain 会恒真 ⇒ 先锁"切片非空转"。
+    expect(start, `源里必须存在 async function ${name}(`).toBeGreaterThan(-1);
     const next = source.indexOf("\nasync function ", start + 1);
     return source.slice(start, next < 0 ? source.length : next);
   };

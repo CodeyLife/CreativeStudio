@@ -171,3 +171,28 @@ describe("序列证据目标判据同形", () => {
     expect([...code.matchAll(/PROJECTABLE_FINAL_DOCUMENT_SQL/g)].length).toBeGreaterThan(6);
   });
 });
+
+/**
+ * 真库用例的跳过判据单一真源（product-audit 事故①的锁）。
+ * 旧形状 `if (EXPLICIT_TEST_DB_URL) throw` 在没设环境变量时把 CREATE SCHEMA／迁移 SQL／FK／
+ * 权限错误一律当"环境缺失"吞掉 ⇒ 整块真库用例空过判绿。09-20 收口 6 个残留文件后用本锁钉住：
+ * 凡"吞掉不可用警告"的测试文件都必须走 `isPostgresUnavailable`，且不得再出现环境变量存在性判据。
+ */
+describe("真库用例的跳过判据只许共享判据", () => {
+  const dir = join(process.cwd(), "src", "novel-v2", "__tests__");
+  const swallowing = readdirSync(dir)
+    .filter((file) => file.endsWith(".test.ts"))
+    .map((file) => ({ file, source: readFileSync(join(dir, file), "utf8") }))
+    .filter((entry) => /Postgres (unavailable|不可用)/u.test(entry.source));
+
+  it("判据覆盖面非空（扫描本身不得空转）", () => {
+    expect(swallowing.length).toBeGreaterThan(20);
+  });
+
+  it("吞掉不可用警告的文件必须用 isPostgresUnavailable，且不得再用环境变量存在性判可达", () => {
+    for (const entry of swallowing) {
+      expect(entry.source, entry.file).toContain("isPostgresUnavailable(");
+      expect(entry.source, entry.file).not.toContain("EXPLICIT_TEST_DB_URL");
+    }
+  });
+});

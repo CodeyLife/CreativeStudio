@@ -181,7 +181,11 @@ describe("run 状态写入面接线锁", () => {
   });
 
   it("人工门族成员确实等人，对账不得收编", () => {
-    const reconcile = repository.slice(repository.indexOf("async reconcileStaleWorkflowRuns"), repository.indexOf("async reconcileStaleWorkflowRuns") + 6000);
+    const start = repository.indexOf("async reconcileStaleWorkflowRuns");
+    // 锚点改名或方法被搬走时 indexOf 返回 −1，slice 只剩尾字符 ⇒ 下面的 not.toContain 会恒真。
+    expect(start, "对账方法改名会让本条锁空转").toBeGreaterThan(-1);
+    const reconcile = repository.slice(start, start + 6000);
+    expect(reconcile.length, "切片要真的覆盖到方法体").toBeGreaterThan(1000);
     for (const status of HUMAN_GATE_WORKFLOW_RUN_STATUSES) {
       expect(isHumanGateWorkflowRunStatus(status)).toBe(true);
       expect(reconcile).not.toContain(`'${status}'`);

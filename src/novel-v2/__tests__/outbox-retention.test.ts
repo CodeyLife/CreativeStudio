@@ -84,9 +84,13 @@ describe("域事件账本的面与保留策略（迁移 094）", () => {
 
     const removed = await repository.pruneOutboxEvents(now);
     expect(removed, "至少清掉本轮种的超期行").toBeGreaterThanOrEqual(1);
-    expect(await exists(expiredId)).toBe(0);
+    expect(await exists(expiredId), "超期行必须被删（判决性断言，不靠全局计数）").toBe(0);
     expect(await exists(freshId), "期内一行都不能动").toBe(1);
-    expect(await repository.pruneOutboxEvents(now), "重放必须零删除").toBe(0);
+    // 重放安全只按**本轮两行**判：清理本就是全局动作（migrate 尾每个测试文件都会跑一次），
+    // 共享库上断言"全局第二次返回 0"会随别的并行会话残留时红时绿，也在替别人删数据。
+    await repository.pruneOutboxEvents(now);
+    expect(await exists(expiredId)).toBe(0);
+    expect(await exists(freshId)).toBe(1);
   });
 
   it("扫描窗上界与保留期同源：旧事件被清后不会把同一候选再通报一次", async () => {

@@ -1,10 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { NovelPostgresRepository } from "../postgres-repository";
+import { isPostgresUnavailable } from "./test-db";
 import type { ChapterMemory } from "../protocol";
 
-const EXPLICIT_TEST_DB_URL = process.env.TEST_DATABASE_URL;
-const TEST_DB_URL = EXPLICIT_TEST_DB_URL ?? "postgresql://ymcp:ymcp@127.0.0.1:5432/ymcp_test";
+const TEST_DB_URL = process.env.TEST_DATABASE_URL ?? "postgresql://ymcp:ymcp@127.0.0.1:5432/ymcp_test";
 
 describe("chapter memory recency", () => {
   const projectId = `test-memory-order-${randomUUID().slice(0, 8)}`;
@@ -34,7 +34,7 @@ describe("chapter memory recency", () => {
       }
       available = true;
     } catch (error) {
-      if (EXPLICIT_TEST_DB_URL) throw error;
+      if (!isPostgresUnavailable(error)) throw error;
       console.warn(`[chapter-memory-order.test] Postgres unavailable: ${(error as Error).message}`);
     }
   }, 30_000);

@@ -69,6 +69,8 @@ const ddlOnly = (sql: string) => sql.split("\n").filter((line) => !/^\s*--/u.tes
 describe("092 迁移文本守卫", () => {
   it("状态判据不把词表抄进 SQL（partial index 内联状态清单必然与 run-lifecycle 漂移）", () => {
     const ddl = ddlOnly(MIGRATION);
+    // 词表为空时下面的循环零次断言 ⇒ 锁空转，先钉它有成员。
+    expect([...ACTIVE_WORKFLOW_RUN_STATUSES].length, "活动态词表为空会让本条锁零断言").toBeGreaterThan(0);
     for (const status of ACTIVE_WORKFLOW_RUN_STATUSES) expect(ddl).not.toContain(`'${status}'`);
     // 反向：确实建了 (status, updated_at) 全量复合索引，而不是退回旧的 partial 形态。
     expect(ddl).toMatch(/workflow_runs\(status, updated_at\)/u);

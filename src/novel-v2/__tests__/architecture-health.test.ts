@@ -76,7 +76,7 @@ describe("story arc approval architecture gate", () => {
       plotThreads: { issues: Array<{ severity: string; message: string }> };
       foreshadowing: { issues: Array<{ severity: string; message: string }> };
     }>;
-  }) {
+  }, reason: RegExp) {
     const fakeRepository = {
       previewStoryArcApproval: async () => ({ creates: [], updates: [], conflicts: [], artifactId: blueprint.id }),
       getArtifact: async (id: string) => id === blueprint.id ? blueprint : id === review.id ? review : undefined,
@@ -84,16 +84,17 @@ describe("story arc approval architecture gate", () => {
       // approveStoryArc 在引用门禁前会先物化弧引用；测试中不物化，保持 health 的 blocking issues 可见
       normalizeStoryArcReferences: async () => ({ arc: null, mappings: [], created: [] }),
     } as unknown as NovelPostgresRepository;
+    // 每道门禁各配自己的原因式：共用一条判据时，删掉 foundation 检查由引用门禁顶罪仍全绿。
     await expect(NovelPostgresRepository.prototype.approveStoryArc.call(fakeRepository, "project-1", "arc-1", blueprint.id, review.id, "test"))
-      .rejects.toThrow(/故事弧审批前置门禁未通过|故事弧存在未解决的结构引用/);
+      .rejects.toThrow(reason);
   }
 
   it("blocks when required Foundation stages are missing", async () => {
-    await expectGate({ foundation: { missing: ["worldview"] }, fullBookArchitecture: { issues: [] } });
+    await expectGate({ foundation: { missing: ["worldview"] }, fullBookArchitecture: { issues: [] } }, /前置门禁未通过：Foundation 未批准：worldview/);
   });
 
   it("blocks blocker and major issues from full-book architecture", async () => {
-    await expectGate({ foundation: { missing: [] }, fullBookArchitecture: { issues: [{ severity: "major", path: "worldview.rules", message: "缺少规则" }] } });
+    await expectGate({ foundation: { missing: [] }, fullBookArchitecture: { issues: [{ severity: "major", path: "worldview.rules", message: "缺少规则" }] } }, /前置门禁未通过：全书架构审计：worldview\.rules 缺少规则/);
   });
 
   it("blocks unknown foreshadowing references", async () => {
@@ -105,6 +106,24 @@ describe("story arc approval architecture gate", () => {
         plotThreads: { issues: [] },
         foreshadowing: { issues: [{ severity: "blocking", message: "伏笔引用无法解析" }] },
       }],
-    });
+    }, /故事弧存在未解决的结构引用：伏笔引用无法解析/);
+  });
+
+  /**
+   * 正向：三道门禁全清时，审批必须**推进到门禁之后**才失败。假仓储没有 getStoryArc（门禁后的
+   * 第一步），所以正确形态是"弧不存在"而不是任何一条门禁文案——这补的是"只测反面"那一侧：
+   * 若某道门禁因判据写反而恒拦，上面的三条负向用例照绿，本条会红。
+   */
+  it("门禁全清时放行到门禁之后（不是被任何一道门禁拦下）", async () => {
+    const fakeRepository = {
+      previewStoryArcApproval: async () => ({ creates: [], updates: [], conflicts: [], artifactId: blueprint.id }),
+      getArtifact: async (id: string) => id === blueprint.id ? blueprint : id === review.id ? review : undefined,
+      getArchitectureHealth: async () => ({ foundation: { missing: [] }, fullBookArchitecture: { issues: [] }, references: [] }),
+      normalizeStoryArcReferences: async () => ({ arc: null, mappings: [], created: [] }),
+      // 门禁后的第一步就是取弧快照；返回 undefined 让它在门禁之后才报错，从而证明三道门全放行。
+      getStoryArc: async () => undefined,
+    } as unknown as NovelPostgresRepository;
+    await expect(NovelPostgresRepository.prototype.approveStoryArc.call(fakeRepository, "project-1", "arc-1", blueprint.id, review.id, "test"))
+      .rejects.toThrow(/故事弧不存在/);
   });
 });
