@@ -4,7 +4,6 @@ import {
   buildPolishUserMessage,
 } from "@/lib/imagegenPresets";
 import { DEFAULT_BASE_URL } from "@/config/defaults";
-import { recordModelContextWindow } from "@/lib/model-capabilities";
 
 export const api = axios.create({
   baseURL: "/api",
@@ -275,12 +274,6 @@ export async function listChatModels(config: { baseUrl: string; apiKey: string }
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
   const payload = await response.json();
   const modelItems: unknown[] = Array.isArray(payload?.data) ? payload.data : [];
-  for (const item of modelItems) {
-    if (!item || typeof item !== "object") continue;
-    const record = item as Record<string, unknown>;
-    const id = typeof record.id === "string" ? record.id : "";
-    recordModelContextWindow(id, record.context_window ?? record.context_length ?? record.max_model_len ?? record.max_context_length);
-  }
   const ids: unknown[] = modelItems
     .map((item: unknown) => typeof item === "string" ? item : (item as { id?: unknown })?.id);
   const modelIds = ids.filter((id): id is string => (

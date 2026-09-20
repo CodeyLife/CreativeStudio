@@ -5,7 +5,8 @@
  * `Math.ceil(text.length / 2)` 出现在 5 处（cognition 记忆装配的本地函数、
  * stage-context 的 `estimateStageTokens`、model-gateway 调用前预算闸×2、
  * activities 的记忆选择收据），model-gateway 的用量留痕侧另有一份 CJK 感知估算，
- * `src/lib/model-capabilities` 的硬上限闸又有第三份（CJK 系数 1.1）。重复的代价
+ * `src/lib/model-capabilities` 的硬上限闸（2026-09-20 随该死面一并撤除）又有第三份
+ * （CJK 系数 1.1）。重复的代价
  * 不是"代码冗余"，而是**同一字段承载多种口径**：`selectionReceipts[].tokenCost` 由
  * cognition 与 activities 两条路径用不同公式各写一遍（一处含 `\n` 分隔、一处不含），
  * `estimated_input_tokens` 一列里既有 0.5 token/字的行也有 0.75 token/字的行——而
@@ -13,7 +14,10 @@
  * 分母口径混杂时它会把"两处估算本来就不一样"误读成"provider 上报异常"。
  *
  * 本文件把实现收敛为一个（CJK 判定、空白判定、下限 1、拉丁档折算只有一份代码），
- * 口径差异收敛为 3 个具名 basis。**刻意没有合并成单一口径**，原因是预算侧的口径与
+ * 口径差异收敛为 2 个具名 basis（第三条 `HARD_GATE` 1.1/4 已于 2026-09-20 随其唯一消费方
+ * `src/lib/model-capabilities` 撤除——那条硬上限闸的限额来源是浏览器侧进程内 Map，服务端
+ * 永远取不到值，"必带资料不被截断"实际由 stage-context / cognition / model-gateway 三处
+ * 显式抛错承担，取证见 product-audit §五 4）。**刻意没有合并成单一口径**，原因是预算侧的口径与
  * 预算常数是"共同标定的一对"：`computeTokenBudget` 的阶梯（24K/64K→96K→128K，
  * 见 cognition 内 ch125 顶穿实证注释）与 `maxInputTokens` 配置都是在 flat 口径下
  * 对着实测"必要上下文"数字调出来的，只换口径不换常数等于把这轮标定作废，会让已上线
@@ -49,12 +53,6 @@ export const AUDIT_TOKEN_BASIS: TokenEstimateBasis = { cjkTokensPerChar: 0.75, l
  * 改动此口径必须同批重derive 全部预算常数，否则边界章节会批量顶穿。
  */
 export const BUDGET_TOKEN_BASIS: TokenEstimateBasis = { cjkTokensPerChar: 0.5, latinCharsPerToken: 2 };
-
-/**
- * 硬上限闸口径：对 CJK 取悲观系数，失败模式是"必带资料被 provider 截断"，宁可早报错。
- * TODO 可配置：仅 `assertModelContextLimit` 一类"绝不截断"的闸使用。
- */
-export const HARD_GATE_TOKEN_BASIS: TokenEstimateBasis = { cjkTokensPerChar: 1.1, latinCharsPerToken: 4 };
 
 // 统一表意文字（含扩展 A 与兼容表意区）。补充平面（扩展 B 及以后）落进"非 CJK"一档，
 // 按 UTF-16 代理对计 2 字符 → 低估；生僻字入名的场景偏差方向是低估，故留此注记而非静默。
