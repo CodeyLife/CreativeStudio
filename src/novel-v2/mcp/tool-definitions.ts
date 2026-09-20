@@ -591,7 +591,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     },
   },
 
-  // ===== 一键流程（2）=====
+  // ===== 规划与创作主体（13：含一键流程 2 条，另 2 条见下"外部产出"段）=====
 
   {
     name: "novel_bootstrap_run",
@@ -816,7 +816,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     },
   },
 
-  // ===== 外部产出与 Skill 读取（3，v2 新增）=====
+  // ===== 规划与创作·外部产出与 Skill 读取（2，v2 新增）=====
 
   {
     name: "novel_skill_get",
@@ -962,7 +962,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     },
   },
 
-  // ===== 外部 LLM 深度参与：上下文查询与子 agent 调度（5，2026-09-08）=====
+  // ===== 外部 LLM 深度参与：上下文查询与子 agent 调度（9，2026-09-08 起陆续扩至 9 条）=====
 
   {
     name: "novel_memory_query",

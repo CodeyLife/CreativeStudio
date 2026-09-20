@@ -89,7 +89,7 @@ dsh --profile headless --patch orchestrator/dsh/cordis.patch.yml "<任务描述>
 ## Phase 1 计划（下一步）
 
 1. **dsh 版 novel-orchestration skill**：改编 `.agents/skills/novel-mcp-orchestration`（治理流程不变，调整触发与工具映射描述以适配 dsh 会话形态）。
-2. **dsh 版 short-drama-orchestration skill**：短剧创作编排（novel_short_script_h3 / novel_chapter_script_h3 / submit 工具链）。
+2. **dsh 版 short-drama-orchestration skill**：短剧创作编排（novel_chapter_script_h3 与其 submit 双轨）。现状注（09-20）：创意短剧一轨的 `novel_short_script_h3` 已随 2026-09-17「独立短剧改浏览器本地存储」从 MCP 工具面移除，只有章节派生一轨仍在 MCP 内。
 3. **运行手册** `docs/orchestrator/dsh-runbook.md`：启动顺序、常见故障（含本页关键发现速查）、会话恢复。
 
 ## Phase 1 验收结论（2026-09-04，2026-09-07 修订）

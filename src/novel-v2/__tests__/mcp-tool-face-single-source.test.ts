@@ -99,4 +99,28 @@ describe("MCP 工具面单一真源", () => {
     expect(perGroup.length).toBe(TOOL_GROUPS.length);
     expect(perGroup.reduce((sum, value) => sum + value, 0)).toBe(TOOL_COUNT);
   });
+
+  /**
+   * 文件头分组是"按能力分类"的账，正文的 `// ===== 段名（N）=====` 是"按代码位置分段"的账，
+   * 两者会各自漂移：2026-09-20 取证时正文三处括号已与实际条目不符（一键流程标 2 实为 13、
+   * 外部产出标 3 实为 2、外部 LLM 参与标 5 实为 9），而头部分组总和仍恰好等于 50——
+   * 只锁头部会漏掉这类"注释段落边界变了、括号留在旧数"的漂移。
+   */
+  it("注册表正文每个段落标记的括号数等于该段实际条目数", () => {
+    const source = readFileSync(fileURLToPath(new URL("../mcp/tool-definitions.ts", import.meta.url)), "utf8");
+    const lines = source.split(/\r?\n/);
+    const start = lines.findIndex((line) => /\/\/ ===== 工具定义 =====/u.test(line));
+    expect(start).toBeGreaterThan(-1);
+    const marks = lines
+      .map((line, index) => ({ line, index }))
+      .filter((entry) => entry.index > start && /\/\/ ===== .+（\d{1,2}/u.test(entry.line));
+    expect(marks.length, "段落标记扫描不得空转").toBeGreaterThan(5);
+    const total = marks.reduce((sum, mark, position) => {
+      const end = position + 1 < marks.length ? marks[position + 1].index : lines.length;
+      const actual = lines.slice(mark.index, end).filter((line) => /\bname: "novel_/u.test(line)).length;
+      expect(Number(/（(\d{1,2})/u.exec(mark.line)?.[1]), mark.line.trim()).toBe(actual);
+      return sum + actual;
+    }, 0);
+    expect(total).toBe(TOOL_COUNT);
+  });
 });

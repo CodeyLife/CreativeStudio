@@ -139,7 +139,9 @@ deadpan discipline. Mechanisms, in priority order:
 Repetition across a channel's catalogue kills retention faster than repetition
 inside a piece. The pipeline automates its half — recent shorts' core ideas are
 injected into brainstorm and generation prompts as an avoidance list
-(`avoidMotifs`, cross-work 反同质 line, derived from `short_scripts` history, never
+(`avoidMotifs`, cross-work 反同质 line, derived from the browser-side IndexedDB
+history since 09-17 — the server-side `short_scripts` table it used to read was
+dropped by migration 093, never
 a fixed-phrase blacklist). The orchestrating agent's half:
 
 - Before committing an idea, skim the recent output list; if the new concept is a

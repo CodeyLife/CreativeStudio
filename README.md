@@ -203,7 +203,7 @@ pnpm dev
 
 也可以通过 Web 设置页或 Novel V2 的模型配置 API 管理路由。不要把真实密钥写入 Git；`.env.example` 只用于查看变量名和本地基础设施默认值。
 
-如果没有配置内部模型，Novel V2 仍可以通过外部 MCP 路由执行任务。相关协议和任务生命周期见 [`docs/novel-mcp.md`](docs/novel-mcp.md)。
+如果没有配置内部模型，Novel V2 仍可以通过外部 MCP 路由执行任务。相关协议和任务生命周期见 [`docs/novel-v2/mcp-orchestrator.md`](docs/novel-v2/mcp-orchestrator.md)。
 
 ## 常用命令
 
@@ -248,11 +248,11 @@ Novel V2 默认使用本地 MinIO 作为对象存储。运行时会校验对象�
 
 - [`docs/novel-v2-runtime.md`](docs/novel-v2-runtime.md)：本地服务栈、环境变量、HTTP 表面和运行时边界。
 - [`docs/novel-v2/workflow-map.md`](docs/novel-v2/workflow-map.md)：Novel V2 工作流和阶段契约。
-- [`docs/novel-v2/quality-standard.md`](docs/novel-v2/quality-standard.md)：长篇创作质量标准和审校维度。
+- [`docs/novel-v2/quality-loop-engineering.md`](docs/novel-v2/quality-loop-engineering.md)：长篇创作质量标准和审校维度。
 - [`docs/novel-v2/pipeline-audit.md`](docs/novel-v2/pipeline-audit.md)：当前流程审核、回归边界和验证矩阵。
-- [`docs/novel-v2/prompt-skill-audit.md`](docs/novel-v2/prompt-skill-audit.md)：Prompt 与 Skill 的审计和发布流程。
-- [`docs/novel-v2/research-methods.md`](docs/novel-v2/research-methods.md)：创作研究方法和系统转译边界。
-- [`docs/novel-mcp.md`](docs/novel-mcp.md)：外部 MCP 执行协议。
+- [`docs/novel-v2/workflow-map.md`](docs/novel-v2/workflow-map.md)：Prompt 与 Skill 的契约、发布口径与执行点投影。
+- [`docs/novel-agent-role-research.md`](docs/novel-agent-role-research.md)：创作研究方法和系统转译边界。
+- [`docs/novel-v2/mcp-orchestrator.md`](docs/novel-v2/mcp-orchestrator.md)：外部 MCP 执行协议与编排流程。
 - [`CONTEXT.md`](CONTEXT.md)：小说创作领域术语和数据边界。
 - [`AGENTS.md`](AGENTS.md)：仓库协作、验证和架构约束。
 
