@@ -26,7 +26,9 @@ import {
 import {
   createExperimentWorkspace,
   getExperimentWorkspace,
+  isOrphanExperimentSchemaResidue,
   listExperimentWorkspaces,
+  listOrphanExperimentSchemas,
 } from "../evaluation/experiment-workspace";
 import type { ExperimentWorkspaceHandle } from "../evaluation/experiment-workspace";
 import {
@@ -537,6 +539,60 @@ describe("evaluation integration", () => {
 
       const afterDelete = await getExperimentWorkspace(repository, `exp-${randomUUID().slice(0, 8)}`);
       expect(afterDelete).toBeNull();
+    });
+  });
+
+  describe("零登记实验沙箱观测面", () => {
+    /**
+     * 四条判据各占一角，缺一即盲区：
+     * - 在册工作区不报（否则观测面会把活实验当残留，下次就没人敢按清单删）；
+     * - 超宽限的零登记报出，且 tables/columns 是本 schema 自己的数（在册沙箱有 60+ 张克隆表，
+     *   聚合子查询若漏掉命名空间绑定就会把它们算进来）；
+     * - 宽限内不判残留——登记行晚于 schema 插入，这是真实窗口，不是理论担忧；
+     * - `status='deleted'` 的登记行按不可达对待（`getExperimentWorkspace` 对它返回 null）。
+     */
+    integrationIt("在册不报、超宽限报出规模、窗口内不判残留、tombstone 行按不可达算", async () => {
+      const projectId = `orphan-obs-${randomUUID().slice(0, 8)}`;
+      await repository.ensureProject(projectId, "Orphan Observability Test");
+      const snapshot = await captureProjectSnapshot(repository, projectId);
+      const workspace = await createExperimentWorkspace(repository, snapshot);
+      const tag = randomUUID().slice(0, 8);
+      const staleSchema = `experiment_exp_1600000000000_${tag}`;
+      const freshMs = Date.now();
+      const freshSchema = `experiment_exp_${freshMs}_${tag}`;
+      const namelessSchema = `experiment_handmade_${tag}`;
+      const handmade = [staleSchema, freshSchema, namelessSchema];
+      try {
+        for (const name of handmade) await repository.pool.query(`CREATE SCHEMA ${name}`);
+        await repository.pool.query(`CREATE TABLE ${staleSchema}.probe_probe (id integer, note text)`);
+
+        const byName = new Map((await listOrphanExperimentSchemas(repository)).map((item) => [item.schemaName, item]));
+
+        expect(byName.has(workspace.schemaName), "在册沙箱不应出现在零登记清单").toBe(false);
+
+        expect(byName.get(staleSchema)).toEqual({
+          schemaName: staleSchema,
+          derivedCreatedAtMs: 1_600_000_000_000,
+          tables: 1,
+          columns: 2,
+        });
+        expect(isOrphanExperimentSchemaResidue(byName.get(staleSchema)!)).toBe(true);
+
+        expect(byName.get(freshSchema)?.derivedCreatedAtMs).toBe(freshMs);
+        expect(isOrphanExperimentSchemaResidue(byName.get(freshSchema)!), "创建窗口内不得判成残留").toBe(false);
+
+        expect(byName.get(namelessSchema)?.derivedCreatedAtMs, "名内无毫秒时间戳 ⇒ 非本模块产出").toBeNull();
+        expect(isOrphanExperimentSchemaResidue(byName.get(namelessSchema)!)).toBe(true);
+
+        await repository.pool.query("UPDATE public.experiment_workspaces SET status='deleted' WHERE id=$1", [workspace.id]);
+        const afterTombstone = await listOrphanExperimentSchemas(repository);
+        expect(afterTombstone.some((item) => item.schemaName === workspace.schemaName), "tombstone 登记行等于无登记").toBe(true);
+      } finally {
+        await repository.pool.query("UPDATE public.experiment_workspaces SET status='active' WHERE id=$1", [workspace.id]).catch(() => undefined);
+        for (const name of handmade) await repository.pool.query(`DROP SCHEMA IF EXISTS ${name} CASCADE`).catch(() => undefined);
+        await workspace.delete().catch(() => undefined);
+        await repository.deleteProject(projectId).catch(() => undefined);
+      }
     });
   });
 

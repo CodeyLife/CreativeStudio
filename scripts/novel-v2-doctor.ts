@@ -4,6 +4,7 @@ import { NovelPostgresRepository } from "../src/novel-v2/postgres-repository";
 import { ContentObjectStore } from "../src/novel-v2/object-store";
 import { loadRuntimeEnv } from "./runtime-env.mjs";
 import { publicRuntimeIdentity, resolveNovelRuntimeConfig } from "../src/novel-v2/runtime-config";
+import { isOrphanExperimentSchemaResidue, listOrphanExperimentSchemas, ORPHAN_SCHEMA_INFLIGHT_GRACE_MS } from "../src/novel-v2/evaluation/experiment-workspace";
 
 Object.assign(process.env, loadRuntimeEnv(process.cwd()));
 const runtime = resolveNovelRuntimeConfig(process.env);
@@ -42,6 +43,22 @@ try {
     const missing = availability.filter((item) => !item.available).slice(0, 10).map((item) => item.objectKey);
     set("object-store-references", { ok: missing.length === 0, detail: `references=${references.length} missing=${missing.length}`, data: { missing } });
   } catch (error) { set("postgres", { ok: false, detail: (error as Error).message }); }
+
+  // 零登记实验沙箱：数据库全局残留，只报不删（删除是 DROP SCHEMA CASCADE，既会在单事务里
+  // 打爆共享锁表，也会误删"登记行尚未插入"的在飞实验——两条都在真库实测过，见 migration 093
+  // 头注释）。查到残留不改退出码——残留是运维 backlog 而非运行时不健康；只有查询本身失败才算
+  // 检查失败。目的是让这件事从人工取证变成常规观测面。
+  try {
+    const orphans = await listOrphanExperimentSchemas(repository);
+    const residue = orphans.filter((item) => isOrphanExperimentSchemaResidue(item));
+    const tables = residue.reduce((sum, item) => sum + item.tables, 0);
+    const columns = residue.reduce((sum, item) => sum + item.columns, 0);
+    set("experiment-sandbox", {
+      ok: true,
+      detail: `零登记 ${orphans.length} 个（超在飞宽限 ${residue.length} 个：表 ${tables} / 列 ${columns}；宽限 ${ORPHAN_SCHEMA_INFLIGHT_GRACE_MS}ms）——只报不删`,
+      data: { withinGrace: orphans.length - residue.length, residue: residue.slice(0, 20) },
+    });
+  } catch (error) { set("experiment-sandbox", { ok: false, detail: (error as Error).message }); }
 
   try {
     const [aliases, collection] = await Promise.all([

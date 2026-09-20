@@ -50,11 +50,14 @@ function generateExperimentId(): string {
   return `exp-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+/** 实验 schema 名前缀：所有实验 schema 都以它开头，观测面按同一常量匹配。 */
+const EXPERIMENT_SCHEMA_PREFIX = "experiment_";
+
 /**
  * 从 experimentId 派生 schema 名：experiment_<id with underscores>。
  */
 function schemaNameFromExperimentId(experimentId: string): string {
-  return `experiment_${experimentId.replace(/-/g, "_")}`;
+  return `${EXPERIMENT_SCHEMA_PREFIX}${experimentId.replace(/-/g, "_")}`;
 }
 
 /**
@@ -480,4 +483,101 @@ export async function listExperimentWorkspaces(
     [projectId],
   );
   return result.rows.map(mapWorkspaceRow);
+}
+
+// ===== 观测面：零登记沙箱（只读、只报不删） =====
+
+/**
+ * 一个 `experiment_*` schema 在登记表里没有可寻址行时的观测结果。
+ *
+ * 可达性判据：代码只按登记表寻址工作区（`getExperimentWorkspace` 按 id、
+ * `listExperimentWorkspaces` 按 project_id），所以对应用而言零登记的 schema 永久不可达。
+ * `status = 'deleted'` 的登记行同样算不可达：两条读路径都把它当不存在（前者返回 null、
+ * 后者过滤掉），本模块无人写入该状态（`handle.delete()` 是直接删行）。
+ *
+ * 不可达不等于无害：克隆表仍在 catalog 与磁盘上，且每张克隆表里那些
+ * `LIKE public.x INCLUDING ALL` 抄来的 id 默认值（未限定名）仍按 search_path 解析到 public 的序列。
+ */
+export type OrphanExperimentSchema = {
+  schemaName: string;
+  /** schema 名内嵌的创建毫秒；名里无可解析时间戳（手工建的 schema）时为 null */
+  derivedCreatedAtMs: number | null;
+  tables: number;
+  /** 非 dropped 的普通列数——残留规模的度量 */
+  columns: number;
+};
+
+/**
+ * 在飞宽限期。`createExperimentWorkspace` 的顺序是 CREATE SCHEMA → 克隆 60+ 张影子表 →
+ * 回灌快照 → **最后一步**才插登记行，故窗口内目录看起来正是"零登记"。取一次创建（含大项目
+ * 回灌）耗时的上界量级；宽限内不算残留，超窗者才需要人看。
+ * TODO: 属可调运维参数。把登记行改为首步插入（或整段包进单事务）后窗口归零，此常数可删。
+ */
+export const ORPHAN_SCHEMA_INFLIGHT_GRACE_MS = 5 * 60_000;
+
+/**
+ * 名内时间戳不可解析 ⇒ 不是本模块建的 ⇒ 不在创建窗口里，按残留对待。
+ * 与 `listOrphanExperimentSchemas` 同处：判据是"能否排除在飞"，不是"年龄大小"。
+ */
+export function isOrphanExperimentSchemaResidue(schema: OrphanExperimentSchema, nowMs = Date.now()): boolean {
+  if (schema.derivedCreatedAtMs === null) return true;
+  return nowMs - schema.derivedCreatedAtMs > ORPHAN_SCHEMA_INFLIGHT_GRACE_MS;
+}
+
+/**
+ * 从 schema 名取创建时刻。四个实验 id 生成器都把 `Date.now()` 嵌在名字里
+ * （`exp-<ms>-…`、`exp-craft-rule-<ms>-…`、`exp-craft-rule-post-<ms>-…`），故无需新列即可判年龄。
+ */
+function deriveCreatedAtFromSchemaName(schemaName: string, nowMs: number): number | null {
+  // 早于此的毫秒值不可能是本系统的实验 id（生成器只用 Date.now()，2026 年为 1.7e12）。
+  const earliestPlausible = Date.UTC(2000, 0, 1);
+  for (const run of schemaName.match(/\d+/gu) ?? []) {
+    if (run.length < 11 || run.length > 13) continue;
+    const value = Number(run);
+    if (value >= earliestPlausible && value <= nowMs) return value;
+  }
+  return null;
+}
+
+/**
+ * 列出零登记的 `experiment_*` schema（数据库全局，不限项目）。纯目录查询，不写任何东西。
+ *
+ * 刻意**只观测不删除**：删除只能是 `DROP SCHEMA … CASCADE`，而它有两个实测代价——
+ * ①  几十上百个沙箱一次 CASCADE 会在单事务内打爆共享锁表（SQLSTATE 53200，migration 093 首版即如此）；
+ * ②  登记行晚于 schema 插入，判据落在窗口里就会把在飞实验整库删掉。
+ * 清理仍由知道在飞状态的人按清单执行；本函数只负责让它出现在常规观测面上。
+ *
+ * 另有一条已知的生成器：`deleteProject` 靠 `experiment_workspaces.project_id` 的
+ * `ON DELETE CASCADE` 抹掉登记行，而 schema 不受外键管控 ⇒ 删项目即产孤儿。故这里看到的
+ * 残留未必来自崩溃。
+ */
+export async function listOrphanExperimentSchemas(
+  repository: NovelPostgresRepository,
+  nowMs = Date.now(),
+): Promise<OrphanExperimentSchema[]> {
+  const result = await repository.pool.query<{ schema_name: string; tables: string; columns: string }>(
+    `
+      SELECT n.nspname AS schema_name,
+             (SELECT count(*)::text FROM pg_class c
+               WHERE c.relnamespace = n.oid AND c.relkind = 'r') AS tables,
+             (SELECT count(*)::text FROM pg_attribute a
+                JOIN pg_class c ON c.oid = a.attrelid
+               WHERE c.relnamespace = n.oid AND c.relkind = 'r'
+                 AND a.attnum > 0 AND NOT a.attisdropped) AS columns
+      FROM pg_namespace n
+      WHERE left(n.nspname, char_length($1)) = $1
+        AND NOT EXISTS (
+          SELECT 1 FROM public.experiment_workspaces w
+          WHERE w.schema_name = n.nspname AND w.status <> 'deleted'
+        )
+      ORDER BY n.nspname
+    `,
+    [EXPERIMENT_SCHEMA_PREFIX],
+  );
+  return result.rows.map((row) => ({
+    schemaName: row.schema_name,
+    derivedCreatedAtMs: deriveCreatedAtFromSchemaName(row.schema_name, nowMs),
+    tables: Number(row.tables),
+    columns: Number(row.columns),
+  }));
 }
