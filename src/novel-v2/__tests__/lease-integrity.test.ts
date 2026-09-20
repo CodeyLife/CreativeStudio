@@ -1,4 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { isPostgresUnavailable } from "./test-db";
 import { randomUUID } from "node:crypto";
 import { NovelPostgresRepository } from "../postgres-repository";
@@ -259,5 +261,31 @@ describe("reconcileStaleWorkflowRuns（OR-B4 僵尸对账）", () => {
     expect(expiredTask?.status).toBe("failed");
     expect((expiredTask?.result as { value?: { reason?: string } } | undefined)?.value?.reason).toBe("run-terminal:failed");
     expect((await repository.getModelTask(unrelated.id))?.status, "别的 run 的任务不受牵连").toBe("pending");
+  });
+
+  it("只写不读的两本账在真库已缺席（迁移 096，不靠迁移文本自证）", async () => {
+    if (!available) return;
+    const face = await repository.pool.query<{ commit_ledger: string | null; run_summaries: string | null }>(
+      "SELECT to_regclass('public.commit_records')::text AS commit_ledger, to_regclass('public.workflow_run_summaries')::text AS run_summaries",
+    );
+    expect(face.rows[0]).toEqual({ commit_ledger: null, run_summaries: null });
+    const applied = await repository.pool.query<{ n: number }>("SELECT COUNT(*)::int AS n FROM schema_migrations WHERE version=$1", ["096_drop_write_only_ledgers.sql"]);
+    expect(applied.rows[0].n, "缺席必须是「迁移应用过」的结果，而不是「表本来就没建」").toBe(1);
+  });
+
+  it("run 诊断清理不再依赖摘要表，也不再需要为摘要做的 document_id 预检", () => {
+    const source = readFileSync(join(process.cwd(), "src/novel-v2/postgres-repository.ts"), "utf8");
+    const start = source.indexOf("async cleanupExpiredChapterData");
+    expect(start).toBeGreaterThan(-1);
+    const body = source.slice(start, source.indexOf("async refreshChapterReviewSnapshot", start))
+      .split("\n").filter((line) => !/^\s*\/\//.test(line)).join("\n");
+    // 摘要面彻底消失，含那句只为摘要 INSERT 不撞 23503 而存在的文档存在性预检
+    // （同一段里 `JOIN manuscript_documents` 是滚动修订清理的合法用法，故只锁预检那一句）。
+    expect(body).not.toMatch(/workflow_run_summaries|SELECT 1 FROM manuscript_documents/);
+    // 同一段的本职仍在：四类细节各删一次，run 行原地压成 compactPayload。
+    for (const detail of ["DELETE FROM artifacts", "DELETE FROM task_attempts", "DELETE FROM model_tasks", "DELETE FROM outbox_events"]) {
+      expect(body, `清理的删除清单少了一项 ⇒ 摘要是被"顺手删掉"而非"不再需要"`).toContain(detail);
+    }
+    expect(body).toContain("diagnosticsCleanedAt");
   });
 });

@@ -289,24 +289,6 @@ class PromotionServiceImpl implements PromotionService {
         skillUpdates.push(iterated.skillId);
       }
 
-      // 6.9 INSERT commit_records
-      await client.query(
-        "INSERT INTO commit_records(id, project_id, revision_id, artifact_fingerprint, base_revision, result) VALUES($1, $2, $3, $4, $5, $6)",
-        [
-          randomUUID(),
-          candidate.sourceProjectId,
-          newRevisionId,
-          candidate.manuscript.contentHash,
-          candidate.target.baseRevision,
-          JSON.stringify({
-            revisionId: newRevisionId,
-            revision: newRevision,
-            contentHash: candidate.manuscript.contentHash,
-            promotedFrom: candidate.id,
-          }),
-        ],
-      );
-
       // 6.10 INSERT promotion_receipts（status=promoted）
       const receipt: PromotionReceipt = {
         id: receiptId,

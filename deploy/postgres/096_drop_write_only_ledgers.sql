@@ -1,0 +1,49 @@
+-- 096_drop_write_only_ledgers.sql
+-- 删除两本"只有写方、无人回读"的账：commit_records、workflow_run_summaries。
+-- （作者 2026-09-20 裁决：既然作用都很小就移除。）
+--
+-- 判据与 093/095 那条"零读写方"不同：这两张表**有真实数据在写**（不是死表），
+-- 判的是"整仓没有任何 SELECT/UPDATE/DELETE，写进去的内容没有读者"。
+-- 取证面（可复跑）：`tmp/ledger-readers.cjs`（两库行数/体积/跨度/键分布 + 全仓 SQL 动词计数）。
+--
+-- - commit_records (001)：`ymcp` 实测 348 行 / 1 项目 / 1,312 kB，`result` JSONB 平均 7,043 B、
+--   最大 20,089 B、合计 2.45 MB。全仓仅两处 `INSERT INTO commit_records`（提交事务内、
+--   实验晋升路径），零读者。三个键在别处都已有权威面，且是**同一份数据**：
+--     · `result` 与紧邻那句 `INSERT INTO idempotency_keys(...,result)` 存的是同一个对象字面量
+--       （提交幂等重放读的是 idempotency_keys，不是本表）；
+--     · 晋升路径里它的 `result`（revisionId/revision/contentHash/promotedFrom）与五行之后写入
+--       `promotion_receipts.result` 的对象逐键相同，且 `promotion_receipts` 是真被读的账
+--       （listPromotionReceipts 有 SELECT 与消费方）；
+--     · `contentHash`/`revision` 在 `manuscript_revisions`，`outboxEventId` 在 `outbox_events`。
+--   另有一处双真源代价：它把激活的 claim **整对象**抄进 `result`（实测内嵌 2,280 条，其中仅
+--   1,102 条今天仍能在 `memory_claims` 解到，52% 已随治理漂移）——既非权威也非稳定投影。
+--   声明→提交的追溯实际由 `memory_claims.sourceRevisionIds`/`sourceDocumentId` 承担（在实时写）。
+-- - workflow_run_summaries (022)：`ymcp` 实测 32 行 / 48 kB，唯一写入者在
+--   `cleanupExpiredChapterData` 的诊断清理事务里。它的设计前提是"细节将被删，摘要须长存"，
+--   而该前提在本部署从未成立：32/32 的宿主 run 仍在 `workflow_runs`（只压了 payload），
+--   `model_invocations` 也不在那条清理的删除清单里 ⇒ 摘要信息严格是直查的的子集，读它无增益；
+--   终态 run 543 个 vs 摘要 32 个 = 5.9% 覆盖率。第二重不可信来自上游遥测：359 次调用对应
+--   input/output 各 276 tokens（`model_invocations` 13,861 行里 4,752 行 `workflow_run_id` 为 NULL，
+--   非空 9,109 行只有 4,675 行对得上现存 run），摘要如实 SUM 了这些近零值。
+--   删表后清理仍照旧删 artifacts/task_attempts/model_tasks/该 run 的 outbox 事件并压缩 payload；
+--   随之消失的还有那段只为"摘要 INSERT 不撞 23503"而存在的 document_id 存在性预检。
+--
+-- 依赖取证（不照抄 093）：两表**均无归属序列**（`pg_depend` deptype='a' 指向它们的序列为空），
+-- 故"沙箱副本 id 默认值钉住公共序列 ⇒ DROP 报 2BP01"那条链在此不存在，无需 `OWNED BY NONE` 解绑；
+-- 入向外键 0 条（`workflow_run_summaries` 只**指向**workflow_runs/manuscript_documents，反向无引用），
+-- 沙箱克隆 11 + 8 个仅复制定义、不产生对父表的依赖。DROP 仍刻意不带 CASCADE。
+--
+-- 配套改动：`EXPERIMENT_RUNTIME_TABLES` 去掉这两个名字（留着每次建实验工作区都抛
+-- "V2 runtime schema 不完整"）；两处 INSERT 与那段摘要 metrics 计算（含 4 条只为摘要服务的
+-- COUNT/SUM 查询）一并移除，不做"保留计算但不写表"的中间形态。
+--
+-- 不可逆面：**这两表有真实存量**（348 + 32 行），与 093/095 的 0 行不同——删除即丢历史刻痕。
+-- 已按裁决执行，取舍记录在产品审核 §九末条：所丢内容要么在别处有同源（idempotency_keys /
+-- promotion_receipts / manuscript_revisions / model_invocations），要么被实测判定为漂移副本。
+-- 幂等：`IF EXISTS`，重复 migrate 为 no-op；迁移文件内不自管事务（本仓纪律）。
+-- 范围外：`memory_gate_states` 同样"零 SELECT"但**不删**——它的读就是写语句自己的
+-- `INSERT … ON CONFLICT DO UPDATE … RETURNING`，`blocked` 由该返回值当场决定并交给 activity，
+-- 属于"读回内联在同一句 SQL"的形态；按"零 SELECT"判它正是 095 那条"0 行≠死表"判据的同型误判。
+
+DROP TABLE IF EXISTS commit_records;
+DROP TABLE IF EXISTS workflow_run_summaries;

@@ -1964,28 +1964,6 @@ export class NovelPostgresRepository {
             : null;
         const artifactRows = await client.query<{ id: string }>("SELECT id FROM artifacts WHERE project_id=$1 AND (payload->>'workflowId'=$2 OR payload->>'runId'=$2)", [current.project_id, current.temporal_workflow_id]);
         const artifactIds = artifactRows.rows.map((row) => row.id);
-        const reviewCount = artifactIds.length ? await client.query<{ count: string }>("SELECT COUNT(*)::text AS count FROM reviews WHERE artifact_id=ANY($1::text[])", [artifactIds]) : { rows: [{ count: "0" }] };
-        const eventCount = await client.query<{ count: string }>("SELECT COUNT(*)::text AS count FROM outbox_events WHERE (aggregate_type='workflow-run' AND aggregate_id=$1) OR payload->>'workflowId'=$1 OR payload->>'runId'=$1", [current.temporal_workflow_id]);
-        const usage = await client.query<{ calls: string; input_tokens: string; output_tokens: string; provider_cached_input_tokens: string }>("SELECT COUNT(*)::text AS calls,COALESCE(SUM(input_tokens),0)::text AS input_tokens,COALESCE(SUM(output_tokens),0)::text AS output_tokens,COALESCE(SUM(provider_cached_input_tokens),0)::text AS provider_cached_input_tokens FROM model_invocations WHERE workflow_run_id=$1", [current.temporal_workflow_id]);
-        const elapsedMs = Math.max(0, new Date(current.updated_at).getTime() - new Date(current.created_at).getTime());
-        const finalStage = typeof current.payload.stage === "string" ? current.payload.stage : null;
-        const failureSummary = typeof current.payload.error === "string" ? current.payload.error.slice(0, 1000) : null;
-        // document_id 的 FK 语义是"引用有效或为 NULL"（ON DELETE SET NULL 同义）。run 可能引用
-        // 已被删除的章节文档（孤儿 run）：直接 INSERT 会 23503 并让整轮清理中断、积压增长。
-        // 先校验文档仍存在，已删除则置 NULL——摘要（metrics/failure_summary）本身保留。
-        let summaryDocumentId = documentId;
-        if (summaryDocumentId) {
-          const doc = await client.query("SELECT 1 FROM manuscript_documents WHERE id=$1", [summaryDocumentId]);
-          if (!doc.rowCount) summaryDocumentId = null;
-        }
-        await client.query(`
-          INSERT INTO workflow_run_summaries(workflow_run_id,project_id,document_id,workflow_type,final_status,final_stage,elapsed_ms,failure_summary,metrics,cleaned_at,completed_at)
-          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,now(),$10)
-          ON CONFLICT(workflow_run_id) DO UPDATE SET cleaned_at=EXCLUDED.cleaned_at,metrics=EXCLUDED.metrics
-        `, [current.id, current.project_id, summaryDocumentId, current.workflow_type, current.status, finalStage, elapsedMs, failureSummary, {
-          artifacts: artifactIds.length, reviews: Number(reviewCount.rows[0]?.count ?? 0), events: Number(eventCount.rows[0]?.count ?? 0),
-          modelCalls: Number(usage.rows[0]?.calls ?? 0), inputTokens: Number(usage.rows[0]?.input_tokens ?? 0), outputTokens: Number(usage.rows[0]?.output_tokens ?? 0), providerCachedInputTokens: Number(usage.rows[0]?.provider_cached_input_tokens ?? 0),
-        }, current.updated_at]);
         if (artifactIds.length) {
           await client.query("UPDATE manuscript_revisions SET artifact_id=NULL WHERE artifact_id=ANY($1::text[])", [artifactIds]);
           await client.query("DELETE FROM artifacts WHERE id=ANY($1::text[])", [artifactIds]);
@@ -7631,7 +7609,6 @@ export class NovelPostgresRepository {
       const event = await this.appendOutboxTx(client, "manuscript-revision", input.revisionId, "manuscript-revision.committed", { projectId: input.projectId, documentId: input.documentId, revision, contentHash: input.contentHash });
       result.outboxEventId = event;
       await client.query("INSERT INTO idempotency_keys(project_id,key,result) VALUES($1,$2,$3)", [input.projectId, input.idempotencyKey, result]);
-      await client.query("INSERT INTO commit_records(id,project_id,revision_id,artifact_fingerprint,base_revision,result) VALUES($1,$2,$3,$4,$5,$6)", [randomUUID(), input.projectId, input.revisionId, input.artifact.fingerprint, input.baseRevision, result]);
       await client.query("COMMIT");
       return result;
     } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }

@@ -83,7 +83,7 @@ type WorkspaceRow = {
 export const EXPERIMENT_RUNTIME_TABLES = [
   "approval_evidence", "arcs", "artifacts", "audit_records", "books", "chapter_memories", "chapter_planning_contexts", "chapter_production_specs",
   "chapter_review_snapshot_issues", "chapter_review_snapshots", "chapter_script_subject_presets", "chapters",
-  "commit_records", "content_blobs", "context_manifests",
+  "content_blobs", "context_manifests",
   "craft_rule_candidates", "creative_reviews", "creative_run_events", "creative_runs",
   "creative_work_items", "embedding_cache", "entities", "execution_blueprints",
   "foreshadowing", "idempotency_keys", "learning_assessments", "manuscript_blocks",
@@ -93,7 +93,7 @@ export const EXPERIMENT_RUNTIME_TABLES = [
   "preflight_plans", "project_plan_sections", "projection_failures", "promises", "prompt_executions", "prompt_templates", "provider_configs",
   "relations", "retrieval_runs", "reviews", "scenes", "skill_bundles",
   "skill_definitions", "story_arc_batches", "style_contracts", "task_attempts", "timeline_events",
-  "volumes", "workflow_run_summaries", "workflow_runs",
+  "volumes", "workflow_runs",
 ] as const;
 
 function mapWorkspaceRow(row: WorkspaceRow): ExperimentWorkspace {
