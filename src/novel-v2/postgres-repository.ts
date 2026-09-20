@@ -2917,8 +2917,8 @@ export class NovelPostgresRepository {
     return this.listProjectPlanSections(projectId);
   }
 
-  async listCurrentFoundationArtifacts(projectId: string, approvedOnly = true): Promise<Artifact[]> {
-    const result = await this.pool.query<ArtifactRow>(
+  async listCurrentFoundationArtifacts(projectId: string, approvedOnly = true, connection: Pool | PoolClient = this.pool): Promise<Artifact[]> {
+    const result = await connection.query<ArtifactRow>(
       `SELECT a.id,a.project_id,a.task_id,a.attempt_id,a.kind,a.content_hash,a.object_key,a.base_revision,a.fingerprint,a.payload,a.created_at
        FROM project_plan_sections ps JOIN artifacts a ON a.id=ps.source_artifact_id
        WHERE ps.project_id=$1 AND ($2::boolean=FALSE OR ps.status='approved')`,
@@ -4582,10 +4582,11 @@ export class NovelPostgresRepository {
       "SELECT id,title,payload FROM plot_threads WHERE project_id=$1 AND status='open' ORDER BY id",
       [input.projectId],
     );
-    // 规划上下文只用于取 arcId/阶段，读失败降级为无阶段而非打断账本：它走 this.pool 的独立
-    // 连接（签名不接 connection），因此在事务内看不到本事务未提交的写——默认面调用时前置事务
-    // 已提交，不受影响；调用方持事务路径的口径差已登记为待办。
-    const planning = await this.getChapterPlanningContext(input.projectId, input.documentId, true).catch(() => undefined);
+    // 规划上下文与账本其余读同面（同一 connection）：调用方持事务时它必须看到本事务的状态；
+    // allowHistorical=true ⇒ 方法内的 stale 标记写在本路径不可达。读失败仍降级为"无阶段"而不是
+    // 打断账本；代价是同面之后，一条 SQL 级错误会连带中止调用方事务（旧写法走独立连接不会），
+    // 但两条路径的投影失败都由调用方记进 projection_failures 账，不丢症状。
+    const planning = await this.getChapterPlanningContext(input.projectId, input.documentId, true, connection).catch(() => undefined);
     const arcPosition = await connection.query<{ current_order: string | number; first_order: string | number }>(
       `SELECT c.ordinal AS current_order,MIN(peer.ordinal) AS first_order
        FROM chapters c JOIN chapters peer ON peer.arc_id=c.arc_id
@@ -4723,8 +4724,25 @@ export class NovelPostgresRepository {
     return hits;
   }
 
-  async getChapterPlanningContext(projectId: string, documentId: string, allowHistorical = false): Promise<ChapterPlanningContext> {
-    const chapterResult = await this.pool.query<ChapterBlueprintRow & { planning_status: string; context_fingerprint: string | null; review_artifact_id: string | null; review_fingerprint: string | null; arc_payload: NarrativeArcPlan }>(
+  /**
+   * 章节规划上下文（章/弧蓝图 + 宏观规划 + 相邻章 + 弧审核证据）。
+   *
+   * connection 线程化（F3′ 的"已登记未修"项收口）：本方法的读**与写**都落在调用方给的那条
+   * 连接上。读侧：持事务的调用方（`applyCommittedChapterStateRebuild` → 账本投影）若走默认面
+   * 就是在自己事务之外读，看到的是事务开始前的账本。写侧：三处 `planning_status='stale'` 若走
+   * 另一条连接，而调用方事务已锁住该弧行，就会等自己已持有的那把锁而自死锁（行锁按会话，不可重入）。
+   * 代价如实记：调用方回滚时 stale 标记随之消失，但它由重算派生，下一次读会再标一次，不需持久化。
+   */
+  async getChapterPlanningContext(
+    projectId: string,
+    documentId: string,
+    allowHistorical = false,
+    connection: Pool | PoolClient = this.pool,
+  ): Promise<ChapterPlanningContext> {
+    const markArcStale = async (arcId: string): Promise<void> => {
+      await connection.query("UPDATE arcs SET planning_status='stale',approved_at=CASE WHEN execution_status='completed' THEN approved_at ELSE NULL END,updated_at=now() WHERE id=$1", [arcId]);
+    };
+    const chapterResult = await connection.query<ChapterBlueprintRow & { planning_status: string; context_fingerprint: string | null; review_artifact_id: string | null; review_fingerprint: string | null; arc_payload: NarrativeArcPlan }>(
       `SELECT c.id,c.arc_id,c.project_id,c.document_id,c.title,c.ordinal,c.status,c.payload,c.source_artifact_id,c.blueprint_revision,
          a.planning_status,a.context_fingerprint,a.review_artifact_id,a.review_fingerprint,a.payload AS arc_payload
        FROM chapters c JOIN arcs a ON a.id=c.arc_id WHERE c.project_id=$1 AND c.document_id=$2`,
@@ -4734,10 +4752,9 @@ export class NovelPostgresRepository {
     const row = chapterResult.rows[0];
     if (!allowHistorical && row.planning_status !== "approved") throw new Error(`目标故事弧蓝图不可用：${row.planning_status}`);
     const chapter = chapterBlueprintFromRow(row);
-    const [macro, neighborsResult] = await Promise.all([
-      this.listCurrentFoundationArtifacts(projectId),
-      this.pool.query<ChapterBlueprintRow>("SELECT id,arc_id,project_id,document_id,title,ordinal,status,payload,source_artifact_id,blueprint_revision FROM chapters WHERE arc_id=$1 AND id<>$2 ORDER BY ABS(ordinal-$3),ordinal LIMIT 2", [row.arc_id, row.id, row.ordinal]),
-    ]);
+    // 依次取而非 Promise.all：两条路径可能共用同一个 PoolClient，pg 已废弃同 client 并发 query。
+    const macro = await this.listCurrentFoundationArtifacts(projectId, true, connection);
+    const neighborsResult = await connection.query<ChapterBlueprintRow>("SELECT id,arc_id,project_id,document_id,title,ordinal,status,payload,source_artifact_id,blueprint_revision FROM chapters WHERE arc_id=$1 AND id<>$2 ORDER BY ABS(ordinal-$3),ordinal LIMIT 2", [row.arc_id, row.id, row.ordinal]);
     const sourceArtifactIds = [...macro.map((artifact) => artifact.id), ...(row.source_artifact_id ? [row.source_artifact_id] : [])];
     const withoutFingerprint = {
       projectId,
@@ -4752,16 +4769,16 @@ export class NovelPostgresRepository {
     if (!allowHistorical) {
       const currentArcFingerprint = createHash("sha256").update(JSON.stringify({ macro: macro.map((item) => [foundationTaskKey(item), item.id, item.fingerprint]), artifactId: row.source_artifact_id })).digest("hex");
       if (!row.context_fingerprint || currentArcFingerprint !== row.context_fingerprint) {
-        await this.pool.query("UPDATE arcs SET planning_status='stale',approved_at=CASE WHEN execution_status='completed' THEN approved_at ELSE NULL END,updated_at=now() WHERE id=$1", [row.arc_id]);
+        await markArcStale(row.arc_id);
         throw new Error("故事弧蓝图与当前宏观规划不一致，请先重基线");
       }
       if (!row.review_artifact_id || !row.review_fingerprint) {
-        await this.pool.query("UPDATE arcs SET planning_status='stale',approved_at=CASE WHEN execution_status='completed' THEN approved_at ELSE NULL END,updated_at=now() WHERE id=$1", [row.arc_id]);
+        await markArcStale(row.arc_id);
         throw new Error("故事弧缺少逐章审核证据，请先重新审核");
       }
-      const reviewArtifact = await this.getArtifact(row.review_artifact_id);
+      const reviewArtifact = await this.getArtifact(row.review_artifact_id, connection);
       if (!reviewArtifact || reviewArtifact.fingerprint !== row.review_fingerprint || reviewArtifact.structuredData?.subjectArtifactId !== row.source_artifact_id) {
-        await this.pool.query("UPDATE arcs SET planning_status='stale',approved_at=CASE WHEN execution_status='completed' THEN approved_at ELSE NULL END,updated_at=now() WHERE id=$1", [row.arc_id]);
+        await markArcStale(row.arc_id);
         throw new Error("故事弧审核证据已失效，请先重新审核");
       }
     }
@@ -5239,8 +5256,8 @@ export class NovelPostgresRepository {
     return result.rows.map(artifactFromRow);
   }
 
-  async getArtifact(artifactId: string): Promise<Artifact | undefined> {
-    const result = await this.pool.query<ArtifactRow>(
+  async getArtifact(artifactId: string, connection: Pool | PoolClient = this.pool): Promise<Artifact | undefined> {
+    const result = await connection.query<ArtifactRow>(
       `SELECT id,project_id,task_id,attempt_id,kind,content_hash,object_key,base_revision,fingerprint,payload,created_at
        FROM artifacts WHERE id=$1`,
       [artifactId],
