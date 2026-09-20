@@ -366,6 +366,25 @@ export function chapterBlueprintFromRow(row: ChapterBlueprintRow): ChapterBluepr
  */
 const HEALTH_PROJECTION_FAILURE_PAGE = 20;
 
+/**
+ * 域事件账本（`outbox_events`）的保留天数。**两个判据共用这一个常数**：
+ * `pruneOutboxEvents` 按它删旧行，`detectStaleCraftRuleCandidates` 按它给停滞扫描加上界。
+ *
+ * 为什么必须同源：停滞通报的去重判据是"这条候选的 `updated_at` 之后有没有发过事件"，被查的
+ * 事件必须还在账上。让扫描窗口的上界等于保留期，就有一条不变式成立——被扫的候选其
+ * `updated_at` 不早于保留线，任何可能为它去重的事件（`created_at >= updated_at`）也都未被清理。
+ * 两边各写一个常数迟早错开，错开的表现是**同一个停滞候选被反复通报**（旧事件已清、判据查无）。
+ *
+ * 现形差实测为零（`ymcp` 只读，2026-09-20）：可扫候选 23 条，其中 `updated_at` 早于 90 天线的
+ * 0 条 ⇒ 加上界不改变今天的扫描结果，只是让保留策略可以安全开跑。
+ * TODO 可配置：与 `staleAfterDays` 同属运维节奏参数，应一起进配置面。
+ */
+export const OUTBOX_RETENTION_DAYS = 90;
+
+/** 单次清理的分批大小与批次上限：长期不重启的部署一次删到底会长时间持大量行锁。 */
+const OUTBOX_PRUNE_BATCH_ROWS = 5_000;
+const OUTBOX_PRUNE_MAX_BATCHES = 20;
+
 export class NovelPostgresRepository {
   readonly pool: Pool;
   private readonly connectionConfig: PoolConfig;
@@ -509,6 +528,8 @@ export class NovelPostgresRepository {
     await this.repairStoryArcBatchCompleteFlags();
     await this.repairForeshadowingLedgerDuplicates();
     await this.seedWorkspaceSkills();
+    const prunedOutboxEvents = await this.pruneOutboxEvents();
+    if (prunedOutboxEvents) console.warn(`[migrate] 域事件账本按 ${OUTBOX_RETENTION_DAYS} 天保留清理 ${prunedOutboxEvents} 行`);
   }
 
   /**
@@ -1446,9 +1467,30 @@ export class NovelPostgresRepository {
     return bundle;
   }
 
-  async listOutbox(projectId?: string, afterId = 0) {
-    const result = await this.pool.query("SELECT id,aggregate_type,aggregate_id,event_type,payload,created_at FROM outbox_events WHERE id>$1 AND ($2::text IS NULL OR payload->>'projectId'=$2) ORDER BY id LIMIT 200", [afterId, projectId ?? null]);
-    return result.rows;
+  /**
+   * 按 `OUTBOX_RETENTION_DAYS` 清域事件账本（挂在 `migrate()` 尾部）。
+   *
+   * 分批 DELETE 而不是一条大语句：一条语句删到底会在单个事务里长时间持住大量行锁，
+   * 而"锁按对象数堆爆共享锁表"的形态本仓在迁移面上已实测过（093 的 SQLSTATE 53200）。
+   * 删的是超过保留期的历史事件；游标型消费方（REST 轮询按 `id>` 前进）只会看到窗口左端
+   * 收缩，不会漏取未读过的行。
+   */
+  async pruneOutboxEvents(nowMs = Date.now()): Promise<number> {
+    let removed = 0;
+    for (let batch = 0; batch < OUTBOX_PRUNE_MAX_BATCHES; batch += 1) {
+      const result = await this.pool.query(
+        `DELETE FROM outbox_events WHERE id = ANY(
+           ARRAY(SELECT id FROM outbox_events
+                 WHERE created_at < to_timestamp($1 / 1000.0) - make_interval(days => $2::int)
+                 ORDER BY id LIMIT $3)
+         )`,
+        [nowMs, OUTBOX_RETENTION_DAYS, OUTBOX_PRUNE_BATCH_ROWS],
+      );
+      const deleted = result.rowCount ?? 0;
+      removed += deleted;
+      if (deleted < OUTBOX_PRUNE_BATCH_ROWS) break;
+    }
+    return removed;
   }
 
   async putReview(review: Review, options: { refreshChapterSnapshot?: boolean; plainText?: string } = {}) {
@@ -6847,6 +6889,9 @@ export class NovelPostgresRepository {
    * 队列不再只进不出。不改 status——stale 是提醒不是判定。
    * 事件幂等：同一候选在最后一次 updated_at 之后只发一次（updated_at 前进=重新计时）。
    * 触发时机挂在 recordLearning（随章节提交自然发生，无需独立调度器）。
+   * 扫描窗口有**上界** = `OUTBOX_RETENTION_DAYS`：更老的候选不再通报。这不是省事，是让去重判据
+   * 与保留策略互相成立——被扫候选的 `updated_at` 不早于保留线 ⇒ 任何能为它去重的事件都还没被
+   * `pruneOutboxEvents` 清掉；否则清完旧事件的第二天，同一个候选会被再通报一次（判据查无旧账）。
    */
   async detectStaleCraftRuleCandidates(projectId: string, input: { nowMs: number; staleAfterDays?: number }): Promise<string[]> {
     const staleAfterDays = input.staleAfterDays ?? 30; // TODO P3: 停滞阈值应可配置（memory-gate.blocked 同款提醒模板语义）
@@ -6856,6 +6901,7 @@ export class NovelPostgresRepository {
        WHERE c.project_id=$1
          AND c.status IN ('proposed','evidencing')
          AND c.updated_at < to_timestamp($2 / 1000.0) - make_interval(days => $3::int)
+         AND c.updated_at >= to_timestamp($2 / 1000.0) - make_interval(days => $4::int)
          AND c.evidence_cases = '[]'::jsonb
          AND NOT EXISTS (
            SELECT 1 FROM outbox_events e
@@ -6863,7 +6909,7 @@ export class NovelPostgresRepository {
              AND e.event_type='craft-rule.candidate-stale' AND e.created_at >= c.updated_at
          )
        ORDER BY c.updated_at LIMIT 20`,
-      [projectId, input.nowMs, staleAfterDays],
+      [projectId, input.nowMs, staleAfterDays, OUTBOX_RETENTION_DAYS],
     );
     for (const row of stale.rows) {
       await this.appendOutbox("craft-rule-candidate", row.id, "craft-rule.candidate-stale", {
