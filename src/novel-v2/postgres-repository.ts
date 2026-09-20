@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { foundationArtifactToMemoryClaim, foundationClaimId } from "./foundation-memory";
 import { CLAIM_PROJECTION_SET_SQL, retrievalVisibleClaimsSql, retiredByVisibleKillerSql } from "./memory-visibility";
-import { ACTIVE_WORKFLOW_RUN_STATUSES_SQL, HUMAN_GATE_RESUME_WORKFLOW_RUN_STATUS, WAITING_EXTERNAL_WORKFLOW_RUN_STATUS_SQL, terminalOverwriteGuardSql, type WorkflowRunStatus } from "./run-lifecycle";
+import { ACTIVE_WORKFLOW_RUN_STATUSES_SQL, HUMAN_GATE_RESUME_WORKFLOW_RUN_STATUS, TERMINAL_WORKFLOW_RUN_STATUSES_SQL, WAITING_EXTERNAL_WORKFLOW_RUN_STATUS_SQL, terminalOverwriteGuardSql, type WorkflowRunStatus } from "./run-lifecycle";
 import { normalizeFoundationStructuredDataFlat, validateFoundationTaskContract } from "./application/foundation-contract";
 import { foundationContractFingerprint } from "./application/foundation-contract-fingerprint";
 import { serialContextFingerprint } from "./application/serial-context-fingerprint";
@@ -64,7 +64,7 @@ import type {
 import type { ModelInvocationAudit, ModelPromptExecution } from "./model-gateway";
 import { iso, workflowFromRow, type WorkflowRunRow } from "./repository/shared";
 import { WorkflowRunSlice } from "./repository/workflow-run-slice";
-import { ModelTaskSlice } from "./repository/model-task-slice";
+import { ModelTaskSlice, OUTSTANDING_MODEL_TASK_STATUSES_SQL } from "./repository/model-task-slice";
 import { TelemetrySlice } from "./repository/telemetry-slice";
 import type { ModelRoutingConfig, ModelRoutingSnapshot, ModelTaskRecord, ModelWorkPackage } from "./model-routing";
 import type { ObjectStoreAdapter } from "./object-store";
@@ -419,7 +419,7 @@ export class NovelPostgresRepository {
    * `pool` 只在构造函数里赋值一次、`forSchema` 另建新实例，故缓存切片是安全的。
    */
   private get workflowRuns(): WorkflowRunSlice {
-    return (this.workflowRunsSlice ??= new WorkflowRunSlice({ pool: this.pool, appendOutbox: (aggregateType, aggregateId, eventType, payload) => this.appendOutbox(aggregateType, aggregateId, eventType, payload) }));
+    return (this.workflowRunsSlice ??= new WorkflowRunSlice({ pool: this.pool, appendOutbox: (aggregateType, aggregateId, eventType, payload) => this.appendOutbox(aggregateType, aggregateId, eventType, payload), expireOutstandingTasks: (workflowRunKey, reason) => this.modelTasks.expireForWorkflow(workflowRunKey, reason) }));
   }
 
   /** 同 workflowRuns：懒建以兼容 `Object.create(prototype)` 造桩路数。 */
@@ -528,6 +528,8 @@ export class NovelPostgresRepository {
     await this.repairStoryArcBatchCompleteFlags();
     await this.repairForeshadowingLedgerDuplicates();
     await this.seedWorkspaceSkills();
+    const expiredOrphanTasks = await this.expireOrphanedModelTasks();
+    if (expiredOrphanTasks) console.warn(`[migrate] 收编 run 已终态/缺失的未交付外部任务 ${expiredOrphanTasks} 条`);
     const prunedOutboxEvents = await this.pruneOutboxEvents();
     if (prunedOutboxEvents) console.warn(`[migrate] 域事件账本按 ${OUTBOX_RETENTION_DAYS} 天保留清理 ${prunedOutboxEvents} 行`);
   }
@@ -1533,6 +1535,33 @@ export class NovelPostgresRepository {
 
   async expireWorkflowModelTasks(workflowRunId: string, reason: string): Promise<number> {
     return this.modelTasks.expireForWorkflow(workflowRunId, reason);
+  }
+
+  /**
+   * 收编"run 已终态（或 run 行已不存在）却仍挂着未交付"的外部任务，挂在 `migrate()` 尾。
+   *
+   * 为什么还需要它而不只靠新的终态转换挂钩：挂钩只对未来生效，而运行库已经积着这类行（实测
+   * `ymcp` 3 条 pending：2 条挂在 cancelled、1 条挂在 completed 的 run 上）。它们所在的 run
+   * 早已终态，`reconcileStaleWorkflowRuns` 的候选集只挑**非终态** run，永远不会碰它们，于是
+   * 编排者的任务队列里长期挂着领不走也关不掉的僵尸。
+   * 写入判据不在此重写：本方法只选出待收编的键，过期动作仍走 `expireForWorkflow`（同一份
+   * outstanding 词表、同样认两种键形态）。`submitted`/`failed` 不动——已交付与已放弃的结果是事实。
+   * 幂等：收编后不再命中，重放为 no-op。
+   */
+  async expireOrphanedModelTasks(reason = "run-already-terminal"): Promise<number> {
+    const orphans = await this.pool.query<{ key: string }>(
+      `SELECT DISTINCT t.workflow_run_id AS key
+         FROM model_tasks t
+        WHERE t.status IN (${OUTSTANDING_MODEL_TASK_STATUSES_SQL})
+          AND NOT EXISTS (
+            SELECT 1 FROM workflow_runs r
+            WHERE (r.temporal_workflow_id = t.workflow_run_id OR r.id = t.workflow_run_id)
+              AND r.status NOT IN (${TERMINAL_WORKFLOW_RUN_STATUSES_SQL})
+          )`,
+    );
+    let expired = 0;
+    for (const row of orphans.rows) expired += await this.modelTasks.expireForWorkflow(row.key, reason);
+    return expired;
   }
 
   /**
@@ -3847,16 +3876,9 @@ export class NovelPostgresRepository {
         }
 
         if (removedRevisionIds.length) {
-          const legacyFactSources = await client.query<{ fact_id: string }>("DELETE FROM fact_sources WHERE revision_id=ANY($1::text[]) RETURNING fact_id", [removedRevisionIds]);
-          const legacyFactIds = [...new Set(legacyFactSources.rows.map((row) => row.fact_id))];
-          if (legacyFactIds.length) {
-            await client.query(
-              `DELETE FROM facts fact
-               WHERE fact.project_id=$1 AND fact.id=ANY($2::text[])
-                 AND NOT EXISTS (SELECT 1 FROM fact_sources source WHERE source.fact_id=fact.id)`,
-              [projectId, legacyFactIds],
-            );
-          }
+          // v1 遗留 `facts`/`fact_sources` 的清理分支已随迁移 095 撤表移除：两表在运行库与测试库
+          // 都恒 0 行（真源早已是 memory_claims/memory_claim_sources），留着这段反而会在回滚路径上
+          // 抛 `relation "facts" does not exist` 把一次正常回滚变成失败。
           await client.query("UPDATE promises SET status='open' WHERE id IN (SELECT promise_id FROM payoffs WHERE revision_id=ANY($1::text[]) AND promise_id IS NOT NULL)", [removedRevisionIds]);
           await client.query("UPDATE foreshadowing SET status='open',payoff_revision_id=NULL WHERE project_id=$1 AND payoff_revision_id=ANY($2::text[])", [projectId, removedRevisionIds]);
           await client.query("DELETE FROM payoffs WHERE revision_id=ANY($1::text[])", [removedRevisionIds]);

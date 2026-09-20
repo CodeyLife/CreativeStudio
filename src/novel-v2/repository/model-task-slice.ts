@@ -40,6 +40,15 @@ export interface ModelTaskSliceDeps {
   appendOutbox: OutboxWriter;
 }
 
+/**
+ * "尚未交付"的任务态。过期、放弃、按 run 收编三处判据共用这一份——写第二份字面量时
+ * 一旦漏掉某个态（例如只写 `pending`），僵尸任务就会在账上永久挂着并被编排者反复领到。
+ * 不含 `submitted`：已交付的任务其结果是事实，永不被清理改写。
+ */
+export const OUTSTANDING_MODEL_TASK_STATUSES = ["pending", "claimed", "running"] as const;
+/** 上面词表的 SQL `IN (...)` 片段（与 run-lifecycle 的 asSqlList 同一动机：词表只在 TS 侧单源）。 */
+export const OUTSTANDING_MODEL_TASK_STATUSES_SQL = OUTSTANDING_MODEL_TASK_STATUSES.map((status) => `'${status}'`).join(",");
+
 export class ModelTaskSlice {
   private readonly pool: Pool;
   private readonly appendOutbox: OutboxWriter;
@@ -154,7 +163,7 @@ export class ModelTaskSlice {
 
   async expire(taskId: string, reason: string): Promise<void> {
     const updated = await this.pool.query<{ project_id: string | null; workflow_run_id: string | null }>(
-      "UPDATE model_tasks SET status='failed',result=$2,updated_at=now() WHERE id=$1 AND status IN ('pending','claimed','running') RETURNING project_id,workflow_run_id",
+      `UPDATE model_tasks SET status='failed',result=$2,updated_at=now() WHERE id=$1 AND status IN (${OUTSTANDING_MODEL_TASK_STATUSES_SQL}) RETURNING project_id,workflow_run_id`,
       [taskId, { value: { reason, expired: true } }],
     );
     await this.pool.query("UPDATE task_attempts SET status='failed',payload=payload || $2 WHERE model_task_id=$1 AND status IN ('claimed','running')", [taskId, { reason, expired: true }]);
@@ -165,10 +174,23 @@ export class ModelTaskSlice {
     }
   }
 
-  async expireForWorkflow(workflowRunId: string, reason: string): Promise<number> {
+  /**
+   * 按 run 过期其名下未交付任务。
+   *
+   * 键的两种形态都要认：`model_tasks.workflow_run_id` 与 `task_attempts` 一样存在"id 形态"与
+   * "temporal_workflow_id 形态"并存（migration 088 就是被这个实形逼着改 FK 指向的），reconcile
+   * 传的是 temporal id，而工作流侧建任务时常传 `workflow_runs.id` —— 只认一种形态就会收编不全。
+   * 僵尸行的真正成因不在此而在"run 进终态时没人清任务"，那一条由 `WorkflowRunSlice` 的终态
+   * 转换挂钩负责（见 announceStatus）。
+   */
+  async expireForWorkflow(workflowRunKey: string, reason: string): Promise<number> {
     const result = await this.pool.query(
-      "UPDATE model_tasks SET status='failed',result=$2,updated_at=now() WHERE workflow_run_id=$1 AND status IN ('pending','claimed','running')",
-      [workflowRunId, { text: "", value: { reason } }],
+      `UPDATE model_tasks SET status='failed',result=$2,updated_at=now()
+        WHERE status IN (${OUTSTANDING_MODEL_TASK_STATUSES_SQL})
+          AND (workflow_run_id=$1
+               OR workflow_run_id IN (SELECT id FROM workflow_runs WHERE temporal_workflow_id=$1)
+               OR workflow_run_id IN (SELECT temporal_workflow_id FROM workflow_runs WHERE id=$1))`,
+      [workflowRunKey, { text: "", value: { reason } }],
     );
     return result.rowCount ?? 0;
   }

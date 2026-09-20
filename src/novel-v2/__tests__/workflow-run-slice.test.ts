@@ -9,8 +9,9 @@ import { HUMAN_GATE_WORKFLOW_RUN_STATUSES_SQL, TERMINAL_WORKFLOW_RUN_STATUSES_SQ
  *
  * 这些判据此前**没法在不起 Postgres 的情况下测**：状态 SQL 与 outbox 双写埋在 7,000 行的
  * `NovelPostgresRepository` 里，只能靠 DB 集成面间接覆盖——DB 不可用时整组静默失效。
- * slice 只需要两样依赖（连接 + outbox 写入器），于是守卫 SQL、refusal 留痕、事件顺序
- * 都能用假连接逐条断言。DB 集成测试仍保留（真库上验证并发与 JSONB 合并语义），两者互补。
+ * slice 只需要三样依赖（连接、outbox 写入器、终态时过期任务的回调），于是守卫 SQL、refusal
+ * 留痕、事件顺序与终态连带清理都能用假连接逐条断言。DB 集成测试仍保留（真库上验证并发与
+ * JSONB 合并语义），两者互补。
  */
 
 type FakeResult = { rows: unknown[]; rowCount: number };
@@ -29,7 +30,20 @@ function makeSlice(results: FakeResult[]) {
     events.push({ type: eventType, payload });
     return events.length;
   };
-  return { slice: new WorkflowRunSlice({ pool, appendOutbox }), sqls, events };
+  const expiries: Array<{ key: string; reason: string }> = [];
+  return {
+    slice: new WorkflowRunSlice({
+      pool,
+      appendOutbox,
+      expireOutstandingTasks: async (key, reason) => {
+        expiries.push({ key, reason });
+        return 0;
+      },
+    }),
+    sqls,
+    events,
+    expiries,
+  };
 }
 
 const row = { id: "r1", workflow_type: "chapter-review", project_id: "p1", temporal_workflow_id: "wf1", status: "running", payload: {}, created_at: new Date(0), updated_at: new Date(0) };
@@ -51,6 +65,24 @@ describe("workflow-run slice（假连接）", () => {
     expect(await slice.resumeFromHumanGate("wf1", { stage: "revision" })).toBeUndefined();
     expect(sqls[0].sql).toContain(`status IN (${HUMAN_GATE_WORKFLOW_RUN_STATUSES_SQL})`);
     expect(events).toEqual([]);
+  });
+
+  it("进终态即过期名下未交付外部任务；非终态与人工门态都不过期", async () => {
+    const done = makeSlice([{ rows: [row], rowCount: 1 }]);
+    await done.slice.updateStatus("wf1", "completed", { reason: "ok" });
+    expect(done.expiries).toEqual([{ key: "wf1", reason: "run-terminal:completed" }]);
+
+    const failed = makeSlice([{ rows: [row], rowCount: 1 }]);
+    await failed.slice.updateStatus("wf1", "failed", { reason: "boom" });
+    expect(failed.expiries).toEqual([{ key: "wf1", reason: "run-terminal:failed" }]);
+
+    const gate = makeSlice([{ rows: [row], rowCount: 1 }]);
+    await gate.slice.updateStatus("wf1", "manual-review-required", { stage: "review" });
+    expect(gate.expiries, "等人的门态不得清任务——人可能带着任务结果回来").toEqual([]);
+
+    const running = makeSlice([{ rows: [row], rowCount: 1 }]);
+    await running.slice.updateStatus("wf1", "running", { stage: "draft" });
+    expect(running.expiries, "waiting-external/running 都还在飞，过期判据只看终态").toEqual([]);
   });
 
   it("守卫挡下时留 refusal 事件；行不存在则安静（正常竞态）", async () => {

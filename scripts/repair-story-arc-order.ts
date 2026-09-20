@@ -94,7 +94,8 @@ try {
 
       await client.query("UPDATE chapter_memories SET narrative_start=CASE WHEN narrative_start BETWEEN 11 AND 15 THEN narrative_start-5 ELSE narrative_start END,narrative_end=CASE WHEN narrative_end BETWEEN 11 AND 15 THEN narrative_end-5 ELSE narrative_end END WHERE project_id=$1", [projectId]);
       await client.query("UPDATE foreshadowing SET narrative_order=narrative_order-5 WHERE project_id=$1 AND narrative_order BETWEEN 11 AND 15", [projectId]);
-      await client.query("UPDATE facts SET narrative_start=CASE WHEN narrative_start BETWEEN 11 AND 15 THEN narrative_start-5 ELSE narrative_start END,narrative_end=CASE WHEN narrative_end BETWEEN 11 AND 15 THEN narrative_end-5 ELSE narrative_end END WHERE project_id=$1", [projectId]);
+      // `facts` 的章序修正随迁移 095 撤表移除（v1 遗留账，运行库与测试库恒 0 行；v2 事实真源是
+      // memory_claims，其章序修正见下一行）。
       await client.query("UPDATE memory_claims SET narrative_start=CASE WHEN narrative_start BETWEEN 11 AND 15 THEN narrative_start-5 ELSE narrative_start END,narrative_end=CASE WHEN narrative_end BETWEEN 11 AND 15 THEN narrative_end-5 ELSE narrative_end END WHERE project_id=$1", [projectId]);
       await client.query("UPDATE arcs SET execution_status='active',completed_at=NULL,updated_at=now() WHERE id=$1 AND project_id=$2", [repairArcId, projectId]);
       await client.query("UPDATE arcs SET planning_status='stale',context_fingerprint=NULL,updated_at=now(),payload=payload || jsonb_build_object('replanReason','章节索引与长篇节奏修复后需重建蓝图') WHERE id=$1 AND project_id=$2", [replanArcId, projectId]);

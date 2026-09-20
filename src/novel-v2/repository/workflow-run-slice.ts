@@ -12,14 +12,15 @@
  * `(type, id, event, payload) => this.appendOutbox(...)` 接线，事件留痕口径仍由仓储统一
  * 决定（`outboxProjectId` 那套归属规则只有一份）。
  *
- * 边界（刻意不在本片）：`reconcileStaleWorkflowRuns`（要跨域清名下外部任务）、
+ * 边界（刻意不在本片）：`reconcileStaleWorkflowRuns`（要跨域清名下外部任务，本片只在终态转换处
+ * 经注入回调过期任务，任务表 SQL 仍归 model-task 片）；
  * `claimApprovalEvidence`/`releaseHumanDecisionClaim`（事务内同时动 approvals 与 artifacts，
  * 属于审批片）、`listRunArtifacts`/`listRunReviews`（读的是别的表，只是按 run 过滤）。
  * 这些留在仓储里，等各自的切片线出现再搬——搬动时机由消费面度量决定，不由文件行数决定。
  */
 import type { Pool } from "pg";
 import type { WorkflowRunRecord } from "../protocol";
-import { HUMAN_GATE_RESUME_WORKFLOW_RUN_STATUS, HUMAN_GATE_WORKFLOW_RUN_STATUSES_SQL, isForbiddenTerminalOverwrite, terminalOverwriteGuardPredicateSql, terminalOverwriteGuardSql, type WorkflowRunStatus } from "../run-lifecycle";
+import { HUMAN_GATE_RESUME_WORKFLOW_RUN_STATUS, HUMAN_GATE_WORKFLOW_RUN_STATUSES_SQL, isForbiddenTerminalOverwrite, isTerminalWorkflowRunStatus, terminalOverwriteGuardPredicateSql, terminalOverwriteGuardSql, type WorkflowRunStatus } from "../run-lifecycle";
 import { withTerminalOutcome } from "../terminal-outcome";
 import { workflowFromRow, type OutboxWriter, type WorkflowRunRow } from "./shared";
 
@@ -28,15 +29,23 @@ const RUN_COLUMNS = "id,workflow_type,project_id,temporal_workflow_id,status,pay
 export interface WorkflowRunSliceDeps {
   pool: Pool;
   appendOutbox: OutboxWriter;
+  /**
+   * run 进终态时清其名下未交付的外部任务（由仓储接到 model-task slice）。
+   * 注入而不是在本片直接写 `model_tasks`：状态机与事件留痕归本片，任务表的 SQL 归那片，
+   * 这条回调就是两片之间唯一的接缝。
+   */
+  expireOutstandingTasks: (workflowRunKey: string, reason: string) => Promise<number>;
 }
 
 export class WorkflowRunSlice {
   private readonly pool: Pool;
   private readonly appendOutbox: OutboxWriter;
+  private readonly expireOutstandingTasks: WorkflowRunSliceDeps["expireOutstandingTasks"];
 
   constructor(deps: WorkflowRunSliceDeps) {
     this.pool = deps.pool;
     this.appendOutbox = deps.appendOutbox;
+    this.expireOutstandingTasks = deps.expireOutstandingTasks;
   }
 
   /**
@@ -131,6 +140,13 @@ export class WorkflowRunSlice {
   private async announceStatus(row: WorkflowRunRow, status: WorkflowRunStatus, payload: Record<string, unknown>) {
     const record = workflowFromRow(row);
     await this.appendOutbox("workflow-run", record.temporalWorkflowId, `workflow.${status}`, { projectId: record.projectId, workflowId: record.temporalWorkflowId, runId: record.id, ...payload });
+    // 进终态即过期名下未交付任务。放在这条共用出口而不是各调用点：此前"僵尸 pending 任务"的
+    // 成因正是**没有任何一处**在 run 进终态时清任务——reconcile 只挑非终态 run 收编并顺手清，
+    // 而经人工取消/正常 completed 进终态的 run 永不进那个候选集，其 pending 任务就永久挂着，
+    // 被编排者的队列视图反复领到（运行库实测 3 条）。
+    if (isTerminalWorkflowRunStatus(status)) {
+      await this.expireOutstandingTasks(record.temporalWorkflowId, `run-terminal:${status}`);
+    }
     // OR-C1（product-audit-20260910 E4）：有语义 progress 事件双写持久事件表。
     // run payload 的 stage 键是"后写覆盖"的当前态展示位，守卫决策（revision-decision/
     // revision-reverted/manual-review-required…）若无追加式留痕则事后无法回答

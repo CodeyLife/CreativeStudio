@@ -204,4 +204,60 @@ describe("reconcileStaleWorkflowRuns（OR-B4 僵尸对账）", () => {
     expect((await repository.pool.query("SELECT status FROM creative_runs WHERE id=$1", [pendingRow.rows[0].id])).rows[0].status).toBe("failed");
     expect((await repository.pool.query("SELECT status FROM creative_runs WHERE id=$1", [pausedRow.rows[0].id])).rows[0].status).toBe("paused");
   });
+
+  it("run 进终态即过期名下未交付任务（终态转换挂钩）", async () => {
+    if (!available) return;
+    const temporalId = `term-hook-${randomUUID().slice(0, 8)}`;
+    await makeRun(temporalId, "running", "interval '1 hour'");
+    const wp = workPackage(temporalId);
+    await repository.createModelTask(wp, `idem-${randomUUID()}`);
+    expect((await repository.getModelTask(wp.id))?.status).toBe("pending");
+
+    await repository.updateWorkflowRunStatus(temporalId, "completed", { reason: "用例：终态连带清理" });
+    const task = await repository.getModelTask(wp.id);
+    expect(task?.status).toBe("failed");
+    expect((task?.result as { value?: { reason?: string } } | undefined)?.value?.reason).toBe("run-terminal:completed");
+  });
+
+  it("migrate 尾收编存量僵尸任务：两种键形态都认、重放 no-op、在飞 run 的任务不动", async () => {
+    if (!available) return;
+    const temporalId = `zombie-repair-${randomUUID().slice(0, 8)}`;
+    await makeRun(temporalId, "completed", "interval '1 hour'"); // 直接按 SQL 置终态：绕过挂钩，模拟挂钩上线前的存量
+    const runId = (await repository.pool.query<{ id: string }>("SELECT id FROM workflow_runs WHERE temporal_workflow_id=$1", [temporalId])).rows[0].id;
+
+    const temporalFormTask = workPackage(temporalId);
+    await repository.createModelTask(temporalFormTask, `idem-${randomUUID()}`);
+    const idFormTask = workPackage(runId);
+    await repository.createModelTask(idFormTask, `idem-${randomUUID()}`);
+    // 反例（必须不被收编）：同一项目在飞的 run 名下也有 pending 任务。
+    const liveTemporalId = `zombie-live-${randomUUID().slice(0, 8)}`;
+    await makeRun(liveTemporalId, "running", "interval '1 hour'");
+    const liveTask = workPackage(liveTemporalId);
+    await repository.createModelTask(liveTask, `idem-${randomUUID()}`);
+
+    const expired = await repository.expireOrphanedModelTasks("test-run-already-terminal");
+    expect(expired, "两条形态各异的僵尸任务都要收编").toBeGreaterThanOrEqual(2);
+    expect((await repository.getModelTask(temporalFormTask.id))?.status).toBe("failed");
+    expect((await repository.getModelTask(idFormTask.id))?.status).toBe("failed");
+    expect((await repository.getModelTask(liveTask.id))?.status, "在飞 run 的任务是合法待办，不是僵尸").toBe("pending");
+    expect((await repository.pool.query("SELECT result FROM model_tasks WHERE id=$1", [idFormTask.id])).rows[0].result?.value?.reason).toBe("test-run-already-terminal");
+    expect(await repository.expireOrphanedModelTasks("again"), "重放必须 no-op").toBe(0);
+  });
+
+  it("expireWorkflowModelTasks 认得两种键形态（reconcile 传 temporal、工作流侧常写 id）", async () => {
+    if (!available) return;
+    const temporalId = `key-form-${randomUUID().slice(0, 8)}`;
+    await makeRun(temporalId, "running", "interval '1 hour'");
+    const runId = (await repository.pool.query<{ id: string }>("SELECT id FROM workflow_runs WHERE temporal_workflow_id=$1", [temporalId])).rows[0].id;
+    const task = workPackage(runId); // 按 run 主键形态记账，而收编方手里只有 temporal id
+    await repository.createModelTask(task, `idem-${randomUUID()}`);
+    const unrelated = workPackage(`other-run-${randomUUID()}`);
+    await repository.createModelTask(unrelated, `idem-${randomUUID()}`);
+
+    expect(await repository.expireWorkflowModelTasks(temporalId, "run-terminal:failed"), "跨键形态收编必须命中").toBe(1);
+    const expiredTask = await repository.getModelTask(task.id);
+    expect(expiredTask?.status).toBe("failed");
+    expect((expiredTask?.result as { value?: { reason?: string } } | undefined)?.value?.reason).toBe("run-terminal:failed");
+    expect((await repository.getModelTask(unrelated.id))?.status, "别的 run 的任务不受牵连").toBe("pending");
+  });
 });

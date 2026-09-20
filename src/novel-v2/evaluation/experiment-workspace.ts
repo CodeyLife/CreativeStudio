@@ -85,14 +85,14 @@ export const EXPERIMENT_RUNTIME_TABLES = [
   "chapter_review_snapshot_issues", "chapter_review_snapshots", "chapter_script_subject_presets", "chapters",
   "commit_records", "content_blobs", "context_manifests",
   "craft_rule_candidates", "creative_reviews", "creative_run_events", "creative_runs",
-  "creative_work_items", "embedding_cache", "entities", "execution_blueprints", "fact_sources", "facts",
+  "creative_work_items", "embedding_cache", "entities", "execution_blueprints",
   "foreshadowing", "idempotency_keys", "learning_assessments", "manuscript_blocks",
   "manuscript_documents", "manuscript_revisions", "memory_bundles", "memory_claim_sources", "memory_claims", "memory_gate_states",
   "narrative_state_snapshots", "model_invocations", "model_routes", "model_tasks", "novel_intents",
   "novel_projects", "outbox_events", "payoffs", "plot_threads",
-  "preflight_plans", "project_plan_sections", "projection_failures", "promises", "prompt_executions", "prompt_templates", "provider_configs", "quality_gates",
+  "preflight_plans", "project_plan_sections", "projection_failures", "promises", "prompt_executions", "prompt_templates", "provider_configs",
   "relations", "retrieval_runs", "reviews", "scenes", "skill_bundles",
-  "skill_definitions", "skills", "story_arc_batches", "style_contracts", "task_attempts", "timeline_events",
+  "skill_definitions", "story_arc_batches", "style_contracts", "task_attempts", "timeline_events",
   "volumes", "workflow_run_summaries", "workflow_runs",
 ] as const;
 
