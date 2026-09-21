@@ -5,6 +5,7 @@ import { isPostgresUnavailable } from "./test-db";
 import { NovelPostgresRepository } from "../postgres-repository";
 import { promptExecutionRetentionDays } from "../repository/telemetry-slice";
 import { detectMemoryIndexDrift } from "../memory-index-drift";
+import { qdrantPointId } from "../memory-point-id";
 
 const TEST_DB_URL = process.env.TEST_DATABASE_URL ?? "postgresql://ymcp:ymcp@127.0.0.1:5432/ymcp_test";
 
@@ -114,36 +115,81 @@ describe("prompt_executions 保留清理（载荷到期、收据留存）", () =
   });
 });
 
-/** 记忆索引漂移判据（doctor 的 memory-index-drift 用同一份代码）。 */
+/**
+ * 记忆索引漂移判据（doctor 的 memory-index-drift 用同一份代码）。
+ *
+ * 立用例的根因是本检查首版自己的形态缺陷：按**条数**比较。`ymcp` 首跑给出"应有 2180 /
+ * 实有 2131"，按条数即报"欠灌 49、不脏"；集合级复测的真形是缺 76 条 **且** 多 27 个陈旧点，
+ * 49 只是两者相减。故这里必须有一条"两向等量仍要判脏"的抵消回归——它锁的不是精度，
+ * 是判据方向。
+ */
 describe("memory index drift 判据", () => {
+  const ids = (prefix: string, n: number) => Array.from({ length: n }, (_, index) => `${prefix}-${index}`);
+  const pointSet = (projectId: string, rowIds: string[]) => new Set(rowIds.map((rowId) => qdrantPointId(projectId, rowId)));
   const baseline = [
-    { projectId: "p-dirty", claims: 90, chapterMemories: 10 },
-    { projectId: "p-under", claims: 50, chapterMemories: 5 },
-    { projectId: "p-even", claims: 7, chapterMemories: 3 },
-    { projectId: "p-unknown", claims: 4, chapterMemories: 0 },
+    { projectId: "p-stale", claimIds: ids("c", 9), chapterMemoryIds: ids("m", 1) },
+    { projectId: "p-cancel", claimIds: ids("c", 4), chapterMemoryIds: [] as string[] },
+    { projectId: "p-under", claimIds: ids("c", 3), chapterMemoryIds: [] as string[] },
+    { projectId: "p-even", claimIds: ids("c", 2), chapterMemoryIds: [] as string[] },
+    { projectId: "p-unknown", claimIds: ids("c", 2), chapterMemoryIds: [] as string[] },
   ];
+  // p-cancel 的真形：库里有 4 行、索引里也有 4 个点，但只有 1 行对得上——缺 3、多 3。
+  const indexed = new Map<string, Set<string> | null>([
+    ["p-stale", pointSet("p-stale", [...baseline[0].claimIds, ...baseline[0].chapterMemoryIds, "ghost"])],
+    ["p-cancel", pointSet("p-cancel", ["c-0", "gone-1", "gone-2", "gone-3"])],
+    ["p-under", pointSet("p-under", ["c-0"])],
+    ["p-even", pointSet("p-even", baseline[3].claimIds)],
+    ["p-unknown", null],
+  ]);
 
-  it("只把「点数多于应有行数」判成脏索引，欠灌与点数不可得都不判", () => {
-    const { rows, dirty } = detectMemoryIndexDrift(baseline, new Map([
-      ["p-dirty", 141], ["p-under", 12], ["p-even", 10], ["p-unknown", null],
-    ]));
-    expect(dirty).toEqual([{ projectId: "p-dirty", expected: 100, indexed: 141, extra: 41 }]);
-    expect(rows.find((row) => row.projectId === "p-under")?.extra, "欠灌只报数：写入与索引之间有正常异步窗口").toBeNull();
-    expect(rows.find((row) => row.projectId === "p-even")?.extra).toBeNull();
-    expect(rows.find((row) => row.projectId === "p-unknown"), "拿不到点数两向都不判").toMatchObject({ indexed: null, extra: null });
+  it("陈旧点判脏、欠灌只具名不判、点集不可得两向都不判", () => {
+    const { rows, dirty } = detectMemoryIndexDrift(baseline, indexed);
+    expect(dirty.map((row) => row.projectId), "只有『点比应有的还多』判异常").toEqual(["p-stale", "p-cancel"]);
+    expect(dirty[0]).toMatchObject({ projectId: "p-stale", expected: 10, indexed: 11 });
+    expect(dirty[0].extraPointIds).toEqual([qdrantPointId("p-stale", "ghost")]);
+    const under = rows.find((row) => row.projectId === "p-under");
+    expect(under, "欠灌是『读不到』，与陈旧点的『读到假的』不同级").toMatchObject({ extraPointIds: [] });
+    expect(under?.missingRowIds.sort(), "欠灌要具名给出，供定向补灌").toEqual(["c-1", "c-2"]);
+    expect(rows.find((row) => row.projectId === "p-unknown"), "拿不到点集两向都不判").toMatchObject({ indexed: null, missingRowIds: [], extraPointIds: [] });
   });
 
-  it("应有行数 = 可见声明 + 章记忆（与重建路径同一组成）", () => {
-    const { rows } = detectMemoryIndexDrift(baseline, new Map([["p-dirty", 0]]));
-    expect(rows.map((row) => row.expected)).toEqual([100, 55, 10, 4]);
+  it("抵消回归：缺 N 条与多 N 点相减为零时，判据仍必须报脏并报缺", () => {
+    const { rows, dirty } = detectMemoryIndexDrift(baseline, indexed);
+    const cancel = rows.find((row) => row.projectId === "p-cancel");
+    expect(cancel?.indexed, "两边条数完全相等——按基数比较会在这里报绿").toBe(cancel?.expected);
+    expect(dirty.map((row) => row.projectId)).toContain("p-cancel");
+    expect(cancel?.missingRowIds).toEqual(["c-1", "c-2", "c-3"]);
+    expect(cancel?.extraPointIds).toHaveLength(3);
   });
 
-  it("仓储侧只有一份可见性谓词：全库计数就是按项目计数的和", async () => {
+  it("应有集合 = 可见声明 + 章记忆（与重建路径同一组成）", () => {
+    const { rows } = detectMemoryIndexDrift(baseline, new Map());
+    expect(rows.map((row) => row.expected)).toEqual([10, 4, 3, 2, 2]);
+  });
+
+  it("仓储侧只有一份可见性谓词：三条消费路径都引它、无人自己抄", () => {
     const repo = readFileSync(new URL("../postgres-repository.ts", import.meta.url), "utf8");
-    const globalCount = repo.slice(repo.indexOf("async countIndexableMemoryClaims"), repo.indexOf("async countIndexableMemoryRows"));
-    expect(globalCount, "全库计数若自己再写一遍 SQL，就会与按项目基线各自漂移").toContain("countIndexableMemoryRows()");
+    const at = (marker: string) => repo.indexOf(`async ${marker}`);
+    const globalCount = repo.slice(at("countIndexableMemoryClaims"), at("listIndexableMemoryRowIds"));
+    expect(globalCount, "全库计数若自己再写一遍 SQL，就会与按项目基线各自漂移").toContain("listIndexableMemoryRowIds()");
     expect(globalCount.match(/\bretrievalVisibleClaimsSql\s*\(/gu) ?? [], "谓词若自己再写一遍 SQL，就会与按项目基线各自漂移").toHaveLength(0);
-    const perProject = repo.slice(repo.indexOf("async countIndexableMemoryRows"), repo.indexOf("async listAllChapterMemories"));
-    expect([...perProject.matchAll(/\bretrievalVisibleClaimsSql\("memory_claims"\)/gu)].length).toBe(1);
+    const consumers: Record<string, string> = {
+      基线枚举: repo.slice(at("listIndexableMemoryRowIds"), at("filterIndexableMemoryRowIds")),
+      检索存活判定: repo.slice(at("filterIndexableMemoryRowIds"), at("listAllChapterMemories")),
+    };
+    for (const [name, body] of Object.entries(consumers)) {
+      expect(body, `${name} 找不到＝消费路径被拆走，锁该跟着改而非静默空转`).not.toBe("");
+      expect([...body.matchAll(/\bretrievalVisibleClaimsSql\("memory_claims"\)/gu)].length, `${name} 必须引共享片段恰好一次`).toBe(1);
+      expect(body, `${name} 不得自己抄写可见性字面量`).not.toMatch(/lifecycle_status\s*=\s*'active'/u);
+    }
+    expect(consumers.基线枚举, "点 id 散列若被抄第二份，两侧算出的 id 会各自漂移").not.toContain("sha256");
+  });
+
+  it("点 id 散列单源：判据用写入侧同一个函数，不另造", () => {
+    const drift = readFileSync(new URL("../memory-index-drift.ts", import.meta.url), "utf8");
+    expect(drift).toContain('import { qdrantPointId } from "./memory-point-id"');
+    const writer = readFileSync(new URL("../qdrant-memory.ts", import.meta.url), "utf8");
+    expect(writer).toContain('import { qdrantPointId } from "./memory-point-id"');
+    expect([...writer.matchAll(/function qdrantPointId/gu)].length, "写入侧不得再留一份实现").toBe(0);
   });
 });

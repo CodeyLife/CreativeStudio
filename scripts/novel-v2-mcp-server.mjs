@@ -35,7 +35,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 import { NovelPostgresRepository } from "../src/novel-v2/postgres-repository.ts";
 import { createRuntimeModelGateway } from "../src/novel-v2/model-runtime.ts";
 import { ContentObjectStore } from "../src/novel-v2/object-store.ts";
-import { QdrantMemoryProvider } from "../src/novel-v2/qdrant-memory.ts";
+import { NO_SEMANTIC_SEARCH, QdrantMemoryProvider } from "../src/novel-v2/qdrant-memory.ts";
 import { QdrantClient } from "@qdrant/js-client-rest";
 import { resolveNovelRuntimeConfig } from "../src/novel-v2/runtime-config.ts";
 import { codeRevision } from "../src/novel-v2/code-revision.ts";
@@ -68,7 +68,8 @@ let memoryIndex;
 try {
   const qdrant = new QdrantClient({ url: runtimeConfig.qdrantUrl });
   await qdrant.getCollections();
-  memoryIndex = new QdrantMemoryProvider(qdrant, model, runtimeConfig.qdrantCollection, runtimeConfig.embeddingDimension);
+  // MCP 侧只写索引（upsert/delete），语义检索不从这里走：刻意声明"不检索"，误接 search 会直接抛错而非静默放行陈旧点。
+  memoryIndex = new QdrantMemoryProvider(qdrant, model, runtimeConfig.qdrantCollection, runtimeConfig.embeddingDimension, NO_SEMANTIC_SEARCH);
 } catch (error) {
   console.warn(`[mcp] 向量索引不可用，候选裁决降级为仅库内：${error?.message ?? error}`);
 }

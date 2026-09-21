@@ -86,7 +86,9 @@ const objectStore = new ContentObjectStore();
 await bindRuntimeObjectStore(repository, objectStore, "api");
 const { configStore: modelConfigStore, gateway: model } = await createRuntimeModelGateway(repository, objectStore);
 const qdrant = new QdrantClient({ url: runtime.qdrantUrl });
-const qdrantMemory = new QdrantMemoryProvider(qdrant, model, runtime.qdrantCollection, runtime.embeddingDimension);
+const qdrantMemory = new QdrantMemoryProvider(qdrant, model, runtime.qdrantCollection, runtime.embeddingDimension,
+  // 语义检索的存活判定接回库内可见集（payload 是索引时刻的副本，不能作数）。
+  (projectId, rowIds) => repository.filterIndexableMemoryRowIds(projectId, rowIds));
 const wordCountBackfill = await repository.backfillMissingContentWordCounts(objectStore);
 if (wordCountBackfill.updated || wordCountBackfill.failed) console.log("[word-count] content blob backfill", wordCountBackfill);
 // API 入口的 commitService 也启用 chapter memory 创建（与 worker 保持一致）

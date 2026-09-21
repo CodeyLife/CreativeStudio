@@ -1678,31 +1678,59 @@ export class NovelPostgresRepository {
    * 全库可索引声明总数（`reindex-novel-memory` 拿它对账"应索引 vs 已索引"）。
    * 与 listIndexableMemoryClaims 同口径：被 supersedes 退役的行不进入向量索引
    * （memory-governance-audit-20260909 §5.3.1——可索引集 = 检索可见集）。
-   * 刻意由 {@link countIndexableMemoryRows} 求和得出：可见性谓词只许有一份。
+   * 刻意由 {@link listIndexableMemoryRowIds} 求和得出：可见性谓词只许有一份。
    */
   async countIndexableMemoryClaims(): Promise<number> {
-    const rows = await this.countIndexableMemoryRows();
-    return rows.reduce((sum, row) => sum + row.claims + row.chapterMemories, 0);
+    const rows = await this.listIndexableMemoryRowIds();
+    return rows.reduce((sum, row) => sum + row.claimIds.length + row.chapterMemoryIds.length, 0);
   }
 
   /**
-   * 向量索引"应有多少点"的基线，按项目分组（doctor 的 `memory-index-drift` 观测用）。
+   * 向量索引"该有哪些点"的基线，按项目给出**行 id**（doctor 的 `memory-index-drift` 用）。
    *
    * 与重建路径同源：`POST /v2/projects/:id/memory/rebuild` 灌进 Qdrant 的正是
-   * `listIndexableMemoryClaims` + `listAllChapterMemories` 两批，故基线 = 两者之和；
-   * 谓词直接复用 `retrievalVisibleClaimsSql`，不手写第二份可见性判据（本仓不变量）。
+   * `listIndexableMemoryClaims` + `listAllChapterMemories` 两批，一行一个点；谓词直接复用
+   * `retrievalVisibleClaimsSql`，不手写第二份可见性判据（本仓不变量）。
+   *
+   * 给 id 而非计数：漂移只能按集合对账。按条数比会把"缺 N 条"和"多 M 个点"抵消成
+   * 一条中间数，而这两个方向的后果完全不同（见 memory-index-drift.ts）。
    */
-  async countIndexableMemoryRows(): Promise<Array<{ projectId: string; claims: number; chapterMemories: number }>> {
-    const result = await this.pool.query<{ project_id: string; claims: string; chapter_memories: string }>(`
-      SELECT project_id, sum(claims)::int AS claims, sum(chapter_memories)::int AS chapter_memories
-      FROM (
-        SELECT project_id, count(*)::int AS claims, 0::int AS chapter_memories FROM memory_claims
-        WHERE ${retrievalVisibleClaimsSql("memory_claims")} GROUP BY 1
-        UNION ALL
-        SELECT project_id, 0::int, count(*)::int FROM chapter_memories GROUP BY 1
-      ) per_source
-      GROUP BY project_id ORDER BY 1`);
-    return result.rows.map((row) => ({ projectId: row.project_id, claims: Number(row.claims), chapterMemories: Number(row.chapter_memories) }));
+  async listIndexableMemoryRowIds(): Promise<Array<{ projectId: string; claimIds: string[]; chapterMemoryIds: string[] }>> {
+    const result = await this.pool.query<{ project_id: string; source: string; id: string }>(`
+      SELECT project_id, 'claim' AS source, id FROM memory_claims WHERE ${retrievalVisibleClaimsSql("memory_claims")}
+      UNION ALL
+      SELECT project_id, 'chapter' AS source, id FROM chapter_memories
+      ORDER BY 1, 2, 3`);
+    const byProject = new Map<string, { projectId: string; claimIds: string[]; chapterMemoryIds: string[] }>();
+    for (const row of result.rows) {
+      const entry = byProject.get(row.project_id) ?? { projectId: row.project_id, claimIds: [], chapterMemoryIds: [] };
+      if (row.source === "claim") entry.claimIds.push(row.id); else entry.chapterMemoryIds.push(row.id);
+      byProject.set(row.project_id, entry);
+    }
+    return [...byProject.values()];
+  }
+
+  /**
+   * 给定行 id 中"当前仍在可索引集里"的那个子集——语义检索的存活判定。
+   *
+   * 存在的理由是一条实测缺口：Qdrant 点 payload 里的 `lifecycleStatus`/`authority`/
+   * `supersedes` 都是**索引时刻的副本**，行此后被退役、转 staged、被删都不会自己变。
+   * `ymcp` 实测索引里有 22 个"已被可见杀手退役"的点与 5 个"行已 staged"的点。召回时
+   * 只看这份副本，就会把已退役内容当现行事实交给模型（正是 A1/FM-1 那条不变量要防的）。
+   *
+   * 谓词与 {@link listIndexableMemoryRowIds} 同源，本方法只是把它从"全库枚举"收成
+   * "按 id 批量问"，不另写第二份可见性判据（本仓不变量）。
+   */
+  async filterIndexableMemoryRowIds(projectId: string, rowIds: string[]): Promise<Set<string>> {
+    if (!rowIds.length) return new Set();
+    const claims = await this.pool.query<{ id: string }>(
+      `SELECT id FROM memory_claims WHERE project_id=$1 AND id=ANY($2) AND ${retrievalVisibleClaimsSql("memory_claims")}`,
+      [projectId, rowIds]);
+    // 章记忆点在库里活在 chapter_memories（rebuild 的组成里它就不受 supersedes 约束），
+    // 只判"行还在不在"：删弧连带删行时，它的点必须不再被召回。
+    const chapters = await this.pool.query<{ id: string }>(
+      "SELECT id FROM chapter_memories WHERE project_id=$1 AND id=ANY($2)", [projectId, rowIds]);
+    return new Set([...claims.rows, ...chapters.rows].map((row) => row.id));
   }
 
   async listAllChapterMemories(input: { offset?: number; limit?: number; projectId?: string } = {}): Promise<ChapterMemory[]> {

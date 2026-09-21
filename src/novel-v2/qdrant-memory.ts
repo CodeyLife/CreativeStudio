@@ -1,13 +1,24 @@
 import { QdrantClient } from "@qdrant/js-client-rest";
-import { createHash } from "node:crypto";
 import type { MemoryClaim, MemoryHit, MemoryProvider, RetrievalFacet } from "./protocol";
 import { isVisibleClaimAuthority, VISIBLE_CLAIM_AUTHORITIES } from "./memory-visibility";
+import { qdrantPointId } from "./memory-point-id";
 import type { ModelGateway } from "./model-gateway";
 
 export interface MemoryIndex {
   upsertClaims(projectId: string, claims: MemoryClaim[]): Promise<void>;
   deleteClaims?(projectId: string, claimIds: string[]): Promise<void>;
 }
+
+/**
+ * 存活判定注入点：把一批行 id 收成"当前仍在可索引集里"的子集。
+ * 实现在仓储侧（谓词单源），本模块只负责在召回后问它一次。
+ */
+export type LiveMemoryRowFilter = (projectId: string, rowIds: string[]) => Promise<Set<string>>;
+
+/** 只写不读的构造点（重建脚本、写入侧单测）用它：语义检索在此处不可达。 */
+export const NO_SEMANTIC_SEARCH: LiveMemoryRowFilter = async () => {
+  throw new Error("该 QdrantMemoryProvider 实例未接存活判定，不得用于语义检索");
+};
 
 /**
  * 通过 claim.id 前缀识别 chapter memory（由 chapter-memory/index.ts 的 chapterMemoryAsClaim 产出）。
@@ -18,19 +29,10 @@ export interface MemoryIndex {
  */
 const CHAPTER_MEMORY_ID_PREFIX = "memory:chapter:";
 
-export function qdrantPointId(projectId: string, claimId: string): string {
-  const bytes = createHash("sha256").update(projectId).update("\0").update(claimId).digest().subarray(0, 16);
-  // RFC 9562 UUIDv8: deterministic application-defined content with the standard variant bits.
-  bytes[6] = (bytes[6] & 0x0f) | 0x80;
-  bytes[8] = (bytes[8] & 0x3f) | 0x80;
-  const hex = bytes.toString("hex");
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
-}
-
 export class QdrantMemoryProvider implements MemoryProvider, MemoryIndex {
   readonly collection: string;
   readonly dimension: number;
-  constructor(private readonly client: QdrantClient, private readonly gateway: ModelGateway, collection = process.env.QDRANT_COLLECTION ?? "novel-memory", dimension = Number(process.env.NOVEL_EMBEDDING_DIM ?? 1024)) { this.collection = collection; this.dimension = dimension; }
+  constructor(private readonly client: QdrantClient, private readonly gateway: ModelGateway, collection = process.env.QDRANT_COLLECTION ?? "novel-memory", dimension = Number(process.env.NOVEL_EMBEDDING_DIM ?? 1024), private readonly filterLiveRowIds: LiveMemoryRowFilter = NO_SEMANTIC_SEARCH) { this.collection = collection; this.dimension = dimension; }
 
   async ensureCollection() {
     let info: Awaited<ReturnType<QdrantClient["getCollection"]>>;
@@ -89,7 +91,10 @@ export class QdrantMemoryProvider implements MemoryProvider, MemoryIndex {
     const hits = points.points
       .map((point: any) => {
         const claim = point.payload?.claim as MemoryHit | undefined;
-        if (!claim || !claim.id || claim.projectId !== input.projectId || claim.lifecycleStatus === "staged" || !["approved", "author", "derived"].includes(claim.authority)) return null;
+        // 这里只留结构校验。存活与否不在此判：payload 的 lifecycleStatus/authority/supersedes
+        // 全是索引时刻的副本（`claim.lifecycleStatus ?? "active"` 还会替缺字段的行撒谎），
+        // 统一交给下面的库内可见集判定——那才是 A1/FM-1 的单一真源。
+        if (!claim || !claim.id || claim.projectId !== input.projectId) return null;
         // P0-A5: matchedFacet 按 claim.kind 匹配 facet 列表，而非强制标记为 facets[0].kind
         // 设计依据：AGENTS.md「root-cause analysis」——matchedFacet 错标会导致 missingFacets
         // 计算错误，高风险任务可能因 missingFacets.length && risk==="high" 抛错阻断生成。
@@ -116,15 +121,21 @@ export class QdrantMemoryProvider implements MemoryProvider, MemoryIndex {
       })
       .filter((claim: MemoryHit | null): claim is MemoryHit => claim !== null);
 
-    // P0-A1: 过滤被 supersedes 的旧 claim（retrieval 层屏蔽）
-    // 设计依据：AGENTS.md「root-cause analysis」——supersedes 是长程一致性核心契约，
-    // 旧版本和新版本 claim 不能同时出现，否则 LLM 会看到自相矛盾的事实。
-    // Qdrant 不支持数组包含过滤的复杂语义，这里在应用层过滤。
-    const supersededIds = new Set(hits.flatMap((hit) => hit.supersedes ?? []));
-    const filteredHits = supersededIds.size > 0 ? hits.filter((hit) => !supersededIds.has(hit.id)) : hits;
+    // 存活判定（A1/FM-1 不变量在语义检索侧的落点）：召回后拿命中行 id 回库问一次
+    // "当前仍在可索引集里"的子集，其余丢弃。
+    //
+    // 取代的是此前的 payload 近似：那版只把**同一窗内**命中行的 `supersedes` 互相屏蔽，
+    // 杀手不与受害者同时进 top-64 就失效，而库里被退役/转 staged 的行其点不会自己变
+    // （`ymcp` 实测索引里有 22 个已退役点与 5 个 staged 点）。近似判据留着的代价是
+    // "同一契约两处口径"，正是本仓反复清理的形态，故一并撤掉。
+    //
+    // 失败即抛（不静默放行）：问不到存活集就等于无法排除陈旧事实，宁可让调用方
+    // （融合检索按轨 catch）降级为其他轨，也不把已退役内容当现行事实送进 prompt。
+    const liveRowIds = hits.length ? await this.filterLiveRowIds(input.projectId, hits.map((hit: MemoryHit) => hit.id)) : new Set<string>();
+    const survivingHits = hits.filter((hit: MemoryHit) => liveRowIds.has(hit.id));
 
     // Phase 2.1 rerank：若 gateway.rerank 可用，对 top-N 做 cross-encoder rerank
-    return this.applyRerank(query, filteredHits, input.projectId);
+    return this.applyRerank(query, survivingHits, input.projectId);
   }
 
   /**

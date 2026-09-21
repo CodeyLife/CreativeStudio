@@ -25,7 +25,9 @@ const objectStore = new ContentObjectStore();
 await bindRuntimeObjectStore(repository, objectStore, "worker");
 const qdrant = new QdrantClient({ url: runtime.qdrantUrl });
 const { gateway: modelGateway } = await createRuntimeModelGateway(repository, objectStore);
-const qdrantMemory = new QdrantMemoryProvider(qdrant, modelGateway, runtime.qdrantCollection, runtime.embeddingDimension);
+const qdrantMemory = new QdrantMemoryProvider(qdrant, modelGateway, runtime.qdrantCollection, runtime.embeddingDimension,
+  // 语义检索的存活判定接回库内可见集（payload 是索引时刻的副本，不能作数）。
+  (projectId, rowIds) => repository.filterIndexableMemoryRowIds(projectId, rowIds));
 const workflowsPath = fileURLToPath(new URL("../src/novel-v2/temporal/workflows.ts", import.meta.url));
 
 // P2-G2: 三轨加权融合（semantic 0.5 + lexical 0.3 + graph 0.2）

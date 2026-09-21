@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { chapterMemoryAsClaim } from "../src/novel-v2/chapter-memory";
 import { createRuntimeModelGateway } from "../src/novel-v2/model-runtime";
 import { NovelPostgresRepository } from "../src/novel-v2/postgres-repository";
-import { QdrantMemoryProvider } from "../src/novel-v2/qdrant-memory";
+import { NO_SEMANTIC_SEARCH, QdrantMemoryProvider } from "../src/novel-v2/qdrant-memory";
 
 const targetCollection = process.env.QDRANT_REINDEX_COLLECTION ?? "novel-memory-bge-m3-v1";
 const alias = process.env.QDRANT_COLLECTION ?? "novel-memory-current";
@@ -15,7 +15,7 @@ await repository.migrate();
 const qdrant = new QdrantClient({ url: process.env.QDRANT_URL ?? "http://127.0.0.1:6333" });
 if (reset && (await qdrant.getCollections()).collections.some((item) => item.name === targetCollection)) await qdrant.deleteCollection(targetCollection);
 const { gateway } = await createRuntimeModelGateway(repository);
-const index = new QdrantMemoryProvider(qdrant, gateway, targetCollection, dimension);
+const index = new QdrantMemoryProvider(qdrant, gateway, targetCollection, dimension, NO_SEMANTIC_SEARCH);
 await index.ensureCollection();
 
 // Map.groupBy 属 ES2024（本包 lib 为 ES2022），且回调参数在此处无类型可推。
