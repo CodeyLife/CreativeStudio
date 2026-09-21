@@ -1245,22 +1245,39 @@ export class NovelPostgresRepository {
     return this.telemetry.getPromptExecutionSnapshot(id, objects);
   }
 
-  async cleanupExpiredPromptExecutions(): Promise<{ deleted: number; orphanedObjectKeys: string[] }> {
+  /**
+   * 执行留痕的保留清理（挂在 api 的 retention 循环：启动一次 + 每 24h 一次）。
+   *
+   * 语义是"载荷到期、收据留存"：到期行清掉三样大载荷——两个对象存储键（迁移 028 正是
+   * 为此把它们改成可空）与**整份内联 `context_manifest`**；行本身与 purpose/状态/指纹/耗时
+   * 留着，`listPromptExecutions` 按 run 列留痕、报表按 fingerprint 关联 manifest 都读它们。
+   * 此前只清前两个键，漏了内联 manifest：实测 `ymcp` 9,243 行全部带 30 天到期时间、4,861 行
+   * 已过期，而内联 manifest 合计 184 MB（未压缩）——这张表 89 MB 几乎全是它，即"到期"从未
+   * 真正收走过体积。
+   *
+   * 刻意不删行：删行会把审计收据一起收走，而 `expires_at` 的原意只管载荷；"收据要不要另设
+   * 寿命"是独立问题，不混进这条清理。
+   *
+   * 引用集必须在置 NULL **之前**取：同一 prompt 的幂等重放会共用 content-addressed 键，
+   * 先动键再问"还有谁引用"就会把仍被别的行引用的对象误报成孤儿、被调用方删掉。
+   */
+  async cleanupExpiredPromptExecutions(nowMs = Date.now()): Promise<{ cleared: number; orphanedObjectKeys: string[] }> {
     const expired = await this.pool.query<{ prompt_object_key: string | null; response_object_key: string | null }>(`
       WITH snapshots AS (
         SELECT id,prompt_object_key,response_object_key FROM prompt_executions
-        WHERE expires_at<=now() AND (prompt_object_key IS NOT NULL OR response_object_key IS NOT NULL)
+        WHERE expires_at<=to_timestamp($1 / 1000.0)
+          AND (prompt_object_key IS NOT NULL OR response_object_key IS NOT NULL OR context_manifest IS NOT NULL)
         FOR UPDATE
       ), cleared AS (
         UPDATE prompt_executions AS execution
-        SET prompt_object_key=NULL,response_object_key=NULL
+        SET prompt_object_key=NULL,response_object_key=NULL,context_manifest=NULL
         FROM snapshots WHERE execution.id=snapshots.id
         RETURNING snapshots.prompt_object_key,snapshots.response_object_key
       )
       SELECT * FROM cleared
-    `);
+    `, [nowMs]);
     const keys = [...new Set(expired.rows.flatMap((row) => [row.prompt_object_key, row.response_object_key]).filter((key): key is string => Boolean(key)))];
-    if (!keys.length) return { deleted: 0, orphanedObjectKeys: [] };
+    if (!keys.length) return { cleared: expired.rowCount ?? 0, orphanedObjectKeys: [] };
     const referenced = await this.pool.query<{ object_key: string }>(`
       SELECT prompt_object_key AS object_key FROM prompt_executions WHERE prompt_object_key=ANY($1)
       UNION SELECT response_object_key FROM prompt_executions WHERE response_object_key=ANY($1)
@@ -1268,7 +1285,7 @@ export class NovelPostgresRepository {
       UNION SELECT object_key FROM artifacts WHERE object_key=ANY($1)
     `, [keys]);
     const retained = new Set(referenced.rows.map((row) => row.object_key));
-    return { deleted: expired.rowCount ?? 0, orphanedObjectKeys: keys.filter((key) => !retained.has(key)) };
+    return { cleared: expired.rowCount ?? 0, orphanedObjectKeys: keys.filter((key) => !retained.has(key)) };
   }
 
   async saveBookSynopsisIfCurrent(input: { projectId: string; sourceFingerprint: string; synopsis: BookSynopsisRecord }): Promise<boolean> {
@@ -1657,14 +1674,35 @@ export class NovelPostgresRepository {
     return result.rows.map(memoryClaimFromRow);
   }
 
+  /**
+   * 全库可索引声明总数（`reindex-novel-memory` 拿它对账"应索引 vs 已索引"）。
+   * 与 listIndexableMemoryClaims 同口径：被 supersedes 退役的行不进入向量索引
+   * （memory-governance-audit-20260909 §5.3.1——可索引集 = 检索可见集）。
+   * 刻意由 {@link countIndexableMemoryRows} 求和得出：可见性谓词只许有一份。
+   */
   async countIndexableMemoryClaims(): Promise<number> {
-    // 与 listIndexableMemoryClaims 同口径：被 supersedes 退役的行不进入向量索引
-    // （memory-governance-audit-20260909 §5.3.1——可索引集 = 检索可见集）。
-    const claims = await this.pool.query<{ count: string }>(
-      `SELECT count(*)::text AS count FROM memory_claims
-       WHERE ${retrievalVisibleClaimsSql("memory_claims")}`);
-    const chapters = await this.pool.query<{ count: string }>("SELECT count(*)::text AS count FROM chapter_memories");
-    return Number(claims.rows[0]?.count ?? 0) + Number(chapters.rows[0]?.count ?? 0);
+    const rows = await this.countIndexableMemoryRows();
+    return rows.reduce((sum, row) => sum + row.claims + row.chapterMemories, 0);
+  }
+
+  /**
+   * 向量索引"应有多少点"的基线，按项目分组（doctor 的 `memory-index-drift` 观测用）。
+   *
+   * 与重建路径同源：`POST /v2/projects/:id/memory/rebuild` 灌进 Qdrant 的正是
+   * `listIndexableMemoryClaims` + `listAllChapterMemories` 两批，故基线 = 两者之和；
+   * 谓词直接复用 `retrievalVisibleClaimsSql`，不手写第二份可见性判据（本仓不变量）。
+   */
+  async countIndexableMemoryRows(): Promise<Array<{ projectId: string; claims: number; chapterMemories: number }>> {
+    const result = await this.pool.query<{ project_id: string; claims: string; chapter_memories: string }>(`
+      SELECT project_id, sum(claims)::int AS claims, sum(chapter_memories)::int AS chapter_memories
+      FROM (
+        SELECT project_id, count(*)::int AS claims, 0::int AS chapter_memories FROM memory_claims
+        WHERE ${retrievalVisibleClaimsSql("memory_claims")} GROUP BY 1
+        UNION ALL
+        SELECT project_id, 0::int, count(*)::int FROM chapter_memories GROUP BY 1
+      ) per_source
+      GROUP BY project_id ORDER BY 1`);
+    return result.rows.map((row) => ({ projectId: row.project_id, claims: Number(row.claims), chapterMemories: Number(row.chapter_memories) }));
   }
 
   async listAllChapterMemories(input: { offset?: number; limit?: number; projectId?: string } = {}): Promise<ChapterMemory[]> {

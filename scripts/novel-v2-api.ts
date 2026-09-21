@@ -127,7 +127,7 @@ async function runRetentionCleanup() {
   for (const orphan of result.orphanedObjects) await objectStore.delete(orphan.objectKey);
   const prompts = await repository.cleanupExpiredPromptExecutions();
   for (const objectKey of prompts.orphanedObjectKeys) await objectStore.delete(objectKey);
-  if (result.runsCompacted || result.orphanedObjects.length || prompts.deleted) console.log("[retention] workflow cleanup", { ...result, prompts });
+  if (result.runsCompacted || result.orphanedObjects.length || prompts.cleared) console.log("[retention] workflow cleanup", { ...result, prompts });
   return { ...result, prompts };
 }
 

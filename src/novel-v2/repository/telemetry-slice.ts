@@ -25,6 +25,17 @@ import { embeddingFingerprint } from "../model-gateway";
 import { randomUUID } from "node:crypto";
 import { iso } from "./shared";
 
+/**
+ * 执行留痕的默认保留天数（`NOVEL_PROMPT_RETENTION_DAYS`，缺省 30）。
+ * 单一来源：写入侧据此逐行算 `prompt_executions.expires_at`，报表的 `sinceDays` 缺省同引它。
+ * 每次调用现读环境变量（进程内改配置能影响之后写入的行）。
+ *
+ * 行为差异如实登记：改前 `Math.max(1, Number(env ?? 30))` 会把 `0` 夹成 1 天、把非法值
+ * 变成 NaN 再落进 SQL；现在 `0` 与非法值一律回落到缺省 30（"保留 0 天"不是有效配置，
+ * 而 NaN 会让整批写入抛错）。运行库现值就是缺省 30，本改动不影响既有行。
+ */
+export const promptExecutionRetentionDays = (): number => Math.max(1, Number(process.env.NOVEL_PROMPT_RETENTION_DAYS ?? 30) || 30);
+
 export class TelemetrySlice {
   constructor(private readonly pool: Pool) {}
 
@@ -52,10 +63,13 @@ export class TelemetrySlice {
    * 机制：仅统计双列都非空的行（provider 未上报的行不参与比值，防把"缺报"读成
    * "偏差"）；p50/p95 用分位数而非均值——单条超长调用不应拉爆整体判断；
    * max_ratio 行定位最坏样本。泛化：无 purpose/model 专属分支，任何 provider 接入
-   * 即入报表。sinceDays 窗口对齐遥测保留策略。
+   * 即入报表。sinceDays 缺省值与留痕载荷寿命同源（见 promptExecutionRetentionDays）。
    */
   async getEstimatedVsProviderRatio(input: { sinceDays?: number } = {}) {
-    const sinceDays = input.sinceDays ?? 30; // TODO P3: 诊断窗口应可配置
+    // 诊断窗口默认值与留痕载荷的寿命同源（同一个"30 天"约定，两处不再各写一份字面量）。
+    // 刻意不做夹紧：行与 context_manifest_id 都活得比载荷久（清理只置 NULL 载荷），
+    // 报表请求更长的窗口不是"读不到"，只是"更老的那段没有收据以外的证据"。
+    const sinceDays = input.sinceDays ?? promptExecutionRetentionDays();
     const result = await this.pool.query<{
       purpose: string; model: string; comparable_calls: number; artifact_calls: number;
       p50_ratio: number | null; p95_ratio: number | null; max_ratio: number | null; min_ratio: number | null;
@@ -187,7 +201,9 @@ export class TelemetrySlice {
     }
     const promptObject = await objects.putText(JSON.stringify({ system: input.system, prompt: input.prompt }));
     const responseObject = input.response === undefined ? undefined : await objects.putText(input.response);
-    const retentionDays = Math.max(1, Number(process.env.NOVEL_PROMPT_RETENTION_DAYS ?? 30));
+    // 保留天数的唯一来源见 promptExecutionRetentionDays：写入侧逐行算进 expires_at，
+    // 报表侧的窗口上限也引它；删除侧刻意不另立常数（行的寿命就是 expires_at 那一列）。
+    const retentionDays = promptExecutionRetentionDays();
     const id = `prompt:${randomUUID()}`;
     await this.pool.query(
       `INSERT INTO prompt_executions(id,workflow_run_id,task_id,purpose,candidate_index,status,prompt_fingerprint,response_fingerprint,prompt_object_key,response_object_key,context_manifest,context_manifest_id,error_category,expires_at,project_id)
