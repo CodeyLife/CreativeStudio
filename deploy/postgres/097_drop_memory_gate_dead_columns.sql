@@ -1,0 +1,36 @@
+-- 097_drop_memory_gate_dead_columns.sql
+-- 撤 `memory_gate_states` 上两个无人回读的列：`rebuild_requested_at`、`last_workflow_id`。
+-- （作者 2026-09-20 裁决：撤掉。同批明确**不撤**该表本身与计数器。）
+--
+-- 为什么表留着：它虽然全仓零 SELECT，但它的"读"就是写语句自己的
+-- `INSERT … ON CONFLICT DO UPDATE … RETURNING consecutive_critical_misses,last_missing_facets`，
+-- `blocked` 由该返回值当场算出并交给 `temporal/activities.ts` 的记忆门 activity。
+-- 按"零 SELECT"判它撤表，正是迁移 095 立下的"0 行≠死表"同型误判。
+--
+-- 为什么这两列是死的（`scripts/evidence/ledger-readers.cjs` 同法取证：全仓按 SQL 动词计数、剥注释行）：
+-- - `last_workflow_id`：只在 `recordMemoryGateCheck` 的 INSERT/DO UPDATE 里被写，
+--   连 RETURNING 都不带 ⇒ 纯落库刻痕。它想记的"最近一次检查是哪个 run"，在 outbox 的
+--   `memory-gate.blocked` 事件 payload 里已有一份（那条事件带 workflowId），无需第二处。
+-- - `rebuild_requested_at`：`requestMemoryRebuild` 置它、`completeMemoryRebuild` 清它，
+--   **没有任何一处按它选行**。两条调用路径都把它当本地变量用：
+--     · `POST /v2/projects/:id/memory/rebuild` 是同一请求内"置标记 → 同步重索引 → 清标记"，
+--       该状态从不出进程边界，写库纯属多余；
+--     · 删弧时 Qdrant 清理失败（`novel-v2-api.ts` 的 story-arc delete 分支）会打这个标记当
+--       "索引已脏、待重建"的交接位——这才是它唯一有跨请求意义的用法，而本部署无任何
+--       sweeper/UI/doctor 会再读到它，作者侧只看到一次性 warning 字符串。
+--   撤列的**如实代价**：那个"索引已脏"状态自此完全不持久化（崩溃即无痕，重启也不会提示）。
+--   该路径的可观测性属另一条已登记待办（给删弧失败一个真读者），不在本迁移里赌。
+--
+-- 依赖面：两列都可空、无默认、不在任何索引里（`memory_gate_states_degraded` 只含
+-- `consecutive_critical_misses` 与 `last_checked_at`），沙箱副本（`LIKE … INCLUDING ALL`）
+-- 是独立表，不受本 ALTER 影响也不钉住公共对象。DROP COLUMN 不可逆 ⇒ 存量先测得：
+-- `ymcp` 1 行、其中 `last_workflow_id` 有值 1、`rebuild_requested_at` 有值 0；
+-- `ymcp_test` 0 行。丢弃的是一个 run id 与一个从未被置位的时间戳。
+--
+-- 幂等：`IF EXISTS`，重复 migrate 为 no-op；迁移文件内不自管事务（本仓纪律）。
+-- 同批登记但**不做**：`memory_gate_states_degraded` 是"谓词并非恒真、只是无读者"的写放大面
+-- （全表零 SELECT ⇒ 没有查询能用它）。它属于"要么给它建读者、要么撤索引"的待决项，
+-- 不与本迁移的列裁决混做。
+
+ALTER TABLE memory_gate_states DROP COLUMN IF EXISTS last_workflow_id;
+ALTER TABLE memory_gate_states DROP COLUMN IF EXISTS rebuild_requested_at;

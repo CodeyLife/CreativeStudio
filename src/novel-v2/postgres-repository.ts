@@ -762,15 +762,14 @@ export class NovelPostgresRepository {
       await client.query("BEGIN");
       const missing = [...new Set(input.criticalMissingFacets)].sort();
       const result = await client.query<{ consecutive_critical_misses: number; last_missing_facets: string[] }>(`
-        INSERT INTO memory_gate_states(project_id,consecutive_critical_misses,last_missing_facets,last_workflow_id,last_checked_at)
-        VALUES($1,$2,$3,$4,now())
+        INSERT INTO memory_gate_states(project_id,consecutive_critical_misses,last_missing_facets,last_checked_at)
+        VALUES($1,$2,$3,now())
         ON CONFLICT(project_id) DO UPDATE SET
           consecutive_critical_misses=CASE WHEN cardinality(EXCLUDED.last_missing_facets)=0 THEN 0 ELSE memory_gate_states.consecutive_critical_misses+1 END,
           last_missing_facets=EXCLUDED.last_missing_facets,
-          last_workflow_id=EXCLUDED.last_workflow_id,
           last_checked_at=now()
         RETURNING consecutive_critical_misses,last_missing_facets
-      `, [input.projectId, missing.length ? 1 : 0, missing, input.workflowId]);
+      `, [input.projectId, missing.length ? 1 : 0, missing]);
       const state = result.rows[0];
       const blocked = missing.length > 0 && state.consecutive_critical_misses >= (input.blockAfter ?? 3);
       if (blocked) {
@@ -807,21 +806,22 @@ export class NovelPostgresRepository {
   }
 
   async requestMemoryRebuild(projectId: string) {
-    const result = await this.pool.query<{ consecutive_critical_misses: number; last_missing_facets: string[]; rebuild_requested_at: Date }>(`
-      INSERT INTO memory_gate_states(project_id,rebuild_requested_at,last_checked_at)
-      VALUES($1,now(),now())
-      ON CONFLICT(project_id) DO UPDATE SET rebuild_requested_at=now(),last_checked_at=now()
-      RETURNING consecutive_critical_misses,last_missing_facets,rebuild_requested_at
+    const result = await this.pool.query<{ consecutive_critical_misses: number; last_missing_facets: string[] }>(`
+      INSERT INTO memory_gate_states(project_id,last_checked_at)
+      VALUES($1,now())
+      ON CONFLICT(project_id) DO UPDATE SET last_checked_at=now()
+      RETURNING consecutive_critical_misses,last_missing_facets
     `, [projectId]);
-    await this.appendOutbox("memory-gate", projectId, "memory.rebuild-requested", { projectId, requestedAt: result.rows[0].rebuild_requested_at });
-    return { projectId, status: "rebuild-requested" as const, consecutiveCriticalMisses: result.rows[0].consecutive_critical_misses, missingFacets: result.rows[0].last_missing_facets };
+    const requestedAt = new Date().toISOString();
+    await this.appendOutbox("memory-gate", projectId, "memory.rebuild-requested", { projectId, requestedAt });
+    return { projectId, status: "rebuild-requested" as const, requestedAt, consecutiveCriticalMisses: result.rows[0].consecutive_critical_misses, missingFacets: result.rows[0].last_missing_facets };
   }
 
   async completeMemoryRebuild(projectId: string, indexedClaims: number) {
     await this.pool.query(`
       INSERT INTO memory_gate_states(project_id,consecutive_critical_misses,last_missing_facets,last_checked_at)
       VALUES($1,0,'{}',now())
-      ON CONFLICT(project_id) DO UPDATE SET consecutive_critical_misses=0,last_missing_facets='{}',last_checked_at=now(),rebuild_requested_at=NULL
+      ON CONFLICT(project_id) DO UPDATE SET consecutive_critical_misses=0,last_missing_facets='{}',last_checked_at=now()
     `, [projectId]);
     await this.appendOutbox("memory-gate", projectId, "memory.rebuild-completed", { projectId, indexedClaims });
     return { projectId, status: "ready" as const, indexedClaims };

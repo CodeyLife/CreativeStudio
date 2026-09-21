@@ -195,4 +195,24 @@ describe("真库用例的跳过判据只许共享判据", () => {
       expect(entry.source, entry.file).not.toContain("EXPLICIT_TEST_DB_URL");
     }
   });
+
+  /**
+   * 按**站点**而非按文件判：同一文件里可以一处用对判据、另一处无条件吞（实测抓到
+   * `lease-integrity.test.ts` 的 reconcile 组——它 catch 任何 error 都只 warn 跳过，
+   * 于是 09-21 一次迁移校验和漂移把整组真库用例静默跳过而全量仍判绿）。
+   * 判据形态：打出"跳过"的那一行之上 5 行内必须出现 `isPostgresUnavailable(`。
+   */
+  it("每一处「因不可用而跳过」都必须紧跟共享判据（防空转的第二向）", () => {
+    let sites = 0;
+    for (const file of readdirSync(dir).filter((name) => name.endsWith(".test.ts"))) {
+      const lines = readFileSync(join(dir, file), "utf8").split(/\r?\n/);
+      lines.forEach((line, index) => {
+        if (!/console\.(warn|log)\(/u.test(line) || !/跳过/u.test(line)) return;
+        sites += 1;
+        const above = lines.slice(Math.max(0, index - 5), index).join("\n");
+        expect(above, `${file}:${index + 1} 的跳过没有走共享判据`).toContain("isPostgresUnavailable(");
+      });
+    }
+    expect(sites).toBeGreaterThanOrEqual(10); // 扫描空转时上面的循环不会给出任何失败
+  });
 });

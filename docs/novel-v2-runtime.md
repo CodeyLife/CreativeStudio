@@ -47,6 +47,8 @@ pnpm novel:v2:doctor
 pnpm novel:v2:migrations audit
 ```
 
+Migrations that drop a table or column (`093`/`095`/`096`/`097`) are applied by `migrate()` at new-code startup, so the old processes must be gone before the new build starts: a still-running older process keeps its own copy of the now-invalid SQL and fails on that business path (worst case the commit transaction), not at boot. `novel:v2:doctor` reports the mismatch as the `dropped-face-writers` check — for each applied drop migration it derives the removed tables/columns, then greps the running api/worker `codeRevision` for statements still writing them. It is report-only (never changes the exit status); a failed git lookup is the only FAIL.
+
 Normal startup blocks on checksum drift or unknown applied migrations. The one-time current-data repair is explicit:
 
 ```powershell

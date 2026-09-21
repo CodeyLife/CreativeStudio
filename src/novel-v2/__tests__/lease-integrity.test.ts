@@ -126,7 +126,8 @@ describe("reconcileStaleWorkflowRuns（OR-B4 僵尸对账）", () => {
       await repository.ensureProject(projectId, "Reconcile Test");
       available = true;
     } catch (error) {
-      console.warn(`[lease-integrity.test] reconcile 组跳过: ${(error as Error).message}`);
+      if (!isPostgresUnavailable(error)) throw error;
+      console.warn(`[lease-integrity.test] Postgres 不可用，reconcile 组跳过: ${(error as Error).message}`);
     }
   }, 30_000);
 
