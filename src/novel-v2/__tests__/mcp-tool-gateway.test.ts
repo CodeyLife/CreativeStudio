@@ -11,9 +11,7 @@
  * - 根因分析：测试失败时先识别 failingLayer（路由/校验/handler），不修改 fixture 让单 sample 通过
  *
  * 实现注记：
- * - novel_project_create 的 handler 使用 idempotencyKey 作为 projectId（非 args.projectId），
- *   且 schema 设置 additionalProperties: false，因此不能在 args 中传 projectId。
- * - novel_closed_loop_run 需要 idempotencyKey 通过 ajv 校验后才能到达 handler 的 model 检查，
+ * - novel_rule_candidate_advance 需要 idempotencyKey 通过 ajv 校验后才能到达 handler 的 model 检查，
  *   任务示例中省略 idempotencyKey 会导致参数校验先失败，无法测到 handler 抛错。
  */
 import { describe, expect, it, beforeAll, afterAll, vi } from "vitest";
@@ -38,18 +36,24 @@ const mockCtx = {
 // ===== A. 纯函数：validateToolArgs（无 Postgres 依赖）=====
 
 describe("validateToolArgs pure function", () => {
-  it("TOOL_NAMES has exactly 50 tools", () => {
-    // 47 → 49：2026-09-10 新增 novel_fact_candidate_queue/novel_fact_candidate_decide（FM-2）。
-    // 49 → 50：2026-09-12 弧6 新增 novel_story_arc_decision。
-    // 50 → 52：2026-09-12 弧6 新增 novel_foreshadowing_list/triage。
-    // 52 → 59：2026-09-17 短剧创作台新增 7 个创作台/素材工具（后来被浏览器化移除）。
-    // 59 → 49：2026-09-17 独立短剧改浏览器本地存储，移除 10 个独立短剧工具（short_script_h3/brainstorm/submit + 创作台/素材）。
-    // 49 → 50：2026-09-19 回述对照只读诊断 novel_chapter_recall_report（审计 §四 19 的 D2 项）。
-    expect(TOOL_NAMES).toHaveLength(50);
+  it("TOOL_NAMES has exactly 21 tools", () => {
+    // 50 → 41：2026-09-24 工具面减法一批——撤 9 个零真实调用工具（action_list/run_complete/receipt_get/
+    //          rule_target_get/skill_get/chapter_script_h3_submit/memory_grooming_report/
+    //          chapter_recall_report/model_dispatch；skill_get 的发现能力并入 skill_query）。
+    // 41 → 29：2026-09-24 工具面减法二批——撤 12 增 1（chapter_script_h3/closed_loop_run/
+    //          prompt_inspect/invocation_list/rule_candidate_get/project_delete/run_get/review_submit
+    //          零或近零调用且能力另有通道；rule 五个人工步骤合并为 rule_candidate_advance）。
+    // 29 → 21：2026-09-24 工具面减法三批——撤 project_create（走 REST/Web）；弧规划三入口合一
+    //          （batch_start/orchestrate 并入 story_arc_start 的 mode）；观测面三对合一
+    //          （catalog_get/context_get → project_inspect、artifact_get/artifact_list → artifact_query、
+    //          workflow_get/workflow_list → workflow_query）；审校双入口合一（issue_add 并入
+    //          chapter_review 的 issues）；决策面合一（chapter_review_decision/story_arc_decision
+    //          → workflow_decision 的 target）。
+    expect(TOOL_NAMES).toHaveLength(21);
   });
 
-  it("TOOL_DEFINITIONS has 50 defs, each with name/description/inputSchema", () => {
-    expect(TOOL_DEFINITIONS).toHaveLength(50);
+  it("TOOL_DEFINITIONS has 21 defs, each with name/description/inputSchema", () => {
+    expect(TOOL_DEFINITIONS).toHaveLength(21);
     for (const def of TOOL_DEFINITIONS) {
       expect(typeof def.name).toBe("string");
       expect(def.name.length).toBeGreaterThan(0);
@@ -74,12 +78,12 @@ describe("validateToolArgs pure function", () => {
       documentId: "",
       idempotencyKey: "",
     });
-    expect(buildToolArgumentSkeleton("novel_rule_evidence_submit")).toMatchObject({
+    expect(buildToolArgumentSkeleton("novel_rule_candidate_advance")).toMatchObject({
       projectId: "",
       candidateId: "",
-      scenarioClass: "",
-      scenarioRole: "source-failure",
+      action: "evidence",
     });
+    expect(buildToolArgumentSkeleton("novel_story_arc_start")).toEqual({ projectId: "" });
   });
 
   it("novel_fact_candidate_queue surfaces per-chapter backlog (FM-2)", async () => {
@@ -96,57 +100,6 @@ describe("validateToolArgs pure function", () => {
     const body = JSON.parse(response.content[0].text);
     expect(body.totalPending).toBe(2);
     expect(body.byChapter[0].chapterIndex).toBe(6);
-  });
-
-  it("novel_chapter_recall_report pairs recall sentences with prior-chapter originals and never feeds the target chapter to itself", async () => {
-    const readKeys: string[] = [];
-    const bodies: Record<string, string> = {
-      "key-9": "昨夜他试着让灵气撞开淤塞的经脉，那套走法后来再没用过。",
-      "key-10": "他想起昨夜灵气撞开经脉的那套走法，膝上的旧伤跟着跳了一下。",
-    };
-    const ctx = {
-      repository: {
-        getChapterContentRefsByOrders: async (_projectId: string, orders: number[]) => orders.map((order) => ({
-          documentId: `doc-${order}`,
-          narrativeOrder: order,
-          objectKey: order === 10 ? "key-10" : order === 9 ? "key-9" : `missing-${order}`,
-        })),
-      },
-      objects: {
-        getText: async (objectKey: string) => {
-          readKeys.push(objectKey);
-          if (bodies[objectKey]) return bodies[objectKey];
-          throw new Error("对象不存在");
-        },
-      },
-    } as never;
-    const response = await executeTool("novel_chapter_recall_report", { projectId: "p1", narrativeOrder: 10, window: 2 }, ctx);
-    expect(response.isError).toBeFalsy();
-    const body = JSON.parse(response.content[0].text);
-    expect(body).toMatchObject({ narrativeOrder: 10, documentId: "doc-10", window: 2 });
-    expect(body.anchors).toHaveLength(1);
-    expect(body.anchors[0]).toMatchObject({ cue: "想起" });
-    // 第 9 章正文与回述句共享"灵气/经脉/走法"，是对照的真实来源；缺文的第 8 章被尝试读取后
-    // 跳过（不计入 chaptersCompared），既不让缺文伪装成"无相似内容"，也不因此整批失败。
-    expect(body.anchors[0].sources[0]).toMatchObject({ narrativeOrder: 9 });
-    expect(typeof body.anchors[0].sources[0].similarity).toBe("number");
-    expect(body.chaptersCompared).toBe(1);
-    expect(readKeys).toContain("missing-8");
-  });
-
-  it("novel_chapter_recall_report fails loudly instead of guessing when inputs or object storage are missing", async () => {
-    const withoutStore = { repository: { getChapterContentRefsByOrders: async () => [] } } as never;
-    expect((await executeTool("novel_chapter_recall_report", { projectId: "p1", narrativeOrder: 3 }, withoutStore)).isError).toBe(true);
-    const missingSnapshot = {
-      repository: { getChapterContentRefsByOrders: async () => [] },
-      objects: { getText: async () => "" },
-    } as never;
-    const response = await executeTool("novel_chapter_recall_report", { projectId: "p1", narrativeOrder: 3 }, missingSnapshot);
-    expect(response.isError).toBe(true);
-    expect(response.content[0].text).toContain("没有当前正文快照");
-    // schema 层就挡住缺参/非法值，不把手写校验当唯一防线。
-    expect((await executeTool("novel_chapter_recall_report", { projectId: "p1" }, missingSnapshot)).isError).toBe(true);
-    expect((await executeTool("novel_chapter_recall_report", { projectId: "p1", narrativeOrder: 0 }, missingSnapshot)).isError).toBe(true);
   });
 
   it("novel_fact_candidate_decide is idempotent per claim and syncs the approved point once", async () => {
@@ -202,61 +155,42 @@ describe("validateToolArgs pure function", () => {
     expect(result.valid).toBe(false);
   });
 
-  describe("novel_project_create", () => {
+  describe("novel_project_inspect", () => {
     it("valid args → valid=true", () => {
-      const result = validateToolArgs("novel_project_create", {
-        premise: "一个失去记忆的法医发现每具尸体都认识自己",
-        idempotencyKey: "k-1",
-      });
-      expect(result.valid).toBe(true);
+      expect(validateToolArgs("novel_project_inspect", { projectId: "p-1" }).valid).toBe(true);
+      expect(validateToolArgs("novel_project_inspect", { projectId: "p-1", view: "context", sections: ["narrative-state", "open-elements"] }).valid).toBe(true);
     });
 
-    it("accepts an optional versioned creative brief", () => {
-      const result = validateToolArgs("novel_project_create", {
-        premise: "一位失忆法医追查旧案",
-        idempotencyKey: "k-brief",
-        creativeBrief: {
-          targetReader: "悬疑读者",
-          corePromise: "真相会改变关系",
-          themeQuestion: { notApplicable: true, rationale: "本作不直接回答价值问题" },
-          researchNeeds: ["法医流程"],
-          nonNegotiables: ["不提前揭示结局"],
-        },
-      });
-      expect(result.valid).toBe(true);
+    it("unknown section → valid=false", () => {
+      expect(validateToolArgs("novel_project_inspect", { projectId: "p-1", view: "context", sections: ["facts"] }).valid).toBe(false);
     });
 
-    it("rejects a known creative brief field with the wrong type", () => {
-      const result = validateToolArgs("novel_project_create", {
-        premise: "一位失忆法医追查旧案",
-        idempotencyKey: "k-bad-brief-type",
-        creativeBrief: { targetReader: 3 },
-      });
-      expect(result.valid).toBe(false);
+    it("missing projectId → valid=false", () => {
+      expect(validateToolArgs("novel_project_inspect", {}).valid).toBe(false);
+    });
+  });
+
+  describe("novel_artifact_query", () => {
+    it("single-get and list args → valid=true（artifactId/projectId 一属由 handler 分发）", () => {
+      expect(validateToolArgs("novel_artifact_query", { artifactId: "a-1" }).valid).toBe(true);
+      expect(validateToolArgs("novel_artifact_query", { projectId: "p-1", kind: "review", limit: 10 }).valid).toBe(true);
     });
 
-    it("rejects a non-object creative brief at schema validation", () => {
-      const result = validateToolArgs("novel_project_create", {
-        premise: "一位失忆法医追查旧案",
-        idempotencyKey: "k-bad-brief",
-        creativeBrief: "not-an-object",
-      });
-      expect(result.valid).toBe(false);
+    it("out-of-range limit → valid=false", () => {
+      expect(validateToolArgs("novel_artifact_query", { projectId: "p-1", limit: 0 }).valid).toBe(false);
+      expect(validateToolArgs("novel_artifact_query", { projectId: "p-1", limit: 101 }).valid).toBe(false);
+    });
+  });
+
+  describe("novel_workflow_decision", () => {
+    it("both targets → valid=true", () => {
+      expect(validateToolArgs("novel_workflow_decision", { target: "chapter-review", workflowId: "w-1", artifactId: "a-1", decision: "approve" }).valid).toBe(true);
+      expect(validateToolArgs("novel_workflow_decision", { target: "story-arc", projectId: "p-1", arcId: "arc-1", decision: "revise", feedback: "补线索" }).valid).toBe(true);
     });
 
-    it("missing premise → valid=false", () => {
-      const result = validateToolArgs("novel_project_create", {
-        idempotencyKey: "k-1",
-      });
-      expect(result.valid).toBe(false);
-    });
-
-    it("empty premise → valid=false", () => {
-      const result = validateToolArgs("novel_project_create", {
-        premise: "",
-        idempotencyKey: "k-1",
-      });
-      expect(result.valid).toBe(false);
+    it("unknown target/decision → valid=false", () => {
+      expect(validateToolArgs("novel_workflow_decision", { target: "run", workflowId: "w-1", decision: "approve" }).valid).toBe(false);
+      expect(validateToolArgs("novel_workflow_decision", { workflowId: "w-1", artifactId: "a-1", decision: "defer" }).valid).toBe(false);
     });
   });
 
@@ -280,62 +214,68 @@ describe("validateToolArgs pure function", () => {
     });
   });
 
-  describe("novel_closed_loop_run", () => {
-    it("valid args → valid=true", () => {
-      const result = validateToolArgs("novel_closed_loop_run", {
+  describe("novel_rule_candidate_advance", () => {
+    it("valid evidence args → valid=true", () => {
+      const result = validateToolArgs("novel_rule_candidate_advance", {
         projectId: "p-1",
-        documentId: "d-1",
-        idempotencyKey: "k-1",
+        candidateId: "c-1",
+        action: "evidence",
+        scenarioClass: "chapter-drafting",
+        scenarioRole: "source-failure",
+        baselineWorkItemId: "b-1",
+        candidateWorkItemId: "n-1",
       });
       expect(result.valid).toBe(true);
     });
 
-    it("missing documentId → valid=false", () => {
-      const result = validateToolArgs("novel_closed_loop_run", {
+    it("invalid action → valid=false", () => {
+      const result = validateToolArgs("novel_rule_candidate_advance", {
         projectId: "p-1",
-        idempotencyKey: "k-1",
+        candidateId: "c-1",
+        action: "merge",
+      });
+      expect(result.valid).toBe(false);
+    });
+
+    it("missing candidateId → valid=false", () => {
+      const result = validateToolArgs("novel_rule_candidate_advance", {
+        projectId: "p-1",
+        action: "promote",
       });
       expect(result.valid).toBe(false);
     });
   });
 
-  describe("novel_review_submit", () => {
+  describe("novel_action_execute review.submit", () => {
+    const base = {
+      runId: "r-1",
+      action: "review.submit",
+      workItemId: "w-1",
+      review: {
+        subjectArtifactId: "a-1",
+        reviewer: "internal",
+        verdict: "passed",
+        issues: [],
+        summary: "ok",
+      },
+      idempotencyKey: "k-1",
+    };
+
     it("valid args → valid=true", () => {
-      const result = validateToolArgs("novel_review_submit", {
-        runId: "r-1",
-        workItemId: "w-1",
-        review: {
-          subjectArtifactId: "a-1",
-          reviewer: "internal",
-          verdict: "passed",
-          issues: [],
-          summary: "ok",
-        },
-        idempotencyKey: "k-1",
-      });
-      expect(result.valid).toBe(true);
+      expect(validateToolArgs("novel_action_execute", base).valid).toBe(true);
     });
 
     it("invalid verdict → valid=false", () => {
-      const result = validateToolArgs("novel_review_submit", {
-        runId: "r-1",
-        workItemId: "w-1",
-        review: {
-          subjectArtifactId: "a-1",
-          reviewer: "internal",
-          verdict: "invalid",
-          issues: [],
-          summary: "ok",
-        },
-        idempotencyKey: "k-1",
+      const result = validateToolArgs("novel_action_execute", {
+        ...base,
+        review: { ...base.review, verdict: "invalid" },
       });
       expect(result.valid).toBe(false);
     });
 
     it("accepts optional reader reconstruction evidence", () => {
-      const base = {
-        runId: "r-1",
-        workItemId: "w-1",
+      const withIssues = {
+        ...base,
         review: {
           subjectArtifactId: "a-1",
           reviewer: "internal",
@@ -350,16 +290,17 @@ describe("validateToolArgs pure function", () => {
         },
         idempotencyKey: "k-reader-reconstruction",
       };
-      expect(validateToolArgs("novel_review_submit", base).valid).toBe(true);
-      expect(validateToolArgs("novel_review_submit", { ...base, review: { ...base.review, issues: [{ ...base.review.issues[0], readerReconstruction: null }] } }).valid).toBe(true);
-      expect(validateToolArgs("novel_review_submit", { ...base, review: { ...base.review, issues: [{ ...base.review.issues[0], readerReconstruction: { impact: "core", missingEvidence: ["unknown"], blockedQuestion: "问题" } }] } }).valid).toBe(false);
+      expect(validateToolArgs("novel_action_execute", withIssues).valid).toBe(true);
+      expect(validateToolArgs("novel_action_execute", { ...withIssues, review: { ...withIssues.review, issues: [{ ...withIssues.review.issues[0], readerReconstruction: null }] } }).valid).toBe(true);
+      expect(validateToolArgs("novel_action_execute", { ...withIssues, review: { ...withIssues.review, issues: [{ ...withIssues.review.issues[0], readerReconstruction: { impact: "core", missingEvidence: ["unknown"], blockedQuestion: "问题" } }] } }).valid).toBe(false);
     });
   });
 
-  describe("novel_story_arc_orchestrate", () => {
+  describe("novel_story_arc_start (orchestrated)", () => {
     it("valid args → valid=true", () => {
-      const result = validateToolArgs("novel_story_arc_orchestrate", {
+      const result = validateToolArgs("novel_story_arc_start", {
         projectId: "p-1",
+        mode: "orchestrated",
         plotOutline: {
           objective: "主角必须混进暗渠上方的体系",
           centralConflict: "体系要求交出秘密",
@@ -374,61 +315,37 @@ describe("validateToolArgs pure function", () => {
       expect(result.valid).toBe(true);
     });
 
-    it("missing plotOutline → valid=false", () => {
-      expect(validateToolArgs("novel_story_arc_orchestrate", { projectId: "p-1" }).valid).toBe(false);
+    it("mode=batch with arcId → valid=true", () => {
+      expect(validateToolArgs("novel_story_arc_start", { projectId: "p-1", mode: "batch", arcId: "arc-1" }).valid).toBe(true);
     });
 
     it("empty objective → valid=false", () => {
-      expect(validateToolArgs("novel_story_arc_orchestrate", { projectId: "p-1", plotOutline: { objective: "" } }).valid).toBe(false);
+      expect(validateToolArgs("novel_story_arc_start", { projectId: "p-1", mode: "orchestrated", plotOutline: { objective: "" } }).valid).toBe(false);
     });
 
     it("malformed threadResponsibility entry → valid=false", () => {
-      expect(validateToolArgs("novel_story_arc_orchestrate", {
+      expect(validateToolArgs("novel_story_arc_start", {
         projectId: "p-1",
+        mode: "orchestrated",
         plotOutline: { objective: "目标", threadResponsibilities: [{ threadRef: "t-1", responsibility: "r" }] },
       }).valid).toBe(false);
     });
 
     it("unknown field in plotOutline → valid=false", () => {
-      expect(validateToolArgs("novel_story_arc_orchestrate", {
+      expect(validateToolArgs("novel_story_arc_start", {
         projectId: "p-1",
+        mode: "orchestrated",
         plotOutline: { objective: "目标", sceneCount: 5 },
       }).valid).toBe(false);
     });
 
     it("invalid reviewPolicy → valid=false", () => {
-      expect(validateToolArgs("novel_story_arc_orchestrate", {
+      expect(validateToolArgs("novel_story_arc_start", {
         projectId: "p-1",
+        mode: "orchestrated",
         plotOutline: { objective: "目标", plotNotes: "说明" },
         reviewPolicy: "partial",
       }).valid).toBe(false);
-    });
-  });
-
-  describe("novel_context_get", () => {
-    it("valid args → valid=true", () => {
-      expect(validateToolArgs("novel_context_get", { projectId: "p-1" }).valid).toBe(true);
-      expect(validateToolArgs("novel_context_get", { projectId: "p-1", sections: ["narrative-state", "open-elements"] }).valid).toBe(true);
-    });
-
-    it("unknown section → valid=false", () => {
-      expect(validateToolArgs("novel_context_get", { projectId: "p-1", sections: ["facts"] }).valid).toBe(false);
-    });
-
-    it("missing projectId → valid=false", () => {
-      expect(validateToolArgs("novel_context_get", {}).valid).toBe(false);
-    });
-  });
-
-  describe("novel_artifact_list", () => {
-    it("valid args → valid=true", () => {
-      expect(validateToolArgs("novel_artifact_list", { projectId: "p-1" }).valid).toBe(true);
-      expect(validateToolArgs("novel_artifact_list", { projectId: "p-1", kind: "review", limit: 10 }).valid).toBe(true);
-    });
-
-    it("out-of-range limit → valid=false", () => {
-      expect(validateToolArgs("novel_artifact_list", { projectId: "p-1", limit: 0 }).valid).toBe(false);
-      expect(validateToolArgs("novel_artifact_list", { projectId: "p-1", limit: 101 }).valid).toBe(false);
     });
   });
 });
@@ -443,17 +360,16 @@ describe("executeTool error paths", () => {
   });
 
   it("invalid args → isError=true, content contains '参数校验失败'", async () => {
-    // novel_project_create 需要 title + idempotencyKey，传空对象
-    const result = await executeTool("novel_project_create", {}, mockCtx);
+    // novel_project_inspect 需要 projectId，传空对象
+    const result = await executeTool("novel_project_inspect", {}, mockCtx);
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("参数校验失败");
   });
 
-  it("handler throws (novel_closed_loop_run without model) → isError=true, content contains 'model'", async () => {
-    // 需要 idempotencyKey 通过 ajv 校验后才能到达 handler 的 model 检查
+  it("handler throws (novel_rule_candidate_advance promote without model) → isError=true, content contains 'model'", async () => {
     const result = await executeTool(
-      "novel_closed_loop_run",
-      { projectId: "p1", documentId: "d1", idempotencyKey: "k1" },
+      "novel_rule_candidate_advance",
+      { projectId: "p1", candidateId: "c1", action: "promote" },
       mockCtx,
     );
     expect(result.isError).toBe(true);
@@ -529,27 +445,66 @@ describe("executeTool error paths", () => {
     expect(updateWorkflowRunStatus).toHaveBeenCalledWith(expect.any(String), "failed", expect.objectContaining({ reason: "workflow.start 失败" }));
   });
 
-  it("novel_chapter_review_issue_add persists an author issue without mutating the manuscript", async () => {
-    const addChapterReviewIssue = vi.fn().mockResolvedValue({ id: "issue-1", status: "pending" });
+  it("novel_chapter_review registers new issues and routes them as targeted ids in one call", async () => {
+    const addChapterReviewIssue = vi.fn()
+      .mockResolvedValueOnce({ id: "issue-1", status: "pending" })
+      .mockResolvedValueOnce({ id: "issue-2", status: "pending" });
+    const putWorkflowRun = vi.fn().mockResolvedValue(undefined);
+    const start = vi.fn().mockResolvedValue({ firstExecutionRunId: "temporal-run-issues-1" });
     const result = await executeTool(
-      "novel_chapter_review_issue_add",
-      { projectId: "p1", documentId: "d1", severity: "major", title: "推断超出蓝图边界", evidenceQuote: "正文证据", paragraph: 3, suggestion: "收回为未解观察" },
-      { repository: { addChapterReviewIssue } as never },
+      "novel_chapter_review",
+      {
+        projectId: "p1",
+        documentId: "d1",
+        idempotencyKey: "review-issues-1",
+        issues: [
+          { severity: "major", title: "推断超出蓝图边界", evidenceQuote: "正文证据", paragraph: 3, suggestion: "收回为未解观察" },
+          { severity: "warning", title: "节奏拖沓" },
+        ],
+      },
+      {
+        repository: {
+          getChapterReviewPreflight: vi.fn().mockResolvedValue({ status: "final", baseRevision: 1, hasBlueprint: true }),
+          getFinalDocumentContentRef: vi.fn().mockResolvedValue(undefined),
+          addChapterReviewIssue,
+          putWorkflowRun,
+        } as never,
+        temporal: { workflow: { start } } as never,
+        taskQueue: "novel-v2",
+      },
     );
     expect(result.isError).toBeFalsy();
-    expect(addChapterReviewIssue).toHaveBeenCalledWith(expect.objectContaining({
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.mode).toBe("targeted");
+    expect(payload.registeredIssueIds).toEqual(["issue-1", "issue-2"]);
+    expect(payload.targetIssueIds).toEqual(["issue-1", "issue-2"]);
+    expect(addChapterReviewIssue).toHaveBeenNthCalledWith(1, expect.objectContaining({
       projectId: "p1", documentId: "d1", severity: "major", title: "推断超出蓝图边界", paragraph: 3,
+    }));
+    expect(start).toHaveBeenCalledWith("chapterReviewWorkflow", expect.objectContaining({
+      args: [expect.objectContaining({ mode: "targeted", targetIssueIds: ["issue-1", "issue-2"] })],
     }));
   });
 
-  it("novel_chapter_review_issue_add rejects an invalid severity", async () => {
+  it("novel_chapter_review rejects an invalid severity inside issues at schema validation", () => {
+    expect(validateToolArgs("novel_chapter_review", {
+      projectId: "p1",
+      documentId: "d1",
+      idempotencyKey: "review-bad-severity",
+      issues: [{ severity: "info", title: "无效" }],
+    }).valid).toBe(false);
+  });
+
+  it("novel_chapter_review rejects issues together with targetIssueIds before starting Temporal", async () => {
+    const start = vi.fn();
     const result = await executeTool(
-      "novel_chapter_review_issue_add",
-      { projectId: "p1", documentId: "d1", severity: "info", title: "无效" },
-      { repository: { addChapterReviewIssue: vi.fn() } as never },
+      "novel_chapter_review",
+      { projectId: "p1", documentId: "d1", idempotencyKey: "review-both", issues: [{ severity: "major", title: "重复来源" }], targetIssueIds: ["issue-1"] },
+      { repository: { getChapterReviewPreflight: vi.fn() } as never, temporal: { workflow: { start } } as never, taskQueue: "novel-v2" },
     );
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("参数校验失败");
+    expect(result.content[0].text).toContain("不能同时提供");
+    expect(start).not.toHaveBeenCalled();
   });
 
   it("rejects targeted chapter review without issue ids before starting Temporal", async () => {
@@ -609,13 +564,13 @@ describe("executeTool error paths", () => {
     }));
   });
 
-  it("novel_story_arc_batch_start plans the next batch through the formal workflow", async () => {
+  it("novel_story_arc_start mode=batch plans the next batch through the formal workflow", async () => {
     const putWorkflowRun = vi.fn().mockResolvedValue(undefined);
     const prepareNextStoryArcBatch = vi.fn().mockResolvedValue({ batchIndex: 2, startChapterIndex: 11 });
     const start = vi.fn().mockResolvedValue({ firstExecutionRunId: "temporal-run-arc-batch-1" });
     const result = await executeTool(
-      "novel_story_arc_batch_start",
-      { projectId: "p1", arcId: "arc-1" },
+      "novel_story_arc_start",
+      { projectId: "p1", mode: "batch", arcId: "arc-1" },
       {
         repository: { prepareNextStoryArcBatch, withStoryArcWorkflowLock: async (_projectId: string, _arcId: string, callback: () => Promise<unknown>) => callback(), putWorkflowRun } as never,
         temporal: { workflow: { start } } as never,
@@ -631,14 +586,27 @@ describe("executeTool error paths", () => {
     }));
   });
 
-  it("novel_story_arc_orchestrate starts the orchestrated planning workflow with the outline", async () => {
+  it("novel_story_arc_start mode=batch without arcId is rejected before starting Temporal", async () => {
+    const start = vi.fn();
+    const result = await executeTool(
+      "novel_story_arc_start",
+      { projectId: "p1", mode: "batch" },
+      { repository: {} as never, temporal: { workflow: { start } } as never, taskQueue: "novel-v2" },
+    );
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("arcId");
+    expect(start).not.toHaveBeenCalled();
+  });
+
+  it("novel_story_arc_start mode=orchestrated starts the orchestrated planning workflow with the outline", async () => {
     const createNextStoryArc = vi.fn().mockResolvedValue({ id: "arc-orch-1" });
     const putWorkflowRun = vi.fn().mockResolvedValue(undefined);
     const start = vi.fn().mockResolvedValue({ firstExecutionRunId: "temporal-run-orch-1" });
     const result = await executeTool(
-      "novel_story_arc_orchestrate",
+      "novel_story_arc_start",
       {
         projectId: "p1",
+        mode: "orchestrated",
         plotOutline: { objective: "查明暗渠上方的体系", development: ["找到守门人", "通过审查"], plotNotes: "伏笔在守门人手里" },
         reviewPolicy: "auto",
       },
@@ -664,11 +632,11 @@ describe("executeTool error paths", () => {
     }));
   });
 
-  it("novel_story_arc_orchestrate rejects an empty-substance outline before starting Temporal", async () => {
+  it("novel_story_arc_start mode=orchestrated rejects an empty-substance outline before starting Temporal", async () => {
     const start = vi.fn();
     const result = await executeTool(
-      "novel_story_arc_orchestrate",
-      { projectId: "p1", plotOutline: { objective: "写一个故事" } },
+      "novel_story_arc_start",
+      { projectId: "p1", mode: "orchestrated", plotOutline: { objective: "写一个故事" } },
       {
         repository: { withStoryArcWorkflowLock: async (_projectId: string, _arcId: string, callback: () => Promise<unknown>) => callback() } as never,
         temporal: { workflow: { start } } as never,
@@ -680,7 +648,7 @@ describe("executeTool error paths", () => {
     expect(start).not.toHaveBeenCalled();
   });
 
-  it("novel_context_get projects the planning context with section filtering", async () => {
+  it("novel_project_inspect view=context projects the planning context with section filtering", async () => {
     const getStoryArcPlanningInput = vi.fn().mockResolvedValue({
       projectTitle: "测试项目",
       macro: [{ taskKey: "characters", title: "人物", summary: "甲" }],
@@ -693,8 +661,8 @@ describe("executeTool error paths", () => {
       contextReceipt: { narrativeCutoff: 3, sourceArtifactIds: [], sourceRevisionIds: [], sectionFingerprints: {}, fingerprint: "ctx-fp", legacy: false },
     });
     const result = await executeTool(
-      "novel_context_get",
-      { projectId: "p1", sections: ["narrative-state", "recent-chapters"] },
+      "novel_project_inspect",
+      { projectId: "p1", view: "context", sections: ["narrative-state", "recent-chapters"] },
       { repository: { getStoryArcPlanningInput } as never },
     );
     expect(result.isError).toBeFalsy();
@@ -706,12 +674,12 @@ describe("executeTool error paths", () => {
     expect(payload.foundation).toBeUndefined();
   });
 
-  it("novel_artifact_list lists project artifacts through the repository", async () => {
+  it("novel_artifact_query lists project artifacts through the repository", async () => {
     const listProjectArtifacts = vi.fn().mockResolvedValue([
       { id: "a-1", kind: "chapter-blueprint", taskId: "t-1", fingerprint: "f-1", createdAt: 1, objectKey: "o-1" },
     ]);
     const result = await executeTool(
-      "novel_artifact_list",
+      "novel_artifact_query",
       { projectId: "p1", kind: "chapter-blueprint" },
       { repository: { listProjectArtifacts } as never },
     );
@@ -782,19 +750,6 @@ describe("mcp-tool-gateway integration", () => {
   });
 
   describe("with postgres", () => {
-    itDb("novel_project_create happy path", async () => {
-      // handler 使用 idempotencyKey 作为 projectId（schema additionalProperties: false 禁止传 projectId）
-      const projectId = `mcp-test-${randomUUID().slice(0, 8)}`;
-      const result = await executeTool(
-        "novel_project_create",
-        { title: "MCP 测试项目", premise: "测试用创意：一名少年在旧宅发现会呼吸的石阶。", autoBootstrap: false, idempotencyKey: projectId },
-        { repository },
-      );
-      expect(result.isError).toBeFalsy();
-      const payload = JSON.parse(result.content[0].text);
-      expect(payload.project.id).toBe(projectId);
-    });
-
     itDb("novel_run_create happy path", async () => {
       const projectId = `mcp-run-${randomUUID().slice(0, 8)}`;
       await repository.ensureProject(projectId, "Run Test");
@@ -820,9 +775,9 @@ describe("mcp-tool-gateway integration", () => {
       expect(payload.projects.some((p: { id: string }) => p.id === projectId)).toBe(true);
     });
 
-    itDb("novel_artifact_get non-existent → isError=true", async () => {
+    itDb("novel_artifact_query non-existent artifactId → isError=true", async () => {
       const result = await executeTool(
-        "novel_artifact_get",
+        "novel_artifact_query",
         { artifactId: "nonexistent" },
         { repository },
       );

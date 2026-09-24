@@ -521,6 +521,124 @@ describe("long-form prompt contracts", () => {
     expect(none.find((section) => section.id === "arc-context-serial-signals")?.text).not.toContain("跨弧回报节奏");
   });
 
+  it("收束形态轮换契约注入蓝图生成面，重基线不注入（2026-09-22 章末仪式 38/168 确诊）", () => {
+    const base = { projectTitle: "测试项目", macro: [], recentChapters: [], openThreads: [] };
+    const arc = { title: "当前弧" } as never;
+    const batch = { batchIndex: 2, startChapterIndex: 11, complete: false };
+    // 命中面：普通批次生成契约携带轮换配额与"动作帧可复用、句式必须变体"边界。
+    const prompted = buildStoryArcChaptersPrompt({ ...base, arc, batch });
+    expect(prompted).toContain("收束形态轮换契约");
+    expect(prompted).toContain("至少三分之一");
+    expect(prompted).toContain("同一收束动作帧跨章可以复用意象，但表层句式必须变体");
+    // 反例 1：安静章静收束合法——契约不得把"静"本身当病。
+    expect(prompted).toContain("安静章、余波章以静收束合法");
+    // 反例 2：重基线（历史章保真）不注入本契约——契约只约束新生成批次。
+    const rebase = buildStoryArcRebasePrompt({
+      ...base,
+      target: {
+        arcId: "arc-1",
+        executionStatus: "active",
+        approvedArc: {
+          title: "第一弧",
+          objective: "保留既有因果并修复边界",
+          entryState: "入口",
+          centralConflict: "冲突",
+          development: [],
+          resolution: "阶段结果",
+          exitState: "出口",
+          threadResponsibilities: [{ threadRef: "thread-1", responsibility: "保持压力", nextAdvance: "出现新证据" }],
+          foreshadowingRefs: [],
+          expectedChapterCount: 2,
+          phases: [],
+        },
+        batchIndex: 1,
+        startChapterIndex: 1,
+        chapters: [{
+          chapterId: "chapter-1",
+          documentId: "document-1",
+          globalOrder: 1,
+          title: "第一章",
+          revisionId: "revision-1",
+          chapterMemory: { summary: "历史章节", keyEvents: [], characterStates: [], unresolvedThreads: [] },
+          authoritativeFacts: [],
+        }],
+      },
+    });
+    expect(rebase).not.toContain("收束形态轮换契约");
+  });
+
+  it("弧审核面携带收束形态分布检查，静收束与个别安静章不误伤（2026-09-22）", () => {
+    const prompt = buildStoryArcReviewPrompt(
+      { arc: { title: "第一弧" }, chapters: [] } as never,
+      "上下文",
+    );
+    expect(prompt).toContain("收束形态分布检查");
+    expect(prompt).toContain("连续 ≥3 章");
+    expect(prompt).toContain("个别安静章的静收束不构成问题");
+  });
+
+  it("正文契约携带收束轮换与计量克制度（2026-09-22 半X 738 处/31 章超线确诊）", () => {
+    const instruction = buildChapterDraftPromptPackage({
+      intent: { id: "intent-1", projectId: "p", source: "chapter-review", objective: "完成章节", createdAt: 1, idempotencyKey: "intent-1" },
+      blueprint: { id: "blueprint-1", baseRevision: 0, commitPolicy: "human-only", tasks: [], budget: { maxInputTokens: 10000, maxOutputTokens: 1000 } } as never,
+      memory: { id: "memory-1", claims: [], conflicts: [], missingFacets: [], narrativeRhythm: undefined } as never,
+      skills: { id: "skills-1", skills: [], resolution: { bundleId: "skills-1", fingerprint: "skills", executionPoint: "chapter.drafting", skills: [] } } as never,
+      workflowId: "workflow-1",
+      system: "系统",
+    }).instruction;
+    // 收束轮换：动作帧可复用、句式必须变体；不与"自然收束"契约冲突。
+    expect(instruction).toContain("同一收束动作帧（如回到居所、静场清点、留白悬置）不得连续多章以近似句式复现");
+    // 计量克制度：生成偏好而非硬预算（软预算已实证拦不住），允许戏剧装置豁免。
+    expect(instruction).toContain("计量克制度");
+    expect(instruction).toContain("承担戏剧装置的用法");
+    // 双向反例：不得重新引入已证伪的硬性节奏公式（字数/钩子/爽点）。
+    expect(instruction).not.toContain("钩子公式");
+    expect(instruction).not.toContain("每章必须");
+  });
+
+  it("篇幅信号：连续低量给出稀疏提示，健康窗口与单章不误伤（2026-09-22 2E）", () => {
+    const base = { projectTitle: "测试项目", macro: [], recentChapters: [], openThreads: [] };
+    // 命中面：连续低量（≥2 章低于下限）→ 透支式提示
+    const sections = buildStoryArcPlanningContextSections({
+      ...base,
+      lengthDrift: { windowSize: 6, avgChars: 1620, sparseCount: 4, minChars: 1250 },
+    });
+    const serial = sections.find((section) => section.id === "arc-context-serial-signals");
+    expect(serial?.text).toContain("均章 1620 字");
+    expect(serial?.text).toContain("4 章低于单章下限");
+    expect(serial?.text).toContain("不得系统性延续低声明");
+    // 反例 1：健康窗口（无低量章）→ 只报统计不提示
+    const healthy = buildStoryArcPlanningContextSections({ ...base, lengthDrift: { windowSize: 6, avgChars: 2600, sparseCount: 0, minChars: 2100 } });
+    expect(healthy.find((section) => section.id === "arc-context-serial-signals")?.text).toContain("无低于单章下限的章");
+    expect(healthy.find((section) => section.id === "arc-context-serial-signals")?.text).not.toContain("篇幅信号提示");
+    // 反例 2：窗口不足 3 章 → 整体不注入（宁缺毋伪）
+    const none = buildStoryArcPlanningContextSections({ ...base, lengthDrift: { windowSize: 2, avgChars: 1200, sparseCount: 2, minChars: 1100 } });
+    expect(none.find((section) => section.id === "arc-context-serial-signals")?.text).not.toContain("篇幅信号");
+  });
+
+  it("审核面携带内容稀疏检查，章长本身不是病（2026-09-22 2E）", () => {
+    const prompt = buildStoryArcReviewPrompt(
+      { arc: { title: "第一弧" }, chapters: [] } as never,
+      "上下文",
+    );
+    expect(prompt).toContain("内容稀疏检查");
+    expect(prompt).toContain("拆事件凑章数");
+    expect(prompt).toContain("章长本身不是病，碎片化才是");
+  });
+
+  it("蓝图生成契约的目标篇幅条款携带反系统性低声明边界（2026-09-22 2E）", () => {
+    const prompted = buildStoryArcChaptersPrompt({
+      projectTitle: "测试项目",
+      macro: [],
+      recentChapters: [],
+      openThreads: [],
+      arc: { title: "当前弧" } as never,
+      batch: { batchIndex: 2, startChapterIndex: 11, complete: false },
+    });
+    expect(prompted).toContain("不得系统性延续低声明");
+    expect(prompted).toContain("逐章达标不等于全书内容密度合格");
+  });
+
   it("treats rebase input envelopes as read-only and preserves the affected batch window", () => {
     const prompt = buildStoryArcRebasePrompt({
       projectTitle: "测试项目",

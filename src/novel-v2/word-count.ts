@@ -86,3 +86,30 @@ export const ENDING_RITUAL_POLICY = {
   shortSentenceMax: 8,
   minRatio: 0.5,
 } as const;
+
+/**
+ * 章长漂移与内容稀疏信号的计量口径（唯一事实源）。
+ *
+ * 住叶子纯模块的理由同 ENDING_RITUAL_POLICY：getStoryArcPlanningInput（仓储层）
+ * 与 prompts 渲染两侧共用，workflow bundle 只允许无 node 依赖的纯导入链。
+ *
+ * 判据形态（2026-09-22 用 168 章实测校准，见 tmp/diag-lengthdrift.txt 与
+ * docs/novel-v2/improvement-plan-20260922.md §2E 修正记录）：
+ * **章长只做描述性统计（近窗口均长 / 低于下限计数），不做正文结构门**。
+ * - 退役考古：`manuscript.length` 已退役，长度约束由提交门 `length-under-target`
+ *   （revision-policy.ts，对蓝图声明目标的 60% 兑现率）承担——"绝对字数"不是病，
+ *   "对声明目标欠账"才是，新门不得与该语义竞争。
+ * - 候选"局部漂移门"（单章 <1800 且 < 前 6 章均长 ×0.85）被实测推翻：168 章命中
+ *   28 章且全书散布（含第 8/9/22 章等早期章）——局部短章在任何位置都呈"大跌幅"，
+ *   合取判据收不住；绝对 <1800 也命中 31 章、同样散布。两者精确率都不达标。
+ * - `sparseFloor` 的定位因此只是 serial-signals 段的**计数口径**（多少章低于此线），
+ *   配合"连续低量 + 蓝图延续低声明才报"的审核语义判断，不是逐章门。
+ * - 取值依据：商业口径"连续 3 章合计不足 5000 字判内容稀疏"折算单章均值 ≈1667，
+ *   取 1800 略偏保守（宁多提示不漏带）。
+ *
+ * TODO: 应随语料进 output-policy 配置化。
+ */
+export const LENGTH_DRIFT_POLICY = {
+  window: 6,
+  sparseFloor: 1800,
+} as const;

@@ -19,7 +19,7 @@ metadata:
 
 # 小说创作 MCP 编排流程（外部大模型作为治理者）
 
-> 当前工具面：50（= 代码 `TOOL_COUNT`，由 `src/novel-v2/__tests__/mcp-tool-face-single-source.test.ts` 校验本文件与 spec 的声明）。本文出现的一切工具名都必须真实存在于注册表——外部编排者按本文行动，写到不存在的工具会直接造成调用失败与重试死循环。
+> 当前工具面：21（= 代码 `TOOL_COUNT`，由 `src/novel-v2/__tests__/mcp-tool-face-single-source.test.ts` 校验本文件与 spec 的声明）。本文出现的一切工具名都必须真实存在于注册表——外部编排者按本文行动，写到不存在的工具会直接造成调用失败与重试死循环。2026-09-24 减法三批 50→41→29→21：一批撤 9 个零调用工具（novel_action_list、novel_run_complete、novel_receipt_get、novel_rule_target_get、novel_skill_get〔发现能力并入 novel_skill_query〕、novel_chapter_script_h3_submit、novel_memory_grooming_report、novel_chapter_recall_report、novel_model_dispatch）；二批撤 12 增 1（novel_review_submit〔并入 novel_action_execute 的 review.submit〕、rule 五个人工步骤合并为 novel_rule_candidate_advance、novel_closed_loop_run / novel_chapter_script_h3 / novel_prompt_inspect / novel_invocation_list 等能力走 REST）；三批撤 8 合 5——novel_project_create 撤除（项目创建走 REST `POST /v2/projects`）、弧规划三入口合一为 novel_story_arc_start(mode=auto|batch|orchestrated)、观测面三对合一（novel_project_inspect(view=catalog|context)、novel_artifact_query 单查/列表、novel_workflow_query 单查/列表）、审校双入口合一（novel_chapter_review 的 issues=[...] 一步登记意见并定向修订）、决策面合一（novel_workflow_decision(target=chapter-review|story-arc) 双门分发）。
 
 ## 你是谁：外部编排者
 
@@ -31,23 +31,25 @@ metadata:
 
 | 职责 | 工具 |
 | --- | --- |
-| 编排 | novel_project_create、novel_bootstrap_run、novel_story_arc_start、novel_story_arc_orchestrate、novel_chapter_generate、novel_run_create / novel_action_execute(work.enqueue) |
-| 审核 | novel_workflow_get/list、novel_artifact_get/list、novel_story_arc_review、novel_action_execute(review.request/review.submit)、novel_review_submit、novel_chapter_review_decision |
-| 推进 | novel_action_execute(work.accept/retry/recover/run.pause/resume/cancel)、novel_chapter_review_decision(approve)、novel_story_arc_batch_start |
-| 编辑 | novel_chapter_review_issue_add、novel_chapter_review(mode=targeted)、novel_chapter_review_decision(revise+feedback)、novel_action_execute(work.revise)、novel_story_arc_orchestrate |
-| 迭代优化 | novel_closed_loop_run、novel_rule_candidate_create/get、novel_rule_evidence_submit、novel_rule_foundation_evaluate、novel_rule_review_submit、novel_rule_promote、novel_rule_rollback |
-| 派生产物 | novel_chapter_script_h3（定稿章节 → MiniMax H3 Ref2VA 短剧剧本提示词）。核心创意 → 短剧脚本已不走 MCP（见阶段 2.5 的 09-17 浏览器化说明），跨引擎候选发散由编排者自行完成后逐个调 REST |
-| 查询 | novel_catalog_get、novel_context_get、novel_artifact_list、novel_story_arc_get、novel_workflow_get/list |
+| 编排 | REST `POST /v2/projects`（项目创建，2026-09-24 三批起不在 MCP 面）、novel_bootstrap_run、novel_story_arc_start(mode=auto|batch|orchestrated)、novel_chapter_generate、novel_run_create / novel_action_execute(work.enqueue) |
+| 审核 | novel_workflow_query、novel_artifact_query、novel_story_arc_review、novel_action_execute(review.request/review.submit)、novel_workflow_decision(target=story-arc) |
+| 推进 | novel_action_execute(work.accept/retry/recover/run.pause/resume/cancel)、novel_workflow_decision(target=chapter-review, decision=approve)、novel_story_arc_start(mode=batch) |
+| 编辑 | novel_chapter_review（issues=[...] 登记意见并定向修订；或 mode=targeted + targetIssueIds 引用既有意见）、novel_workflow_decision(target=chapter-review, decision=revise+feedback)、novel_action_execute(work.revise)、novel_story_arc_start(mode=orchestrated) |
+| 迭代优化 | novel_rule_candidate_create、novel_rule_candidate_advance(action=evidence|evaluate|review|promote|rollback) |
+| 派生产物 | REST `POST /v2/projects/:id/documents/:documentId/script-h3`（定稿章节 → MiniMax H3 Ref2VA 短剧剧本提示词；原 MCP 工具 novel_chapter_script_h3 已于 2026-09-24 撤除）。核心创意 → 短剧脚本也不走 MCP（见阶段 2.5 的 09-17 浏览器化说明），跨引擎候选发散由编排者自行完成后逐个调 REST |
+| 查询 | novel_project_inspect(view=catalog|context)、novel_artifact_query、novel_story_arc_get、novel_workflow_query |
 
 ## 全流程各阶段
 
 ### 阶段 0 项目创建与宏观规划
 
 ```
-novel_project_create(premise, genre?, creativeBrief?, reviewGate=manual|auto, progression=automatic|user-driven)
+项目创建走 REST：POST /v2/projects（body: premise, idempotencyKey, title?, genre?, objective?,
+  autoBootstrap?, includeChapterPlan?）
   → 自动启动 foundation 5 阶段（project-positioning → architecture / characters / worldview → plot-design）
-novel_bootstrap_run(projectId, reviewGate)   # 已存在项目补规划
-novel_catalog_get(projectId, compact)        # 确认规划状态
+  （原 MCP novel_project_create 已于 2026-09-24 三批撤除）
+novel_bootstrap_run(projectId, reviewGate)          # 已存在项目补规划
+novel_project_inspect(projectId, view=catalog)      # 确认规划状态
 ```
 
 - 你可以在 creativeBrief 里写清读者承诺、主角欲望/矛盾、核心对抗、结局包络，
@@ -68,14 +70,16 @@ manual reviewGate 下，bootstrap 的 5 个 foundation 阶段每阶段都要走"
 作者确认 → accept"。标准序列（approve 与 passed review 顺序不敏感）：
 
 ```
-1. 生成后先读 artifact（novel_artifact_get）细读评估；放行前必须核对：
+1. 生成后先读 artifact（novel_artifact_query(artifactId)）细读评估；放行前必须核对：
    语言契约（表层有无英文/技术原词，卷名/章节名是重点）、揭示物分层、
    跨产物一致性（卷数/实体关系/势力命名/地点）。
 2. approve section（作者确认）：novel_action_execute(action=plan.approve,
    runId, workItemId)。等价于 repository 的 approveProjectPlanSection
    （actor=author），落库后发 reviewSubmitted 信号唤醒 workflow。
-3. 提交独立审核：novel_review_submit(reviewer=independent, verdict=passed,
-   issues=[跨阶段缺口登记清单])。落库即触发 reviewSubmitted 信号。
+3. 提交独立审核：novel_action_execute(action="review.submit",
+   runId, workItemId, review={reviewer="independent", verdict="passed",
+   issues=[跨阶段缺口登记清单], summary})。落库即触发 reviewSubmitted 信号
+   （review.submit 自 2026-09-24 起是唯一 MCP 审核提交通道，独立工具已并入）。
 4. workflow 醒来 → recheckGate → acceptWork（校验：当前 artifact 存在
    passed independent review + section approved）→ accept → 下游阶段自动启动。
 ```
@@ -141,13 +145,13 @@ manual reviewGate 下，bootstrap 的 5 个 foundation 阶段每阶段都要走"
 **模式 A 系统自规划**：`novel_story_arc_start(projectId, authorIntent?)`
 → `novel_story_arc_get` 查看蓝图 → 审核/推进：
 - `novel_story_arc_review(projectId, arcId, reviewPolicy=manual|auto)` 恢复/重审
-- `novel_story_arc_decision(projectId, arcId, decision, feedback?)` 人工门放行（reviewPolicy=manual 且工作流停在 manual-review-required 时）：`approve` 批准当前蓝图——**审核 verdict=revise 时会被门禁正当拒绝，不要硬批**；`revise` + feedback 把作者修订指令送进等待中的门，系统合并审核意见走定向修订→重审→再入门（feedback 写"改什么、怎么改、不许动什么"三件套，点名蓝图字段与不许消费的边界）
-- `novel_story_arc_batch_start(projectId, arcId, retryFailed?)` 推进下一批章节。**批次窗口由系统分配**：单批章数 = 弧内剩余未规划章数（上限 16），prompt 注入、内部/外部提交守卫与修订面同契约，外部编排方提交 chapters bundle 时章数必须恰等于该窗口——多与少都会被拒绝进审核，不要按"少出几章更稳"自行缩窗
+- `novel_workflow_decision(target=story-arc, projectId, arcId, decision, feedback?)` 人工门放行（reviewPolicy=manual 且工作流停在 manual-review-required 时）：`approve` 批准当前蓝图——**审核 verdict=revise 时会被门禁正当拒绝，不要硬批**；`revise` + feedback 把作者修订指令送进等待中的门，系统合并审核意见走定向修订→重审→再入门（feedback 写"改什么、怎么改、不许动什么"三件套，点名蓝图字段与不许消费的边界）
+- `novel_story_arc_start(mode=batch, projectId, arcId, retryFailed?)` 推进下一批章节（原独立工具 novel_story_arc_batch_start 已于 2026-09-24 三批并入）。**批次窗口由系统分配**：单批章数 = 弧内剩余未规划章数（上限 16），prompt 注入、内部/外部提交守卫与修订面同契约，外部编排方提交 chapters bundle 时章数必须恰等于该窗口——多与少都会被拒绝进审核，不要按"少出几章更稳"自行缩窗
 
-**模式 B 外部编排（你提供剧情编排，系统完善）**：
+**模式 B 外部编排（你提供剧情编排，系统完善；原独立工具 novel_story_arc_orchestrate 已于 2026-09-24 三批并入）**：
 
 ```
-novel_story_arc_orchestrate(projectId, plotOutline, reviewPolicy=auto)
+novel_story_arc_start(projectId, mode=orchestrated, plotOutline, reviewPolicy=auto)
   plotOutline = {
     objective（必填：本弧讲什么、解决什么读者问题）,
     title?, entryState?, centralConflict?, development[]?, resolution?,
@@ -159,15 +163,13 @@ novel_story_arc_orchestrate(projectId, plotOutline, reviewPolicy=auto)
 - 系统负责**完善**：对照冻结事实与叙事状态账本做事实梳理，补全场景因果、
   章节状态转换、连续性约束与章节蓝图，再走正式弧审核 → 修订闭环。
 - **伏笔归属写在线上报**：`threadResponsibilities[].foreshadowingRefs` 声明"本条线本弧
-  承担哪几条伏笔"，取值必须是本弧伏笔账（弧级 foreshadowingRefs / `novel_context_get`
+  承担哪几条伏笔"，取值必须是本弧伏笔账（弧级 foreshadowingRefs / `novel_project_inspect(view=context)`
   的开放伏笔 id）中已出现的引用。系统据此写 `foreshadowing.thread_id`，让到期账与静默账
   可按线追责。一条伏笔只能归一条线（多线同时认领=归属不可判定，系统留空并在审计
   `threadBindingAmbiguous` 里留痕）；无人承担的宁可留空交作者分流，不要为清空而摊派。
-- **回述漂移自查用只读诊断**：`novel_chapter_recall_report(projectId, narrativeOrder)` 把本章"想起/那日/上次"类回述句与近窗各章原句成对给出（含章号与相似度），
-  矛盾与"回述无据"的判定仍归你与作者——机械层不代替下结论，也不设阈值替你筛掉候选。
 - 编排权威顺序：已定稿事实 / 叙事状态账本 / 作者边界 > 你的编排 > 模型自行发挥。
   编排与事实冲突时系统以事实为准，你不需要预先消化全部事实——但**先调用
-  `novel_context_get` 做事实梳理**，能显著减少修订轮次。
+  `novel_project_inspect(view=context)` 做事实梳理**，能显著减少修订轮次。
 - 编排被拒绝的边界：没有 objective；只有 objective 没有实质编排内容
   （至少给 development / plotNotes / entryState / chapterHints 之一）；
   threadResponsibilities 条目缺字段或 threadRef 重复；expectedChapterCount 越界；
@@ -180,8 +182,8 @@ novel_story_arc_orchestrate(projectId, plotOutline, reviewPolicy=auto)
 novel_chapter_generate(projectId, documentId?, instruction?)
   → review（structure / character / prose 三审）→ targeted revision
   → manuscriptApproval → extractFacts → approveFacts → commit → enrichCharacters
-novel_workflow_get(workflowId)    # 轮询进度；temporal 字段反映真实运行状态
-novel_chapter_review_decision(workflowId, artifactId, decision, feedback?, revisionBase?)
+novel_workflow_query(workflowId)  # 轮询进度；temporal 字段反映真实运行状态
+novel_workflow_decision(target=chapter-review, workflowId, artifactId, decision, feedback?, revisionBase?)
 ```
 
 作为编辑者的正确做法：
@@ -203,14 +205,16 @@ novel_chapter_review_decision(workflowId, artifactId, decision, feedback?, revis
    禁止以叙述者断言出现，给"旧规矩里有过这种改法"一类的角色内视角示例）；
    ④动作-结论间补一拍身体过渡（推定/确认/被看见类结论前必须有落眼、停息、扫视等
    物理证据动作——弧规划门 28 条微修的绝大多数即此型，前置一句省一轮门）。
-1. 读候选稿与三份审核：`novel_workflow_get(workflowId)` 拿 artifactId →
-   `novel_artifact_get(artifactId)` 读正文与审校 issue。
-2. 追加你的意见：`novel_chapter_review_issue_add(projectId, documentId,
-   severity, title, evidenceQuote, paragraph|revisionRanges, suggestion?)`
-   —— 只写 pending issue，不改正文；同机制多处必须用 revisionRanges 一次覆盖。
-3. 定向修订：`novel_chapter_review(projectId, documentId, mode=targeted,
-   targetIssueIds=[...])` 走正式修订闭环（仍是完整审核 → 事实提取 → commit）。
-4. 或者在工作流等待处 `novel_chapter_review_decision(revise, feedback, revisionBase=current|previous)`。
+1. 读候选稿与三份审核：`novel_workflow_query(workflowId)` 拿 artifactId →
+   `novel_artifact_query(artifactId)` 读正文与审校 issue。
+2. 登记意见并定向修订一步完成（2026-09-24 三批合入）：`novel_chapter_review(projectId,
+   documentId, issues=[{severity, title, evidenceQuote, paragraph|revisionRanges, suggestion?}])`
+   —— issues 只写 pending issue 不改正文，登记后自动以 targeted 模式走正式修订闭环
+   （仍是完整审核 → 事实提取 → commit）；同机制多处必须用 revisionRanges 一次覆盖。
+   已登记的意见也可用 `novel_chapter_review(mode=targeted, targetIssueIds=[...])` 引用推进
+   （issues 与 targetIssueIds 不能同时提供）。
+3. 或者在工作流等待处 `novel_workflow_decision(target=chapter-review, workflowId,
+   artifactId, decision=revise, feedback, revisionBase=current|previous)`。
    修订残留（收束区/个别措辞反复改不净是修订模型的稳定弱点，弧5 ch32/弧7 ch49/弧8 ch51
    三实证）时，升级为**令牌级指令**：逐字引用原句 + 给出替换句全文 + 声明"其余零改动"；
    一轮即净。分层判据（ch58 实证）：**词级/句级替换**令牌法一轮可救；**场景插入**
@@ -232,8 +236,10 @@ novel_chapter_review_decision(workflowId, artifactId, decision, feedback?, revis
 ### 阶段 2.5 短剧剧本提示词（章节派生与核心创意两条路径，只读派生）
 
 ```
-novel_chapter_script_h3(projectId, documentId, instruction?)
-  → artifacts(kind=chapter-script)，返回各片段 promptText
+# 章节派生：novel_chapter_script_h3 已于 2026-09-24 撤出 MCP 工具面
+# （近零调用，能力走 REST 同通道）：
+#   POST /v2/projects/:projectId/documents/:documentId/script-h3
+#     body: instruction? → artifacts(kind=chapter-script)，返回各片段 promptText
 
 # 核心创意 → 短剧脚本：2026-09-17 起不在 MCP 工具面内（`novel_short_script_h3`、
 # `_brainstorm`、`_submit` 三个工具随"独立短剧改浏览器本地存储"一并移除，见
@@ -291,14 +297,14 @@ novel_chapter_script_h3(projectId, documentId, instruction?)
 ### 阶段 3 事实梳理与记忆（编排/编辑前必做）
 
 ```
-novel_context_get(projectId, sections?)
+novel_project_inspect(projectId, view=context, sections?)
   sections: foundation / recent-chapters / narrative-state / open-elements / planning-feedback
-novel_catalog_get(projectId, documentStatus=["final"])
-novel_artifact_list(projectId, kind?, workflowId?, limit?)
+novel_project_inspect(projectId, view=catalog)   # 目录观测（原 novel_catalog_get，2026-09-24 三批并入）
+novel_artifact_query(projectId, kind?, limit?)   # 列表（原 novel_artifact_list）；或 novel_artifact_query(artifactId) 单查
 ```
 
 - 编排剧情前读 narrative-state + open-elements（开放线索/伏笔/承诺）+ recent-chapters。
-- 定位审校对象时用 novel_artifact_list 拿 artifactId。
+- 定位审校对象时用 novel_artifact_query(projectId) 列表拿 artifactId。
 - **弧收口伏笔对账（必做）**：`novel_foreshadowing_list(projectId, status=open, limit=400)`
   取全量开放伏笔与 overdue 判定，逐条三选一：本弧 digest（把 id 写进编排的
   foreshadowingRefs/phase 目标）、改窗续期（`novel_foreshadowing_triage` action=rewrite-window，
@@ -311,12 +317,14 @@ novel_artifact_list(projectId, kind?, workflowId?, limit?)
 ### 阶段 4 学习闭环与经验沉淀
 
 ```
-novel_closed_loop_run(projectId, documentId, dryRun?)
 novel_rule_candidate_create(targetKind=skill|system-prompt, targetId, afterText, rationale, scope)
-novel_rule_evidence_submit(candidateId, scenarioClass, scenarioRole, baselineWorkItemId, candidateWorkItemId)
-novel_rule_foundation_evaluate(candidateId, taskKey, scenarioClass, scenarioRole)
-novel_rule_review_submit(candidateId, role, reviewerId, reviewRunId, model, verdict, summary, concerns)
-novel_rule_promote(candidateId) / novel_rule_rollback(candidateId)
+novel_rule_candidate_advance(candidateId, action=…)
+  action=evidence  → scenarioClass/scenarioRole/baselineWorkItemId/candidateWorkItemId
+  action=evaluate  → taskKey/scenarioClass/scenarioRole（需模型调用）
+  action=review    → role/reviewerId/reviewRunId/model/verdict/summary/concerns
+  action=promote / action=rollback（含回归验证 LLM 调用）
+# novel_closed_loop_run 已于 2026-09-24 撤出 MCP 工具面，能力走 REST：
+#   POST /v2/projects/:projectId/closed-loop  body: { documentId, dryRun? }
 ```
 
 - scope 四件套必填：observedSymptom / failingLayer / underlyingMechanism /
@@ -343,8 +351,8 @@ novel_rule_promote(candidateId) / novel_rule_rollback(candidateId)
 9. **LLM 编排者直接参与编辑**：外部编排模型既是审核者也是编辑者，不是纯守门人。
    对**证据明确、修法无争议**的问题（错字/标点混用、账本可查证的跨章时序矛盾、
    与冻结契约直接冲突的违例段落），直接走完整编辑闭环：
-   `novel_chapter_review_issue_add` → `novel_chapter_review(mode=targeted)` →
-   核对候选稿实际改动 → `novel_chapter_review_decision(approve, feedback=证据链)`，
+   `novel_chapter_review(issues=[...])`（登记即定向修订）→
+   核对候选稿实际改动 → `novel_workflow_decision(target=chapter-review, decision=approve, feedback=证据链)`，
    不必逐条请示作者；**修法涉及取舍**（剧情走向、人物命运、弧级 resolution、
    风格偏好）时不擅自决定，登记意见并给作者选项。批准 feedback 必须写清：
    目标达成证据、范围外遗留登记、命名漂移警告的核实结论
@@ -362,16 +370,16 @@ novel_rule_promote(candidateId) / novel_rule_rollback(candidateId)
 
 | 场景 | 首选工具 |
 | --- | --- |
-| 开新书 | novel_project_create（带 creativeBrief + reviewGate=manual 精细控制） |
+| 开新书 | REST `POST /v2/projects`（premise + idempotencyKey；原 novel_project_create 已于 2026-09-24 三批撤除，reviewGate=manual 精细控制经 novel_bootstrap_run 补规划） |
 | 补全书规划 | novel_bootstrap_run |
-| 看项目现状 | novel_catalog_get(compact) / novel_context_get |
-| 有剧情想法想交给系统完善 | novel_story_arc_orchestrate |
-| 常规推进故事弧 | novel_story_arc_start → novel_story_arc_get → novel_story_arc_batch_start |
+| 看项目现状 | novel_project_inspect(view=catalog) / novel_project_inspect(view=context) |
+| 有剧情想法想交给系统完善 | novel_story_arc_start(mode=orchestrated) |
+| 常规推进故事弧 | novel_story_arc_start → novel_story_arc_get → novel_story_arc_start(mode=batch) |
 | 生成下一章 | novel_chapter_generate |
-| 定稿章节转短剧剧本（H3 视频提示词） | novel_chapter_script_h3 → 产物 kind=chapter-script；方法论见 h3-prompt-writing skill |
+| 定稿章节转短剧剧本（H3 视频提示词） | REST `POST /v2/projects/:id/documents/:documentId/script-h3`（原 MCP 工具已于 2026-09-24 撤除）→ 产物 kind=chapter-script；方法论见 h3-prompt-writing skill |
 | 从核心创意直接写短剧（无需小说项目） | 无 MCP 工具（09-17 浏览器化移除）：`POST /v2/short-script-h3` stateless 生成，产物存浏览器 IndexedDB |
 | 开放创意方向要多个非默认母题候选 | 编排者自行穷举跨主引擎候选（见阶段 2.5「候选奇观发散」）→ 逐个带 avoidMotifs 调同一端点 |
-| 追进度 | novel_workflow_get(workflowId) |
-| 人工定稿/修订 | novel_chapter_review_decision(approve/revise/feedback) |
-| 追加编辑意见 | novel_chapter_review_issue_add → novel_chapter_review(mode=targeted) |
-| 沉淀经验 | novel_closed_loop_run / novel_rule_candidate_create → … → novel_rule_promote |
+| 追进度 | novel_workflow_query(workflowId) |
+| 人工定稿/修订 | novel_workflow_decision(target=chapter-review, decision=approve/revise, feedback) |
+| 追加编辑意见 | novel_chapter_review(issues=[...])（登记即定向修订；或 mode=targeted + targetIssueIds 引用既有意见） |
+| 沉淀经验 | REST `POST /v2/projects/:id/closed-loop`（原 novel_closed_loop_run 已于 2026-09-24 撤除）/ novel_rule_candidate_create → … → novel_rule_candidate_advance(action=promote) |

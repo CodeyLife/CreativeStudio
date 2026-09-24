@@ -17,7 +17,7 @@ metadata:
 
 # 小说创作自主推进协议（autopilot）
 
-> 当前工具面：50（= 代码 `src/novel-v2/mcp/tool-metadata.ts` 的 `TOOL_COUNT`，由 `src/novel-v2/__tests__/mcp-tool-face-single-source.test.ts` 校验本文件与 spec 声明一致）。阶段/工具映射的细则在 novel-mcp-orchestration，本文件只写决策规则；改工具面后两处都要跟上。
+> 当前工具面：21（= 代码 `src/novel-v2/mcp/tool-metadata.ts` 的 `TOOL_COUNT`，由 `src/novel-v2/__tests__/mcp-tool-face-single-source.test.ts` 校验本文件与 spec 声明一致；2026-09-24 三批减法 50→41→29→21：一批撤 9 个零真实调用工具，二批撤 12 增 1——review_submit 并入 action_execute(review.submit)、rule 五个人工步骤合并为 rule_candidate_advance、closed_loop_run/chapter_script_h3 等能力走 REST；三批撤 8 合 5——project_create 撤除（走 REST）、弧规划三入口合一为 story_arc_start(mode=auto|batch|orchestrated)、观测面三对合一（project_inspect/artifact_query/workflow_query）、审校双入口合一（chapter_review issues=[...]）、决策面合一（workflow_decision(target=chapter-review|story-arc)）。阶段/工具映射的细则在 novel-mcp-orchestration，本文件只写决策规则；改工具面后两处都要跟上。
 
 ## 定位与加载顺序
 
@@ -33,17 +33,17 @@ metadata:
 每一轮开始先感知项目状态，再按决策表行动：
 
 ```
-感知：novel_catalog_get(projectId, compact=true)
-     + novel_context_get(projectId, sections=["narrative-state","open-elements"])
+感知：novel_project_inspect(projectId, view=catalog)
+     + novel_project_inspect(projectId, view=context, sections=["narrative-state","open-elements"])
 ```
 
 | 项目状态 | 动作 |
 | --- | --- |
 | foundation 未完成（bootstrap 进行中或中断） | `novel_bootstrap_run`（同项目幂等重启）→ 走阶段 0.5 逐阶段推进 |
 | foundation 某阶段已生成、待审核 | 读 artifact 评估 → approve + 提交 independent review（见下节） |
-| foundation 完成、无故事弧 | `novel_story_arc_start`；任务要求剧情编排时 `novel_story_arc_orchestrate`（编排前先 `novel_context_get` 事实梳理） |
+| foundation 完成、无故事弧 | `novel_story_arc_start`；任务要求剧情编排时 `novel_story_arc_start(mode=orchestrated)`（编排前先 `novel_project_inspect(view=context)` 事实梳理） |
 | 弧蓝图待审 | `novel_story_arc_review` 读蓝图 → 审核/推进 |
-| 弧完成、章节可推进 | `novel_story_arc_batch_start` |
+| 弧完成、章节可推进 | `novel_story_arc_start(mode=batch)` |
 | 章节生成 workflow 进行中 | 等待（见下节等待策略），完成后读产物决策 |
 | 章节候选稿待决策 | 读三审 + 正文 → 自主审校决策（见下节） |
 | 目标章节全部定稿（final） | 任务完成 → 汇报 |
@@ -56,20 +56,22 @@ metadata:
    跨产物一致性（卷数/实体/势力/地点）——这些是 novel-mcp-orchestration
    阶段 0.5 的放行核对项。
 2. 达标：`novel_action_execute(action=plan.approve, runId, workItemId)` +
-   `novel_review_submit(reviewer=independent, verdict=passed, issues=[跨阶段缺口清单])`。
+   `novel_action_execute(action="review.submit", runId, workItemId,
+   review={reviewer="independent", verdict="passed", issues=[跨阶段缺口清单], summary})`。
    两者顺序不敏感，都落库即自动 accept。
-3. 不达标：`novel_review_submit(verdict=revise, issues=[可执行意见])` 驱动重新生成，
+3. 不达标：`novel_action_execute(action="review.submit", runId, workItemId,
+   review={reviewer="independent", verdict="revise", issues=[可执行意见], summary})`
+   驱动重新生成，
    **不要**手动 work.start / work.revise（会与自动修订竞态导致 workflow failed）。
 4. 跨阶段职责判定遵循既有规则：本阶段核心职责达标即可放行，下游职责登记为
    跨阶段审核清单。
 
 ## 章节候选稿的自主审校决策
 
-1. `novel_workflow_get(workflowId)` 拿 artifactId → `novel_artifact_get` 读正文与三审。
-2. 无 blocker/major：`novel_chapter_review_decision(approve)`。
-3. 有问题但可定向修：追加 issue（带 evidenceQuote + 段落号）→
-   `novel_chapter_review(mode=targeted, targetIssueIds=[...])`。
-4. 严重问题：`novel_chapter_review_decision(revise, feedback, revisionBase)`。
+1. `novel_workflow_query(workflowId)` 拿 artifactId → `novel_artifact_query(artifactId)` 读正文与三审。
+2. 无 blocker/major：`novel_workflow_decision(target=chapter-review, decision=approve)`。
+3. 有问题但可定向修：`novel_chapter_review(issues=[{severity, title, evidenceQuote, paragraph|revisionRanges, ...}])` 一步登记意见并定向修订（或 mode=targeted + targetIssueIds 引用既有意见）。
+4. 严重问题：`novel_workflow_decision(target=chapter-review, decision=revise, feedback, revisionBase)`。
    approve 带 blocker/major 时必须给 feedback 理由。
 5. 同项目章节审校互斥：`projectActiveReviewWorkflowId` 存在时等待，不并发启动。
 
@@ -85,13 +87,13 @@ $deadline = (Get-Date).AddMinutes(10)
 while ((Get-Date) -lt $deadline) {
   $resp = curl -s -X POST http://127.0.0.1:7654/mcp `
     -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" `
-    -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"novel_workflow_get","arguments":{"workflowId":"<id>"}}}'
+    -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"novel_workflow_query","arguments":{"workflowId":"<id>"}}}'
   if ($resp -match '"status":"(completed|failed)"' -or $resp -match '"latestStatus":"(COMPLETED|FAILED)"') { break }
   Start-Sleep -Seconds 30
 }
 ```
 
-- 状态字段名以 novel_workflow_get 实际返回为准（temporal 字段反映真实运行状态），
+- 状态字段名以 novel_workflow_query 实际返回为准（temporal 字段反映真实运行状态），
   模板中的匹配模式是兜底；首次调用后按真实响应调整匹配。
 - 短等待（<2 分钟）可接受一次同步轮询脚本（上限 2 分钟）。
 - 连续多章推进时，等待期间不要并发启动同项目的互斥操作。

@@ -39,23 +39,6 @@ function buildMcpCommand(toolName: string, args: unknown): string {
 
 async function directExecute(toolName: string, args: Record<string, unknown>): Promise<unknown> {
   switch (toolName) {
-    case "novel_project_create": {
-      // 对齐 v1 一句话创意入口:premise 必填,idempotencyKey 作为 projectId
-      // autoBootstrap/includeChapterPlan 透传给后端,默认 true
-      const premise = String(args.premise ?? "");
-      const idempotencyKey = String(args.idempotencyKey ?? "");
-      if (!premise || !idempotencyKey) throw new Error("premise 和 idempotencyKey 必填");
-      const payload: Record<string, unknown> = {
-        premise,
-        idempotencyKey,
-        ...(typeof args.autoBootstrap === "boolean" ? { autoBootstrap: args.autoBootstrap } : {}),
-        ...(typeof args.includeChapterPlan === "boolean" ? { includeChapterPlan: args.includeChapterPlan } : {}),
-      };
-      if (typeof args.title === "string" && args.title.trim()) payload.title = args.title.trim();
-      if (typeof args.genre === "string" && args.genre.trim()) payload.genre = args.genre.trim();
-      if (typeof args.objective === "string" && args.objective.trim()) payload.objective = args.objective.trim();
-      return novelFetch("/v2/projects", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
-    }
     case "novel_project_list": {
       return novelFetch("/v2/projects");
     }
@@ -69,11 +52,6 @@ async function directExecute(toolName: string, args: Record<string, unknown>): P
       const documentId = String(args.documentId ?? "");
       if (!projectId || !documentId) throw new Error("projectId 和 documentId 必填");
       return novelFetch(`/v2/projects/${encodeURIComponent(projectId)}/documents/${encodeURIComponent(documentId)}/review`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(args) });
-    }
-    case "novel_closed_loop_run": {
-      const projectId = String(args.projectId ?? "");
-      if (!projectId) throw new Error("projectId 必填");
-      return novelFetch(`/v2/projects/${encodeURIComponent(projectId)}/closed-loop`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(args) });
     }
     default:
       throw new Error(`工具 ${toolName} 不支持直接执行，请复制 MCP 调用命令后通过 MCP server 调用`);

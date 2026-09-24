@@ -70,7 +70,7 @@ pnpm novel:v2:migrations repair-compatible
 - `POST /v2/commits` is guarded by `CommitService` and requires both current internal and independent review evidence for the artifact fingerprint; chapter workflows additionally pass the applicable target word count into the same gate (`length-under-target` blocks the auto path); D1-D5 dimension scores are **not** a commit prerequisite — `putReview` writes `dimension_scores: {}` and `evaluateCommitGate` takes no dimensions argument, so the reviewer-level scoring stays advisory by design (见 workflow-map 的 D1-D5 与篇幅门条目).
 - `GET/PUT /v2/model-config` reads or atomically replaces the masked global provider and purpose routing configuration.
 - `GET /v2/model-tasks` and the claim/heartbeat/submit/fail routes back external MCP execution without calling a model API.
-- 同步链路的外部 MCP 兜底（2026-09-08）：进程内同步调用（创意短剧 `POST /v2/short-script-h3`、章节剧本直出等 REST 直返路径）没有外部任务物化通道；API 候选全部失败触发 `ExternalMcpRequiredError` 冒泡时，顶层错误通道经 `syncExternalMcpHttpStatus` 返回 **503**（可行动文案：补充 API 候选或由外部编排者走章节剧本派生的 `novel_chapter_script_h3_submit` 双轨；创意短剧轨 09-17 起无 MCP 工具，改由编排者自行组装后走 stateless REST），不再以裸 500（系统内部错误语义）暴露。
+- 同步链路的外部 MCP 兜底（2026-09-08）：进程内同步调用（创意短剧 `POST /v2/short-script-h3`、章节剧本直出等 REST 直返路径）没有外部任务物化通道；API 候选全部失败触发 `ExternalMcpRequiredError` 冒泡时，顶层错误通道经 `syncExternalMcpHttpStatus` 返回 **503**（可行动文案：补充 API 候选或由外部编排者自行组装提交；章节剧本双轨 `novel_chapter_script_h3_submit` 已于 2026-09-24 随工具面减法移除，创意短剧轨 09-17 起也无 MCP 工具，两轨均改由编排者自行组装后走 stateless REST），不再以裸 500（系统内部错误语义）暴露。
 
 ## Live smoke
 

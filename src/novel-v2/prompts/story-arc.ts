@@ -169,6 +169,12 @@ export type StoryArcPromptInput = {
    * 定稿章数 vs 兑付笔数。密度是题材判断不设硬门；连续零兑付必须成为规划数字。
    */
   payoffRhythm?: Array<{ arcOrdinal: number; title: string | null; finalChapters: number; payoffCount: number }>;
+  /**
+   * 章长漂移/内容稀疏信号（2026-09-22 商业基准对照确诊）：近窗口定稿章的字数统计。
+   * 只做描述性统计（判据校准与"不做结构门"的边界见 word-count.ts LENGTH_DRIFT_POLICY）；
+   * "连续低量 + 蓝图延续低声明"的判断归审核面。
+   */
+  lengthDrift?: { windowSize: number; avgChars: number; sparseCount: number; minChars: number };
 };
 
 /**
@@ -206,6 +212,21 @@ export function renderStoryArcEnsembleSignal(signal: StoryArcPromptInput["ensemb
   if (!signal || signal.windowSize < 3) return "";
   if (!signal.soloOnlyOrders.length) return `近 ${signal.windowSize} 章群像信号：全部章节都含两名及以上参与者的互动场景，无独处游程。`;
   return `近 ${signal.windowSize} 章群像信号（确定性统计）：${signal.soloOnlyOrders.length} 章的全部场景参与者≤1（第${signal.soloOnlyOrders.join("、")}章），最长连续独处游程 ${signal.longestSoloRun} 章。连续独处不等于问题，但逐拍内心节目单式编排会把对白与对手戏挤出正文预算（实证：独处蓝图批次产出的正文对白密度崩落）——本批次若再整体独处将延续该失败形态；分配章节时保持每批≥1/3 章有两名及以上参与者互相施加代价的场景（对方有欲望、行动改变处境，不是道具或背景板）；纯独处章每批至多一章，且在该场景 planningRationale 写明这章的静在与不在场的谁对话。安静章两人同场依然合法——静≠独。`;
+}
+
+/**
+ * 章长漂移/内容稀疏信号渲染（描述性统计；判据边界见 word-count.ts LENGTH_DRIFT_POLICY）。
+ *
+ * 措辞纪律：不设字数硬门（`manuscript.length` 已退役，执法面是提交门对声明目标的
+ * 兑现率）；提示只针对"连续低量"这一**批的形态**，单个功能静章不构成问题。
+ */
+export function renderStoryArcLengthDrift(drift: StoryArcPromptInput["lengthDrift"]): string {
+  if (!drift || drift.windowSize < 3) return "";
+  const lines = [`近 ${drift.windowSize} 章篇幅信号（确定性统计）：均章 ${drift.avgChars} 字，最短 ${drift.minChars} 字${drift.sparseCount ? `，${drift.sparseCount} 章低于单章下限 ${1800} 字` : "，无低于单章下限的章"}。`];
+  if (drift.sparseCount >= 2) {
+    lines.push("篇幅信号提示：近窗口出现连续低量章——逐章对声明目标达标不等于全书内容密度合格（'拆事件凑章数'会让每章都过门而读者看到的是碎片化）。本批次声明 targetWordCount 时回到各章信息量的诚实估计；除非个别章功能确需短章（planningRationale 声明），不得系统性延续低声明。");
+  }
+  return lines.join("\n");
 }
 
 /**
@@ -321,7 +342,7 @@ export function buildStoryArcPlanningContextSections(input: StoryArcPromptInput)
     ...(dormancyText ? [{ id: "arc-context-dormancy", kind: "planning" as const, title: "线索静默账（曾活跃、现已静默）", text: dormancyText, priority: "required" as const, provenanceRefs: sourceRefs(receipt, "dormancy") }] : []),
     { id: "arc-context-open-elements", kind: "planning" as const, title: "开放线索、伏笔与承诺候选", text: open, priority: "normal" as const, provenanceRefs: sourceRefs(receipt, "open-elements") },
     { id: "arc-context-feedback-state", kind: "review" as const, title: "机制反馈与叙事状态", text: feedback, priority: "normal" as const, provenanceRefs: sourceRefs(receipt, "feedback-state", receipt?.sourceRevisionIds ?? []) },
-    { id: "arc-context-serial-signals", kind: "review" as const, title: "跨章序列信号（功能游程、群像独处游程与回报节奏）", text: [serialSignals, renderStoryArcEnsembleSignal(input.ensembleSignal), renderStoryArcPayoffRhythm(input.payoffRhythm)].filter(Boolean).join("\n\n"), priority: "normal" as const, provenanceRefs: sourceRefs(receipt, "serial-signals") },
+    { id: "arc-context-serial-signals", kind: "review" as const, title: "跨章序列信号（功能游程、群像独处游程、回报节奏与篇幅信号）", text: [serialSignals, renderStoryArcEnsembleSignal(input.ensembleSignal), renderStoryArcPayoffRhythm(input.payoffRhythm), renderStoryArcLengthDrift(input.lengthDrift)].filter(Boolean).join("\n\n"), priority: "normal" as const, provenanceRefs: sourceRefs(receipt, "serial-signals") },
     { id: "arc-context-receipt", kind: "background" as const, title: "上下文来源收据", text: receiptText, priority: "normal" as const, provenanceRefs: receipt ? [receipt.fingerprint] : ["legacy-context"] },
   ];
   return outlineSection ? [outlineSection, ...base] : base;
@@ -374,6 +395,7 @@ function context(input: StoryArcPromptInput): string {
     renderStoryArcDueLedger(input.dueLedger),
     renderStoryArcNarrativeDormancy(input.narrativeDormancy),
     renderStoryArcPayoffRhythm(input.payoffRhythm),
+    renderStoryArcLengthDrift(input.lengthDrift),
     `全局规划引用：${input.macro.map((item) => `[${item.taskKey}] ${item.title}: ${item.summary}`).join("\n") || "无"}`,
     `最近章节位置：${input.recentChapters.map((item) => `第${item.order}章 ${item.summary}；未解=${item.unresolvedThreads.join("、") || "无"}`).join("\n") || "无"}`,
     `开放剧情线（threadRef 只能填下列 id 的精确值、不带名称；确需新建剧情线用“new:<名称>”显式表达）：\n${input.openThreads.map((item) => `- id: ${item.id}\n  名称: ${item.title}${renderThreadPayload(item.payload)}`).join("\n") || "无"}`,
@@ -453,9 +475,14 @@ export function buildStoryArcChaptersPrompt(input: StoryArcPromptInput & { arc: 
     // 无法输出——写作端因此拿不到权威篇幅，只能靠 instruction 手写等量段配额代偿，
     // 产出全书段长趋同（cv 0.62，ch167 仅 0.07）。此契约要求**逐章给出并允许有差异**：
     // 篇幅是本章信息量的函数，不是全弧的常数。
-    "目标篇幅契约：每章都要给出 targetWordCount（可见字符数，整数）。它是**本章**信息量与场景数的函数，不是全弧常数——推进章、对峙章、高潮章可以更长；安静章、余波章、过渡章可以更短。同一批次内若各章目标完全相等，说明没有按章估量，应重估。给出后，正文写作与提交门会共用这个数字（缺省才回落系统默认值），因此不要写明显偏离本章实际承载能力的数。",
+    "目标篇幅契约：每章都要给出 targetWordCount（可见字符数，整数）。它是**本章**信息量与场景数的函数，不是全弧常数——推进章、对峙章、高潮章可以更长；安静章、余波章、过渡章可以更短。同一批次内若各章目标完全相等，说明没有按章估量，应重估。给出后，正文写作与提交门会共用这个数字（缺省才回落系统默认值），因此不要写明显偏离本章实际承载能力的数。篇幅信号显示近窗口连续低量时（见上下文篇幅信号段），除非个别章功能确需短章（planningRationale 声明），不得系统性延续低声明——逐章达标不等于全书内容密度合格。",
     target ? "" : "群像配额（蓝图结构契约，先于正文存在）：本批次章节窗口中至少三分之一（向上取整）的章节要包含两名及以上参与者互相作用的场景——对方有自己的欲望与代价、其行动改变彼此处境，不是道具或背景板；纯独处章每批至多一章，且该场景的 planningRationale 必须写明这章的静在与不在场的谁对话。安静、余波、内省章两人同场依然合法——静不等于独。",
     target ? "" : "第二意志契约（2026-09-17 全量复扫确诊：参与者计数与\"有人可交锋\"是两个解耦事实——全书 108 章参与者≥2，其中 52 章的 opposition 全指向\"格法/旧例/环境/他自己的判断\"，人在场却只执行工序、彼此不索取任何东西，正文因此读成一个人对着制度做分析）：凡某章场景参与者≥2，该章至少一个场景的 opposition 必须写清**谁**（具名或具体差称）**想要什么**、**他的行动如何改变对方的可选集合**。只写\"格法不许\"\"旧例如此\"\"他不能问\"\"两人都不能明说\"不算第二意志——那仍是环境压力。对手的欲望可以是小的、日常的、甚至出于善意的（想早点收工、不想担责、想保一个人），但必须是他自己的、且与主角的意图不完全一致。单人静章不受此约束。",
+    // 收束形态轮换契约（2026-09-22 商业基准对照确诊，docs/novel-v2/commercial-benchmark-review-20260922.md）：
+    // 章末仪式窗口命中 38/168 章且集中成段——批级"同形落点"是**批的属性**，逐章判据
+    // 测不到（与群像游程同构），故契约与配额都放在蓝图生成面。判据是"同一动作帧的
+    // 近似句式复现"，不是"静收束"本身——余波章、安静章的静落点合法。
+    target ? "" : "收束形态轮换契约（2026-09-22 全书复盘确诊：章末反复以同一动作帧收束——如回到居所、静场清点、留白悬置——在 168 章中 38 章落入可预测同形落点，连续 20 余章以同一形态收尾，读者第三天就能预测落点）：本批次章节窗口中至少三分之一（向上取整）的章节，其收束不落在『回到居所/静场收尾/留白悬置』这类静收束动作帧上——改用外部小事件、他人动作或闲话、或直接切在动作与对话中间。同一收束动作帧跨章可以复用意象，但表层句式必须变体，不得以近似句式复现；每章的收束形态选形理由写入 planningRationale。安静章、余波章以静收束合法——轮换针对的是跨章可预测的同形落点，不是静本身。",
     "每个场景填写处境、可观察行动和结果；阻力、选择、代价在自然承担时写清，不用标签代替过程。需要保留但不应进入正文的分析方法放入 planningRationale，不要写进 observableActions 或 outcome。没有真实连续性约束时使用空数组，不为了满足格式虚构内容。",
     "章节术语降噪（叙事语言）：章节标题、场景标题、处境/可观察行动/结果/决策/代价等设计字段一律使用题材通用表达，不得直接使用主角职业/专业黑话原词。主角的特殊认知是能力的设定来源，通过'发现规律''看出异常'这类可感观察体现，不通过章节设计里的专业术语表达；机制层面的专业概念如需向作者说明，放在 planningRationale（正文执行上下文不读取它）。",
     `当前故事弧：${JSON.stringify(input.arc)}`,
@@ -486,6 +513,14 @@ export function buildStoryArcReviewPrompt(bundle: StoryArcBundle, contextText: s
     ...(ensembleReport ? [`${ensembleReport}审核契约：独处编排是正文对白崩落的上游病灶（已实证），当配额未满足或最长独处游程≥4 时，检查是否复现"单人内心节目单"形态——本弧承诺的读者体验是否因缺对手戏而受损；受损则报告节奏问题，并指出最小修改：把哪一章的独处解码事件改造为一名有欲望有代价的第二意志进场的交锋。个别功能静章（planningRationale 已声明与谁对话）不构成问题。**第二意志缺口检查（独立于配额）**：凡某章场景参与者≥2，至少一个场景的 opposition 必须写清谁（具名或具体差称）想要什么、他的行动如何改变对方的可选集合；若该章的 opposition 全部指向"格法不许/旧例如此/环境/他自己的判断"，即使参与者数达标，也按 major 报告并给出最小修改：为哪一章补一名带着自身目的进场的对手（欲望可以小、可以善意，但必须是他自己的、且与主角意图不完全一致）。另核对每章 povCharacterId 是否精确命中『人物登记表』中的 id——变体名（截短、改拼、用显示名）会导致 POV 作用域的记忆召回静默失效，按 major 报告并给出登记表中的正确 id。`] : []),
     "把‘没有事件’与‘没有变化’区分开：安静章节可以通过关系温度、理解、信息分布、资源条件、心理方向或余波完成自身功能；只有在当前功能需要而正文/蓝图没有承载时才报告问题。",
     "检查节奏时看目标、阻力、期待、揭示、结果和余波的波形，以及重复冲突/反转造成的疲劳，不用固定章数、钩子密度、爽点数量或持续升级作为硬标准。同时按弧设计契约检查（契约是检查方向，不是必须全部成立的硬门）：development 各阶段是否呈承接的子问题链而非并列步骤，场景 outcome 是否成为下一场景 situation 的触发条件或承担独立体验/理解修正功能，安静章是否让读者获得可感知的新东西（关系温度/风险判断/物品易主/理解修正/情绪确认/余波承载），推进型弧的退出状态相对入口是否有身份、资源、知识、关系或威胁级别中的可感知变化。安静、关系、背景、铺垫和余波弧与行动弧同样合法，只要其功能有可感知证据；只有契约缺失且确实损害了本弧承诺功能的证据时才报告 major。",
+    // 收束形态分布检查（2026-09-22 章末仪式 38/168 章窗口命中的审核面落点）：
+    // 蓝图层没有正文末段可统计，判断落在 planningRationale 声明的收束形态上——
+    // 语义判断归审核，不做句式黑名单。
+    "收束形态分布检查（通用，语义判断）：依据各章 planningRationale 与末场景结果，核对本批各章的收束形态是否呈现轮换——连续 ≥3 章计划以同一动作帧收束（如回屋清点、静场留白、仪式化收尾）而 planningRationale 未声明理由时，按节奏问题报告，并给出最小修改：指出哪几章改用外部事件、他人动作或切在动作中间收束，其余保留。个别安静章的静收束不构成问题；轮换压力针对的是跨章可预测的同形落点。",
+    // 内容稀疏检查（2026-09-22 章长漂移确诊的审核面落点；判据边界见 LENGTH_DRIFT_POLICY）：
+    // 逐章对声明目标达标 ≠ 全书内容密度合格——"拆事件凑章数"（一个事件拆三日内心戏
+    // 三章的实证病例 ch121）每章都过 length-under-target 门而读者看到碎片化。
+    "内容稀疏检查（通用，语义判断）：以上下文『篇幅信号』段为准（无该段时跳过）——近窗口连续低量章，且本批蓝图 targetWordCount 又延续低声明、而各章承载的仍是单个可并置事件或单次内心解码时，检查是否复现'拆事件凑章数'形态；是则按节奏问题报告并给出最小修改：合并哪些章，或为哪几章补充实际承载（第二人进场、事件推进、可感知回报）。个别功能静章（planningRationale 已声明）与安静章不构成问题；章长本身不是病，碎片化才是。",
     "以目标读者视角检查本弧的读者回报：entryState/objective 承诺了什么体验（解决问题、关系升温、世界揭秘、认知落差、情绪确认），exitState 与 development 是否真的交付了这种体验；若弧结束时读者只经历了过程而没有获得解决、成长、理解、情绪或新问题中的任何回报，报告为节奏问题。安静弧的回报可以是理解修正或关系温度，不要求每弧交付事件性高潮。",
     "故事弧按批次滚动审核：当 batch.complete=false 或当前章节窗口少于 arc.expectedChapterCount 时，未到达 arc.exitState、后续阶段尚未交汇或长线尚未收束是预期的未决状态，不能仅因未来证据尚未出现而报告问题。只有当前窗口改写边界、提前消费答案、破坏责任传递或声称已完成却没有证据时才报告。",
     "对未知物质、装置、痕迹或局部反应执行同一证据边界：湿度、颜色、气味、声音、光亮或接触变化只能支持当下可观察现象，不能单凭一次反应推出用途、成分、机制、追踪/筛选/警示功能或排除某种用途。若蓝图把局部现象写成角色尚未获得的功能结论，必须列为问题并要求修订保留未知状态。",

@@ -16,16 +16,13 @@
  * 规则与规则文本，不禁止测试样本携带题材）。
  */
 import { readFileSync } from "node:fs";
-import { describe, expect, it, vi } from "vitest";
-import type { Artifact } from "../protocol";
-import { NovelPostgresRepository } from "../postgres-repository";
+import { describe, expect, it } from "vitest";
 import {
   assembleSegmentPromptText,
   buildChapterScriptCharacterDigests,
   buildChapterScriptPrompt,
   buildSharedSubjectLibraryText,
   CHAPTER_SCRIPT_H3_SCHEMA,
-  CHAPTER_SCRIPT_ARTIFACT_KIND,
   computeCinematicHints,
   deriveMinSegments,
   MAX_SEGMENTS_PER_CHAPTER,
@@ -36,7 +33,6 @@ import {
   parseSharedSubjectPreset,
   SCRIPT_CONTRACT_VERSION,
   validateChapterScriptSegment,
-  submitExternalChapterScriptH3,
 } from "../application/chapter-script-h3";
 
 const COURIER_BASELINE = "A middle-aged courier with short black hair, stubble, a faded grey uniform jacket and a scuffed delivery satchel.";
@@ -607,89 +603,5 @@ describe("buildChapterScriptCharacterDigests / buildChapterScriptPrompt", () => 
     expect(prompt).toContain("以上 <Subject 1>~<Subject 2> 已由作者预设定义");
     expect(prompt).toContain("编号从 <Subject 3> 起连续递增");
     expect(prompt).toContain("subjectDefinitions 返回空字符串");
-  });
-});
-
-describe("submitExternalChapterScriptH3（外部 MCP 接手产出）", () => {
-  const submitObjects = {
-    getText: vi.fn(async () => "楚衡头痛惊醒，确认身处陌生木屋。记忆碎片涌入，得知杂役弟子身份与欠供守夜死因。"),
-    putText: vi.fn(async () => ({ key: "objects/test-chapter-script" })),
-  };
-
-  function mockChapterRepository(options: { existingArtifactId?: string; status?: string; storedArtifact?: unknown } = {}) {
-    const repository = Object.create(NovelPostgresRepository.prototype) as NovelPostgresRepository;
-    const finalDoc = {
-      title: "测试章节",
-      status: options.status ?? "final",
-      narrativeOrder: 1,
-      revision: 1,
-      sourceRevisionId: "rev-1",
-      artifactId: "art-1",
-      contentHash: "hash-1",
-      objectKey: "objects/chapter",
-    };
-    const getFinalDocumentContentRef = vi.fn(async () => finalDoc);
-    const getChapterScriptSubjectPreset = vi.fn(async () => "");
-    const poolQuery = vi.fn(async () => ({
-      rows: options.existingArtifactId ? [{ id: options.existingArtifactId }] : [],
-      rowCount: options.existingArtifactId ? 1 : 0,
-    }));
-    const recordArtifact = vi.fn(async (_artifact: Artifact) => {});
-    const getArtifact = vi.fn(async () => options.storedArtifact ?? {
-      id: "art-stored",
-      kind: CHAPTER_SCRIPT_ARTIFACT_KIND,
-      projectId: "project-1",
-      structuredData: { ...validScript(), documentId: "doc-1", sourceFingerprint: "ext-stored", contractVersion: SCRIPT_CONTRACT_VERSION },
-    });
-    Object.defineProperty(repository, "getFinalDocumentContentRef", { value: getFinalDocumentContentRef });
-    Object.defineProperty(repository, "getChapterScriptSubjectPreset", { value: getChapterScriptSubjectPreset });
-    Object.defineProperty(repository, "pool", { value: { query: poolQuery } });
-    Object.defineProperty(repository, "recordArtifact", { value: recordArtifact });
-    Object.defineProperty(repository, "getArtifact", { value: getArtifact });
-    return { repository, getFinalDocumentContentRef, getChapterScriptSubjectPreset, poolQuery, recordArtifact, getArtifact };
-  }
-
-  it("rejects a non-final chapter with a 409-style error", async () => {
-    const { repository } = mockChapterRepository({ status: "drafting" });
-    await expect(submitExternalChapterScriptH3(
-      { projectId: "project-1", documentId: "doc-1", payload: validScript() },
-      { repository, objects: submitObjects as never },
-    )).rejects.toThrow(/只能为已有正式 revision 的定稿章节/);
-  });
-
-  it("rejects payload without segments", async () => {
-    const { repository } = mockChapterRepository();
-    await expect(submitExternalChapterScriptH3(
-      { projectId: "project-1", documentId: "doc-1", payload: { plotBeats: [], characters: [] } },
-      { repository, objects: submitObjects as never },
-    )).rejects.toThrow(/payload\.segments 必填且非空/);
-  });
-
-  it("assembles external chapter script and marks origin=external-chapter-script-h3", async () => {
-    const { repository, recordArtifact } = mockChapterRepository();
-    const record = await submitExternalChapterScriptH3(
-      { projectId: "project-1", documentId: "doc-1", payload: validScript() },
-      { repository, objects: submitObjects as never },
-    );
-    expect(record.reused).toBeUndefined();
-    expect(record.artifactId).toEqual(expect.any(String));
-    expect(record.segments).toHaveLength(2);
-    expect(record.segments[0].promptText).toContain("subject_definitions:");
-    expect(recordArtifact).toHaveBeenCalledTimes(1);
-    const stored = recordArtifact.mock.calls[0][0] as unknown as Artifact;
-    expect(stored.kind).toBe(CHAPTER_SCRIPT_ARTIFACT_KIND);
-    expect((stored.structuredData as Record<string, unknown>).origin).toBe("external-chapter-script-h3");
-    expect((stored.structuredData as Record<string, unknown>).sourceFingerprint).toMatch(/^ext:/);
-  });
-
-  it("reuses identical external content (ext: fingerprint) without re-recording", async () => {
-    const { repository, recordArtifact } = mockChapterRepository({ existingArtifactId: "art-stored" });
-    const record = await submitExternalChapterScriptH3(
-      { projectId: "project-1", documentId: "doc-1", payload: validScript() },
-      { repository, objects: submitObjects as never },
-    );
-    expect(record.reused).toBe(true);
-    expect(record.artifactId).toBe("art-stored");
-    expect(recordArtifact).not.toHaveBeenCalled();
   });
 });

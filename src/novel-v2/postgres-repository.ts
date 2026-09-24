@@ -68,7 +68,7 @@ import { ModelTaskSlice, OUTSTANDING_MODEL_TASK_STATUSES_SQL } from "./repositor
 import { TelemetrySlice } from "./repository/telemetry-slice";
 import type { ModelRoutingConfig, ModelRoutingSnapshot, ModelTaskRecord, ModelWorkPackage } from "./model-routing";
 import type { ObjectStoreAdapter } from "./object-store";
-import { countNovelCharacters, effectiveTargetWordCount, normalizeTargetWordCount } from "./word-count";
+import { countNovelCharacters, effectiveTargetWordCount, LENGTH_DRIFT_POLICY, normalizeTargetWordCount } from "./word-count";
 import type { ObjectStoreIdentity } from "./object-store";
 import { normalizeManuscriptStructuralReview } from "./application/manuscript-structure";
 import { arcCompletionPredicateSql, auditEmotionalContractCarriage, auditNamedReferences, auditStoryArcBatchRanges, canonicalReferenceId, findEmbeddedInternalIdentifiers, normalizeThreadResponsibilityReferences, parseExplicitNewReference, planThreadForeshadowingBindings, resolveNamedReference, sanitizeReferenceToken, type NamedReferenceCandidate, type StoryArcIntegrityIssue } from "./application/story-arc-integrity";
@@ -4358,6 +4358,38 @@ export class NovelPostgresRepository {
       }),
     }));
     const ensembleSignal = ensembleWindow.length >= 3 ? inspectStoryArcEnsemble(ensembleWindow) : undefined;
+    // 章长漂移/内容稀疏信号（2026-09-22 商业基准对照确诊的可见性落点）：近窗口定稿
+    // 章的 \p{L}\p{N} 字数统计（均长 / 低于 sparseFloor 计数 / 最短章）。**只做描述性
+    // 统计**——候选逐章门被 168 章实测推翻（28/31 章全书散布命中，见
+    // word-count.ts LENGTH_DRIFT_POLICY 注释），章长约束的执法面仍是提交门
+    // length-under-target（对声明目标），本信号只让"连续低量"成为规划与审核
+    // 看得见的数字。判据校准与口径见 LENGTH_DRIFT_POLICY。
+    const lengthRows = narrativeCutoffForSerial > 0
+      ? await this.pool.query<{ narrative_order: string | number; word_count: string | number }>(
+        `SELECT d.narrative_order, cb.word_count
+         FROM chapters c
+         JOIN manuscript_documents d ON d.id=c.document_id AND d.project_id=c.project_id
+         JOIN manuscript_revisions mr ON mr.id=d.current_revision_id
+         JOIN content_blobs cb ON cb.content_hash=mr.content_hash
+         WHERE c.project_id=$1 AND ${PROJECTABLE_FINAL_DOCUMENT_SQL}
+           AND d.narrative_order <= $2
+         ORDER BY d.narrative_order DESC
+         LIMIT $3`,
+        [projectId, narrativeCutoffForSerial, LENGTH_DRIFT_POLICY.window],
+      )
+      : { rows: [] as Array<{ narrative_order: string | number; word_count: string | number }> };
+    const lengthWindow = lengthRows.rows
+      .map((row) => ({ order: Number(row.narrative_order), chars: Number(row.word_count) }))
+      .filter((row) => Number.isFinite(row.chars) && row.chars > 0)
+      .sort((left, right) => left.order - right.order);
+    const lengthDrift = lengthWindow.length >= 3
+      ? {
+        windowSize: lengthWindow.length,
+        avgChars: Math.round(lengthWindow.reduce((sum, row) => sum + row.chars, 0) / lengthWindow.length),
+        sparseCount: lengthWindow.filter((row) => row.chars < LENGTH_DRIFT_POLICY.sparseFloor).length,
+        minChars: lengthWindow.reduce((min, row) => Math.min(min, row.chars), Number.MAX_SAFE_INTEGER),
+      }
+      : undefined;
     // 窗口上界已过的账（P1，2026-09-16 起，2026-09-18 修正语义）：
     // 规划者需要看见"哪些线索的兑现窗口上界已经过去"，但**不把它叫超期债务**——
     // 实测 244 条上界已过中 238 条仍在活跃推进，对连载而言这是常态而非欠账。
@@ -4460,6 +4492,7 @@ export class NovelPostgresRepository {
       ensembleSignal?: { soloOnlyOrders: number[]; longestSoloRun: number; windowSize: number };
       dueLedger?: { currentOrder: number; windowElapsedCount: number; agedOpenCount: number; items: Array<{ id: string; description: string; horizonOrder: number; plantedOrder: number | null }> };
       payoffRhythm?: Array<{ arcOrdinal: number; title: string | null; finalChapters: number; payoffCount: number }>;
+      lengthDrift?: { windowSize: number; avgChars: number; sparseCount: number; minChars: number };
     } = {
       projectTitle: project.rows[0].title,
       macro: macro.map((artifact) => ({ taskKey: foundationTaskKey(artifact) ?? "unknown", title: typeof artifact.structuredData?.title === "string" ? artifact.structuredData.title : "", summary: typeof artifact.structuredData?.summary === "string" ? artifact.structuredData.summary : "" })),
@@ -4475,6 +4508,7 @@ export class NovelPostgresRepository {
       ...(ensembleSignal ? { ensembleSignal: { soloOnlyOrders: ensembleSignal.soloOnlyChapterIndexes, longestSoloRun: ensembleSignal.longestSoloRun, windowSize: ensembleWindow.length } } : {}),
       ...(dueLedger ? { dueLedger } : {}),
       ...(payoffRhythm.length ? { payoffRhythm } : {}),
+      ...(lengthDrift ? { lengthDrift } : {}),
     };
     // PL-8③：未揭示秘密清单投影（plot-design informationBoundaries.hidden）。别名迁移
     // 在 flat 归一层内完成（散文时代成员升为 {claim}）；plot-design 缺失或形态非法时返回
@@ -4543,7 +4577,7 @@ export class NovelPostgresRepository {
       recent: canonicalSha256(contextData.recentChapters),
       "open-elements": canonicalSha256({ openThreads: contextData.openThreads, openForeshadowings: contextData.openForeshadowings, openPromises: contextData.openPromises }),
       "feedback-state": canonicalSha256({ planningFeedback: contextData.planningFeedback, narrativeState: contextData.narrativeState }),
-      ...(contextData.serialFunctionRuns ? { "serial-signals": canonicalSha256({ runs: contextData.serialFunctionRuns, ensembleSignal: contextData.ensembleSignal }) } : {}),
+      ...(contextData.serialFunctionRuns || contextData.lengthDrift ? { "serial-signals": canonicalSha256({ runs: contextData.serialFunctionRuns, ensembleSignal: contextData.ensembleSignal, lengthDrift: contextData.lengthDrift }) } : {}),
       ...(contextData.payoffRhythm ? { "payoff-rhythm": canonicalSha256(contextData.payoffRhythm) } : {}),
       ...(contextData.cast ? { cast: canonicalSha256(contextData.cast) } : {}),
       ...(contextData.dueLedger ? { "due-ledger": canonicalSha256(contextData.dueLedger) } : {}),
@@ -6980,7 +7014,7 @@ export class NovelPostgresRepository {
     for (const row of stale.rows) {
       await this.appendOutbox("craft-rule-candidate", row.id, "craft-rule.candidate-stale", {
         projectId, candidateId: row.id, status: row.status, targetKind: row.target_kind, targetId: row.target_id, proposedVersion: row.proposed_version,
-        decisionHint: "停滞候选需裁决：补证据、晋升（走双回归）或显式 rejected；编排者可用 novel_rule_review_submit/novel_rule_promote 或作者驳回。",
+        decisionHint: "停滞候选需裁决：补证据、晋升（走双回归）或显式 rejected；编排者可用 novel_rule_candidate_advance(action=review/promote) 或作者驳回。",
       });
     }
     return stale.rows.map((row) => row.id);

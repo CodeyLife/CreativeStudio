@@ -27,12 +27,13 @@ function renderPanel() {
   );
 }
 
-// 4 个直接执行工具（DIRECT_EXEC_TOOLS）
+// 直接执行工具抽样（DIRECT_EXEC_TOOLS 面随工具面减法收缩，这里锚定代表性成员；
+// 2026-09-24 三批后 project_create 已撤出工具面，项目创建走 REST/Web 通道）
 const DIRECT_EXEC_TOOLS = [
-  "novel_project_create",
   "novel_project_list",
   "novel_run_create",
-  "novel_closed_loop_run",
+  "novel_chapter_review",
+  "novel_chapter_generate",
 ];
 
 // ===== Tests =====
@@ -46,14 +47,14 @@ describe("McpToolGatewayPanel", () => {
   describe("工具名", () => {
     it("渲染关键工具名", () => {
       const html = renderPanel();
-      expect(html).toContain("novel_project_create");
+      expect(html).toContain("novel_project_inspect");
       expect(html).toContain("novel_run_create");
-      expect(html).toContain("novel_closed_loop_run");
       expect(html).toContain("novel_bootstrap_run");
       expect(html).toContain("novel_story_arc_start");
       expect(html).toContain("novel_story_arc_get");
       expect(html).toContain("novel_chapter_review");
       expect(html).toContain("novel_chapter_generate");
+      expect(html).toContain("novel_workflow_decision");
     });
   });
 

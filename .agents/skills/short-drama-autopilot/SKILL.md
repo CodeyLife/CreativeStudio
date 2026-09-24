@@ -22,7 +22,7 @@ metadata:
 
 # 短剧创作自主编排协议（autopilot）
 
-> 当前工具面：50（= 代码 `TOOL_COUNT`，由 `src/novel-v2/__tests__/mcp-tool-face-single-source.test.ts` 校验）。独立短剧已于 2026-09-17 浏览器化：`novel_short_script_h3` / `_brainstorm` / `_submit` 均不在 MCP 工具面内，本文件的短剧生成一律走 `POST /v2/short-script-h3`（stateless，产物存浏览器 IndexedDB）。
+> 当前工具面：21（= 代码 `TOOL_COUNT`，由 `src/novel-v2/__tests__/mcp-tool-face-single-source.test.ts` 校验）。2026-09-24 三批工具面减法 50→41→29→21：一批撤 9 个零真实调用工具（action_list、run_complete、receipt_get、rule_target_get、skill_get、chapter_script_h3_submit、memory_grooming_report、chapter_recall_report、model_dispatch），skill 读取并入 novel_skill_query；二批撤 12 增 1（review_submit 并入 action_execute(review.submit)、rule 五个人工步骤合并为 rule_candidate_advance、closed_loop_run/chapter_script_h3/prompt_inspect/invocation_list 等零或近零调用工具撤除，closed_loop_run/chapter_script_h3 能力走 REST）；三批撤 8 合 5（project_create 走 REST、弧规划三入口合一为 story_arc_start(mode=auto|batch|orchestrated)、观测面三对合一、审校双入口合一、决策面合一）。独立短剧已于 2026-09-17 浏览器化：`novel_short_script_h3` / `_brainstorm` / `_submit` 均不在 MCP 工具面内，本文件的短剧生成一律走 `POST /v2/short-script-h3`（stateless，产物存浏览器 IndexedDB）。
 
 ## 定位与加载顺序
 
@@ -68,7 +68,7 @@ metadata:
 | --- | --- |
 | 方向开放/创意单薄 | 你自行跨引擎发散候选（近期母题作 avoidMotifs 回避清单随请求传入）→ 选定 → 常规路径 |
 | 常规（默认） | `POST /v2/short-script-h3`（body: idea / durationMode? / targetDurationSeconds? / instruction?）stateless 生成，不经 MCP；返回含 `creativeStrategy` 承诺，核对与预期一致 |
-| 需要精细控制节拍/结构 | 先 `novel_skill_get(executionPoint=short.script)` 拿运行时方法论 → 自产模型形态 JSON（**creativeStrategy** / plotBeats / characters / segments 六段字段）→ `POST /v2/short-script-h3` 提交自产 payload（原 `*_submit` 双轨工具已移除，服务端不落库） |
+| 需要精细控制节拍/结构 | 先 `novel_skill_query(executionPoint="short.script")` 拿运行时方法论（SkillBundle promptSections，附带 availableSkills 执行点清单）→ 自产模型形态 JSON（**creativeStrategy** / plotBeats / characters / segments 六段字段）→ `POST /v2/short-script-h3` 提交自产 payload（原 `*_submit` 双轨工具已移除，服务端不落库） |
 
 - `idea` 写清谁/何处/什么（≥10 字符）；文化特定核心意象（如御剑飞行）必须
   在创意或 instruction 里写明标准物理呈现（姿势、接触点、相对位置、构图）。
@@ -139,6 +139,7 @@ REST 读取路径、以及后续建议（如送 MiniMax H3 生成视频、Creati
 ## 与章节派生的分工
 
 本协议面向**独立短剧**（或关联小说项目的衍生创意短剧）。从已定稿章节派生
-剧本走 `novel_chapter_script_h3(projectId, documentId)`（只读派生，不需要
-本协议的迭代循环）——那是小说 autopilot（novel-autopilot）推进定稿后的
+剧本走 REST `POST /v2/projects/:projectId/documents/:documentId/script-h3`
+（只读派生，不需要本协议的迭代循环；原 MCP 工具 novel_chapter_script_h3
+已于 2026-09-24 撤除）——那是小说 autopilot（novel-autopilot）推进定稿后的
 自然延伸，流程见 novel-mcp-orchestration 阶段 2.5 路径 A。

@@ -973,8 +973,9 @@ describe("伏笔归属按线程声明（PL-5④ 判据收口，2026-09-19）", (
     // "本条线不承担伏笔"因此以空数组表达而非省略字段。
     expect(planResponsibilities.required).toContain("foreshadowingRefs");
 
-    const orchestrate = TOOL_DEFINITIONS.find((tool) => tool.name === "novel_story_arc_orchestrate");
-    const externalFace = (orchestrate?.inputSchema as unknown as {
+    // 2026-09-24 三批：编排入口并入 novel_story_arc_start（mode=orchestrated），外部面同源锁随迁
+    const arcStart = TOOL_DEFINITIONS.find((tool) => tool.name === "novel_story_arc_start");
+    const externalFace = (arcStart?.inputSchema as unknown as {
       properties: { plotOutline: { properties: { threadResponsibilities: { items: { properties: Record<string, unknown> } } } } };
     }).properties.plotOutline.properties.threadResponsibilities.items.properties;
     expect(Object.keys(externalFace)).toContain("foreshadowingRefs");

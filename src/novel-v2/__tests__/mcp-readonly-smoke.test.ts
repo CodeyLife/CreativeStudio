@@ -9,7 +9,10 @@
  *
  * 判据是结构性的（AGENTS.md 泛化优先）：
  * - 只读面 = 名称匹配 `*_(get|list|query|inspect|queue|report)` 的工具（写动作工具不
- *   smoke，避免副作用）；反向守卫断言三个历史坏工具都在面内（模式漂移即报警）。
+ *   smoke，避免副作用）；反向守卫断言历史坏工具 `novel_context_get` 的现役承载者
+ *   `novel_project_inspect`（2026-09-24 三批观测面合一）与另两个合并观测点在面内
+ *   （模式漂移即报警）。2026-09-24 工具面减法后 prompt_inspect/invocation_list 已撤除
+ *   （能力走 REST 孪生），反向守卫随之收缩到仍在面的成员。
  * - 失败判据 = PostgreSQL schema 漂移错误（列/表/函数不存在、非法输入语法、类型不符）。
  *   业务性 "not found" 允许（空 fixture 的诚实输出）；schema 漂移说明 SQL 与当前
  *   migration 脱节，正是"恒抛/恒静默"的形态。
@@ -35,18 +38,20 @@ function readOnlyToolNames(): string[] {
 }
 
 describe("MCP 只读工具 smoke 契约（OR-E1）", () => {
-  it("只读面按命名形态自动覆盖，且三个历史坏工具（恒抛×2+恒静默×1）都在面内", () => {
+  it("只读面按命名形态自动覆盖，且历史坏工具的现役承载者在面内", () => {
     const names = readOnlyToolNames();
-    // 反向守卫：模式若漂移（如改名丢失后缀），坏工具会溜出烟测面——正是本次事故形态。
-    for (const broken of ["novel_prompt_inspect", "novel_invocation_list", "novel_context_get"]) {
-      expect(names).toContain(broken);
+    // 反向守卫：模式若漂移（如改名丢失后缀），观测工具会溜出烟测面——正是本次事故形态。
+    // 2026-09-24 三批观测面合一后，历史坏工具 context_get 的能力由 project_inspect 承载，
+    // 另两个合并观测点（artifact/workflow 单查列查合一）同为 query 后缀。
+    for (const guard of ["novel_project_inspect", "novel_artifact_query", "novel_workflow_query"]) {
+      expect(names).toContain(guard);
     }
-    expect(names.length).toBeGreaterThanOrEqual(18);
+    expect(names.length).toBeGreaterThanOrEqual(9);
   });
 
   it("模式不会把写动作工具吸进烟测面（副作用边界）", () => {
     const names = new Set(readOnlyToolNames());
-    for (const writeTool of ["novel_project_create", "novel_project_delete", "novel_rule_promote", "novel_rule_rollback", "novel_review_submit", "novel_action_execute", "novel_run_complete"]) {
+    for (const writeTool of ["novel_workflow_decision", "novel_rule_candidate_advance", "novel_fact_candidate_decide", "novel_action_execute", "novel_chapter_generate", "novel_foreshadowing_triage"]) {
       expect(names.has(writeTool)).toBe(false);
     }
   });
@@ -95,9 +100,9 @@ describe("MCP 只读工具 smoke 契约（OR-E1，需 Postgres）", () => {
     }
   });
 
-  it("novel_context_get 增强字段显式可达（旧 bug：坏 SQL 被裸 catch 吞成恒缺字段）", async () => {
+  it("novel_project_inspect(context) 增强字段显式可达（旧 bug：坏 SQL 被裸 catch 吞成恒缺字段）", async () => {
     if (!postgresAvailable) return;
-    const result = await executeTool("novel_context_get", { projectId }, { repository });
+    const result = await executeTool("novel_project_inspect", { projectId, view: "context" }, { repository });
     expect(result.isError).toBeFalsy();
     const payload = JSON.parse(result.content[0].text);
     // recentModelInvocations 必须出现（查询成功、空数组是诚实输出）；
@@ -139,7 +144,7 @@ describe("MCP 只读工具 smoke 契约（OR-E1，需 Postgres）", () => {
         );
       }
       const objects = { getText: async (key: string) => prose[key] ?? "" } as never;
-      const result = await executeTool("novel_context_get", { projectId: arcProject }, { repository, objects });
+      const result = await executeTool("novel_project_inspect", { projectId: arcProject, view: "context" }, { repository, objects });
       const payload = JSON.parse(result.content[0].text);
       expect(payload.enhancementErrors, JSON.stringify(payload.enhancementErrors)).toBeUndefined();
       expect(typeof payload.serialContext?.window).toBe("number");
@@ -148,7 +153,7 @@ describe("MCP 只读工具 smoke 契约（OR-E1，需 Postgres）", () => {
       expect(payload.serialContext.assetSpans.map((span: { subject: string }) => span.subject)).toContain("灵石");
 
       // 反向：无对象存储时不静默给空账本，而是记一条可见降级。
-      const withoutStore = await executeTool("novel_context_get", { projectId: arcProject }, { repository });
+      const withoutStore = await executeTool("novel_project_inspect", { projectId: arcProject, view: "context" }, { repository });
       expect(JSON.parse(withoutStore.content[0].text).enhancementErrors).toEqual([expect.stringContaining("assetSpans")]);
 
       // F1′：`novel_memory_query` 曾直取 repository 拿序列证据 ⇒ 账本恒空，而 compact 摘要里
@@ -164,17 +169,5 @@ describe("MCP 只读工具 smoke 契约（OR-E1，需 Postgres）", () => {
     } finally {
       await repository.deleteProject(arcProject).catch(() => undefined);
     }
-  });
-
-  it("novel_prompt_inspect / novel_invocation_list 空 run 查询给出业务错误而非 schema 漂移", async () => {
-    if (!postgresAvailable) return;
-    const inspect = await executeTool("novel_prompt_inspect", { workflowId: "smoke-missing-run", taskId: "smoke-missing-task" }, { repository });
-    // 空 fixture 下诚实报"未找到"（业务语义），而旧 bug 是直接抛 column does not exist。
-    expect(inspect.isError).toBe(true);
-    expect(inspect.content[0].text).toContain("未找到");
-    expect(inspect.content[0].text).not.toMatch(SCHEMA_DRIFT);
-    const list = await executeTool("novel_invocation_list", { projectId }, { repository });
-    expect(list.isError).toBeFalsy();
-    expect(JSON.parse(list.content[0].text).invocations).toEqual([]);
   });
 });
