@@ -17,7 +17,7 @@ metadata:
 
 # 小说创作自主推进协议（autopilot）
 
-> 当前工具面：21（= 代码 `src/novel-v2/mcp/tool-metadata.ts` 的 `TOOL_COUNT`，由 `src/novel-v2/__tests__/mcp-tool-face-single-source.test.ts` 校验本文件与 spec 声明一致；2026-09-24 三批减法 50→41→29→21：一批撤 9 个零真实调用工具，二批撤 12 增 1——review_submit 并入 action_execute(review.submit)、rule 五个人工步骤合并为 rule_candidate_advance、closed_loop_run/chapter_script_h3 等能力走 REST；三批撤 8 合 5——project_create 撤除（走 REST）、弧规划三入口合一为 story_arc_start(mode=auto|batch|orchestrated)、观测面三对合一（project_inspect/artifact_query/workflow_query）、审校双入口合一（chapter_review issues=[...]）、决策面合一（workflow_decision(target=chapter-review|story-arc)）。阶段/工具映射的细则在 novel-mcp-orchestration，本文件只写决策规则；改工具面后两处都要跟上。
+> 当前工具面：20（= 代码 `src/novel-v2/mcp/tool-metadata.ts` 的 `TOOL_COUNT`，由 `src/novel-v2/__tests__/mcp-tool-face-single-source.test.ts` 校验本文件与 spec 声明一致；2026-09-24 四批减法 50→41→29→21→20：一批撤 9 个零真实调用工具，二批撤 12 增 1——review_submit 并入 action_execute(review.submit)、rule 五个人工步骤合并为 rule_candidate_advance、closed_loop_run/chapter_script_h3 等能力走 REST；三批撤 8 合 5——project_create 撤除（走 REST）、弧规划三入口合一为 story_arc_start(mode=auto|batch|orchestrated)、观测面三对合一（project_inspect/artifact_query/workflow_query）、审校双入口合一（chapter_review issues=[...]）、决策面合一（workflow_decision(target=chapter-review|story-arc)）；四批撤 project_list（走 REST `GET /v2/projects`）。阶段/工具映射的细则在 novel-mcp-orchestration，本文件只写决策规则；改工具面后两处都要跟上。
 
 ## 定位与加载顺序
 

@@ -22,7 +22,7 @@ metadata:
 
 # 短剧创作自主编排协议（autopilot）
 
-> 当前工具面：21（= 代码 `TOOL_COUNT`，由 `src/novel-v2/__tests__/mcp-tool-face-single-source.test.ts` 校验）。2026-09-24 三批工具面减法 50→41→29→21：一批撤 9 个零真实调用工具（action_list、run_complete、receipt_get、rule_target_get、skill_get、chapter_script_h3_submit、memory_grooming_report、chapter_recall_report、model_dispatch），skill 读取并入 novel_skill_query；二批撤 12 增 1（review_submit 并入 action_execute(review.submit)、rule 五个人工步骤合并为 rule_candidate_advance、closed_loop_run/chapter_script_h3/prompt_inspect/invocation_list 等零或近零调用工具撤除，closed_loop_run/chapter_script_h3 能力走 REST）；三批撤 8 合 5（project_create 走 REST、弧规划三入口合一为 story_arc_start(mode=auto|batch|orchestrated)、观测面三对合一、审校双入口合一、决策面合一）。独立短剧已于 2026-09-17 浏览器化：`novel_short_script_h3` / `_brainstorm` / `_submit` 均不在 MCP 工具面内，本文件的短剧生成一律走 `POST /v2/short-script-h3`（stateless，产物存浏览器 IndexedDB）。
+> 当前工具面：20（= 代码 `TOOL_COUNT`，由 `src/novel-v2/__tests__/mcp-tool-face-single-source.test.ts` 校验）。2026-09-24 四批工具面减法 50→41→29→21→20：一批撤 9 个零真实调用工具（action_list、run_complete、receipt_get、rule_target_get、skill_get、chapter_script_h3_submit、memory_grooming_report、chapter_recall_report、model_dispatch），skill 读取并入 novel_skill_query；二批撤 12 增 1（review_submit 并入 action_execute(review.submit)、rule 五个人工步骤合并为 rule_candidate_advance、closed_loop_run/chapter_script_h3/prompt_inspect/invocation_list 等零或近零调用工具撤除，closed_loop_run/chapter_script_h3 能力走 REST）；三批撤 8 合 5（project_create 走 REST、弧规划三入口合一为 story_arc_start(mode=auto|batch|orchestrated)、观测面三对合一、审校双入口合一、决策面合一）；四批撤 project_list（走 REST）。独立短剧已于 2026-09-17 浏览器化：`novel_short_script_h3` / `_brainstorm` / `_submit` 均不在 MCP 工具面内，本文件的短剧生成一律走 `POST /v2/short-script-h3`（stateless，产物存浏览器 IndexedDB）。
 
 ## 定位与加载顺序
 

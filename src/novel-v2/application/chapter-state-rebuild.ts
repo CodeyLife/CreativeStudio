@@ -77,6 +77,7 @@ export class ChapterStateRebuildService {
       existingClaimsDigest: extractionContext.claimsDigest,
       existingContentHashes: extractionContext.contentHashes,
       existingClaimsIndex: extractionContext.claimsIndex,
+      existingValueHashById: extractionContext.valueHashById,
       narrativeOrder: source.narrativeOrder,
       routingSnapshot: this.deps.routingSnapshot,
       workflowRunId: workflowId,

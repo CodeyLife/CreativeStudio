@@ -1,5 +1,7 @@
 skillId: narrative-continuity
-version: 1.0.2
+version: 1.1.0
+# 1.1.0 = 事实矛盾确定性核验接入 chapter.fact-extraction（improvement-plan-fact-injection-20260922
+# 迭代 2）：提取后对值槽谓词做同槽异值对账，矛盾候选强制 candidate，未裁决不得晋升。
 # 1.0.2 = craft-rule 闭环晋升（crc-1786247823320-f48c8df7，promotion_receipts:
 # promote:crc-1786247823320-f48c8df7，双回归+晋升后验证通过）。证据边界规则：可观察
 # 现象与功能/机制/统计结论分层，单次关联观测只支撑疑似；审核报证据越界为 major；修订
@@ -40,6 +42,6 @@ promptSections:
   chapter.revision: |
     修订正文不得新增冻结来源和原文都未建立的事实；无法确认的边界保持原状，不用修辞性解释掩盖不确定性。修订不得把推断升级为确认，也不得通过补充细节使原本未知的机制显得已被证实。
   chapter.fact-extraction: |
-    只提取会约束后续因果、知识边界、状态或关系的事实；记录来源证据和 novelty，不把一次性描写泛化为永久事实。
+    只提取会约束后续因果、知识边界、状态或关系的事实；记录来源证据和 novelty，不把一次性描写泛化为永久事实。提取后系统对值槽谓词（持有/位于/身份/修为等单当前值槽位）执行确定性矛盾核验：与冻结事实同槽异值且未携带 supersedes 的候选将被强制降为 candidate，冲突未裁决不得晋升为可检索事实；正文改写既有事实时必须以 novelty=update 显式声明覆盖。
   character.enrichment: |
     只回写正文实际呈现的角色声部、动机、知识和关系增量，并保留观察、听闻和推测之间的确定性差异。

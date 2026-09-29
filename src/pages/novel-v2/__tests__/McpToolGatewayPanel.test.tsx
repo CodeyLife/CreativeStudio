@@ -28,9 +28,9 @@ function renderPanel() {
 }
 
 // 直接执行工具抽样（DIRECT_EXEC_TOOLS 面随工具面减法收缩，这里锚定代表性成员；
-// 2026-09-24 三批后 project_create 已撤出工具面，项目创建走 REST/Web 通道）
+// 2026-09-24 三批后 project_create 已撤出工具面（走 REST/Web），四批后 project_list
+// 同撤（REST GET /v2/projects 完整孪生））
 const DIRECT_EXEC_TOOLS = [
-  "novel_project_list",
   "novel_run_create",
   "novel_chapter_review",
   "novel_chapter_generate",
@@ -68,14 +68,14 @@ describe("McpToolGatewayPanel", () => {
   });
 
   describe("可执行工具标识", () => {
-    it("4 个直接执行工具带有「可执行」标识", () => {
+    it("直接执行工具带有「可执行」标识", () => {
       const html = renderPanel();
       for (const toolName of DIRECT_EXEC_TOOLS) {
         expect(html).toContain(toolName);
       }
-      // 「可执行」Tag 出现次数应 >= 4（每个 DIRECT_EXEC 工具一个）
+      // 「可执行」Tag 出现次数 = DIRECT_EXEC_TOOLS 全集（当前 8 个）
       const execCount = (html.match(/可执行/g) ?? []).length;
-      expect(execCount).toBeGreaterThanOrEqual(4);
+      expect(execCount).toBeGreaterThanOrEqual(DIRECT_EXEC_TOOLS.length);
       expect(html).toContain("执行（通过 API）");
     });
   });

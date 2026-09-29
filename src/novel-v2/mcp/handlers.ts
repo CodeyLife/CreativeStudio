@@ -624,16 +624,6 @@ const novel_rule_candidate_advance: ToolHandler = async (args, ctx) => {
   throw new Error("action 只能是 evidence/evaluate/review/promote/rollback");
 };
 
-// ===== 项目生命周期（1）=====
-
-// novel_project_create 已于 2026-09-24 撤出 MCP 工具面（三批减法）：近零 MCP 调用，
-// 项目创建走 REST/Web 通道；已存在项目的规划重启用 novel_bootstrap_run。
-
-const novel_project_list: ToolHandler = async (_args, ctx) => {
-  const projects = await ctx.repository.listProjects();
-  return { projects };
-};
-
 // ===== 规划与创作（8）=====
 
 const novel_bootstrap_run: ToolHandler = async (args, ctx) => {
@@ -1268,9 +1258,6 @@ export const TOOL_HANDLERS: Record<string, ToolHandler> = {
   // Run / Action 主体（2）
   novel_run_create,
   novel_action_execute,
-
-  // 项目生命周期（1）
-  novel_project_list,
 
   // 项目观测（1）
   novel_project_inspect,

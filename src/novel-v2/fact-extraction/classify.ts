@@ -34,6 +34,8 @@ export interface ClassifiedFact {
   readonly claim: MemoryClaim;
   readonly risk: FactRisk;
   readonly riskReason: string;
+  /** 确定性矛盾核验命中时的审计信息：同槽位的冻结声明 id 列表（迭代 2）。 */
+  readonly factContradiction?: { frozenClaimIds: string[] };
 }
 
 export interface ClassifyFactCandidatesInput {
@@ -47,6 +49,12 @@ export interface ClassifyFactCandidatesInput {
    * 若未提供，supersedes 始终为空数组（与旧行为一致，但不满足长程一致性契约）。
    */
   existingClaimIndex?: Map<string, string[]>;
+  /**
+   * 确定性矛盾核验的取值指纹索引（improvement-plan-fact-injection-20260922 迭代 2）：
+   * 冻结 claim id → value_hash。与 existingClaimIndex 同源（getFactExtractionContext）。
+   * 缺省时不做异值判定（无法区分同值重复与异值矛盾，保持沉默由审批通道兜底）。
+   */
+  existingValueHashById?: Map<string, string | undefined>;
 }
 
 const CONTINUITY_PREDICATE_PATTERN = /身份|姓名|年龄|生死|死亡|存活|状态|位置|所在地|持有|拥有|失去|获得|知道|得知|隐瞒|关系|亲属|敌友|承诺|约定|时间|日期|先后|能力|限制|伤势|阵营|职位|修为/u;
@@ -99,8 +107,50 @@ export function classifyFactRisk(params: {
   artifactId: string;
   baseRevision: number;
   existingClaimIndex?: Map<string, string[]>;
+  existingValueHashById?: Map<string, string | undefined>;
 }): ClassifiedFact {
   const { fact, projectId } = params;
+
+  // P0-A1: novelty=update 时按 subject.id+predicate 查 existingClaimIndex 填充 supersedes。
+  // FM-1 收紧（product-audit-20260910 A1）：仅值槽谓词（单一当前值）允许整槽退役；
+  // 事件累积型谓词的多行同属不同事件，单条 update 不得清扫整槽，否则会把未提及的
+  // 既有派生事实连带逐出检索面（实测资产账本断线根因）。
+  let supersedes: string[] = [];
+  if (fact.novelty === "update" && params.existingClaimIndex && isValueSlotPredicate(fact.predicate)) {
+    const key = `${normalizeFactToken(fact.subject.id)}|${canonicalizeFactPredicate(fact.predicate)}`;
+    supersedes = params.existingClaimIndex.get(key) ?? [];
+  }
+
+  const identityHash = factIdentityHash(fact);
+  const valueHash = factValueHash(fact);
+
+  // 确定性矛盾核验（improvement-plan-fact-injection-20260922 迭代 2，零模型调用）。
+  //
+  // 根因：supersedes 只在 LLM 声明 novelty=update 且谓词属值槽时填充——LLM 把
+  // "改写冻结事实"误声明为 novelty=new 时（020 账册日期 / 021 交易条款 / 024
+  // 玉牌归属的漏网通道），同槽异值矛盾会以低风险 derived 静默入库并进入检索面。
+  //
+  // 判定（与 FM-1 同一语义边界，只覆盖值槽谓词；事件累积型谓词同槽多值合法，
+  // 交由 asset-ledger 对照与三审，此处刻意不覆盖）：
+  //   同 `subject|predicate` 键命中冻结表 + 值槽谓词 + 新取值指纹与全部已知冻结
+  //   取值不同 + 未携带合法 supersedes → fact-contradiction：强制 high risk +
+  //   authority=candidate，复用既有"冲突须人工裁决"晋升门（candidate 不进检索面，
+  //   见 memory-visibility.ts VISIBLE_CLAIM_AUTHORITIES）。
+  //   同值（指纹相同）→ 归去重不报；冻结取值未知（其他管道写入）→ 保持沉默
+  //   （宁可少报，与 classify 的"安全偏置"同向）。
+  let factContradiction = false;
+  let contradictionFrozenIds: string[] = [];
+  if (!fact.conflict && fact.truthStatus === "objective" && fact.polarity === "affirmed" && !supersedes.length && params.existingClaimIndex && params.existingValueHashById && isValueSlotPredicate(fact.predicate)) {
+    const key = `${normalizeFactToken(fact.subject.id)}|${canonicalizeFactPredicate(fact.predicate)}`;
+    const frozenIds = params.existingClaimIndex.get(key) ?? [];
+    const knownFrozenHashes = frozenIds
+      .map((id) => params.existingValueHashById?.get(id))
+      .filter((hash): hash is string => typeof hash === "string");
+    if (frozenIds.length > 0 && knownFrozenHashes.length > 0 && !knownFrozenHashes.includes(valueHash)) {
+      factContradiction = true;
+      contradictionFrozenIds = frozenIds;
+    }
+  }
 
   let risk: FactRisk = "low";
   let riskReason = "新增客观事实，自动入库";
@@ -114,6 +164,9 @@ export function classifyFactRisk(params: {
   } else if (fact.novelty === "update") {
     risk = "medium";
     riskReason = "更新既有事实，需审核影响范围";
+  } else if (factContradiction) {
+    risk = "high";
+    riskReason = "确定性矛盾核验：与冻结事实同槽异值且未声明覆盖（supersedes），须人工裁决后方可晋升";
   } else if (fact.confidence < 0.75 && isContinuitySensitiveFact(fact)) {
     risk = "medium";
     riskReason = "低置信连续性事实可能改变角色、关系、时间线或承诺状态，需人工确认";
@@ -135,19 +188,6 @@ export function classifyFactRisk(params: {
     ? "derived"
     : "candidate";
 
-  // P0-A1: novelty=update 时按 subject.id+predicate 查 existingClaimIndex 填充 supersedes。
-  // FM-1 收紧（product-audit-20260910 A1）：仅值槽谓词（单一当前值）允许整槽退役；
-  // 事件累积型谓词的多行同属不同事件，单条 update 不得清扫整槽，否则会把未提及的
-  // 既有派生事实连带逐出检索面（实测资产账本断线根因）。
-  let supersedes: string[] = [];
-  if (fact.novelty === "update" && params.existingClaimIndex && isValueSlotPredicate(fact.predicate)) {
-    const key = `${normalizeFactToken(fact.subject.id)}|${canonicalizeFactPredicate(fact.predicate)}`;
-    supersedes = params.existingClaimIndex.get(key) ?? [];
-  }
-
-  const identityHash = factIdentityHash(fact);
-  const valueHash = factValueHash(fact);
-
   const claim: MemoryClaim = {
     id: `claim:${projectId}:${valueHash.slice(0, 24)}`,
     projectId,
@@ -168,7 +208,7 @@ export function classifyFactRisk(params: {
     valueHash,
   };
 
-  return { claim, risk, riskReason };
+  return { claim, risk, riskReason, ...(factContradiction ? { factContradiction: { frozenClaimIds: contradictionFrozenIds } } : {}) };
 }
 
 /**
@@ -186,5 +226,6 @@ export function classifyFactCandidates(params: ClassifyFactCandidatesInput): Cla
     artifactId: params.artifactId,
     baseRevision: params.baseRevision,
     existingClaimIndex: params.existingClaimIndex,
+    existingValueHashById: params.existingValueHashById,
   }));
 }

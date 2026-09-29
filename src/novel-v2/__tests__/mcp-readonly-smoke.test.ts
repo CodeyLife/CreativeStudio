@@ -46,7 +46,8 @@ describe("MCP 只读工具 smoke 契约（OR-E1）", () => {
     for (const guard of ["novel_project_inspect", "novel_artifact_query", "novel_workflow_query"]) {
       expect(names).toContain(guard);
     }
-    expect(names.length).toBeGreaterThanOrEqual(9);
+    // 2026-09-24 四批撤 project_list（REST 孪生）后，只读面 8 个。
+    expect(names.length).toBeGreaterThanOrEqual(8);
   });
 
   it("模式不会把写动作工具吸进烟测面（副作用边界）", () => {

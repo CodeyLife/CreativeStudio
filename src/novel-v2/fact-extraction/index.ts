@@ -38,6 +38,12 @@ export interface ExtractFactsInput {
    * 让 retrieval 层屏蔽被覆盖的旧版本，避免 LLM 看到自相矛盾的事实。
    */
   existingClaimsIndex?: Map<string, string[]>;
+  /**
+   * 确定性矛盾核验的取值指纹索引（improvement-plan-fact-injection-20260922 迭代 2）：
+   * 冻结 claim id → value_hash，与 existingClaimsIndex 同源（getFactExtractionContext）。
+   * 提供时 classify 层对值槽谓词做同槽异值对账，矛盾候选强制 candidate（不进检索面）。
+   */
+  existingValueHashById?: Map<string, string | undefined>;
   /** 当前叙事截止点可见的开放伏笔/承诺，用于兑现时建立精确关联。 */
   openNarrativeElements?: {
     foreshadowings: Array<{ id: string; description: string; triggerKeywords: string[]; expectedPayoffWindow: string; readerQuestion?: string; possiblePayoffs?: string[]; meaningDelta?: string; cost?: string }>;
@@ -83,6 +89,13 @@ export interface ExtractFactsResult {
    * repository.recordNarrativeElements 写入对应表；没有对应内容时使用空数组。
    */
   narrativeElements: FactExtractionOutput["narrativeElements"];
+  /**
+   * 确定性矛盾核验结果（迭代 2）：与冻结表同槽异值且未声明覆盖的候选清单。
+   * 这些候选已被强制 authority=candidate（须人工裁决后晋升，不进检索面）。
+   */
+  verification: {
+    contradictions: Array<{ claimId: string; subjectRef: string; predicate: string; frozenClaimIds: string[]; riskReason: string }>;
+  };
   stats: {
     totalCandidates: number;
     kept: number;
@@ -204,6 +217,7 @@ export function projectFactExtractionOutput(input: Omit<ExtractFactsInput, "mode
     artifactId: input.artifact.id,
     baseRevision: input.artifact.baseRevision,
     existingClaimIndex,
+    existingValueHashById: input.existingValueHashById,
   });
 
   const projectedClaims = classified.map((item) => item.claim);
@@ -215,6 +229,13 @@ export function projectFactExtractionOutput(input: Omit<ExtractFactsInput, "mode
     claims,
     // Phase 3.1: 透传 narrativeElements 给 activity 层，由其调用 recordNarrativeElements
     narrativeElements: normalized.narrativeElements,
+    // 确定性矛盾核验审计面（迭代 2）：结构化冲突清单随提取结果上浮，
+    // activity 层落 factArtifact.structuredData.verification，不静默。
+    verification: {
+      contradictions: classified
+        .filter((item) => item.factContradiction)
+        .map((item) => ({ claimId: item.claim.id, subjectRef: item.claim.subjectRefs[0] ?? "", predicate: item.claim.predicate ?? "", frozenClaimIds: item.factContradiction!.frozenClaimIds, riskReason: item.riskReason })),
+    },
     stats: {
       totalCandidates: deduped.totalCandidates,
       kept: deduped.kept.length,

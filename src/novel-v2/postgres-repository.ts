@@ -7420,9 +7420,9 @@ export class NovelPostgresRepository {
     }
   }
 
-  async getFactExtractionContext(projectId: string, narrativeCutoff?: number): Promise<{ contentHashes: Set<string>; claimsIndex: Map<string, string[]>; claimsDigest: string }> {
-    const result = await this.pool.query<{ id: string; content_hash: string; subject_refs: string[] | null; predicate: string | null; title: string; content: string }>(
-      `SELECT id,content_hash,subject_refs,predicate,title,content
+  async getFactExtractionContext(projectId: string, narrativeCutoff?: number): Promise<{ contentHashes: Set<string>; claimsIndex: Map<string, string[]>; claimsDigest: string; valueHashById: Map<string, string | undefined> }> {
+    const result = await this.pool.query<{ id: string; content_hash: string; value_hash: string | null; subject_refs: string[] | null; predicate: string | null; title: string; content: string }>(
+      `SELECT id,content_hash,value_hash,subject_refs,predicate,title,content
        FROM memory_claims
        WHERE project_id=$1 AND lifecycle_status='active' AND authority <> 'rejected'
          AND NOT ${retiredByVisibleKillerSql("memory_claims")}
@@ -7433,8 +7433,14 @@ export class NovelPostgresRepository {
     );
     const contentHashes = new Set<string>();
     const claimsIndex = new Map<string, string[]>();
+    // 值哈希索引（improvement-plan-fact-injection-20260922 迭代 2）：确定性矛盾核验
+    // 需要"同槽位冻结声明的取值指纹"来区分 同值重复 / 异值矛盾，claimsIndex 只有 id。
+    // 未知 value_hash（其他管道写入的行）记 undefined——核验侧对未知取值保持沉默
+    // （宁可少报，由既有审批通道兜底）。
+    const valueHashById = new Map<string, string | undefined>();
     for (const row of result.rows) {
       contentHashes.add(row.content_hash);
+      valueHashById.set(row.id, row.value_hash ?? undefined);
       if (!row.predicate) continue;
       for (const subject of row.subject_refs ?? []) {
         const key = `${normalizeFactToken(subject)}|${canonicalizeFactPredicate(row.predicate)}`;
@@ -7492,7 +7498,7 @@ export class NovelPostgresRepository {
     const claimsDigest = detailLines.length || slotLines.length
       ? [...truncationNotice, ...detailLines, ...slotLines].join("\n")
       : "- 暂无已存在记忆。所有事实 novelty=new。";
-    return { contentHashes, claimsIndex, claimsDigest };
+    return { contentHashes, claimsIndex, claimsDigest, valueHashById };
   }
 
   async recordFactApprovalPolicy(input: { projectId: string; artifactId: string; workflowId: string }): Promise<FactApprovalSummary> {

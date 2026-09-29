@@ -109,12 +109,28 @@ export function dedupeDraftMemory(input: DraftPromptInput): MemoryBundle {
 export function buildChapterDraftPromptPackage(input: DraftPromptInput & { workflowId: string; system: string }): StagePromptPackage {
   const memory = dedupeDraftMemory(input);
   const instruction = buildWritingContract(input.planningContext?.chapter?.targetWordCount);
+  // 方向冻结事实分轨（improvement-plan-fact-injection-20260922 迭代 1）：
+  // reason="direction-pinned" 的 claim 是按本章蓝图实体/线程定向检索并强制注入的
+  // 冻结断言（020/021/024 类改写矛盾的生成端防线）。单独成段并配对照指令，
+  // 不与普通 ranked-fill 冻结事实混列——它是"须严格遵循"的验收面，不是背景参考。
+  const directionClaims = memory.claims.filter((claim) => claim.reason === "direction-pinned");
   const sections = [
     { id: "draft-contract", kind: "goal" as const, title: "正文写作契约", text: instruction, priority: "critical" as const, provenanceRefs: [input.intent.id] },
     { id: "author-intent", kind: "goal" as const, title: "作者目标", text: renderIntent(input.intent), priority: "required" as const, provenanceRefs: [input.intent.id] },
     ...(input.planningContext ? [{ id: "execution-contract", kind: "planning" as const, title: "章节执行合同", text: renderChapterExecutionContract(input.planningContext), priority: "required" as const, provenanceRefs: [input.planningContext.fingerprint] }] : []),
     { id: "blueprint", kind: "blueprint" as const, title: "工作流蓝图引用", text: buildBlueprintSummary(input.blueprint, input.planningContext), priority: "normal" as const, provenanceRefs: [input.blueprint.id] },
-    ...memory.claims.filter((claim) => !claim.id.startsWith("foundation:")).map((claim) => ({ id: `memory:${claim.id}`, kind: "fact" as const, title: `冻结事实：${claim.title}`, text: renderExecutionMemoryClaim(claim).text, priority: memoryClaimPriority(memory, claim), provenanceRefs: [claim.id, ...claim.sourceRevisionIds] })),
+    ...(directionClaims.length ? [{
+      id: "direction-frozen-facts",
+      kind: "fact" as const,
+      title: "本章方向冻结事实",
+      text: [
+        "以下为与本章创作方向直接相关的已冻结事实（按本章蓝图实体与所属弧线程定向检索）：须严格遵循，不得改写其数值、归属、时间或既定状态；情节需要状态变化时必须以正文中真实发生的事件呈现并保持与既有事实的先后一致，不得静默改写。",
+        ...directionClaims.map((claim) => `- ${claim.title}：${claim.content}`),
+      ].join("\n"),
+      priority: "required" as const,
+      provenanceRefs: directionClaims.map((claim) => claim.id),
+    }] : []),
+    ...memory.claims.filter((claim) => !claim.id.startsWith("foundation:") && claim.reason !== "direction-pinned").map((claim) => ({ id: `memory:${claim.id}`, kind: "fact" as const, title: `冻结事实：${claim.title}`, text: renderExecutionMemoryClaim(claim).text, priority: memoryClaimPriority(memory, claim), provenanceRefs: [claim.id, ...claim.sourceRevisionIds] })),
     // 创作契约与冻结事实分轨（product-audit-20260910 A2）：foundation 段级投影是
     // 规划边界而非逐字事实清单，混在「冻结事实」名下会诱导把规划摘要当既定事实复述，
     // 且以体量垄断事实预算（实测 fact token 97:3）。分轨后仍全部注入，仅归名与角色不同。

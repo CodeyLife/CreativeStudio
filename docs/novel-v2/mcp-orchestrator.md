@@ -2,7 +2,7 @@
 
 > 活动契约：2026-08-06。本文定义「外部大模型作为任务编排、审核、推进、编辑与迭代优化者」参与小说创作全流程的 MCP 工作流。代码行为以 [workflow-map.md](./workflow-map.md) 与源码为准，本文是流程与工具映射参考。
 >
-> 当前工具面：21（真值 `src/novel-v2/mcp/tool-metadata.ts` 的 `TOOL_COUNT`；本文与各 skill 声明的数字由 `src/novel-v2/__tests__/mcp-tool-face-single-source.test.ts` 强制对齐，改工具必须同批改这里）。2026-09-24 减法记录（三批）：撤 project_create（项目创建走 REST/Web；已存在项目的规划重启用 novel_bootstrap_run）；弧规划三入口合一（novel_story_arc_batch_start / novel_story_arc_orchestrate 并入 novel_story_arc_start 的 mode=batch / mode=orchestrated）；观测面三对合一（novel_catalog_get + novel_context_get → novel_project_inspect(view=catalog|context)、novel_artifact_get + novel_artifact_list → novel_artifact_query、novel_workflow_get + novel_workflow_list → novel_workflow_query）；审校双入口合一（novel_chapter_review_issue_add 并入 novel_chapter_review 的 issues 参数，两步协议并一步）；决策面合一（novel_chapter_review_decision + novel_story_arc_decision → novel_workflow_decision 的 target=chapter-review|story-arc）。减法记录（二批，同日）：撤 12 增 1——novel_chapter_script_h3、novel_closed_loop_run、novel_prompt_inspect、novel_invocation_list、novel_rule_candidate_get、novel_review_submit（并入 novel_action_execute 的 review.submit）、novel_project_delete、novel_run_get；rule 五个人工步骤合并为 novel_rule_candidate_advance。减法记录（一批，同日）：撤 9 个零真实调用工具（novel_action_list、novel_run_complete、novel_receipt_get、novel_rule_target_get、novel_skill_get〔发现能力并入 novel_skill_query〕、novel_chapter_script_h3_submit、novel_memory_grooming_report、novel_chapter_recall_report、novel_model_dispatch），下文已同步。
+> 当前工具面：20（真值 `src/novel-v2/mcp/tool-metadata.ts` 的 `TOOL_COUNT`；本文与各 skill 声明的数字由 `src/novel-v2/__tests__/mcp-tool-face-single-source.test.ts` 强制对齐，改工具必须同批改这里）。2026-09-24 减法记录（四批）：撤 novel_project_list（REST `GET /v2/projects` 完整同源孪生，项目状态观测由 novel_project_inspect(view=catalog) 承载）。减法记录（三批）：撤 project_create（项目创建走 REST/Web；已存在项目的规划重启用 novel_bootstrap_run）；弧规划三入口合一（novel_story_arc_batch_start / novel_story_arc_orchestrate 并入 novel_story_arc_start 的 mode=batch / mode=orchestrated）；观测面三对合一（novel_catalog_get + novel_context_get → novel_project_inspect(view=catalog|context)、novel_artifact_get + novel_artifact_list → novel_artifact_query、novel_workflow_get + novel_workflow_list → novel_workflow_query）；审校双入口合一（novel_chapter_review_issue_add 并入 novel_chapter_review 的 issues 参数，两步协议并一步）；决策面合一（novel_chapter_review_decision + novel_story_arc_decision → novel_workflow_decision 的 target=chapter-review|story-arc）。减法记录（二批，同日）：撤 12 增 1——novel_chapter_script_h3、novel_closed_loop_run、novel_prompt_inspect、novel_invocation_list、novel_rule_candidate_get、novel_review_submit（并入 novel_action_execute 的 review.submit）、novel_project_delete、novel_run_get；rule 五个人工步骤合并为 novel_rule_candidate_advance。减法记录（一批，同日）：撤 9 个零真实调用工具（novel_action_list、novel_run_complete、novel_receipt_get、novel_rule_target_get、novel_skill_get〔发现能力并入 novel_skill_query〕、novel_chapter_script_h3_submit、novel_memory_grooming_report、novel_chapter_recall_report、novel_model_dispatch），下文已同步。
 
 ## 1. 核心设计
 
@@ -178,14 +178,13 @@ novel_rule_candidate_advance(candidateId, action=evidence|evaluate|review|promot
 8. **编排权威顺序**：已定稿事实 / 叙事状态账本 / 作者边界 > 外部剧情编排 > 模型自行发挥；编排只给方向，不给假事实。
 9. **外部编排模型直接参与编辑**：外部编排模型既是审核者也是编辑者，不是纯守门人。对**证据明确、修法无争议**的问题（错字/标点混用、账本可查证的跨章时序矛盾、与冻结契约直接冲突的违例段落），直接走完整编辑闭环：`novel_chapter_review(issues=[...])`（一次登记 + 定向修订）→ 核对候选稿实际改动 → `novel_workflow_decision(target=chapter-review, approve, feedback=证据链)`，不必逐条请示作者；**修法涉及取舍**（剧情走向、人物命运、弧级 resolution、风格偏好）时不擅自决定，登记意见并给作者选项。批准 feedback 必须写清目标达成证据、范围外遗留登记与命名漂移警告的核实结论（删除引语/复述段导致的短语频次下降是常见假阳性，≠实体漂移）；命名漂移警告必须人工核对后再批准或打回。
 
-## 4. 工具清单（当前工具面：21 个）
+## 4. 工具清单（当前工具面：20 个）
 
 | 组 | 工具 |
 | --- | --- |
 | Run / Action（2） | novel_run_create、novel_action_execute |
 | 项目观测（1） | novel_project_inspect（view=catalog|context，2026-09-24 三批吸收原 Catalog 与 context_get） |
 | Craft Rule 演进（2） | novel_rule_candidate_create、novel_rule_candidate_advance |
-| 项目生命周期（1） | novel_project_list（项目创建走 REST/Web） |
 | 规划与创作（8） | novel_bootstrap_run、novel_chapter_review（issues 参数吸收原 issue_add）、novel_chapter_generate、novel_story_arc_start（mode=auto|batch|orchestrated 三入口合一）、novel_story_arc_get、novel_story_arc_review、novel_foreshadowing_list、novel_foreshadowing_triage |
 | 产物与工作流观测（2） | novel_artifact_query（单查/列查合一）、novel_workflow_query（单查/列查合一） |
 | Workflow 决策（1） | novel_workflow_decision（target=chapter-review|story-arc 双门合一） |

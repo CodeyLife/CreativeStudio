@@ -15,7 +15,6 @@ export const TOOL_GROUPS: ToolGroup[] = [
   { key: "run-action", title: "Run / Action 主体", tools: ["novel_run_create", "novel_action_execute"] },
   { key: "project-inspect", title: "项目观测", tools: ["novel_project_inspect"] },
   { key: "craft-rule", title: "Craft Rule 候选演进", tools: ["novel_rule_candidate_create", "novel_rule_candidate_advance"] },
-  { key: "project", title: "项目生命周期", tools: ["novel_project_list"] },
   { key: "bootstrap", title: "规划与创作", tools: ["novel_bootstrap_run", "novel_chapter_review", "novel_chapter_generate", "novel_story_arc_start", "novel_story_arc_get", "novel_story_arc_review", "novel_foreshadowing_list", "novel_foreshadowing_triage"] },
   { key: "observability", title: "产物与工作流观测", tools: ["novel_artifact_query", "novel_workflow_query"] },
   { key: "workflow-decision", title: "Workflow 决策", tools: ["novel_workflow_decision"] },
@@ -28,7 +27,6 @@ const SHORT_LABELS: Partial<Record<ToolName, string>> = {
   novel_project_inspect: "项目观测",
   novel_rule_candidate_create: "创建规则候选",
   novel_rule_candidate_advance: "推进规则候选",
-  novel_project_list: "列出项目",
   novel_bootstrap_run: "启动基础+规划",
   novel_chapter_review: "章节审校工作流",
   novel_chapter_generate: "生成章节",
@@ -57,7 +55,6 @@ export const TOOL_DESCRIPTIONS: Record<string, ToolInfo> = Object.fromEntries(
 ) as Record<string, ToolInfo>;
 
 export const DIRECT_EXEC_TOOLS = new Set<string>([
-  "novel_project_list",
   "novel_run_create",
   "novel_chapter_review",
   "novel_chapter_generate",

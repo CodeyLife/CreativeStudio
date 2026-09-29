@@ -14,12 +14,15 @@
  * - Run / Action 主体（2）
  * - 项目观测（1，project_inspect 吸收 catalog_get 与 context_get）
  * - Craft Rule 候选演进（2）
- * - 项目生命周期（1，project_create 撤出 MCP 面，能力走 REST/Web）
  * - 规划与创作（8，story_arc_start 按 mode 三合一；chapter_review 吸收 issue_add）
  * - 产物与工作流观测（2，artifact_query / workflow_query 各吸收单查与列查）
  * - Workflow 决策（1，workflow_decision 合并章节门与故事弧门）
  * - 外部 LLM 深度参与（4，记忆查询/候选队列/裁决/skill 查询；
  *   明细见 tool-metadata.ts 的 TOOL_GROUPS）
+ *
+ * 减法记录 2026-09-24（四批）：21→20——novel_project_list（项目列表 REST `GET /v2/projects`
+ * 完整同源孪生（同一 listProjects），Web 面板直执本就走 REST；项目级状态观测由
+ * novel_project_inspect(view=catalog) 承载，MCP 形态是纯重复壳）。
  *
  * 减法记录 2026-09-24（三批）：29→21，净撤 8 增 0——novel_project_create（近零 MCP 调用，
  * REST/Web 创建通道在场）；story_arc_batch_start / story_arc_orchestrate 并入
@@ -178,8 +181,6 @@ export const TOOL_NAMES = [
   // Craft Rule 候选演进（2）
   "novel_rule_candidate_create",
   "novel_rule_candidate_advance",
-  // 项目生命周期（1）
-  "novel_project_list",
   // 规划与创作（8）
   "novel_bootstrap_run",
   "novel_chapter_review",
@@ -340,21 +341,6 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
       additionalProperties: false,
     },
   },
-
-  // ===== 项目生命周期（1）=====
-
-
-
-  {
-    name: "novel_project_list",
-    description: "列出所有项目（按 updatedAt DESC）。",
-    inputSchema: {
-      type: "object",
-      properties: {},
-      additionalProperties: false,
-    },
-  },
-
 
   // ===== 规划与创作主体（8）=====
 

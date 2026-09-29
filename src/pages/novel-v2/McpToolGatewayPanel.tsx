@@ -39,9 +39,6 @@ function buildMcpCommand(toolName: string, args: unknown): string {
 
 async function directExecute(toolName: string, args: Record<string, unknown>): Promise<unknown> {
   switch (toolName) {
-    case "novel_project_list": {
-      return novelFetch("/v2/projects");
-    }
     case "novel_run_create": {
       const projectId = String(args.projectId ?? "");
       if (!projectId) throw new Error("projectId 必填");

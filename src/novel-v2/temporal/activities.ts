@@ -23,6 +23,7 @@ import { buildChapterReviewPromptPackage, getReviewFocus, reviewExecutionPoint, 
 import { applyRevisionWindows, applyTargetedRevisionReplacements, authorRevisionAlignmentSchema, buildAuthorRevisionRepairPromptPackage, buildFullChapterRevisionPromptPackage, buildRevisionWindowPromptPackage, buildTargetedRevisionBatchPromptPackage, planRevisionWindows, revisionWindowsCoverAllIssues, sanitizeRevisionOutput, shouldUseRevisionWindows, splitChapterParagraphs, TargetedRevisionContractError, targetedRevisionBatchSchema, type AuthorRevisionAlignment, type RevisionAttempt, type TargetedRevisionReplacement } from "../prompts/chapter-revision";
 import { chapterStateDeltaSchema, reviewerSchema, type ChapterStateDelta, type FactExtractionOutput, type FoundationOutput, type ReviewerOutput } from "../prompts/schemas";
 import { extractFactsWithStats, projectFactExtractionOutput } from "../fact-extraction";
+import { buildFactRetrievalPlan, capDirectionPinnedClaims } from "../fact-retrieval";
 import { enrichCharactersFromChapter, loadCharacterIdentityRegistry, parseCharacterEnrichmentOutput } from "../character-enrichment";
 import { uniqueCharacterIdentities, type CharacterIdentityIndex } from "../character-identity";
 import { characterEnrichmentSchema } from "../prompts/schemas";
@@ -457,7 +458,31 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
           console.warn(`[memory] 文风契约注入失败，继续使用已有记忆：${(error as Error).message}`);
         }
       }
-      const bundle = await buildMemoryBundle(input.plan, { projectId: input.projectId, provider: deps.memoryProvider, tokenBudget, pinnedClaims: narrativeHits, additionalClaims: [...openNarrativeHits, ...styleContractHits] });
+      // 方向驱动事实检索（improvement-plan-fact-injection-20260922 迭代 1）：
+      // 把"本章要写什么方向"翻译成强制注入的冻结断言。020/021/024 类硬矛盾的根因
+      // 是相关冻结断言在预算竞价中落选、模型凭记忆重写；这里从结构化源（蓝图场景
+      // 参与者 + 弧线程责任）派生定向 facet，命中经 cutoff/生命周期过滤后作为
+      // pinnedClaims 注入——即使预算竞价落选也强制在场。任何失败都降级为无方向
+      // 强注，不阻塞检索主链。
+      let directionHits: MemoryHit[] = [];
+      if ((input.plan.taskClass === "drafting" || input.plan.taskClass === "revision") && input.plan.targetDocumentId) {
+        try {
+          // allowHistorical=true：只读蓝图做 facet 派生，不重复工作流侧的弧新鲜度门
+          // （该门由 loadChapterPlanningContext 在 compileBlueprint 前照常执行）。
+          const planning = await deps.repository.getChapterPlanningContext(input.projectId, input.plan.targetDocumentId, true);
+          const factPlan = buildFactRetrievalPlan({ chapterBlueprint: planning.chapter, threadResponsibilities: planning.arc.threadResponsibilities });
+          for (const warning of factPlan.enhancementWarnings) console.warn(`[fact-retrieval] ${warning}`);
+          if (factPlan.facets.length) {
+            const hits = await deps.memoryProvider.search({ projectId: input.projectId, facets: factPlan.facets, narrativeCutoff: input.plan.narrativeCutoff, povCharacterId: input.plan.povCharacterId });
+            directionHits = capDirectionPinnedClaims(
+              hits.filter((hit) => hit.lifecycleStatus !== "staged" && isMemoryClaimVisibleAtCutoff(hit, input.plan.narrativeCutoff)),
+            );
+          }
+        } catch (error) {
+          console.warn(`[fact-retrieval] 方向事实检索失败，降级为无方向强注：${(error as Error).message}`);
+        }
+      }
+      const bundle = await buildMemoryBundle(input.plan, { projectId: input.projectId, provider: deps.memoryProvider, tokenBudget, pinnedClaims: [...narrativeHits, ...directionHits], additionalClaims: [...openNarrativeHits, ...styleContractHits] });
       if (!input.plan.targetDocumentId || typeof input.plan.narrativeCutoff !== "number") return bundle;
       const [narrativeRhythm, serialContext] = await Promise.all([
         loadNarrativeRhythm(input.projectId, input.plan.targetDocumentId, input.plan.narrativeCutoff),
@@ -1034,9 +1059,14 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
           : await deps.repository.getOpenForeshadowingAndPromises(input.projectId, input.narrativeOrder - 1).catch(() => undefined);
         const identityContext = await loadExtractionIdentityContext(input.projectId);
         // Phase 3.1: 提取 claims 与正文修订派生数据；派生数据等待 commit 取得真实 revisionId 后落库。
-        const result = await extractFactsWithStats({ projectId: input.projectId, artifact: factArtifact, text: input.text, model, existingClaimsDigest: extractionContext.claimsDigest, existingContentHashes: extractionContext.contentHashes, existingClaimsIndex: extractionContext.claimsIndex, openNarrativeElements, narrativeOrder: input.narrativeOrder, routingSnapshot: input.routingSnapshot, candidateStartIndex: input.candidateStartIndex, workflowRunId: input.workflowId, taskId: `${input.artifact.taskId}:facts:model`, skillBundle: currentSkills, identityIndex: identityContext?.identityIndex, canonicalCharacters: identityContext?.canonicalCharacters });
+        const result = await extractFactsWithStats({ projectId: input.projectId, artifact: factArtifact, text: input.text, model, existingClaimsDigest: extractionContext.claimsDigest, existingContentHashes: extractionContext.contentHashes, existingClaimsIndex: extractionContext.claimsIndex, existingValueHashById: extractionContext.valueHashById, openNarrativeElements, narrativeOrder: input.narrativeOrder, routingSnapshot: input.routingSnapshot, candidateStartIndex: input.candidateStartIndex, workflowRunId: input.workflowId, taskId: `${input.artifact.taskId}:facts:model`, skillBundle: currentSkills, identityIndex: identityContext?.identityIndex, canonicalCharacters: identityContext?.canonicalCharacters });
+        if (result.verification.contradictions.length) {
+          // 确定性矛盾核验命中（迭代 2）：冲突候选已强制 candidate，不进检索面；
+          // 此处留痕 + 随 factArtifact.structuredData 上浮供审批/审计面消费。
+          console.warn(`[fact-verification] ${result.verification.contradictions.length} 条新事实与冻结表同槽异值且未声明覆盖，已强制候选待裁决：${result.verification.contradictions.map((item) => item.claimId).join("、")}`);
+        }
         await deps.repository.recordFactExtraction({ projectId: input.projectId, artifact: factArtifact, claims: result.claims, lifecycleStatus: "staged", documentId: input.documentId, workflowId: input.workflowId, narrativeOrder: input.narrativeOrder });
-        return { kind: "completed", artifact: { ...factArtifact, structuredData: { ...factArtifact.structuredData, narrativeElements: result.narrativeElements } } };
+        return { kind: "completed", artifact: { ...factArtifact, structuredData: { ...factArtifact.structuredData, narrativeElements: result.narrativeElements, verification: result.verification } } };
       } catch (error) {
         if (!(error instanceof ExternalMcpRequiredError)) throw error;
         const extractionContext = await deps.repository.getFactExtractionContext(input.projectId, input.narrativeOrder === undefined ? undefined : input.narrativeOrder - 1);
@@ -1057,9 +1087,9 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       if (!task || task.status !== "submitted" || !validate(task.result?.value)) throw new Error(`外部事实提取结果无效：${validate.errors?.map((item) => item.message).join("；") ?? "任务未提交"}`);
       const extractionContext = await deps.repository.getFactExtractionContext(input.projectId, input.narrativeOrder === undefined ? undefined : input.narrativeOrder - 1);
       const identityContext = await loadExtractionIdentityContext(input.projectId);
-      const projected = projectFactExtractionOutput({ projectId: input.projectId, artifact: input.artifact, text: input.text, existingClaimsDigest: extractionContext.claimsDigest, existingContentHashes: extractionContext.contentHashes, existingClaimsIndex: extractionContext.claimsIndex, narrativeOrder: input.narrativeOrder, identityIndex: identityContext?.identityIndex }, task.result!.value as ChapterStateDelta);
+      const projected = projectFactExtractionOutput({ projectId: input.projectId, artifact: input.artifact, text: input.text, existingClaimsDigest: extractionContext.claimsDigest, existingContentHashes: extractionContext.contentHashes, existingClaimsIndex: extractionContext.claimsIndex, existingValueHashById: extractionContext.valueHashById, narrativeOrder: input.narrativeOrder, identityIndex: identityContext?.identityIndex }, task.result!.value as ChapterStateDelta);
       await deps.repository.recordFactExtraction({ projectId: input.projectId, artifact: input.artifact, claims: projected.claims, lifecycleStatus: "staged", documentId: input.documentId, workflowId: task.workflowRunId, narrativeOrder: input.narrativeOrder });
-      return { ...input.artifact, structuredData: { ...input.artifact.structuredData, narrativeElements: projected.narrativeElements } };
+      return { ...input.artifact, structuredData: { ...input.artifact.structuredData, narrativeElements: projected.narrativeElements, verification: projected.verification } };
     },
     approveFacts: (input: { workflowId: string; projectId: string; artifact: Artifact }) =>
       deps.repository.recordFactApprovalPolicy({ workflowId: input.workflowId, projectId: input.projectId, artifactId: input.artifact.id }),

@@ -36,7 +36,7 @@ const mockCtx = {
 // ===== A. 纯函数：validateToolArgs（无 Postgres 依赖）=====
 
 describe("validateToolArgs pure function", () => {
-  it("TOOL_NAMES has exactly 21 tools", () => {
+  it("TOOL_NAMES has exactly 20 tools", () => {
     // 50 → 41：2026-09-24 工具面减法一批——撤 9 个零真实调用工具（action_list/run_complete/receipt_get/
     //          rule_target_get/skill_get/chapter_script_h3_submit/memory_grooming_report/
     //          chapter_recall_report/model_dispatch；skill_get 的发现能力并入 skill_query）。
@@ -49,11 +49,13 @@ describe("validateToolArgs pure function", () => {
     //          workflow_get/workflow_list → workflow_query）；审校双入口合一（issue_add 并入
     //          chapter_review 的 issues）；决策面合一（chapter_review_decision/story_arc_decision
     //          → workflow_decision 的 target）。
-    expect(TOOL_NAMES).toHaveLength(21);
+    // 21 → 20：2026-09-24 工具面减法四批——撤 project_list（REST GET /v2/projects 完整同源孪生，
+    //          面板直执本就走 REST；项目状态观测由 project_inspect(view=catalog) 承载）。
+    expect(TOOL_NAMES).toHaveLength(20);
   });
 
-  it("TOOL_DEFINITIONS has 21 defs, each with name/description/inputSchema", () => {
-    expect(TOOL_DEFINITIONS).toHaveLength(21);
+  it("TOOL_DEFINITIONS has 20 defs, each with name/description/inputSchema", () => {
+    expect(TOOL_DEFINITIONS).toHaveLength(20);
     for (const def of TOOL_DEFINITIONS) {
       expect(typeof def.name).toBe("string");
       expect(def.name.length).toBeGreaterThan(0);
@@ -762,17 +764,6 @@ describe("mcp-tool-gateway integration", () => {
       const payload = JSON.parse(result.content[0].text);
       expect(payload.run.projectId).toBe(projectId);
       expect(payload.run.status).toBe("pending");
-    });
-
-    itDb("novel_project_list happy path", async () => {
-      // 先创建一个项目保证列表非空
-      const projectId = `mcp-list-${randomUUID().slice(0, 8)}`;
-      await repository.ensureProject(projectId, "List Test");
-      const result = await executeTool("novel_project_list", {}, { repository });
-      expect(result.isError).toBeFalsy();
-      const payload = JSON.parse(result.content[0].text);
-      expect(Array.isArray(payload.projects)).toBe(true);
-      expect(payload.projects.some((p: { id: string }) => p.id === projectId)).toBe(true);
     });
 
     itDb("novel_artifact_query non-existent artifactId → isError=true", async () => {
