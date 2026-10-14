@@ -3,7 +3,7 @@ import { Button, Input, Modal, Popconfirm, Segmented, Space, Table, Tabs, Tag, T
 import { CheckCircleOutlined, DeleteOutlined, EditOutlined, ExclamationCircleOutlined, EyeOutlined, PlusOutlined, ReloadOutlined, SearchOutlined, TeamOutlined } from "@ant-design/icons";
 import { motion } from "motion/react";
 import "../novel-v2.css";
-import { novelFetch as readJson } from "../../lib/novelApi";
+import { novelCommands, novelKeys, novelPaths, useNovelCommand, useNovelQuery } from "../../lib/novelApi";
 import { knowledgeKindMeta, shortId } from "./presentation";
 import KnowledgeRecordForm, { type KnowledgeFormKind } from "./KnowledgeRecordForm";
 
@@ -194,8 +194,6 @@ function sourceLabel(source: unknown): string {
 
 export default function KnowledgeWorkbenchPanel({ projectId }: { projectId: string }) {
   const [kind, setKind] = useState<KnowledgeKind>("characters");
-  const [records, setRecords] = useState<KnowledgeRecord[]>([]);
-  const [loading, setLoading] = useState(false);
   const [editing, setEditing] = useState<KnowledgeRecord>();
   const [viewing, setViewing] = useState<KnowledgeRecord>();
   const [draft, setDraft] = useState<KnowledgeRecord>({});
@@ -203,19 +201,21 @@ export default function KnowledgeWorkbenchPanel({ projectId }: { projectId: stri
   const [editorMode, setEditorMode] = useState<"form" | "json">("form");
   const [characterQuery, setCharacterQuery] = useState("");
 
-  async function load(nextKind = kind) {
-    setLoading(true);
-    try {
-      const body = await readJson<{ records: KnowledgeRecord[] }>(`/v2/projects/${encodeURIComponent(projectId)}/knowledge/${nextKind}`);
-      setRecords(body.records ?? []);
-    } catch (error) {
-      message.error(error instanceof Error ? error.message : String(error));
-    } finally {
-      setLoading(false);
-    }
-  }
+  // 缓存身份 = key 表，端点 = 路径表；kind 进 key，切 tab 自然换查询，不再手写 effect 依赖。
+  const { data, isLoading, error, refetch } = useNovelQuery<{ records: KnowledgeRecord[] }>(
+    novelKeys.knowledge(projectId, kind),
+    novelPaths.knowledge({ projectId, kind }),
+  );
+  const records = useMemo(() => data?.records ?? [], [data]);
 
-  useEffect(() => { void load(kind); }, [projectId, kind]);
+  // 写路径只给业务入参；路径/方法/体/失效面都住在命令注册表里。
+  const createRecord = useNovelCommand<{ projectId: string; kind: string; value: KnowledgeRecord }>(novelCommands.knowledgeCreate);
+  const updateRecord = useNovelCommand<{ projectId: string; kind: string; id: string; value: KnowledgeRecord }>(novelCommands.knowledgeUpdate);
+  const deleteRecord = useNovelCommand<{ projectId: string; kind: string; id: string }>(novelCommands.knowledgeDelete);
+
+  useEffect(() => {
+    if (error) message.error(error instanceof Error ? error.message : String(error));
+  }, [error]);
 
   function openCreate() {
     if (!isEditableKnowledgeKind(kind)) return;
@@ -248,11 +248,11 @@ export default function KnowledgeWorkbenchPanel({ projectId }: { projectId: stri
       value = draft;
     }
     const id = recordId(editing);
-    const path = `/v2/projects/${encodeURIComponent(projectId)}/knowledge/${kind}${id ? `/${encodeURIComponent(id)}` : ""}`;
     try {
-      await readJson(path, { method: id ? "PATCH" : "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(value) });
+      // 有 id 走 PATCH、无 id 走 POST——由命令表的两条命令表达，调用点只挑一条。
+      if (id) await updateRecord.mutateAsync({ projectId, kind, id, value });
+      else await createRecord.mutateAsync({ projectId, kind, value });
       setEditing(undefined);
-      await load();
       message.success(id ? "记录已更新" : "记录已创建");
     } catch (error) {
       message.error(error instanceof Error ? error.message : String(error));
@@ -263,8 +263,7 @@ export default function KnowledgeWorkbenchPanel({ projectId }: { projectId: stri
     const id = recordId(record);
     if (!id) return;
     try {
-      await readJson(`/v2/projects/${encodeURIComponent(projectId)}/knowledge/${kind}/${encodeURIComponent(id)}`, { method: "DELETE" });
-      await load();
+      await deleteRecord.mutateAsync({ projectId, kind, id });
       message.success("记录已删除");
     } catch (error) {
       message.error(error instanceof Error ? error.message : String(error));
@@ -340,7 +339,7 @@ export default function KnowledgeWorkbenchPanel({ projectId }: { projectId: stri
           <h2 className="novel-display-h2" style={{ marginTop: 3 }}>创作资料工作台</h2>
         </div>
         <Space>
-          <Button icon={<ReloadOutlined />} onClick={() => void load()}>刷新</Button>
+          <Button icon={<ReloadOutlined />} onClick={() => void refetch()}>刷新</Button>
           {isEditableKnowledgeKind(kind) ? <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>新增记录</Button> : null}
         </Space>
       </div>
@@ -356,7 +355,7 @@ export default function KnowledgeWorkbenchPanel({ projectId }: { projectId: stri
           <div><span>待补全</span><strong className={characterStats.pending ? "is-warning" : ""}>{characterStats.pending}</strong></div>
         </div>
       </div> : null}
-      <Table rowKey={(record) => recordId(record) || JSON.stringify(record)} loading={loading} dataSource={visibleRecords} columns={columns} pagination={{ pageSize: 12, showSizeChanger: false }} scroll={{ x: kind === "characters" ? 1180 : 900 }} />
+      <Table rowKey={(record) => recordId(record) || JSON.stringify(record)} loading={isLoading} dataSource={visibleRecords} columns={columns} pagination={{ pageSize: 12, showSizeChanger: false }} scroll={{ x: kind === "characters" ? 1180 : 900 }} />
       <Modal title={viewing ? labelOf(viewing) : "资料详情"} open={Boolean(viewing)} onCancel={() => setViewing(undefined)} footer={<Button onClick={() => setViewing(undefined)}>关闭</Button>} width={820} destroyOnHidden>
         {viewing && kind === "characters" ? <CharacterDetail record={viewing} /> : <pre style={{ margin: 0, maxHeight: "62vh", overflow: "auto", whiteSpace: "pre-wrap", overflowWrap: "anywhere", fontFamily: "ui-monospace, SFMono-Regular, Consolas, monospace", fontSize: 12, lineHeight: 1.65 }}>{viewing ? JSON.stringify(viewing, null, 2) : ""}</pre>}
       </Modal>

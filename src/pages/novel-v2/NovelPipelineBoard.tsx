@@ -38,6 +38,7 @@ import {
 
 import { STAGE_META, type StageMeta } from "./workflow-showcase/stage-meta";
 import type { WorkflowStage } from "@/novel-v2/protocol";
+import { isAbandonedWorkflowRunStatus, isFailedWorkflowRunStatus, isOpenWorkflowRunStatus, isSucceededWorkflowRunStatus } from "@/novel-v2/run-lifecycle";
 import { describeEvent, documentStatusMeta, relativeTime, statusMeta, type EventCategory } from "./presentation";
 import ArtifactContentModal, { ArtifactCard, type ArtifactSummary } from "./ArtifactContentModal";
 import ChapterScriptModal from "./ChapterScriptModal";
@@ -88,8 +89,6 @@ export { novelRunDocumentId };
 
 /** EventCategory（中文）→ 事件点配色 class key */
 const EVENT_CATEGORY_CLASS: Record<EventCategory, string> = { 运行: "run", 任务: "task", 产物: "artifact", 记忆: "memory", 学习: "learning", 文档: "doc", 其他: "default" };
-const RUN_FAILURE_STATUSES = new Set(["failed", "rejected", "cancelled", "terminated"]);
-const RUN_ACTIVE_STATUSES = new Set(["running", "waiting-external", "pending", "accepted", "paused"]);
 const DISMISSED_REVIEW_RUN_KEY = "ymcp:novel-v2:dismissed-review-run";
 
 function readDismissedReviewRun(projectId: string): string | undefined {
@@ -121,12 +120,12 @@ export function deriveChapterWorkspaceState(document: NovelDocumentSummary | und
   if (latestRun?.status === "manual-review-required") {
     return { mode: reasonCode === "fact-approval-pending" ? "fact-review" : "manuscript-review", latestRun, reasonCode };
   }
-  if (latestRun && RUN_ACTIVE_STATUSES.has(latestRun.status)) return { mode: "running", latestRun, reasonCode };
+  if (latestRun && isOpenWorkflowRunStatus(latestRun.status)) return { mode: "running", latestRun, reasonCode };
   // A terminal background run must never hide an existing formal manuscript.
   // The author can continue reading/editing the approved text and recover the
   // interrupted review from its own issue snapshot.
   if (document.status === "final") return { mode: "final", latestRun, reasonCode };
-  if (latestRun && RUN_FAILURE_STATUSES.has(latestRun.status)) return { mode: "failed", latestRun, reasonCode };
+  if (latestRun && isFailedWorkflowRunStatus(latestRun.status)) return { mode: "failed", latestRun, reasonCode };
   if (document.status === "planned" && !latestRun) return { mode: "planned" };
   return { mode: "stalled", latestRun, reasonCode };
 }
@@ -140,7 +139,7 @@ export function findInterruptedChapterReviewRun(documentId: string | undefined, 
       && Array.isArray(run.payload.targetIssueIds)
       && run.payload.targetIssueIds.length > 0)
     .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0];
-  return latestTargetedReview && ["failed", "cancelled", "terminated"].includes(latestTargetedReview.status)
+  return latestTargetedReview && isFailedWorkflowRunStatus(latestTargetedReview.status)
     ? latestTargetedReview
     : undefined;
 }
@@ -223,12 +222,12 @@ export function deriveStageStates(run: NovelRunState | undefined, artifacts: Nov
   const activeStage = payloadStageKey(payload);
   const reasonCode = typeof payload.reasonCode === "string" ? payload.reasonCode : undefined;
 
-  if (status === "completed" || status === "succeeded") {
+  if (isSucceededWorkflowRunStatus(status)) {
     order.forEach((s) => (states[s] = "done"));
     return states;
   }
 
-  if (status === "abandoned") {
+  if (isAbandonedWorkflowRunStatus(status)) {
     const stoppedAt = order.indexOf(activeStage ?? "manuscript-approval");
     order.forEach((s, i) => (states[s] = i < stoppedAt ? "done" : "pending"));
     return states;
@@ -499,7 +498,7 @@ function RunStatusPanel({ run, document, superseded }: { run?: NovelRunState; do
   if (!run) return <Alert type="info" showIcon message="该章节暂无生产运行" description="可从右上角“发起创作”创建本章的第一条运行。" />;
   const payload = (run.record?.payload ?? {}) as Record<string, unknown>;
   const error = typeof payload.error === "string" ? payload.error : undefined;
-  if (["failed", "rejected", "cancelled", "terminated"].includes(run.status)) {
+  if (isFailedWorkflowRunStatus(run.status)) {
     const stage = failedStage(payload, []);
     const stageLabel = STAGE_META.find((item) => item.stage === stage)?.label ?? "未知阶段";
     return <Alert
@@ -510,7 +509,7 @@ function RunStatusPanel({ run, document, superseded }: { run?: NovelRunState; do
     />;
   }
   if (run.status === "abandoned") return <Alert type="info" showIcon message="已放弃本次工作流" description="本次候选稿未写入章节正文；章节保持工作流开始时的正式版本，候选产物仍可在历史记录中查看。" />;
-  if (run.status === "completed" || run.status === "succeeded") return <Alert type="success" showIcon message={document?.status === "final" ? "本次运行已完成，章节已经定稿" : "本次运行已完成"} description="流水线中的审批节点是历史执行记录，无需再次点击批准。" />;
+  if (isSucceededWorkflowRunStatus(run.status)) return <Alert type="success" showIcon message={document?.status === "final" ? "本次运行已完成，章节已经定稿" : "本次运行已完成"} description="流水线中的审批节点是历史执行记录，无需再次点击批准。" />;
   if (run.status === "manual-review-required") return null;
   const stage = normalizeStageKey(typeof payload.stage === "string" ? payload.stage : undefined);
   return <Alert type="info" showIcon message={`运行${statusMeta(run.status).label}`} description={stage ? `当前正在执行“${STAGE_META.find((item) => item.stage === stage)?.label ?? stage}”，完成后会自动刷新。` : "Runtime 已受理任务，正在准备执行上下文。"} />;
@@ -1025,7 +1024,7 @@ function WorkflowInspector({
 
     <RunStatusPanel run={run} document={document} superseded={Boolean(selectedWorkflowId && selectedWorkflowId !== latestWorkflowId)} />
 
-    {run && !["completed", "succeeded", "abandoned", "failed", "rejected", "cancelled", "terminated"].includes(run.status) && <section className="pb-card pb-current-progress">
+    {run && isOpenWorkflowRunStatus(run.status) && <section className="pb-card pb-current-progress">
       <header className="pb-card-head"><span className="pb-card-title"><LoadingOutlined /> 当前进度</span><Tag color="blue">{progressDetail.stageLabel}</Tag></header>
       <p className="pb-stage-desc"><strong>{progressDetail.title}</strong><br />{progressDetail.next}</p>
       <div className="pb-running-details">{progressDetail.facts.map((fact) => <Tag key={fact}>{fact}</Tag>)}{progressDetail.latestEventSummary && <Tag color="cyan">最新：{progressDetail.latestEventSummary}</Tag>}</div>

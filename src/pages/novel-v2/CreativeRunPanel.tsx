@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { Alert, Button, Card, Descriptions, Empty, Form, Input, InputNumber, Modal, Select, Space, Switch, Table, Tag, message, type TableColumnsType } from "antd";
 import { ArrowLeftOutlined, DownOutlined, ReloadOutlined, SendOutlined, ThunderboltOutlined, PlayCircleOutlined, FileTextOutlined, AuditOutlined, ApiOutlined } from "@ant-design/icons";
 import { motion } from "motion/react";
 import "../novel-v2.css";
-import { novelFetch as readJson } from "../../lib/novelApi";
+import { novelCommands, novelKeys, novelPaths, useNovelCommand, useNovelQuery } from "../../lib/novelApi";
 import {
   commandTypeMeta,
   describeCreativeEvent,
@@ -54,15 +55,17 @@ const VERDICT_OPTIONS: { value: ReviewVerdict; label: string }[] = [
   { value: "blocked", label: "阻塞" },
 ];
 
+/** 查询尚无数据时的稳定空数组：保持引用稳定，避免每次渲染都触发依赖它的 memo/effect。 */
+const NO_RUNS: CreativeRun[] = [];
+
 export default function CreativeRunPanel({ projectId }: CreativeRunPanelProps) {
-  const [runs, setRuns] = useState<CreativeRun[]>([]);
+  const queryClient = useQueryClient();
   const [selectedRun, setSelectedRun] = useState<CreativeRun>();
   const [events, setEvents] = useState<CreativeEvent[]>([]);
   const [lastSequence, setLastSequence] = useState(0);
   const [expandedEvents, setExpandedEvents] = useState<Set<string>>(new Set());
   // TODO P2: 用 ref 维护 lastSequence 以避免轮询闭包捕获过期 state；state 仅用于 UI 展示
   const lastSequenceRef = useRef(0);
-  const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string>();
   const [createOpen, setCreateOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -71,56 +74,71 @@ export default function CreativeRunPanel({ projectId }: CreativeRunPanelProps) {
   const workItemId = Form.useWatch("workItemId", commandForm) as string | undefined;
   const commandType = Form.useWatch("type", commandForm) as CommandType | undefined;
 
-  async function loadRuns() {
-    setLoading(true);
-    try {
-      const body = await readJson<{ runs: CreativeRun[] }>(`/v2/projects/${encodeURIComponent(projectId)}/creative-runs`);
-      setRuns(body.runs ?? []);
-      setError(undefined);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setLoading(false);
-    }
-  }
+  const selectedRunId = selectedRun?.id;
 
-  async function loadRunDetail(runId: string) {
-    try {
-      setSelectedRun(await readJson<CreativeRun>(`/v2/creative-runs/${encodeURIComponent(runId)}`));
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    }
-  }
+  // ---- 读：run 列表 ----
+  // 原 `useEffect(() => { void loadRuns(); }, [projectId])` 由 key 承载：projectId 变则 key 变，自动取数。
+  const runsQuery = useNovelQuery<{ runs: CreativeRun[] }>(
+    novelKeys.creativeRuns(projectId),
+    novelPaths.creativeRuns({ projectId }),
+  );
+  const runs = runsQuery.data?.runs ?? NO_RUNS;
 
-  async function loadEvents(runId: string) {
-    const after = lastSequenceRef.current;
-    try {
-      const body = await readJson<{ events: CreativeEvent[] }>(`/v2/creative-runs/${encodeURIComponent(runId)}/events?afterSequence=${after}`);
-      const next = body.events ?? [];
-      if (next.length === 0) return;
-      setEvents((prev) => [...prev, ...next]);
-      const maxSeq = next.reduce((max, event) => Math.max(max, eventSequence(event)), after);
-      lastSequenceRef.current = maxSeq;
-      setLastSequence(maxSeq);
-    } catch (err) {
-      // TODO P2: 轮询错误目前静默吞掉以避免刷屏；后续应做退避重试并仅在连续失败时上报
-      console.warn("creative run events poll failed", err);
-    }
-  }
+  // ---- 读：选中 run 的详情（workItems / reviews）----
+  // 原 `loadRunDetail` + 3000ms interval 由 `pollWhile` 承载：选中期间持续轮询（与原实现一致，不按状态收敛）。
+  const runQuery = useNovelQuery<CreativeRun>(
+    novelKeys.creativeRun(selectedRunId ?? ""),
+    novelPaths.creativeRun({ runId: selectedRunId ?? "" }),
+    { enabled: Boolean(selectedRunId), pollWhile: () => true },
+  );
+  // 详情优先取查询结果；首次返回前先展示列表里那条记录（等价于原 setSelectedRun(record) → loadRunDetail 的过渡）。
+  // `run` 与 `selectedRun` 同时为真：无选中时 key 为 ""，该查询不会命中任何缓存条目。
+  const run = runQuery.data ?? selectedRun;
 
-  useEffect(() => { void loadRuns(); }, [projectId]);
-
+  // ---- 读：增量事件流 ----
+  // 事件流是**增量累积**的：`afterSequence` 是游标，响应只含游标之后的新事件，因此结果要 append 而非替换。
+  // 这里刻意分工：**react-query 只负责取数与轮询**，**本地 state 负责累积**。
+  // queryKey 不含 afterSequence——否则每来一批就多一个缓存条目；游标放在 path 里，取自 lastSequenceRef。
+  const eventsQuery = useNovelQuery<{ events: CreativeEvent[] }>(
+    novelKeys.creativeRunEvents(selectedRunId ?? ""),
+    novelPaths.creativeRunEvents({ runId: selectedRunId ?? "", afterSequence: lastSequenceRef.current }),
+    { enabled: Boolean(selectedRunId), pollWhile: () => true },
+  );
+  const eventsData = eventsQuery.data;
   useEffect(() => {
-    if (!selectedRun) return;
-    const runId = selectedRun.id;
+    const next = eventsData?.events ?? [];
+    if (next.length === 0) return;
+    const after = lastSequenceRef.current;
+    setEvents((prev) => [...prev, ...next]);
+    const maxSeq = next.reduce((max, event) => Math.max(max, eventSequence(event)), after);
+    lastSequenceRef.current = maxSeq;
+    setLastSequence(maxSeq);
+  }, [eventsData]);
+
+  // TODO P2: 轮询错误目前静默吞掉以避免刷屏；后续应做退避重试并仅在连续失败时上报
+  const eventsError = eventsQuery.error;
+  useEffect(() => {
+    if (eventsError) console.warn("creative run events poll failed", eventsError);
+  }, [eventsError]);
+
+  // 读失败沿用原 loadRuns/loadRunDetail 的 catch：写进同一个 error 槽位（Alert 可关闭，关闭后同一错误不再弹回）。
+  const queryError = runsQuery.error ?? runQuery.error;
+  useEffect(() => {
+    setError(queryError ? queryError.message : undefined);
+  }, [queryError]);
+
+  // 列表查询在飞＝原 `loading`（原 loadRunDetail 不置 loading，故详情刷新按钮不转圈，这里保持不变）。
+  const loading = runsQuery.isFetching;
+
+  // 事件流是**增量批次**而非完整资源：游标住在组件里，缓存条目就必须与游标同生命周期。
+  // 否则重新进入同一 run 时会命中上一轮的批次，从中间续接而丢掉游标 0 到该批次之间的事件。
+  function selectRun(record: CreativeRun) {
+    queryClient.removeQueries({ queryKey: novelKeys.creativeRunEvents(record.id) });
     setEvents([]);
     lastSequenceRef.current = 0;
     setLastSequence(0);
-    void loadRunDetail(runId);
-    void loadEvents(runId);
-    const timer = window.setInterval(() => { void loadRunDetail(runId); void loadEvents(runId); }, 3000);
-    return () => window.clearInterval(timer);
-  }, [selectedRun?.id]);
+    setSelectedRun(record);
+  }
 
   function backToList() {
     setSelectedRun(undefined);
@@ -129,20 +147,24 @@ export default function CreativeRunPanel({ projectId }: CreativeRunPanelProps) {
     setLastSequence(0);
     setError(undefined);
     commandForm.resetFields();
-    void loadRuns();
+    void runsQuery.refetch();
   }
+
+  // ---- 写：路径 / 方法 / 请求体 / 失效面全部来自命令注册表，调用点只给业务入参 ----
+  const createRunCommand = useNovelCommand<{ projectId: string; mode: RunMode; policy: CreativePolicy }>(novelCommands.creativeRunCreate);
+  const sendCommand = useNovelCommand<{ projectId: string; runId: string; command: CreativeCommand }>(novelCommands.creativeRunCommand);
 
   async function createRun(values: { mode: RunMode; maxRetries?: number; reviewGate?: boolean; autoAcceptThreshold?: number }) {
     try {
-      await readJson<{ run: CreativeRun }>(`/v2/projects/${encodeURIComponent(projectId)}/creative-runs`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ mode: values.mode, policy: { maxRetries: values.maxRetries, reviewGate: values.reviewGate, autoAcceptThreshold: values.autoAcceptThreshold } }),
+      // 成功后按项目前缀失效，列表自动刷新（原 `await loadRuns()` 不再需要）
+      await createRunCommand.mutateAsync({
+        projectId,
+        mode: values.mode,
+        policy: { maxRetries: values.maxRetries, reviewGate: values.reviewGate, autoAcceptThreshold: values.autoAcceptThreshold },
       });
       setCreateOpen(false);
       createForm.resetFields();
       message.success("Creative run 已创建");
-      await loadRuns();
     } catch (err) {
       message.error(err instanceof Error ? err.message : String(err));
     }
@@ -173,12 +195,10 @@ export default function CreativeRunPanel({ projectId }: CreativeRunPanelProps) {
     }
     setSubmitting(true);
     try {
-      await readJson(`/v2/creative-runs/${encodeURIComponent(runId)}/commands`, {
-        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(command),
-      });
+      // 成功后按命令声明的失效面失效：该 run 的详情 + 事件流，以及项目级列表（原 `await loadRunDetail(runId)` 不再需要）
+      await sendCommand.mutateAsync({ projectId, runId, command });
       message.success(`命令 ${values.type} 已提交`);
       commandForm.resetFields();
-      await loadRunDetail(runId);
     } catch (err) {
       message.error(err instanceof Error ? err.message : String(err));
     } finally {
@@ -186,8 +206,8 @@ export default function CreativeRunPanel({ projectId }: CreativeRunPanelProps) {
     }
   }
 
-  const workItems = selectedRun?.workItems ?? [];
-  const reviews = selectedRun?.reviews ?? [];
+  const workItems = run?.workItems ?? [];
+  const reviews = run?.reviews ?? [];
   const commandOptions = useMemo<CommandType[]>(() => (workItemId ? [...WORK_ITEM_COMMANDS, ...RUN_COMMANDS] : RUN_COMMANDS), [workItemId]);
   // work item 被清空后，已选的 work 级命令需要重置
   useEffect(() => {
@@ -210,7 +230,7 @@ export default function CreativeRunPanel({ projectId }: CreativeRunPanelProps) {
       );
     }},
     { title: "创建时间", dataIndex: "createdAt", render: (t: string) => <span className="novel-table-cell-sub">{relativeTime(t)}</span> },
-    { title: "操作", key: "actions", width: 90, render: (_: unknown, record: CreativeRun) => <Button type="link" size="small" onClick={() => setSelectedRun(record)}>查看详情</Button> },
+    { title: "操作", key: "actions", width: 90, render: (_: unknown, record: CreativeRun) => <Button type="link" size="small" onClick={() => selectRun(record)}>查看详情</Button> },
   ];
   const workItemColumns: TableColumnsType<CreativeWorkItem> = [
     { title: "工作项", key: "work", render: (_: unknown, record: CreativeWorkItem) => {
@@ -259,27 +279,27 @@ export default function CreativeRunPanel({ projectId }: CreativeRunPanelProps) {
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.55, ease: [0.16, 1, 0.3, 1] }}
       >
-        <Button type="text" icon={<ArrowLeftOutlined />} onClick={backToList} disabled={!selectedRun}>返回 Run 列表</Button>
+        <Button type="text" icon={<ArrowLeftOutlined />} onClick={backToList} disabled={!run}>返回 Run 列表</Button>
         <div className="novel-topbar-body" style={{ minWidth: 0 }}>
           <span className="novel-eyebrow">创意执行</span>
           <h2 className="novel-display-h2" style={{ marginTop: 2 }}>
-            {selectedRun ? `Run ${shortId(selectedRun.id)}` : "创意执行控制台"}
+            {run ? `Run ${shortId(run.id)}` : "创意执行控制台"}
           </h2>
           <p className="novel-lede" style={{ margin: "8px 0 0" }}>
-            {selectedRun
+            {run
               ? "查看 Run 详情、工作项、审核记录与事件流；通过命令面板控制 work item 或整个 run。"
               : "创建 Creative Run，分章节或自动分段执行创作任务，实时观察工作项状态与审核闭环。"}
           </p>
         </div>
         <div className="novel-topbar-actions">
-          <Button icon={<ReloadOutlined />} loading={loading} onClick={() => void (selectedRun ? loadRunDetail(selectedRun.id) : loadRuns())}>刷新</Button>
-          {!selectedRun && <Button type="primary" icon={<PlayCircleOutlined />} onClick={() => setCreateOpen(true)}>创建 Run</Button>}
+          <Button icon={<ReloadOutlined />} loading={loading} onClick={() => void (run ? runQuery.refetch() : runsQuery.refetch())}>刷新</Button>
+          {!run && <Button type="primary" icon={<PlayCircleOutlined />} onClick={() => setCreateOpen(true)}>创建 Run</Button>}
         </div>
       </motion.header>
 
       {error && <Alert type="error" showIcon message={error} className="novel-v2-alert" closable onClose={() => setError(undefined)} />}
 
-      {!selectedRun ? (
+      {!run ? (
         /* ===== LIST VIEW ===== */
         <motion.section
           initial={{ opacity: 0, y: 12 }}
@@ -328,7 +348,7 @@ export default function CreativeRunPanel({ projectId }: CreativeRunPanelProps) {
               <div className="novel-card-head">
                 <h3 className="novel-display-h3">Run 详情</h3>
                 {(() => {
-                  const stMeta = statusMeta(selectedRun.status);
+                  const stMeta = statusMeta(run.status);
                   return (
                     <span className={stMeta.pill}>
                       {stMeta.icon}
@@ -338,12 +358,12 @@ export default function CreativeRunPanel({ projectId }: CreativeRunPanelProps) {
                 })()}
               </div>
               <Descriptions column={2} size="small">
-                <Descriptions.Item label="模式">{runModeMeta(selectedRun.mode).label}</Descriptions.Item>
-                <Descriptions.Item label="Run ID"><code>{shortId(selectedRun.id, 12)}</code></Descriptions.Item>
-                <Descriptions.Item label="创建时间">{relativeTime(selectedRun.createdAt)}</Descriptions.Item>
-                <Descriptions.Item label="最大重试">{selectedRun.policy?.maxRetries ?? "—"}</Descriptions.Item>
-                <Descriptions.Item label="审核门控">{selectedRun.policy?.reviewGate ? "开启" : "关闭"}</Descriptions.Item>
-                <Descriptions.Item label="自动采纳阈值">{selectedRun.policy?.autoAcceptThreshold ?? "—"}</Descriptions.Item>
+                <Descriptions.Item label="模式">{runModeMeta(run.mode).label}</Descriptions.Item>
+                <Descriptions.Item label="Run ID"><code>{shortId(run.id, 12)}</code></Descriptions.Item>
+                <Descriptions.Item label="创建时间">{relativeTime(run.createdAt)}</Descriptions.Item>
+                <Descriptions.Item label="最大重试">{run.policy?.maxRetries ?? "—"}</Descriptions.Item>
+                <Descriptions.Item label="审核门控">{run.policy?.reviewGate ? "开启" : "关闭"}</Descriptions.Item>
+                <Descriptions.Item label="自动采纳阈值">{run.policy?.autoAcceptThreshold ?? "—"}</Descriptions.Item>
               </Descriptions>
             </div>
 

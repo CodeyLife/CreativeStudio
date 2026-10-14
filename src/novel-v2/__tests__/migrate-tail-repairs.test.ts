@@ -81,10 +81,19 @@ describe("migrate 尾启动修复路径", () => {
 
     const first = await repository.backfillMissingContentWordCounts(objects);
     expect(first.failed).toBeGreaterThanOrEqual(1);
-    const rows = await repository.pool.query<{ word_count: string | null }>("SELECT word_count FROM content_blobs WHERE content_hash = ANY($1::text[])", [[goodHash, brokenHash]]);
+    /**
+     * 按 `content_hash` 取值，**不按位置**：`= ANY(...)` 不保证返回顺序，`rows[0]` 可能
+     * 拿到 broken 那行（`word_count` 为 NULL ⇒ `Number(null)` = 0），于是断言报
+     * "expected 0 to be 9"——一个与实现无关、只与执行计划有关的假红。全量首跑即撞上。
+     */
+    const rows = await repository.pool.query<{ content_hash: string; word_count: string | null }>(
+      "SELECT content_hash, word_count FROM content_blobs WHERE content_hash = ANY($1::text[])",
+      [[goodHash, brokenHash]],
+    );
+    const wordCountByHash = new Map(rows.rows.map((row) => [row.content_hash, row.word_count]));
     // pg 把 bigint 以字符串返回，判据前先归一（不依赖驱动配置）。
-    expect(Number(rows.rows[0].word_count)).toBe(countNovelCharacters(text));
-    expect(rows.rows[1].word_count).toBeNull();
+    expect(Number(wordCountByHash.get(goodHash))).toBe(countNovelCharacters(text));
+    expect(wordCountByHash.get(brokenHash)).toBeNull();
 
     // 重放：已回填的行不再进入选择集（该查询是全库扫描，故只断言自己这行没被再动，
     // 不断言全局 updated/failed 计数——别的套件的数据也在同一库里）。判据用 xmin 而不是

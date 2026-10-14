@@ -8,6 +8,7 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef } from "react";
+import { isOpenWorkflowRunStatus, isTerminalWorkflowRunStatus } from "../novel-v2/run-lifecycle";
 
 // ---------- API 类型（对齐 scripts/novel-v2-api.ts 返回体） ----------
 export interface NovelDocumentSummary {
@@ -454,7 +455,17 @@ export function getNovelRuntimeIdentity(): NovelRuntimeIdentity | undefined {
   return runtimeIdentity;
 }
 
-export async function novelFetch<T>(path: string, init?: RequestInit): Promise<T> {
+/**
+ * 裸 transport —— **本模块私有，刻意不导出**。
+ *
+ * 它曾经是导出面的一部分，于是 7 个文件、41 处调用自选了这一级：缓存、去重、失效
+ * 全部作废，失效被重新发明成 prop 回调（见 `.scratch/w1-novel-api-seam/spec.md`）。
+ *
+ * 现在消费侧只有两个入口：`useNovelQuery` / `useNovelCommand`（+ 唯一的具名逃逸口
+ * `executeNovelTool`）。把这一层收回私有，是让"收编"不会被下一处内联 fetch 重新打穿的
+ * 机械保证——`novel-api-seam.test.ts` 会断言它不在导出面上。
+ */
+async function novelFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, init);
   const fingerprint = response.headers.get("x-novel-runtime-fingerprint");
   const profile = response.headers.get("x-novel-runtime-profile");
@@ -488,9 +499,50 @@ export const novelKeys = {
   learningCenter: (id: string) => ["novel", "learning-center", id] as const,
   styleContracts: (id: string) => ["novel", "project", id, "style-contracts"] as const,
   activeStyleContract: (id: string) => ["novel", "project", id, "style-contracts", "active"] as const,
+  /**
+   * 以下九类资源此前**一个 key 都没有**——面板只能绕开缓存层自己发请求，于是缓存、去重、
+   * 失效全部作废（见 `.scratch/w1-novel-api-seam/spec.md`）。
+   *
+   * 项目级资源一律挂在 `["novel","project",<id>]` 之下：react-query 按前缀失效，
+   * 因此 `novelScopes.project(id)` 一次即覆盖整族，不必逐 key 枚举。
+   */
+  projectPlan: (id: string) => ["novel", "project", id, "plan"] as const,
+  storyArcs: (id: string) => ["novel", "project", id, "story-arcs"] as const,
+  knowledge: (id: string, kind: string) => ["novel", "project", id, "knowledge", kind] as const,
+  creativeRuns: (id: string) => ["novel", "project", id, "creative-runs"] as const,
+  snapshots: (id: string) => ["novel", "project", id, "snapshots"] as const,
+  experiments: (id: string) => ["novel", "project", id, "experiments"] as const,
+  candidates: (id: string) => ["novel", "project", id, "candidates"] as const,
+  receipts: (id: string) => ["novel", "project", id, "receipts"] as const,
+  scriptSubjectPreset: (id: string) => ["novel", "project", id, "script-h3-subject-preset"] as const,
+  // 非项目级：按自身 id 归属，失效面各自独立。
+  chapterScript: (id: string, docId: string) => ["novel", "doc", id, docId, "script-h3"] as const,
+  snapshot: (snapshotId: string) => ["novel", "snapshot", snapshotId] as const,
+  creativeRun: (runId: string) => ["novel", "creative-run", runId] as const,
+  creativeRunEvents: (runId: string) => ["novel", "creative-run", runId, "events"] as const,
 };
 
-const isTerminalStatus = (status?: string) => Boolean(status) && !isActiveStatus(status);
+/**
+ * 失效面的单一真源。
+ *
+ * 命令注册表只声明"这次写让哪些**面**过期"，具体 key 由这里展开——调用点永远不写 key，
+ * 否则缓存图就重新散回 7 个面板里（那正是本片要收掉的东西）。
+ */
+export const novelScopes = {
+  project: (projectId: string) => ["novel", "project", projectId] as const,
+  document: (projectId: string, documentId: string) => ["novel", "doc", projectId, documentId] as const,
+  run: (workflowId: string) => ["novel", "run", workflowId] as const,
+  artifact: () => ["novel", "artifact"] as const,
+  creativeRun: (runId: string) => ["novel", "creative-run", runId] as const,
+};
+
+/**
+ * 运行中任务的轮询间隔——单一常量。
+ *
+ * 此前 10 处 `refetchInterval` 各自硬编码 3000（`novelApi.ts` 内 8 处 + 30_000/10_000 各一处），
+ * 另有 `api.ts` 的 1500 与 `PsdTaskPanel.tsx` 的 4000 各自为政。间隔是运维决策，不该散落。
+ */
+export const ACTIVE_RUN_POLL_MS = 3000;
 
 export function invalidateNovelProject(queryClient: ReturnType<typeof useQueryClient>, projectId: string | undefined, documentId?: string, workflowId?: string): void {
   if (!projectId) return;
@@ -515,6 +567,319 @@ export function invalidateNovelProject(queryClient: ReturnType<typeof useQueryCl
   }
 }
 
+// ---------- 两个通用原语（消费侧唯一入口） ----------
+/**
+ * 读原语。
+ *
+ * 调用点给 `queryKey`（缓存身份）与 `path`（端点）；轮询策略用 `pollWhile` 声明，
+ * **调用点不写间隔数字**——间隔是 `ACTIVE_RUN_POLL_MS`。
+ *
+ * 端点字符串只允许出现在本模块：`src/pages/**` 里出现 `/v2/` 字面量即由守卫判红
+ * （见 `novel-api-seam.test.ts`），否则"数据访问收归一层"会被下一处内联路径重新打穿。
+ */
+export function useNovelQuery<T>(
+  queryKey: readonly unknown[],
+  path: string,
+  options?: { enabled?: boolean; pollWhile?: (data: T | undefined) => boolean },
+) {
+  const enabled = options?.enabled ?? true;
+  const pollWhile = options?.pollWhile;
+  return useQuery<T>({
+    queryKey,
+    queryFn: () => novelFetch<T>(path),
+    enabled,
+    refetchInterval: pollWhile
+      ? (query) => (pollWhile(query.state.data as T | undefined) ? ACTIVE_RUN_POLL_MS : false)
+      : false,
+  });
+}
+
+/**
+ * 一条写操作的完整声明：路径、方法、请求体、失效面。
+ *
+ * `path` / `body` / `invalidates` 刻意用**方法语法**而非函数属性语法：方法声明在
+ * `strictFunctionTypes` 下是**双变**的，于是 `path` 只需声明它真正用到的字段
+ * （`{ projectId }`）、`body` 只需声明它真正要发出去的字段（`{ instruction }`），
+ * 两者不必写成同一个宽类型。同时它把"路径字段不得泄进请求体"这件事留给 body 自己表达。
+ */
+export interface NovelCommand<TInput> {
+  method: "POST" | "PATCH" | "PUT" | "DELETE";
+  path(input: TInput): string;
+  body?(input: TInput): unknown;
+  /**
+   * 额外请求头（`content-type` 由 `body` 的存在与否自动决定，不必在此重复声明）。
+   *
+   * 存在的理由是可验证的：`storyArcDelete` 在 `force` 时必须带 `x-force-delete: true`，
+   * 缺了它强制删除会静默退化成普通删除。契约缺这个字段时，这种差异只能靠"少传一个
+   * header"发生，而且编译期与测试都看不见——本片首跑就踩了这一条。
+   */
+  headers?(input: TInput): Record<string, string>;
+  /**
+   * 失效面。缺省＝`novelScopes.project(input.projectId)`（有 projectId 时失效整族）。
+   * 需要更细或额外面时在此覆写——**失效策略住在注册表，不回调用点**。
+   */
+  invalidates?(input: TInput): readonly (readonly unknown[])[];
+}
+
+/**
+ * 写原语。
+ *
+ * 命令（路径/方法/体/失效面）全部来自注册表；调用点只给业务入参，不碰 key、不碰 URL。
+ * 成功后按命令声明的面失效，失败不失效（避免把失败当成功刷缓存）。
+ *
+ * 返回体类型由调用点按需标注（多数写操作只关心"写完并失效"，用缺省 `unknown` 即可）。
+ */
+export function useNovelCommand<TInput extends { projectId?: string }, TResult = unknown>(
+  command: NovelCommand<TInput>,
+) {
+  const queryClient = useQueryClient();
+  return useMutation<TResult, Error, TInput>({
+    mutationFn: (input) => {
+      const extra = command.headers ? command.headers(input) : {};
+      const headers = { ...(command.body ? { "content-type": "application/json" } : {}), ...extra };
+      return novelFetch<TResult>(command.path(input), {
+        method: command.method,
+        headers: Object.keys(headers).length ? headers : undefined,
+        body: command.body ? JSON.stringify(command.body(input)) : undefined,
+      });
+    },
+    onSuccess: (_result, input) => {
+      const targets = command.invalidates
+        ? command.invalidates(input)
+        : (input.projectId ? [novelScopes.project(input.projectId)] : []);
+      for (const target of targets) void queryClient.invalidateQueries({ queryKey: target });
+    },
+  });
+}
+
+// ---------- 路径注册表 ----------
+/**
+ * 端点路径的单一真源。
+ *
+ * 为什么连"读"的路径也要收进来：本片的完成判据之一是 **`src/pages/**` 零 `/v2/` 字面量**。
+ * 若只收命令（写）而不收读路径，面板仍要自己拼 URL，收编就会被下一处内联路径重新打穿。
+ */
+export const novelPaths = {
+  projectPlan: (i: { projectId: string }) => `/v2/projects/${enc(i.projectId)}/plan`,
+  storyArcs: (i: { projectId: string }) => `/v2/projects/${enc(i.projectId)}/story-arcs`,
+  knowledge: (i: { projectId: string; kind: string }) => `/v2/projects/${enc(i.projectId)}/knowledge/${enc(i.kind)}`,
+  creativeRuns: (i: { projectId: string }) => `/v2/projects/${enc(i.projectId)}/creative-runs`,
+  creativeRun: (i: { runId: string }) => `/v2/creative-runs/${enc(i.runId)}`,
+  creativeRunEvents: (i: { runId: string; afterSequence: number }) =>
+    `/v2/creative-runs/${enc(i.runId)}/events?afterSequence=${encodeURIComponent(String(i.afterSequence))}`,
+  snapshots: (i: { projectId: string }) => `/v2/projects/${enc(i.projectId)}/snapshots`,
+  snapshot: (i: { snapshotId: string }) => `/v2/snapshots/${enc(i.snapshotId)}`,
+  experiments: (i: { projectId: string }) => `/v2/projects/${enc(i.projectId)}/experiments`,
+  candidates: (i: { projectId: string }) => `/v2/projects/${enc(i.projectId)}/candidates`,
+  receipts: (i: { projectId: string }) => `/v2/projects/${enc(i.projectId)}/receipts`,
+  chapterScript: (i: { projectId: string; documentId: string }) =>
+    `/v2/projects/${enc(i.projectId)}/documents/${enc(i.documentId)}/script-h3`,
+  scriptSubjectPreset: (i: { projectId: string }) => `/v2/projects/${enc(i.projectId)}/script-h3/subject-preset`,
+  chapterReview: (i: { projectId: string; documentId: string }) =>
+    `/v2/projects/${enc(i.projectId)}/documents/${enc(i.documentId)}/review`,
+};
+
+// ---------- 命令注册表（写操作的单一真源） ----------
+/**
+ * 每条命令声明 method / path / body / 失效面。调用点只给业务入参。
+ *
+ * 失效面缺省＝项目前缀（`novelScopes.project`），对项目级资源已经足够——它们全部挂在
+ * `["novel","project",<id>]` 之下。只有跨项目或非项目级的写（如快照、实验、候选稿按自身
+ * id 归属）才显式覆写。
+ */
+export const novelCommands = {
+  // ---- 全书规划 ----
+  planStart: {
+    method: "POST",
+    path: (i: { projectId: string }) => `/v2/projects/${enc(i.projectId)}/plan/start`,
+    body: (i: { objective: string; idempotencyKey?: string }) => ({ objective: i.objective, idempotencyKey: i.idempotencyKey }),
+  },
+  planSectionGenerate: {
+    method: "POST",
+    path: (i: { projectId: string; taskKey: string }) => `/v2/projects/${enc(i.projectId)}/plan/sections/${enc(i.taskKey)}/generate`,
+    body: (i: { instruction?: string }) => ({ instruction: i.instruction }),
+  },
+  planSectionApprove: {
+    method: "POST",
+    path: (i: { projectId: string; taskKey: string }) => `/v2/projects/${enc(i.projectId)}/plan/sections/${enc(i.taskKey)}/approve`,
+    body: () => ({}),
+  },
+  planSectionUpdate: {
+    method: "PATCH",
+    path: (i: { projectId: string; taskKey: string }) => `/v2/projects/${enc(i.projectId)}/plan/sections/${enc(i.taskKey)}`,
+    body: (i: { payload: unknown }) => ({ payload: i.payload }),
+  },
+  planSynopsisGenerate: {
+    method: "POST",
+    path: (i: { projectId: string }) => `/v2/projects/${enc(i.projectId)}/plan/synopsis`,
+    body: () => ({}),
+  },
+  planTitleCandidatesGenerate: {
+    method: "POST",
+    path: (i: { projectId: string }) => `/v2/projects/${enc(i.projectId)}/plan/title-candidates`,
+    body: () => ({}),
+  },
+  planTitleSelect: {
+    method: "POST",
+    path: (i: { projectId: string }) => `/v2/projects/${enc(i.projectId)}/plan/title`,
+    body: (i: { title: string; sourceFingerprint?: string }) => ({ title: i.title, sourceFingerprint: i.sourceFingerprint }),
+  },
+
+  // ---- 故事弧 ----
+  storyArcStart: {
+    method: "POST",
+    path: (i: { projectId: string }) => `/v2/projects/${enc(i.projectId)}/story-arcs/next`,
+    body: (i: { authorIntent?: string; reviewPolicy: string }) => ({ authorIntent: i.authorIntent, reviewPolicy: i.reviewPolicy }),
+  },
+  storyArcNextBatch: {
+    method: "POST",
+    path: (i: { projectId: string; arcId: string }) => `/v2/projects/${enc(i.projectId)}/story-arcs/${enc(i.arcId)}/batches/next`,
+    body: (i: { reviewPolicy: string }) => ({ reviewPolicy: i.reviewPolicy }),
+  },
+  storyArcUpdate: {
+    method: "PATCH",
+    path: (i: { projectId: string; arcId: string }) => `/v2/projects/${enc(i.projectId)}/story-arcs/${enc(i.arcId)}`,
+    body: (i: { bundle: unknown }) => ({ bundle: i.bundle }),
+  },
+  storyArcApprovePreview: {
+    method: "POST",
+    path: (i: { projectId: string; arcId: string }) => `/v2/projects/${enc(i.projectId)}/story-arcs/${enc(i.arcId)}/approve`,
+    body: () => ({ confirm: false }),
+  },
+  storyArcApprove: {
+    method: "POST",
+    path: (i: { projectId: string; arcId: string }) => `/v2/projects/${enc(i.projectId)}/story-arcs/${enc(i.arcId)}/approve`,
+    body: () => ({ confirm: true }),
+  },
+  storyArcRebase: {
+    method: "POST",
+    path: (i: { projectId: string; arcId: string }) => `/v2/projects/${enc(i.projectId)}/story-arcs/${enc(i.arcId)}/rebase`,
+    body: (i: { authorIntent?: string; reviewPolicy: string }) => ({ authorIntent: i.authorIntent, reviewPolicy: i.reviewPolicy }),
+  },
+  storyArcAbandon: {
+    method: "POST",
+    path: (i: { projectId: string; arcId: string }) => `/v2/projects/${enc(i.projectId)}/story-arcs/${enc(i.arcId)}/abandon`,
+    body: (i: { reason?: string }) => ({ reason: i.reason }),
+  },
+  storyArcDelete: {
+    method: "DELETE",
+    path: (i: { projectId: string; arcId: string; force?: boolean }) =>
+      `/v2/projects/${enc(i.projectId)}/story-arcs/${enc(i.arcId)}${i.force ? "?force=true" : ""}`,
+    // 原实现无论 force 与否都发 body（`{}` / `{force:true}`），照原样保留。
+    body: (i: { force?: boolean }) => (i.force ? { force: true } : {}),
+    // force 时的专属头，缺它会静默退化成普通删除（见 NovelCommand.headers 注释）。
+    headers: (i: { force?: boolean }): Record<string, string> => (i.force ? { "x-force-delete": "true" } : {}),
+  },
+
+  // ---- 评估面（快照 / 实验 / 候选稿按自身 id 归属，失效面需显式声明） ----
+  snapshotCapture: {
+    method: "POST",
+    path: (i: { projectId: string }) => `/v2/projects/${enc(i.projectId)}/snapshots`,
+    body: () => ({}),
+  },
+  experimentCreate: {
+    method: "POST",
+    path: (i: { projectId: string }) => `/v2/projects/${enc(i.projectId)}/experiments`,
+    body: (i: { snapshotId: string }) => ({ snapshotId: i.snapshotId }),
+  },
+  experimentDelete: {
+    method: "DELETE",
+    // path 只用到 experimentId，但仍声明 projectId：它是**失效面的来源**（缺省失效整个项目前缀）。
+    path: (i: { projectId: string; experimentId: string }) => `/v2/experiments/${enc(i.experimentId)}`,
+  },
+  experimentClose: {
+    method: "POST",
+    path: (i: { projectId: string; experimentId: string }) => `/v2/experiments/${enc(i.experimentId)}/close`,
+    body: () => ({}),
+  },
+  candidateGenerate: {
+    method: "POST",
+    path: (i: { projectId: string; experimentId: string }) => `/v2/experiments/${enc(i.experimentId)}/candidate`,
+    body: (i: { documentId: string }) => ({ documentId: i.documentId }),
+  },
+  candidatePromote: {
+    method: "POST",
+    path: (i: { projectId: string; candidateId: string }) => `/v2/candidates/${enc(i.candidateId)}/promote`,
+    body: (i: { authorId?: string; decision: string; reason?: string }) => ({ authorId: i.authorId, decision: i.decision, reason: i.reason }),
+  },
+
+  // ---- 创作运行（creative_runs，与 workflow_runs 是两个词表） ----
+  creativeRunCreate: {
+    method: "POST",
+    path: (i: { projectId: string }) => `/v2/projects/${enc(i.projectId)}/creative-runs`,
+    body: (i: { mode: unknown; policy: unknown }) => ({ mode: i.mode, policy: i.policy }),
+  },
+  creativeRunCommand: {
+    method: "POST",
+    path: (i: { projectId: string; runId: string }) => `/v2/creative-runs/${enc(i.runId)}/commands`,
+    body: (i: { command: unknown }) => i.command,
+    // 两个面：run 自身（详情 + 事件流）与项目级列表。
+    invalidates: (i: { projectId: string; runId: string }) => [novelScopes.creativeRun(i.runId), novelScopes.project(i.projectId)],
+  },
+
+  // ---- 章节剧本 ----
+  chapterScriptGenerate: {
+    method: "POST",
+    path: (i: { projectId: string; documentId: string }) => `/v2/projects/${enc(i.projectId)}/documents/${enc(i.documentId)}/script-h3`,
+    body: (i: { instruction?: string }) => ({ instruction: i.instruction }),
+  },
+  scriptSubjectPresetSave: {
+    method: "PUT",
+    path: (i: { projectId: string }) => `/v2/projects/${enc(i.projectId)}/script-h3/subject-preset`,
+    body: (i: { definitionText: string }) => ({ definitionText: i.definitionText }),
+  },
+
+  // ---- 知识工作台 ----
+  knowledgeCreate: {
+    method: "POST",
+    path: (i: { projectId: string; kind: string }) => `/v2/projects/${enc(i.projectId)}/knowledge/${enc(i.kind)}`,
+    body: (i: { value: unknown }) => i.value,
+  },
+  knowledgeUpdate: {
+    method: "PATCH",
+    path: (i: { projectId: string; kind: string; id: string }) => `/v2/projects/${enc(i.projectId)}/knowledge/${enc(i.kind)}/${enc(i.id)}`,
+    body: (i: { value: unknown }) => i.value,
+  },
+  knowledgeDelete: {
+    method: "DELETE",
+    path: (i: { projectId: string; kind: string; id: string }) => `/v2/projects/${enc(i.projectId)}/knowledge/${enc(i.kind)}/${enc(i.id)}`,
+  },
+} as const;
+
+/** 取必填字符串入参，缺失即抛（与后端 400 相比，这里给出可读的中文原因）。 */
+function requireStringArg(args: Record<string, unknown>, key: string): string {
+  const value = args[key];
+  if (typeof value !== "string" || !value) throw new Error(`${key} 必填`);
+  return value;
+}
+
+/**
+ * 通用 MCP 工具执行器的**具名逃逸口**。
+ *
+ * `McpToolGatewayPanel` 是**通用**工具执行器——它把用户在文本框里编辑的任意 args JSON 原样转发，
+ * 所以它不能走具名命令（那会把"任意 args"这个用途掐掉）。但它也不该拿到裸 transport：
+ * **工具名 → 端点的映射是端点知识**，属本模块，不属于面板。
+ *
+ * 因此这是全仓唯一允许"任意 args"的入口，有名字、有契约、对未知工具给出可执行的报错。
+ * 其余所有写操作一律走 `novelCommands`。
+ */
+export async function executeNovelTool(toolName: string, args: Record<string, unknown>): Promise<unknown> {
+  const jsonHeaders = { "content-type": "application/json" };
+  switch (toolName) {
+    case "novel_run_create": {
+      const projectId = requireStringArg(args, "projectId");
+      return novelFetch(novelPaths.creativeRuns({ projectId }), { method: "POST", headers: jsonHeaders, body: JSON.stringify(args) });
+    }
+    case "novel_chapter_review": {
+      const projectId = requireStringArg(args, "projectId");
+      const documentId = requireStringArg(args, "documentId");
+      return novelFetch(novelPaths.chapterReview({ projectId, documentId }), { method: "POST", headers: jsonHeaders, body: JSON.stringify(args) });
+    }
+    default:
+      throw new Error(`工具 ${toolName} 不支持直接执行，请复制 MCP 调用命令后通过 MCP server 调用`);
+  }
+}
+
 // ---------- 读 ----------
 export function useNovelProjects() {
   return useQuery({
@@ -528,7 +893,7 @@ export function useNovelProject(projectId: string) {
     queryKey: novelKeys.project(projectId),
     queryFn: async () => (await novelFetch<{ project: NovelProjectDetail }>(`/v2/projects/${enc(projectId)}`)).project,
     enabled: Boolean(projectId),
-    refetchInterval: (query) => query.state.data?.latestRuns?.some((run) => isActiveStatus(run.status)) ? 3000 : false,
+    refetchInterval: (query) => query.state.data?.latestRuns?.some((run) => isOpenWorkflowRunStatus(run.status)) ? 3000 : false,
   });
 }
 
@@ -539,12 +904,12 @@ export function useNovelProjectRuns(projectId: string) {
     queryKey: novelKeys.runs(projectId),
     queryFn: async () => (await novelFetch<{ runs: NovelWorkflowRunRecord[] }>(`/v2/projects/${enc(projectId)}/runs`)).runs ?? [],
     enabled: Boolean(projectId),
-    refetchInterval: (current) => current.state.data?.some((run) => isActiveStatus(run.status)) ? 3000 : false,
+    refetchInterval: (current) => current.state.data?.some((run) => isOpenWorkflowRunStatus(run.status)) ? 3000 : false,
   });
   useEffect(() => {
     for (const run of query.data ?? []) {
       const previousStatus = previous.current.get(run.temporalWorkflowId);
-      if (previousStatus && isActiveStatus(previousStatus) && isTerminalStatus(run.status)) {
+      if (previousStatus && isOpenWorkflowRunStatus(previousStatus) && isTerminalWorkflowRunStatus(run.status)) {
         invalidateNovelProject(queryClient, run.projectId || projectId, novelRunDocumentId(run), run.temporalWorkflowId);
       }
       previous.current.set(run.temporalWorkflowId, run.status);
@@ -553,8 +918,6 @@ export function useNovelProjectRuns(projectId: string) {
   return query;
 }
 
-const isActiveStatus = (status?: string) => status === "running" || status === "waiting-external" || status === "manual-review-required" || status === "paused" || status === "pending" || status === "accepted";
-
 export function useNovelRun(workflowId: string | undefined) {
   const queryClient = useQueryClient();
   const previousStatus = useRef<string | undefined>(undefined);
@@ -562,12 +925,12 @@ export function useNovelRun(workflowId: string | undefined) {
     queryKey: novelKeys.run(workflowId ?? "none"),
     queryFn: () => novelFetch<NovelRunState>(`/v2/runs/${enc(workflowId!)}`),
     enabled: Boolean(workflowId),
-    refetchInterval: (query) => (isActiveStatus(query.state.data?.status) ? 3000 : false),
+    refetchInterval: (query) => (isOpenWorkflowRunStatus(query.state.data?.status) ? 3000 : false),
   });
   useEffect(() => {
     const state = query.data;
     const status = state?.record?.status ?? state?.status;
-    if (previousStatus.current && isActiveStatus(previousStatus.current) && isTerminalStatus(status)) {
+    if (previousStatus.current && isOpenWorkflowRunStatus(previousStatus.current) && status && isTerminalWorkflowRunStatus(status)) {
       invalidateNovelProject(queryClient, state?.record?.projectId, novelRunDocumentId(state?.record), workflowId);
     }
     if (status) previousStatus.current = status;

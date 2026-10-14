@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Alert, Button, Input, Modal, Popconfirm, Segmented, Space, Spin, Tag, message } from "antd";
 import { ArrowDownOutlined, ArrowUpOutlined, CheckOutlined, DeleteOutlined, EditOutlined, FileAddOutlined, PlusOutlined, ReloadOutlined, StopOutlined } from "@ant-design/icons";
 import { motion } from "motion/react";
-import { novelFetch as readJson } from "../../lib/novelApi";
+import { novelCommands, novelKeys, novelPaths, useNovelCommand, useNovelQuery } from "../../lib/novelApi";
 
 type Scene = { title: string; participants: string[]; situation: string; observableActions: string[]; opposition?: string; decision?: string; outcome: string; cost?: string };
 type Chapter = { id?: string; index: number; globalOrder?: number; documentId?: string; title: string; narrativeFunction?: string; povCharacterId?: string; stateTransition: { before: string; after: string; evidence: string }; scenes: Scene[]; continuityConstraints: string[]; unresolvedAtClose?: string[] };
@@ -31,10 +31,11 @@ function arcCanBeDeleted(arc: StoryArc): boolean {
   return arc.planningStatus !== "generating" || arc.executionStatus === "abandoned";
 }
 
+/** 查询尚无数据时的稳定空数组：保持 `arcs` 引用稳定，避免每次渲染都触发依赖它的 memo/effect。 */
+const NO_ARCS: StoryArc[] = [];
+
 export default function StoryArcPanel({ projectId, onApplied }: { projectId: string; onApplied?: () => void }) {
-  const [arcs, setArcs] = useState<StoryArc[]>([]);
   const [selectedId, setSelectedId] = useState<string>();
-  const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string>();
   const [intentOpen, setIntentOpen] = useState(false);
   const [authorIntent, setAuthorIntent] = useState("");
@@ -44,35 +45,45 @@ export default function StoryArcPanel({ projectId, onApplied }: { projectId: str
   const [abandonReason, setAbandonReason] = useState("");
   const [abandonOpen, setAbandonOpen] = useState(false);
 
+  const arcsQuery = useNovelQuery<{ arcs: StoryArc[] }>(
+    novelKeys.storyArcs(projectId),
+    novelPaths.storyArcs({ projectId }),
+    { pollWhile: (data) => Boolean(data?.arcs.some((arc) => arc.planningStatus === "generating")) },
+  );
+  const arcs = arcsQuery.data?.arcs ?? NO_ARCS;
+
+  const startArc = useNovelCommand<{ projectId: string; authorIntent?: string; reviewPolicy: string }>(novelCommands.storyArcStart);
+  const nextBatch = useNovelCommand<{ projectId: string; arcId: string; reviewPolicy: string }>(novelCommands.storyArcNextBatch);
+  const saveArcBundle = useNovelCommand<{ projectId: string; arcId: string; bundle: unknown }>(novelCommands.storyArcUpdate);
+  const previewApprovalCommand = useNovelCommand<{ projectId: string; arcId: string }, { preview: ApprovalPreview }>(novelCommands.storyArcApprovePreview);
+  const approveArc = useNovelCommand<{ projectId: string; arcId: string }>(novelCommands.storyArcApprove);
+  const rebaseArc = useNovelCommand<{ projectId: string; arcId: string; authorIntent?: string; reviewPolicy: string }>(novelCommands.storyArcRebase);
+  const abandonArc = useNovelCommand<{ projectId: string; arcId: string; reason?: string }>(novelCommands.storyArcAbandon);
+  const deleteArcCommand = useNovelCommand<{ projectId: string; arcId: string; force?: boolean }>(novelCommands.storyArcDelete);
+
   const selected = useMemo(() => arcs.find((arc) => arc.id === selectedId) ?? arcs.at(-1), [arcs, selectedId]);
 
-  async function load(silent = false) {
-    if (!silent) setLoading(true);
-    try {
-      const body = await readJson<{ arcs: StoryArc[] }>(`/v2/projects/${encodeURIComponent(projectId)}/story-arcs`);
-      setArcs(body.arcs);
-      setSelectedId((current) => current && body.arcs.some((arc) => arc.id === current) ? current : body.arcs.at(-1)?.id);
-    } catch (error) { if (!silent) message.error(error instanceof Error ? error.message : String(error)); }
-    finally { if (!silent) setLoading(false); }
-  }
-
-  useEffect(() => { void load(); }, [projectId]);
+  // 首屏加载失败沿用原实现的提示；轮询失败（此时已有数据）与原实现一样保持静默。
   useEffect(() => {
-    if (!arcs.some((arc) => arc.planningStatus === "generating")) return;
-    const timer = window.setInterval(() => void load(true), 2500);
-    return () => window.clearInterval(timer);
+    if (!arcsQuery.isError || arcsQuery.data) return;
+    message.error(arcsQuery.error instanceof Error ? arcsQuery.error.message : String(arcsQuery.error));
+  }, [arcsQuery.isError, arcsQuery.data, arcsQuery.error]);
+
+  // 原 load() 中的选中项收敛逻辑：选中项仍在则保留，否则回落到最后一条故事弧。
+  useEffect(() => {
+    setSelectedId((current) => current && arcs.some((arc) => arc.id === current) ? current : arcs.at(-1)?.id);
   }, [arcs]);
 
   async function action(key: string, work: () => Promise<void>) {
     setBusy(key);
-    try { await work(); await load(true); }
+    try { await work(); }
     catch (error) { message.error(error instanceof Error ? error.message : String(error)); }
     finally { setBusy(undefined); }
   }
 
   async function startNext() {
     await action("next", async () => {
-      await readJson(`/v2/projects/${encodeURIComponent(projectId)}/story-arcs/next`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ authorIntent: authorIntent.trim() || undefined, reviewPolicy }) });
+      await startArc.mutateAsync({ projectId, authorIntent: authorIntent.trim() || undefined, reviewPolicy });
       setIntentOpen(false); setAuthorIntent(""); message.success("故事弧规划已启动");
     });
   }
@@ -80,7 +91,7 @@ export default function StoryArcPanel({ projectId, onApplied }: { projectId: str
   async function startNextBatch() {
     if (!selected) return;
     await action("next-batch", async () => {
-      await readJson(`/v2/projects/${encodeURIComponent(projectId)}/story-arcs/${encodeURIComponent(selected.id)}/batches/next`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ reviewPolicy }) });
+      await nextBatch.mutateAsync({ projectId, arcId: selected.id, reviewPolicy });
       message.success("下一批章节蓝图已启动");
     });
   }
@@ -92,7 +103,7 @@ export default function StoryArcPanel({ projectId, onApplied }: { projectId: str
       if (!batch) throw new Error("当前故事弧没有可编辑批次");
       const chapters = editArc.chapters.map((chapter, index) => ({ ...chapter, index: index + 1 }));
       const arc = { ...editArc.arc, threadResponsibilities: editArc.arc.threadResponsibilities };
-      await readJson(`/v2/projects/${encodeURIComponent(projectId)}/story-arcs/${encodeURIComponent(editArc.id)}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ bundle: { arc, batch: { batchIndex: batch.batchIndex, startChapterIndex: batch.startChapterIndex, complete: batch.complete }, chapters } }) });
+      await saveArcBundle.mutateAsync({ projectId, arcId: editArc.id, bundle: { arc, batch: { batchIndex: batch.batchIndex, startChapterIndex: batch.startChapterIndex, complete: batch.complete }, chapters } });
       setEditArc(undefined); message.success(`第 ${batch.batchIndex} 批蓝图已保存，需重新审核`);
     });
   }
@@ -100,7 +111,7 @@ export default function StoryArcPanel({ projectId, onApplied }: { projectId: str
   async function previewApproval() {
     if (!selected) return;
     await action("preview", async () => {
-      const body = await readJson<{ preview: ApprovalPreview }>(`/v2/projects/${encodeURIComponent(projectId)}/story-arcs/${encodeURIComponent(selected.id)}/approve`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ confirm: false }) });
+      const body = await previewApprovalCommand.mutateAsync({ projectId, arcId: selected.id });
       setPreview(body.preview);
     });
   }
@@ -108,7 +119,7 @@ export default function StoryArcPanel({ projectId, onApplied }: { projectId: str
   async function confirmApproval() {
     if (!selected) return;
     await action("approve", async () => {
-      await readJson(`/v2/projects/${encodeURIComponent(projectId)}/story-arcs/${encodeURIComponent(selected.id)}/approve`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ confirm: true }) });
+      await approveArc.mutateAsync({ projectId, arcId: selected.id });
       setPreview(undefined); onApplied?.(); message.success("故事弧已批准并应用为章节目标");
     });
   }
@@ -116,7 +127,7 @@ export default function StoryArcPanel({ projectId, onApplied }: { projectId: str
   async function rebase() {
     if (!selected) return;
     await action("rebase", async () => {
-      await readJson(`/v2/projects/${encodeURIComponent(projectId)}/story-arcs/${encodeURIComponent(selected.id)}/rebase`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ authorIntent: authorIntent.trim() || selected.arc.authorIntent, reviewPolicy }) });
+      await rebaseArc.mutateAsync({ projectId, arcId: selected.id, authorIntent: authorIntent.trim() || selected.arc.authorIntent, reviewPolicy });
       setIntentOpen(false); message.success("已按当前宏观规划重建章节蓝图");
     });
   }
@@ -124,7 +135,7 @@ export default function StoryArcPanel({ projectId, onApplied }: { projectId: str
   async function abandon() {
     if (!selected || !abandonReason.trim()) return;
     await action("abandon", async () => {
-      await readJson(`/v2/projects/${encodeURIComponent(projectId)}/story-arcs/${encodeURIComponent(selected.id)}/abandon`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ reason: abandonReason }) });
+      await abandonArc.mutateAsync({ projectId, arcId: selected.id, reason: abandonReason });
       setAbandonOpen(false); setAbandonReason(""); message.success("故事弧已放弃，下一故事弧现已开放");
     });
   }
@@ -132,8 +143,8 @@ export default function StoryArcPanel({ projectId, onApplied }: { projectId: str
   async function deleteArc(force = false) {
     if (!selected) return;
     await action(force ? "force-delete" : "delete", async () => {
-      const deleteUrl = "/v2/projects/" + encodeURIComponent(projectId) + "/story-arcs/" + encodeURIComponent(selected.id) + (force ? "?force=true" : "");
-      await readJson(deleteUrl, { method: "DELETE", headers: { "content-type": "application/json", ...(force ? { "x-force-delete": "true" } : {}) }, body: JSON.stringify(force ? { force: true } : {}) });
+      // TODO(缺口): 原实现 force 时额外带 header x-force-delete: true，命令注册表尚未表达该 header，行为待补
+      await deleteArcCommand.mutateAsync({ projectId, arcId: selected.id, force });
       setEditArc(undefined); setPreview(undefined); message.success(force ? "故事弧及关联章节记忆已强制删除" : "故事弧已删除");
     });
   }
@@ -163,7 +174,7 @@ export default function StoryArcPanel({ projectId, onApplied }: { projectId: str
     setEditArc((current) => current ? { ...current, arc: { ...current.arc, threadResponsibilities: (current.arc.threadResponsibilities ?? []).map((item, at) => at === index ? { ...item, ...changes } : item) } } : current);
   }
 
-  if (loading) return <div className="novel-plan-loading"><Spin /></div>;
+  if (arcsQuery.isLoading) return <div className="novel-plan-loading"><Spin /></div>;
   if (!arcs.length) return <motion.section className="novel-plan-empty" initial={{ opacity: 0 }} animate={{ opacity: 1 }}><div className="novel-plan-empty-mark"><FileAddOutlined /></div><h2>规划第一个故事弧</h2><p>卷负责长篇分区，故事弧负责阶段推进；每次只展开由叙事密度决定的一批连续章节蓝图。</p><Button type="primary" size="large" icon={<PlusOutlined />} onClick={() => setIntentOpen(true)}>生成故事弧</Button><Modal title="本弧创作意图" open={intentOpen} onCancel={() => setIntentOpen(false)} onOk={() => void startNext()} confirmLoading={busy === "next"} okText="开始生成"><Space direction="vertical" size={12} style={{ width: "100%" }}><Segmented block value={reviewPolicy} onChange={(value) => setReviewPolicy(value as "manual" | "auto")} options={[{ label: "人工审核", value: "manual" }, { label: "自动审校修订", value: "auto" }]} /><Input.TextArea value={authorIntent} onChange={(event) => setAuthorIntent(event.target.value)} autoSize={{ minRows: 4, maxRows: 8 }} placeholder="可选：本弧想重点探索的冲突、关系或氛围" /></Space></Modal></motion.section>;
   if (!selected) return null;
   const latestBatch = selected.batches.at(-1);

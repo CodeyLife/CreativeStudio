@@ -58,6 +58,7 @@ import {
   type NovelWorkflowRunRecord,
 } from "@/lib/novelApi";
 import { documentStatusMeta, projectDisplayTitle, relativeTime, statusMeta, workflowTypeMeta } from "./novel-v2/presentation";
+import { isFailedWorkflowRunStatus, isHumanGateWorkflowRunStatus, isOpenWorkflowRunStatus, isSucceededWorkflowRunStatus, isTerminalWorkflowRunStatus } from "@/novel-v2/run-lifecycle";
 import "./novel-v2.css";
 import "./novel-v2/workspace-command.css";
 
@@ -85,8 +86,6 @@ const VIEW_ITEMS: Array<{ key: NovelWorkspaceView; label: string; icon: React.Re
 ];
 
 const VALID_VIEWS = new Set(VIEW_ITEMS.map((item) => item.key));
-const ACTIVE_STATUSES = new Set(["running", "waiting-external", "accepted", "received", "pending", "paused"]);
-const FAILED_STATUSES = new Set(["failed", "rejected", "cancelled", "terminated", "blocked"]);
 const DOCUMENT_STATUSES = ["planned", "draft", "review", "revision", "final", "archived"].map((value) => ({ value, label: documentStatusMeta(value).label }));
 
 function latestRun(runs: NovelWorkflowRunRecord[]) {
@@ -126,7 +125,7 @@ export default function NovelV2Studio() {
   const selectedRunQ = useNovelRun(selectedWorkflowId);
   const chapterTitleRunQ = useNovelRun(chapterTitleWorkflowId);
   const selectedRun = selectedRunQ.data;
-  const runActive = ACTIVE_STATUSES.has(selectedRun?.status ?? "") || selectedRun?.status === "manual-review-required";
+  const runActive = isOpenWorkflowRunStatus(selectedRun?.status);
   const eventsQ = useNovelRunEvents(selectedWorkflowId, runActive);
   const artifactsQ = useNovelRunArtifacts(selectedWorkflowId, runActive);
   const factsQ = useNovelFactCandidates(projectId, selectedDocumentId);
@@ -168,8 +167,8 @@ export default function NovelV2Studio() {
 
   useEffect(() => {
     const run = chapterTitleRunQ.data;
-    if (!chapterTitleWorkflowId || !run || !["completed", "failed"].includes(run.status)) return;
-    if (run.status === "completed") {
+    if (!chapterTitleWorkflowId || !run || !isTerminalWorkflowRunStatus(run.status)) return;
+    if (isSucceededWorkflowRunStatus(run.status)) {
       const title = typeof run.record?.payload.title === "string" ? run.record.payload.title : undefined;
       const documentId = typeof run.record?.payload.documentId === "string" ? run.record.payload.documentId : undefined;
       if (title && chapterModal === "edit" && selectedDocument?.id === documentId) chapterForm.setFieldValue("title", title);
@@ -183,19 +182,19 @@ export default function NovelV2Studio() {
   }, [chapterTitleRunQ.data?.status, chapterTitleWorkflowId]);
 
   const metrics = useMemo(() => {
-    const manual = runs.filter((run) => run.status === "manual-review-required").length;
-    const failed = runs.filter((run) => FAILED_STATUSES.has(run.status)).length;
-    const active = runs.filter((run) => ACTIVE_STATUSES.has(run.status)).length;
+    const manual = runs.filter((run) => isHumanGateWorkflowRunStatus(run.status)).length;
+    const failed = runs.filter((run) => isFailedWorkflowRunStatus(run.status)).length;
+    const active = runs.filter((run) => isOpenWorkflowRunStatus(run.status)).length;
     const blocking = project?.documents.reduce((sum, document) => sum + (document.blockingIssueCount ?? 0), 0) ?? 0;
     return { manual, failed, active, blocking, priority: manual + failed + blocking };
   }, [project?.documents, runs]);
   const productionMetrics = useMemo(() => {
-    const manual = chapterRuns.filter((run) => run.status === "manual-review-required").length;
-    const failed = chapterRuns.filter((run) => FAILED_STATUSES.has(run.status)).length;
+    const manual = chapterRuns.filter((run) => isHumanGateWorkflowRunStatus(run.status)).length;
+    const failed = chapterRuns.filter((run) => isFailedWorkflowRunStatus(run.status)).length;
     const blocking = project?.documents.reduce((sum, document) => sum + (document.blockingIssueCount ?? 0), 0) ?? 0;
     return { priority: manual + failed + blocking };
   }, [chapterRuns, project?.documents]);
-  const arcRiskCount = useMemo(() => runs.filter((run) => run.workflowType === "story-arc-planning" && FAILED_STATUSES.has(run.status)).length, [runs]);
+  const arcRiskCount = useMemo(() => runs.filter((run) => run.workflowType === "story-arc-planning" && isFailedWorkflowRunStatus(run.status)).length, [runs]);
 
   const filteredDocuments = useMemo(() => {
     const keyword = chapterQuery.trim().toLowerCase();
@@ -208,9 +207,9 @@ export default function NovelV2Studio() {
   const priorityItems = useMemo(() => {
     const items: Array<{ key: string; tone: "danger" | "warning" | "active"; title: string; detail: string; documentId?: string; workflowId?: string }> = [];
     for (const run of runs) {
-      if (run.status === "manual-review-required") items.push({ key: run.id, tone: "warning", title: "等待作者审批", detail: `${workflowTypeMeta(run.workflowType).label} · ${relativeTime(run.updatedAt)}`, workflowId: run.temporalWorkflowId, documentId: typeof run.payload.documentId === "string" ? run.payload.documentId : undefined });
-      else if (FAILED_STATUSES.has(run.status)) items.push({ key: run.id, tone: "danger", title: "运行异常", detail: `${workflowTypeMeta(run.workflowType).label} · ${statusMeta(run.status).label}`, workflowId: run.temporalWorkflowId, documentId: typeof run.payload.documentId === "string" ? run.payload.documentId : undefined });
-      else if (ACTIVE_STATUSES.has(run.status)) items.push({ key: run.id, tone: "active", title: "工作流执行中", detail: `${workflowTypeMeta(run.workflowType).label} · ${relativeTime(run.updatedAt)}`, workflowId: run.temporalWorkflowId, documentId: typeof run.payload.documentId === "string" ? run.payload.documentId : undefined });
+      if (isHumanGateWorkflowRunStatus(run.status)) items.push({ key: run.id, tone: "warning", title: "等待作者审批", detail: `${workflowTypeMeta(run.workflowType).label} · ${relativeTime(run.updatedAt)}`, workflowId: run.temporalWorkflowId, documentId: typeof run.payload.documentId === "string" ? run.payload.documentId : undefined });
+      else if (isFailedWorkflowRunStatus(run.status)) items.push({ key: run.id, tone: "danger", title: "运行异常", detail: `${workflowTypeMeta(run.workflowType).label} · ${statusMeta(run.status).label}`, workflowId: run.temporalWorkflowId, documentId: typeof run.payload.documentId === "string" ? run.payload.documentId : undefined });
+      else if (isOpenWorkflowRunStatus(run.status)) items.push({ key: run.id, tone: "active", title: "工作流执行中", detail: `${workflowTypeMeta(run.workflowType).label} · ${relativeTime(run.updatedAt)}`, workflowId: run.temporalWorkflowId, documentId: typeof run.payload.documentId === "string" ? run.payload.documentId : undefined });
     }
     for (const document of project?.documents ?? []) {
       if ((document.blockingIssueCount ?? 0) > 0) items.push({ key: `doc-${document.id}`, tone: "danger", title: `${document.title} 存在阻塞问题`, detail: `${document.blockingIssueCount} 项需要处理`, documentId: document.id });

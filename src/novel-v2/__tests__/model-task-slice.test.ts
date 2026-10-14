@@ -142,14 +142,30 @@ describe("model_tasks / task_attempts 的写入归属", () => {
   const repo = readFileSync(join(process.cwd(), "src/novel-v2/postgres-repository.ts"), "utf8");
   const slice = readFileSync(join(process.cwd(), "src/novel-v2/repository/model-task-slice.ts"), "utf8");
 
-  it("两张表的写 SQL 只有 slice 一个家（仓储再留一条即第二个写入者）", () => {
-    for (const pattern of [/INSERT INTO model_tasks/, /UPDATE model_tasks/, /INSERT INTO task_attempts/, /UPDATE task_attempts/]) {
-      expect(pattern.test(repo), `仓储仍直接写 ${pattern}`).toBe(false);
-      expect(pattern.test(slice), `slice 应持有 ${pattern}`).toBe(true);
-    }
+  /**
+   * 判据落在**代码**上，不是注释上：`workflow-run-slice.ts` 与 `mcp/handlers.ts` 的注释里
+   * 正当提到这两张表（讲"任务表的 SQL 归那片"），不剥注释会误判。
+   */
+  const stripComments = (text: string): string =>
+    text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+
+  /**
+   * 归属判据按**表**判，不按动词判。
+   *
+   * 初版只匹配 `INSERT`/`UPDATE` 四个模式，于是 `DELETE FROM task_attempts`（deleteProject）、
+   * `SELECT … FROM model_tasks`（expireOrphanedModelTasks）、`DELETE FROM model_tasks`
+   * （cleanupExpiredChapterData）全部漏网——守卫断言了一个不成立的不变量（绿的说谎），
+   * 而"租约表生命周期"实际横跨两个文件。详见 `.scratch/w2-model-task-ownership/spec.md`。
+   */
+  const SQL_ON_OWNED_TABLES = /(INSERT\s+INTO|UPDATE|DELETE\s+FROM|FROM|JOIN)\s+(model_tasks|task_attempts)\b/;
+
+  it("切片自己持有这两张表的全部 SQL（判据非空转）", () => {
+    const hits = stripComments(slice).match(new RegExp(SQL_ON_OWNED_TABLES.source, "g")) ?? [];
+    // 现有 SQL 条数远多于此；下限只是防"判据被改宽到恒不命中"。
+    expect(hits.length).toBeGreaterThanOrEqual(10);
   });
 
-  it("全仓（除测试 fixture 与迁移 DDL）没有第二处生产写入者", async () => {
+  it("全仓（除测试与迁移 DDL）没有第二处 SQL：一张表一个家", async () => {
     const { readdirSync } = await import("node:fs");
     const walk = (dir: string): string[] => readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
       const full = join(dir, entry.name);
@@ -158,7 +174,7 @@ describe("model_tasks / task_attempts 的写入归属", () => {
     });
     const offenders = walk(join(process.cwd(), "src")).concat(walk(join(process.cwd(), "scripts")))
       .filter((file) => !file.endsWith("model-task-slice.ts"))
-      .filter((file) => /INSERT INTO (model_tasks|task_attempts)|UPDATE (model_tasks|task_attempts)\b/.test(readFileSync(file, "utf8")));
+      .filter((file) => SQL_ON_OWNED_TABLES.test(stripComments(readFileSync(file, "utf8"))));
     expect(offenders.map((file) => relative(process.cwd(), file).replace(/\\/g, "/"))).toEqual([]);
   });
 
@@ -167,5 +183,81 @@ describe("model_tasks / task_attempts 的写入归属", () => {
     expect(repo).toContain("return this.modelTasks.submit(input);");
     expect(repo).toContain("return this.modelTasks.upsertAttempt(input);");
     expect(repo).toContain("return this.modelTasks.recordSignal(input);");
+    // 级联删除与孤儿收编也一并委托（含 SELECT/DELETE，不再只有写动词）。
+    expect(repo).toContain("await this.modelTasks.removeProjectTasks(client, projectId);");
+    expect(repo).toContain("await this.modelTasks.removeRunTasks(client,");
+    expect(repo).toContain("return this.modelTasks.expireOrphaned(reason);");
+    // 仓储不再需要 outstanding 词表的 SQL 片段（它随 SELECT 一起搬回切片）。
+    expect(repo).not.toContain("OUTSTANDING_MODEL_TASK_STATUSES_SQL");
+  });
+});
+
+/**
+ * 本片新增的三个方法（级联删除两处 + 孤儿收编一处）。
+ *
+ * 它们的价值不在于"多测了几条 SQL"，而在于**把此前只存在于 god-object 里的语句挪到可单测的
+ * 边界内**：`deleteProject` 与 `cleanupExpiredChapterData` 都必须起真库 + 真事务才能验，
+ * 而"删哪两张表、按哪些键形态、用哪个连接"现在能在假连接上逐条断言。
+ */
+describe("model_tasks / task_attempts 的级联删除与孤儿收编（假连接）", () => {
+  /** 只记录、不返回数据的 executor，用来证明"用的是调用方给的连接"而不是 this.pool。 */
+  function makeExecutor() {
+    const sqls: string[] = [];
+    const paramsList: unknown[][] = [];
+    const executor = {
+      query: async (sql: string, params?: unknown[]) => { sqls.push(sql); paramsList.push(params ?? []); return { rows: [], rowCount: 0 }; },
+    };
+    return { executor, sqls, paramsList };
+  }
+
+  it("removeProjectTasks 用调用方的 executor（事务内），先 model_tasks 后 task_attempts，且两种键形态都认", async () => {
+    const { slice, sqls: poolSqls } = makeSlice([]);
+    const { executor, sqls, paramsList } = makeExecutor();
+    await slice.removeProjectTasks(executor as never, "p1");
+
+    expect(sqls).toHaveLength(2);
+    expect(sqls[0]).toContain("DELETE FROM model_tasks");
+    expect(sqls[0]).toContain("project_id=$1 OR workflow_run_id IN (");
+    expect(sqls[1]).toContain("DELETE FROM task_attempts");
+    // 两种键形态（workflow_runs.id 与 temporal_workflow_id）缺一即收不全——migration 088 的实形。
+    expect(sqls[1]).toContain("SELECT temporal_workflow_id FROM workflow_runs WHERE project_id=$1");
+    expect(sqls[1]).toContain("SELECT id FROM workflow_runs WHERE project_id=$1");
+    expect(paramsList).toEqual([["p1"], ["p1"]]);
+    // 关键：一条都没落到 this.pool——否则删除会跑在调用方事务之外。
+    expect(poolSqls).toEqual([]);
+  });
+
+  it("removeRunTasks 用调用方的 executor，先 task_attempts 后 model_tasks，两个键都传", async () => {
+    const { slice, sqls: poolSqls } = makeSlice([]);
+    const { executor, sqls, paramsList } = makeExecutor();
+    await slice.removeRunTasks(executor as never, { id: "run-id-1", temporalWorkflowId: "wf-temporal-1" });
+
+    expect(sqls).toHaveLength(2);
+    expect(sqls[0]).toContain("DELETE FROM task_attempts WHERE workflow_run_id=$1 OR workflow_run_id=$2");
+    expect(sqls[1]).toContain("DELETE FROM model_tasks WHERE workflow_run_id=$1");
+    expect(paramsList[0]).toEqual(["run-id-1", "wf-temporal-1"]);
+    expect(paramsList[1]).toEqual(["wf-temporal-1"]);
+    expect(poolSqls).toEqual([]);
+  });
+
+  it("expireOrphaned 选键与收编同在一处：先按终态反选，再逐键走 expireForWorkflow 并累加", async () => {
+    const { slice, sqls, paramsList } = makeSlice([
+      { rows: [{ key: "wf-a" }, { key: "wf-b" }], rowCount: 2 },   // SELECT 孤儿键
+      { rows: [{ project_id: "p1", workflow_run_id: "wf-a" }], rowCount: 1 }, // expire wf-a
+      { rows: [{ project_id: "p1", workflow_run_id: "wf-b" }], rowCount: 1 }, // expire wf-b
+    ]);
+    const expired = await slice.expireOrphaned("test-reason");
+
+    expect(expired).toBe(2);
+    expect(sqls[0]).toContain("SELECT DISTINCT t.workflow_run_id AS key");
+    expect(sqls[0]).toContain("FROM model_tasks t");
+    // 判据与 run-lifecycle 同源：两段状态串都由常量内插，不在本文件手写。
+    // 精确断言终态片段——`'running'` 在 outstanding 那侧是正当成员（见上一行），
+    // 所以"整个 SQL 不含 running"是错的断言；要锁的是它**不在终态集合里**。
+    expect(sqls[0]).toContain("t.status IN ('pending','claimed','running')");
+    expect(sqls[0]).toContain("r.status NOT IN ('completed','failed','cancelled','abandoned','rejected')");
+    // 逐键收编，键原样透传（不再由仓储读、切片写）。
+    expect(sqls.slice(1).every((sql) => sql.includes("SET status='failed'"))).toBe(true);
+    expect(paramsList.slice(1).map((params) => params[0])).toEqual(["wf-a", "wf-b"]);
   });
 });

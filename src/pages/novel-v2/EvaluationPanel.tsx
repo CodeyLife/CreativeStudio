@@ -21,7 +21,7 @@ import {
 import { motion } from "motion/react";
 import "../novel-v2.css";
 import { decisionMeta, experimentStatusMeta, receiptStatusMeta, shortId } from "./presentation";
-import { novelFetch as readJson } from "../../lib/novelApi";
+import { novelCommands, novelKeys, novelPaths, useNovelCommand, useNovelProject, useNovelQuery } from "../../lib/novelApi";
 
 type SnapshotHead = {
   projectRevision?: number;
@@ -68,7 +68,6 @@ type DocumentSummary = {
   status?: string;
 };
 
-type ProjectDetail = { id: string; title: string; currentRevision?: number; documents: DocumentSummary[] };
 type PromotableFact = { sourceClaimId: string; payload: { title: string; subjectRefs: string[]; kind: string } };
 type IteratedSkill = { id: string; skillId: string; beforePrompt: string; afterPrompt: string; rationale: string };
 type CandidateBundle = {
@@ -143,83 +142,100 @@ function statusColor(status: Experiment["status"]): string {
 }
 
 export default function EvaluationPanel({ projectId }: EvaluationPanelProps) {
-  const [snapshots, setSnapshots] = useState<SnapshotRow[]>([]);
-  const [experiments, setExperiments] = useState<Experiment[]>([]);
-  const [project, setProject] = useState<ProjectDetail>();
-  const [candidates, setCandidates] = useState<CandidateBundle[]>([]);
-  const [receipts, setReceipts] = useState<Receipt[]>([]);
-  const [error, setError] = useState<string>();
-  const [loading, setLoading] = useState(false);
-  const [capturing, setCapturing] = useState(false);
-  const [snapshotDetail, setSnapshotDetail] = useState<SnapshotDetail>();
+  // ---- 本地 UI 状态（数据不再自持：项目/快照/实验/候选/收据一律由 react-query 提供） ----
+  const [selectedSnapshotId, setSelectedSnapshotId] = useState<string>();
   const [createExperimentOpen, setCreateExperimentOpen] = useState(false);
   const [experimentSnapshotId, setExperimentSnapshotId] = useState<string>();
   const [selectedExperimentId, setSelectedExperimentId] = useState<string>();
   const [selectedDocumentId, setSelectedDocumentId] = useState<string>();
-  const [generatingCandidate, setGeneratingCandidate] = useState(false);
   const [currentCandidate, setCurrentCandidate] = useState<CandidateBundle>();
   const [expandedManuscript, setExpandedManuscript] = useState(false);
   const [promoteCandidate, setPromoteCandidate] = useState<CandidateBundle>();
-  const [promoting, setPromoting] = useState(false);
+  /** 错误 Alert 的「已关闭」标记：错误文本本身来自 react-query，本地只记用户是否已关掉它。 */
+  const [dismissedError, setDismissedError] = useState<string>();
   const [promoteForm] = Form.useForm<{ authorId: string; decision: "accept" | "reject"; reason: string }>();
 
-  async function loadAll() {
-    setLoading(true);
-    try {
-      const [proj, snap, exp, candidateResult, receiptResult] = await Promise.all([
-        readJson<{ project: ProjectDetail }>(`/v2/projects/${encodeURIComponent(projectId)}`),
-        readJson<{ snapshots: SnapshotRow[] }>(`/v2/projects/${encodeURIComponent(projectId)}/snapshots`),
-        readJson<{ experiments: Experiment[] }>(`/v2/projects/${encodeURIComponent(projectId)}/experiments`),
-        readJson<{ candidates: CandidateBundle[] }>(`/v2/projects/${encodeURIComponent(projectId)}/candidates`),
-        readJson<{ receipts: Receipt[] }>(`/v2/projects/${encodeURIComponent(projectId)}/receipts`),
-      ]);
-      const nextSnapshots = snap.snapshots ?? [];
-      const nextExperiments = exp.experiments ?? [];
-      const nextCandidates = candidateResult.candidates ?? [];
-      const nextDocuments = proj.project.documents ?? [];
-      const nextActiveExperiment = nextExperiments.find((item) => item.status === "active");
+  // ---- 读：五个项目级资源 + 按需的快照详情，调用点只给 key 与路径表 ----
+  const projectQuery = useNovelProject(projectId);
+  const snapshotsQuery = useNovelQuery<{ snapshots: SnapshotRow[] }>(novelKeys.snapshots(projectId), novelPaths.snapshots({ projectId }), { enabled: Boolean(projectId) });
+  const experimentsQuery = useNovelQuery<{ experiments: Experiment[] }>(novelKeys.experiments(projectId), novelPaths.experiments({ projectId }), { enabled: Boolean(projectId) });
+  const candidatesQuery = useNovelQuery<{ candidates: CandidateBundle[] }>(novelKeys.candidates(projectId), novelPaths.candidates({ projectId }), { enabled: Boolean(projectId) });
+  const receiptsQuery = useNovelQuery<{ receipts: Receipt[] }>(novelKeys.receipts(projectId), novelPaths.receipts({ projectId }), { enabled: Boolean(projectId) });
+  // 快照详情按需请求：只有点开某个快照时才 enabled；未选中时用哨兵 key/path 占位，不发请求。
+  const snapshotQuery = useNovelQuery<{ snapshot: SnapshotDetail }>(
+    novelKeys.snapshot(selectedSnapshotId ?? "none"),
+    novelPaths.snapshot({ snapshotId: selectedSnapshotId ?? "none" }),
+    { enabled: Boolean(selectedSnapshotId) },
+  );
 
-      setProject(proj.project);
-      setSnapshots(nextSnapshots);
-      setExperiments(nextExperiments);
-      setCandidates(nextCandidates);
-      setReceipts(receiptResult.receipts ?? []);
-      setCurrentCandidate((previous) => (previous ? nextCandidates.find((item) => item.id === previous.id) ?? nextCandidates[0] : nextCandidates[0]));
-      setSelectedExperimentId((previous) => previous && nextExperiments.some((item) => item.id === previous && item.status === "active") ? previous : nextActiveExperiment?.id);
-      setSelectedDocumentId((previous) => previous && nextDocuments.some((item) => item.id === previous) ? previous : nextDocuments[0]?.id);
-      setError(undefined);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setLoading(false);
-    }
-  }
+  // ---- 写：路径/方法/请求体/失效面都来自命令注册表，调用点只给业务入参 ----
+  const snapshotCaptureCmd = useNovelCommand<{ projectId: string }>(novelCommands.snapshotCapture);
+  const experimentCreateCmd = useNovelCommand<{ projectId: string; snapshotId: string }>(novelCommands.experimentCreate);
+  const experimentDeleteCmd = useNovelCommand<{ projectId: string; experimentId: string }>(novelCommands.experimentDelete);
+  const experimentCloseCmd = useNovelCommand<{ projectId: string; experimentId: string }>(novelCommands.experimentClose);
+  const candidateGenerateCmd = useNovelCommand<{ projectId: string; experimentId: string; documentId: string }, { candidate: CandidateBundle }>(novelCommands.candidateGenerate);
+  const candidatePromoteCmd = useNovelCommand<{ projectId: string; candidateId: string; authorId?: string; decision: string; reason?: string }>(novelCommands.candidatePromote);
 
+  // ---- 派生数据（渲染面与迁移前逐项对齐） ----
+  const project = projectQuery.data;
+  const snapshots = snapshotsQuery.data?.snapshots ?? [];
+  const experiments = experimentsQuery.data?.experiments ?? [];
+  const candidates = candidatesQuery.data?.candidates ?? [];
+  const receipts = receiptsQuery.data?.receipts ?? [];
+  const snapshotDetail = snapshotQuery.data?.snapshot;
+  const loading = projectQuery.isFetching || snapshotsQuery.isFetching || experimentsQuery.isFetching || candidatesQuery.isFetching || receiptsQuery.isFetching;
+  const allLoaded = !projectQuery.isLoading && !snapshotsQuery.isLoading && !experimentsQuery.isLoading && !candidatesQuery.isLoading && !receiptsQuery.isLoading;
+  const loadError = projectQuery.error ?? snapshotsQuery.error ?? experimentsQuery.error ?? candidatesQuery.error ?? receiptsQuery.error;
+  const error = loadError && loadError.message !== dismissedError ? loadError.message : undefined;
+
+  /**
+   * loadAll 的「统一重算」语义：原实现用 Promise.all 等 5 个 GET 全部回来后，**一次性**重算
+   * selected 系状态与 currentCandidate（含各自的兜底）。这里保留同一时点——依赖这 5 个 data，
+   * 且首轮只在全部就绪（!isLoading）后执行，此后任一 data 变化（含写操作按失效面重取）再统一重算一次。
+   *
+   * 刻意不把这些重算塞进各 query 的 onSuccess/各自的 effect：那会退化成「谁先回来谁先算」，
+   * 丢掉"5 个 GET 都回来"这一并发语义（例如章节兜底会先于实验列表到达而提前落定）。
+   */
   useEffect(() => {
-    if (projectId) void loadAll();
-    // TODO P3: loadAll 依赖 projectId，后续可拆分独立刷新。
-  }, [projectId]);
+    if (!projectId || !allLoaded) return;
+    const nextExperiments = experimentsQuery.data?.experiments ?? [];
+    const nextCandidates = candidatesQuery.data?.candidates ?? [];
+    const nextDocuments = projectQuery.data?.documents ?? [];
+    const nextActiveExperiment = nextExperiments.find((item) => item.status === "active");
+    setCurrentCandidate((previous) => (previous ? nextCandidates.find((item) => item.id === previous.id) ?? nextCandidates[0] : nextCandidates[0]));
+    setSelectedExperimentId((previous) => previous && nextExperiments.some((item) => item.id === previous && item.status === "active") ? previous : nextActiveExperiment?.id);
+    setSelectedDocumentId((previous) => previous && nextDocuments.some((item) => item.id === previous) ? previous : nextDocuments[0]?.id);
+  }, [projectId, allLoaded, projectQuery.data, snapshotsQuery.data, experimentsQuery.data, candidatesQuery.data, receiptsQuery.data]);
+
+  /** 快照详情取用失败保留原来的 message.error 提示（原 viewSnapshot 的 catch 分支）。 */
+  useEffect(() => {
+    if (snapshotQuery.error) message.error(snapshotQuery.error.message);
+  }, [snapshotQuery.error]);
+
+  function refreshAll() {
+    void projectQuery.refetch();
+    void snapshotsQuery.refetch();
+    void experimentsQuery.refetch();
+    void candidatesQuery.refetch();
+    void receiptsQuery.refetch();
+  }
 
   async function captureSnapshot() {
-    setCapturing(true);
     try {
-      await readJson(`/v2/projects/${encodeURIComponent(projectId)}/snapshots`, { method: "POST" });
+      await snapshotCaptureCmd.mutateAsync({ projectId });
       message.success("作品基线已保存");
-      await loadAll();
     } catch (err) {
       message.error(err instanceof Error ? err.message : String(err));
-    } finally {
-      setCapturing(false);
     }
   }
 
-  async function viewSnapshot(snapshotId: string) {
-    try {
-      const body = await readJson<{ snapshot: SnapshotDetail }>(`/v2/snapshots/${encodeURIComponent(snapshotId)}`);
-      setSnapshotDetail(body.snapshot);
-    } catch (err) {
-      message.error(err instanceof Error ? err.message : String(err));
+  function viewSnapshot(snapshotId: string) {
+    // 同一份快照再次点开＝重取，对齐原来"每次点击都发一次请求"的行为。
+    if (snapshotId === selectedSnapshotId) {
+      void snapshotQuery.refetch();
+      return;
     }
+    setSelectedSnapshotId(snapshotId);
   }
 
   async function createExperiment() {
@@ -228,15 +244,10 @@ export default function EvaluationPanel({ projectId }: EvaluationPanelProps) {
       return;
     }
     try {
-      await readJson(`/v2/projects/${encodeURIComponent(projectId)}/experiments`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ snapshotId: experimentSnapshotId }),
-      });
+      await experimentCreateCmd.mutateAsync({ projectId, snapshotId: experimentSnapshotId });
       message.success("隔离实验已创建，可以开始生成候选稿");
       setCreateExperimentOpen(false);
       setExperimentSnapshotId(undefined);
-      await loadAll();
     } catch (err) {
       message.error(err instanceof Error ? err.message : String(err));
     }
@@ -244,9 +255,8 @@ export default function EvaluationPanel({ projectId }: EvaluationPanelProps) {
 
   async function deleteExperiment(experimentId: string) {
     try {
-      await readJson(`/v2/experiments/${encodeURIComponent(experimentId)}`, { method: "DELETE" });
+      await experimentDeleteCmd.mutateAsync({ projectId, experimentId });
       message.success("隔离实验已删除");
-      await loadAll();
     } catch (err) {
       message.error(err instanceof Error ? err.message : String(err));
     }
@@ -254,9 +264,8 @@ export default function EvaluationPanel({ projectId }: EvaluationPanelProps) {
 
   async function closeExperiment(experimentId: string) {
     try {
-      await readJson(`/v2/experiments/${encodeURIComponent(experimentId)}/close`, { method: "POST" });
+      await experimentCloseCmd.mutateAsync({ projectId, experimentId });
       message.success("隔离实验已关闭，正式作品不受影响");
-      await loadAll();
     } catch (err) {
       message.error(err instanceof Error ? err.message : String(err));
     }
@@ -267,39 +276,25 @@ export default function EvaluationPanel({ projectId }: EvaluationPanelProps) {
       message.warning("请先选择隔离实验和目标章节");
       return;
     }
-    setGeneratingCandidate(true);
     try {
-      const body = await readJson<{ candidate: CandidateBundle }>(
-        `/v2/experiments/${encodeURIComponent(selectedExperimentId)}/candidate`,
-        { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ documentId: selectedDocumentId }) },
-      );
+      const body = await candidateGenerateCmd.mutateAsync({ projectId, experimentId: selectedExperimentId, documentId: selectedDocumentId });
       setCurrentCandidate(body.candidate);
-      setCandidates((previous) => [body.candidate, ...previous.filter((candidate) => candidate.id !== body.candidate.id)]);
       setExpandedManuscript(false);
       message.success("候选稿已生成，正式作品尚未改变");
     } catch (err) {
       message.error(err instanceof Error ? err.message : String(err));
-    } finally {
-      setGeneratingCandidate(false);
     }
   }
 
   async function submitPromotion(values: { authorId: string; decision: "accept" | "reject"; reason: string }) {
     if (!promoteCandidate) return;
-    setPromoting(true);
     try {
-      const body = await readJson<{ receipt: Receipt }>(
-        `/v2/candidates/${encodeURIComponent(promoteCandidate.id)}/promote`,
-        { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(values) },
-      );
-      setReceipts((previous) => [body.receipt, ...previous.filter((receipt) => receipt.id !== body.receipt.id)]);
+      await candidatePromoteCmd.mutateAsync({ projectId, candidateId: promoteCandidate.id, authorId: values.authorId, decision: values.decision, reason: values.reason });
       message.success(values.decision === "accept" ? "候选稿已提交晋升" : "候选稿已拒绝，正式作品未改变");
       setPromoteCandidate(undefined);
       promoteForm.resetFields();
     } catch (err) {
       message.error(err instanceof Error ? err.message : String(err));
-    } finally {
-      setPromoting(false);
     }
   }
 
@@ -353,12 +348,12 @@ export default function EvaluationPanel({ projectId }: EvaluationPanelProps) {
           </div>
         </div>
         <div className="novel-topbar-actions">
-          <Button icon={<ReloadOutlined />} loading={loading} onClick={() => void loadAll()}>刷新</Button>
-          <Button type="primary" aria-label="捕获快照，保存当前基线" icon={<CameraOutlined />} loading={capturing} onClick={() => void captureSnapshot()}>保存当前基线</Button>
+          <Button icon={<ReloadOutlined />} loading={loading} onClick={() => void refreshAll()}>刷新</Button>
+          <Button type="primary" aria-label="捕获快照，保存当前基线" icon={<CameraOutlined />} loading={snapshotCaptureCmd.isPending} onClick={() => void captureSnapshot()}>保存当前基线</Button>
         </div>
       </motion.header>
 
-      {error && <Alert type="error" showIcon message={error} className="novel-v2-alert" closable onClose={() => setError(undefined)} />}
+      {error && <Alert type="error" showIcon message={error} className="novel-v2-alert" closable onClose={() => setDismissedError(loadError?.message)} />}
 
       <motion.section
         className="novel-eval-steps"
@@ -439,7 +434,7 @@ export default function EvaluationPanel({ projectId }: EvaluationPanelProps) {
                 <small>{selectedDocument ? `当前版本第 ${selectedDocument.narrativeOrder} 章，生成后可与原稿对照` : "章节名称会显示在候选结果中"}</small>
               </label>
             </div>
-            <Button type="primary" size="large" icon={<ThunderboltOutlined />} loading={generatingCandidate} disabled={!selectedExperimentId || !selectedDocumentId} block onClick={() => void generateCandidate()}>
+            <Button type="primary" size="large" icon={<ThunderboltOutlined />} loading={candidateGenerateCmd.isPending} disabled={!selectedExperimentId || !selectedDocumentId} block onClick={() => void generateCandidate()}>
               生成候选稿
             </Button>
             {!activeExperiments.length && (
@@ -539,7 +534,7 @@ export default function EvaluationPanel({ projectId }: EvaluationPanelProps) {
                       <strong>{index === 0 ? "最近的作品基线" : snapshotName(snapshot)}</strong>
                       <span>{formatDate(snapshot.created_at)} · 修订 {head.projectRevision ?? "未知"} · {head.finalDocumentHashes?.length ?? 0} 章</span>
                     </div>
-                    <Button type="link" icon={<EyeOutlined />} aria-label={`查看${snapshotName(snapshot)}`} onClick={() => void viewSnapshot(snapshot.id)}>查看组成</Button>
+                    <Button type="link" icon={<EyeOutlined />} aria-label={`查看${snapshotName(snapshot)}`} onClick={() => viewSnapshot(snapshot.id)}>查看组成</Button>
                   </div>
                 );
               })}
@@ -626,7 +621,7 @@ export default function EvaluationPanel({ projectId }: EvaluationPanelProps) {
         </motion.aside>
       </section>
 
-      <Modal title="项目基线组成" open={Boolean(snapshotDetail)} onCancel={() => setSnapshotDetail(undefined)} footer={null} width={720} destroyOnHidden>
+      <Modal title="项目基线组成" open={Boolean(snapshotDetail)} onCancel={() => setSelectedSnapshotId(undefined)} footer={null} width={720} destroyOnHidden>
         {snapshotDetail && (
           <div className="novel-eval-snapshot-detail">
             <div className="novel-eval-modal-intro"><CameraOutlined /><div><strong>{snapshotName(snapshotDetail)}</strong><p>这份只读副本保存了当时的章节、事实、角色关系和写作规则，实验会从它开始。</p></div></div>
@@ -657,7 +652,7 @@ export default function EvaluationPanel({ projectId }: EvaluationPanelProps) {
               <Form.Item name="authorId" label="记录人" rules={[{ required: true, message: "请输入记录人" }]}><Input placeholder="web-author" /></Form.Item>
               <Form.Item name="decision" label="你的决定" rules={[{ required: true }]}><Select options={[{ value: "accept", label: decisionMeta("accept").label + "，写入正式作品" }, { value: "reject", label: decisionMeta("reject").label + "，保持现状" }]} /></Form.Item>
               <Form.Item name="reason" label="判断依据"><Input.TextArea rows={3} placeholder="记录你为什么接受或拒绝这份候选稿" /></Form.Item>
-              <Button type="primary" htmlType="submit" block loading={promoting} icon={<CheckCircleOutlined />}>提交决定</Button>
+              <Button type="primary" htmlType="submit" block loading={candidatePromoteCmd.isPending} icon={<CheckCircleOutlined />}>提交决定</Button>
             </Form>
           </>
         )}

@@ -1,9 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type { Client } from "@temporalio/client";
 import type { ChapterTitleWorkflowRepositoryAccess } from "../repository-capabilities";
+import { isOpenWorkflowRunStatus } from "../run-lifecycle";
 import { chapterTitleSourceFingerprint } from "./chapter-title";
-
-const ACTIVE_STATUSES = new Set(["accepted", "pending", "running", "waiting-external"]);
 
 export async function startChapterTitleGeneration(
   repository: ChapterTitleWorkflowRepositoryAccess,
@@ -16,7 +15,7 @@ export async function startChapterTitleGeneration(
   ]);
   if (!source) throw new Error("章节不存在");
   const sourceFingerprint = chapterTitleSourceFingerprint(source);
-  const active = runs.find((run) => run.workflowType === "chapter-title" && ACTIVE_STATUSES.has(run.status)
+  const active = runs.find((run) => run.workflowType === "chapter-title" && isOpenWorkflowRunStatus(run.status)
     && run.payload.documentId === input.documentId && run.payload.sourceFingerprint === sourceFingerprint);
   if (active) return { workflowId: active.temporalWorkflowId, status: active.status, sourceFingerprint, reused: true };
 

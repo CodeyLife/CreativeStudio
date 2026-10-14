@@ -1,7 +1,6 @@
 import { renderToStaticMarkup } from "react-dom/server";
-import { App, ConfigProvider, theme as antdTheme } from "antd";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { ReactNode } from "react";
+import { PanelProviders } from "./panel-providers";
 
 // ===== Mocks =====
 const fetchMock = vi.fn();
@@ -11,19 +10,11 @@ import CreativeRunPanel from "../CreativeRunPanel";
 
 // ===== Helpers =====
 
-function WithTheme({ children }: { children: ReactNode }) {
-  return (
-    <ConfigProvider theme={{ algorithm: antdTheme.darkAlgorithm }}>
-      <App>{children}</App>
-    </ConfigProvider>
-  );
-}
-
 function renderPanel(props: { projectId?: string } = {}) {
   return renderToStaticMarkup(
-    <WithTheme>
+    <PanelProviders>
       <CreativeRunPanel projectId={props.projectId ?? "p1"} />
-    </WithTheme>,
+    </PanelProviders>,
   );
 }
 

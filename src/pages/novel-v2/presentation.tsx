@@ -55,6 +55,18 @@ export function workflowTypeMeta(workflowType: string | undefined): { label: str
 }
 
 // ----- 运行/任务 status → 中文标签 + 状态药丸 class -----
+/**
+ * 状态 → 中文标签的**渲染表**，不是词表。
+ *
+ * 覆盖面比 `run-lifecycle.ts` 的 `WORKFLOW_RUN_STATUSES` 宽，且这是故意的：
+ * ① 它同时服务 `workflow_runs.status` 与 **`creative_runs.status`**
+ *    （`pending|running|paused|completed|failed|cancelled`，见 `CreativeRunPanel.tsx`），
+ *    所以 `pending`/`paused` 是正当成员；
+ * ② 运行库的历史值可能超出词表（见 `run-lifecycle.ts` 的 `toWorkflowRunStatus`），
+ *    为旧拼写留标签可避免老行渲染成裸字符串。
+ *
+ * 因此**不要**把这里的键当作可用状态清单去写判据——判据一律从 `run-lifecycle.ts` 派生。
+ */
 const STATUS_META: Record<string, { label: string; pill: string; icon: ReactNode }> = {
   received: { label: "已接收", pill: "novel-status-pill novel-status-pill-idle", icon: <ClockCircleOutlined /> },
   accepted: { label: "已受理", pill: "novel-status-pill novel-status-pill-running", icon: <ClockCircleOutlined /> },

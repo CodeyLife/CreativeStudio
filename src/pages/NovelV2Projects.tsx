@@ -13,6 +13,7 @@ import {
 } from "@ant-design/icons";
 import { useNavigate } from "react-router-dom";
 import { motion } from "motion/react";
+import { isFailedWorkflowRunStatus, isHumanGateWorkflowRunStatus, isOpenWorkflowRunStatus, isTerminalWorkflowRunStatus } from "@/novel-v2/run-lifecycle";
 import {
   useCreateNovelProject,
   useDeleteNovelProject,
@@ -65,10 +66,10 @@ type ProjectState = "idle" | "running" | "review" | "done" | "failed";
 
 function statusKind(status: string | undefined): ProjectState {
   if (!status) return "idle";
-  if (status === "manual-review-required") return "review";
-  if (/running|accepted|received|pending|paused/i.test(status)) return "running";
-  if (/completed|promoted|passed|succeeded/i.test(status)) return "done";
-  if (/failed|rejected|rolled-back|blocked|cancelled|terminated/i.test(status)) return "failed";
+  if (isHumanGateWorkflowRunStatus(status)) return "review";
+  if (isOpenWorkflowRunStatus(status)) return "running";
+  if (isFailedWorkflowRunStatus(status)) return "failed";
+  if (isTerminalWorkflowRunStatus(status)) return "done";
   return "idle";
 }
 

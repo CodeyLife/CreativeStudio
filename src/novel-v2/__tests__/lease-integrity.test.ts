@@ -284,8 +284,17 @@ describe("reconcileStaleWorkflowRuns（OR-B4 僵尸对账）", () => {
     // （同一段里 `JOIN manuscript_documents` 是滚动修订清理的合法用法，故只锁预检那一句）。
     expect(body).not.toMatch(/workflow_run_summaries|SELECT 1 FROM manuscript_documents/);
     // 同一段的本职仍在：四类细节各删一次，run 行原地压成 compactPayload。
-    for (const detail of ["DELETE FROM artifacts", "DELETE FROM task_attempts", "DELETE FROM model_tasks", "DELETE FROM outbox_events"]) {
+    //
+    // 其中两张**租约表**的 SQL 已归 `ModelTaskSlice`（W2：归属改按表划线，不再按 SQL 动词），
+    // 故这里锁**委托**，再到切片侧锁**语句本体**——两处都锁，"少删一项"才仍然能被发现。
+    // 只锁委托会漏掉"切片里那条被删了"，只锁切片会漏掉"这段不再调它"。
+    for (const detail of ["DELETE FROM artifacts", "DELETE FROM outbox_events"]) {
       expect(body, `清理的删除清单少了一项 ⇒ 摘要是被"顺手删掉"而非"不再需要"`).toContain(detail);
+    }
+    expect(body, "租约表清理应委托给 ModelTaskSlice").toContain("this.modelTasks.removeRunTasks(");
+    const slice = readFileSync(join(process.cwd(), "src/novel-v2/repository/model-task-slice.ts"), "utf8");
+    for (const detail of ["DELETE FROM task_attempts", "DELETE FROM model_tasks"]) {
+      expect(slice, `切片侧租约表清理少了 ${detail}`).toContain(detail);
     }
     expect(body).toContain("diagnosticsCleanedAt");
   });

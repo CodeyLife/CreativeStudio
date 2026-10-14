@@ -4,7 +4,7 @@ import { CopyOutlined, DownOutlined, FormatPainterOutlined, PlayCircleOutlined, 
 import { motion } from "motion/react";
 import "../novel-v2.css";
 import { buildToolArgumentSkeleton, DIRECT_EXEC_TOOLS, TOOL_COUNT, TOOL_DESCRIPTIONS, TOOL_GROUP_COUNT, TOOL_GROUPS, type ToolInfo } from "../../novel-v2/mcp/tool-metadata";
-import { novelFetch } from "../../lib/novelApi";
+import { executeNovelTool } from "../../lib/novelApi";
 
 export interface McpToolGatewayPanelProps {
   // 无 props，MCP 工具面板是全局的
@@ -35,24 +35,6 @@ function saveHistory(records: CallRecord[]) {
 
 function buildMcpCommand(toolName: string, args: unknown): string {
   return JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: toolName, arguments: args ?? {} } }, null, 2);
-}
-
-async function directExecute(toolName: string, args: Record<string, unknown>): Promise<unknown> {
-  switch (toolName) {
-    case "novel_run_create": {
-      const projectId = String(args.projectId ?? "");
-      if (!projectId) throw new Error("projectId 必填");
-      return novelFetch(`/v2/projects/${encodeURIComponent(projectId)}/creative-runs`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(args) });
-    }
-    case "novel_chapter_review": {
-      const projectId = String(args.projectId ?? "");
-      const documentId = String(args.documentId ?? "");
-      if (!projectId || !documentId) throw new Error("projectId 和 documentId 必填");
-      return novelFetch(`/v2/projects/${encodeURIComponent(projectId)}/documents/${encodeURIComponent(documentId)}/review`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(args) });
-    }
-    default:
-      throw new Error(`工具 ${toolName} 不支持直接执行，请复制 MCP 调用命令后通过 MCP server 调用`);
-  }
 }
 
 function summarizeResult(result: unknown): string {
@@ -154,7 +136,7 @@ export default function McpToolGatewayPanel(_props: McpToolGatewayPanelProps) {
       return;
     }
     try {
-      const res = await directExecute(selectedTool, parsedArgs);
+      const res = await executeNovelTool(selectedTool, parsedArgs);
       setResult(res);
       setResultExpanded(false);
       appendHistory({ id: makeRecordId(), timestamp: Date.now(), toolName: selectedTool, status: "success", argsText, summary: summarizeResult(res) });

@@ -1,12 +1,16 @@
 /**
  * 外部模型任务与租约 slice（第二片物理拆分）。
  *
- * 为什么这一片：`model_tasks` 与 `task_attempts` 的读写在全仓**只**由下面这 12 个方法产生
- * （两行的 row 类型与 mapper 也仅此一处使用），是度量到的最干净的一片；而它承载的恰恰是
- * 最容易被跨域写入破坏的不变式——migration 086 的 `CHECK (claimed/running ⇒ lease_owner 非空)`、
- * 088 把 `task_attempts.workflow_run_id` 的 FK 改指 `temporal_workflow_id`（FK 必须服从实际
- * 写入面而非注释）、以及"只有无人认领的任务才打 expired 留痕"的判据。把这些 SQL 关进一个
- * 文件，不变式才有单一归属地，也才能不起 Postgres 就单测。
+ * 为什么这一片：`model_tasks` 与 `task_attempts` 的**全部 SQL**（含 `SELECT` 与 `DELETE`）
+ * 都归本文件——这是可判定的不变量，由 `model-task-slice.test.ts` 按**表名**锁住。
+ * 它承载的恰恰是最容易被跨域写入破坏的不变式——migration 086 的
+ * `CHECK (claimed/running ⇒ lease_owner 非空)`、088 把 `task_attempts.workflow_run_id` 的 FK
+ * 改指 `temporal_workflow_id`（FK 必须服从实际写入面而非注释）、以及"只有无人认领的任务才打
+ * expired 留痕"的判据。把这些 SQL 关进一个文件，不变式才有单一归属地，也才能不起 Postgres 就单测。
+ *
+ * **归属的划线方式（2026-10-13 修正）**：初版只把 `INSERT`/`UPDATE` 搬了过来，`SELECT`/`DELETE`
+ * 留在 god-object 里，守卫也只匹配那两个动词——于是"租约表生命周期"横跨两个文件，而守卫断言
+ * 了一个不成立的不变量（绿的说谎）。现按**表**划线：一张表的所有 SQL 都在这里。
  *
  * 租约模型（本片的地基，逐条对应下面的 SQL）：
  * - 领取靠 `SELECT … FOR UPDATE` 行锁 + `status='pending'` 判据，同事务里建 attempt；
@@ -19,9 +23,10 @@
  * 审计、以及 reconcile 里对 run 状态的收编——那些各自属于 artifact 片与 run 片。
  * `expireWorkflowModelTasks` 被 reconcile 调用，但写的是本片的表，故留在本片由本片负责。
  */
-import type { Pool } from "pg";
+import type { Pool, PoolClient } from "pg";
 import type { TaskAttemptRecord } from "../protocol";
 import type { ModelTaskRecord, ModelWorkPackage } from "../model-routing";
+import { TERMINAL_WORKFLOW_RUN_STATUSES_SQL } from "../run-lifecycle";
 import { iso, type OutboxWriter } from "./shared";
 
 type TaskAttemptRow = { id: string; workflow_run_id: string | null; task_id: string; lease_owner: string | null; lease_expires_at: Date | string | null; heartbeat_at: Date | string | null; status: TaskAttemptRecord["status"]; payload: Record<string, unknown> };
@@ -39,6 +44,14 @@ export interface ModelTaskSliceDeps {
   pool: Pool;
   appendOutbox: OutboxWriter;
 }
+
+/**
+ * 事务参与者：`Pool` 与 `PoolClient` 都满足。
+ *
+ * 级联删除类的操作由调用方开事务，本片必须用**同一个连接**执行，否则删除落在事务之外。
+ * 仓储里 `assertNoActiveStoryArcWorkflow` 早就是同一写法（`client: Pool | PoolClient`）。
+ */
+export type ModelTaskExecutor = Pool | PoolClient;
 
 /**
  * "尚未交付"的任务态。过期、放弃、按 run 收编三处判据共用这一份——写第二份字面量时
@@ -193,6 +206,60 @@ export class ModelTaskSlice {
       [workflowRunKey, { text: "", value: { reason } }],
     );
     return result.rowCount ?? 0;
+  }
+
+  /**
+   * 收编「run 已终态（或 run 行已不存在）却仍挂着未交付」的外部任务。
+   *
+   * **整个概念归本片**：选键（SELECT）与收编（`expireForWorkflow` 循环）都在这里。
+   * 此前是仓储选键、再回调本片写——同一对 slice 之间的第二条接缝，且读侧在仓储里重述了
+   * 一份 outstanding 词表。写入判据仍只有 `expireForWorkflow` 一处。
+   *
+   * `submitted`/`failed` 不动：已交付与已放弃的结果是事实。幂等：收编后不再命中，重放为 no-op。
+   */
+  async expireOrphaned(reason = "run-already-terminal"): Promise<number> {
+    const orphans = await this.pool.query<{ key: string }>(
+      `SELECT DISTINCT t.workflow_run_id AS key
+         FROM model_tasks t
+        WHERE t.status IN (${OUTSTANDING_MODEL_TASK_STATUSES_SQL})
+          AND NOT EXISTS (
+            SELECT 1 FROM workflow_runs r
+            WHERE (r.temporal_workflow_id = t.workflow_run_id OR r.id = t.workflow_run_id)
+              AND r.status NOT IN (${TERMINAL_WORKFLOW_RUN_STATUSES_SQL})
+          )`,
+    );
+    let expired = 0;
+    for (const row of orphans.rows) expired += await this.expireForWorkflow(row.key, reason);
+    return expired;
+  }
+
+  /**
+   * 项目级级联删除：**两张表一起**，且认项目名下 run 的两种键形态。
+   *
+   * 归本片的理由就是守卫锁的那条不变量——这两张表的所有 SQL 只有一个家。此前 `model_tasks`
+   * 的 DELETE 混在 `deleteProject` 的通用表循环里、`task_attempts` 的 DELETE 另起一行，
+   * 于是"租约表生命周期"横跨两个文件，而守卫按动词匹配（只认 INSERT/UPDATE）看不见它们。
+   *
+   * 接受 `executor` 而非只用 `this.pool`：调用方在事务内，必须与它同一个连接。
+   */
+  async removeProjectTasks(executor: ModelTaskExecutor, projectId: string): Promise<void> {
+    await executor.query(
+      `DELETE FROM model_tasks WHERE project_id=$1 OR workflow_run_id IN (SELECT id FROM workflow_runs WHERE project_id=$1 UNION SELECT temporal_workflow_id FROM workflow_runs WHERE project_id=$1)`,
+      [projectId],
+    );
+    await executor.query(
+      `DELETE FROM task_attempts WHERE workflow_run_id IN (SELECT temporal_workflow_id FROM workflow_runs WHERE project_id=$1) OR workflow_run_id IN (SELECT id FROM workflow_runs WHERE project_id=$1)`,
+      [projectId],
+    );
+  }
+
+  /**
+   * run 级诊断数据清理：两张表一起，顺序照旧（先 attempt 后 task，attempt 引用 task）。
+   * 两种键形态都要认——migration 088 就是被这个实形逼着把 FK 改指 `temporal_workflow_id`。
+   */
+  async removeRunTasks(executor: ModelTaskExecutor, keys: { id: string; temporalWorkflowId: string }): Promise<void> {
+    await executor.query("DELETE FROM task_attempts WHERE workflow_run_id=$1 OR workflow_run_id=$2", [keys.id, keys.temporalWorkflowId]);
+    await executor.query("DELETE FROM model_tasks WHERE workflow_run_id=$1", [keys.temporalWorkflowId]);
   }
 
   async upsertAttempt(input: { id: string; workflowRunId?: string; taskId: string; status: TaskAttemptRecord["status"]; leaseOwner?: string; leaseMs?: number; payload?: Record<string, unknown> }) {

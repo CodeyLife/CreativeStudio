@@ -14,10 +14,11 @@ import { Alert, Button, Empty, Input, Modal, Tabs, Tag, Tooltip, Typography, mes
 import { CopyOutlined, LoadingOutlined, ReloadOutlined, SaveOutlined, VideoCameraOutlined } from "@ant-design/icons";
 
 import {
-  fetchNovelChapterScript,
-  fetchNovelChapterScriptSubjectPreset,
-  generateNovelChapterScript,
-  saveNovelChapterScriptSubjectPreset,
+  novelCommands,
+  novelKeys,
+  novelPaths,
+  useNovelCommand,
+  useNovelQuery,
   type NovelChapterScriptCharacterView,
   type NovelChapterScriptSegmentView,
   type NovelChapterScriptSharedSubjectsView,
@@ -149,7 +150,6 @@ export function ScriptGeneratedView({ view, onCopy }: { view: ScriptGeneratedVie
 export default function ChapterScriptModal({ open, onClose, projectId, documentId }: { open: boolean; onClose: () => void; projectId: string; documentId?: string }) {
   const copy = useCopyToClipboard();
   const [view, setView] = useState<NovelChapterScriptView | undefined>(undefined);
-  const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | undefined>(undefined);
   const [instruction, setInstruction] = useState("");
   const [generating, setGenerating] = useState(false);
@@ -157,29 +157,58 @@ export default function ChapterScriptModal({ open, onClose, projectId, documentI
   const [presetSaving, setPresetSaving] = useState(false);
   const [presetError, setPresetError] = useState<string | undefined>(undefined);
 
+  // ---- 读：既有产物 + 项目级共享定义预设 ----
+  // 两者都只在弹窗打开时取数（`enabled: open`），保持原 useEffect 的请求时机；
+  // 卸载取消由 react-query 自身承担，原来的 `cancelled` 标志随之删除。
+  const scriptQuery = useNovelQuery<NovelChapterScriptView>(
+    novelKeys.chapterScript(projectId, documentId ?? ""),
+    novelPaths.chapterScript({ projectId, documentId: documentId ?? "" }),
+    { enabled: open && Boolean(projectId) && Boolean(documentId) },
+  );
+  const presetQuery = useNovelQuery<{ definitionText: string }>(
+    novelKeys.scriptSubjectPreset(projectId),
+    novelPaths.scriptSubjectPreset({ projectId }),
+    { enabled: open && Boolean(projectId) },
+  );
+
+  // 查询结果镜像进本地 state：`view` 还会被 generate() 直接写入（原实现如此），
+  // `presetText` 还会被用户编辑与 savePreset() 回填，故二者仍是本地 state，只是取数换成查询。
+  const scriptData = scriptQuery.data;
   useEffect(() => {
-    if (!open || !projectId) return;
-    let cancelled = false;
-    if (documentId) {
-      setLoading(true);
-      setError(undefined);
-      fetchNovelChapterScript(projectId, documentId)
-        .then((data) => { if (!cancelled) setView(data); })
-        .catch((err) => { if (!cancelled) setError(err instanceof Error ? err.message : String(err)); })
-        .finally(() => { if (!cancelled) setLoading(false); });
-    }
-    fetchNovelChapterScriptSubjectPreset(projectId)
-      .then((data) => { if (!cancelled) setPresetText(data.definitionText ?? ""); })
-      .catch((err) => { if (!cancelled) setPresetError(err instanceof Error ? err.message : String(err)); });
-    return () => { cancelled = true; };
-  }, [open, projectId, documentId]);
+    if (scriptData) setView(scriptData);
+  }, [scriptData]);
+
+  const presetDefinitionText = presetQuery.data?.definitionText;
+  useEffect(() => {
+    if (presetDefinitionText !== undefined) setPresetText(presetDefinitionText);
+  }, [presetDefinitionText]);
+
+  // 读失败与生成失败共用同一个 error 槽位（原实现如此）：请求开始即清空，失败时写入。
+  const loading = scriptQuery.isFetching;
+  const scriptError = scriptQuery.error;
+  useEffect(() => {
+    if (loading) setError(undefined);
+    else if (scriptError) setError(scriptError.message);
+  }, [loading, scriptError]);
+
+  const presetQueryError = presetQuery.error;
+  useEffect(() => {
+    if (presetQueryError) setPresetError(presetQueryError.message);
+  }, [presetQueryError]);
+
+  // ---- 写：路径 / 方法 / 请求体 / 失效面全部来自命令注册表 ----
+  const generateCommand = useNovelCommand<
+    { projectId: string; documentId: string; instruction?: string },
+    { record: NovelChapterScriptView & { reused?: boolean } }
+  >(novelCommands.chapterScriptGenerate);
+  const savePresetCommand = useNovelCommand<{ projectId: string; definitionText: string }, { definitionText: string }>(novelCommands.scriptSubjectPresetSave);
 
   async function generate() {
     if (!documentId) return;
     setGenerating(true);
     setError(undefined);
     try {
-      const body = await generateNovelChapterScript(projectId, documentId, instruction.trim() || undefined);
+      const body = await generateCommand.mutateAsync({ projectId, documentId, instruction: instruction.trim() || undefined });
       const record = body.record;
       setView({
         exists: true,
@@ -206,7 +235,7 @@ export default function ChapterScriptModal({ open, onClose, projectId, documentI
     setPresetSaving(true);
     setPresetError(undefined);
     try {
-      const saved = await saveNovelChapterScriptSubjectPreset(projectId, presetText);
+      const saved = await savePresetCommand.mutateAsync({ projectId, definitionText: presetText });
       setPresetText(saved.definitionText);
       message.success("共享定义已保存；对已生成章节点「重新生成」后生效");
     } catch (err) {

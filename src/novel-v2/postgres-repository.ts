@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { foundationArtifactToMemoryClaim, foundationClaimId } from "./foundation-memory";
 import { CLAIM_PROJECTION_SET_SQL, retrievalVisibleClaimsSql, retiredByVisibleKillerSql } from "./memory-visibility";
-import { ACTIVE_WORKFLOW_RUN_STATUSES_SQL, HUMAN_GATE_RESUME_WORKFLOW_RUN_STATUS, TERMINAL_WORKFLOW_RUN_STATUSES_SQL, WAITING_EXTERNAL_WORKFLOW_RUN_STATUS_SQL, terminalOverwriteGuardSql, type WorkflowRunStatus } from "./run-lifecycle";
+import { ACTIVE_WORKFLOW_RUN_STATUSES_SQL, HUMAN_GATE_RESUME_WORKFLOW_RUN_STATUS, OPEN_WORKFLOW_RUN_STATUSES_SQL, SUCCEEDED_WORKFLOW_RUN_STATUSES_SQL, WAITING_EXTERNAL_WORKFLOW_RUN_STATUS_SQL, terminalOverwriteGuardSql, type WorkflowRunStatus } from "./run-lifecycle";
 import { normalizeFoundationStructuredDataFlat, validateFoundationTaskContract } from "./application/foundation-contract";
 import { foundationContractFingerprint } from "./application/foundation-contract-fingerprint";
 import { serialContextFingerprint } from "./application/serial-context-fingerprint";
@@ -64,7 +64,7 @@ import type {
 import type { ModelInvocationAudit, ModelPromptExecution } from "./model-gateway";
 import { iso, workflowFromRow, type WorkflowRunRow } from "./repository/shared";
 import { WorkflowRunSlice } from "./repository/workflow-run-slice";
-import { ModelTaskSlice, OUTSTANDING_MODEL_TASK_STATUSES_SQL } from "./repository/model-task-slice";
+import { ModelTaskSlice } from "./repository/model-task-slice";
 import { TelemetrySlice } from "./repository/telemetry-slice";
 import type { ModelRoutingConfig, ModelRoutingSnapshot, ModelTaskRecord, ModelWorkPackage } from "./model-routing";
 import type { ObjectStoreAdapter } from "./object-store";
@@ -464,7 +464,7 @@ export class NovelPostgresRepository {
        WHERE project_id=$1
          AND workflow_type='story-arc-planning'
          AND payload->>'arcId'=$2
-         AND status IN ('accepted','running','waiting-external','manual-review-required')
+         AND status IN (${OPEN_WORKFLOW_RUN_STATUSES_SQL})
        ORDER BY updated_at DESC, temporal_workflow_id`,
       [projectId, arcId],
     );
@@ -478,7 +478,7 @@ export class NovelPostgresRepository {
        WHERE project_id=$1
          AND workflow_type='story-arc-planning'
          AND payload->>'arcId'=$2
-         AND status IN ('accepted','running','waiting-external','manual-review-required')
+         AND status IN (${OPEN_WORKFLOW_RUN_STATUSES_SQL})
        ORDER BY updated_at DESC
        LIMIT 1`,
       [projectId, arcId],
@@ -1411,11 +1411,14 @@ export class NovelPostgresRepository {
       // Telemetry and event tables cascade via the project_id FK (migration 083),
       // but rows written before attribution keep a NULL project_id; delete them by
       // the owning run reference while the run rows are still present.
-      for (const table of ["model_tasks", "model_invocations", "prompt_executions"]) {
+      // 注：`model_tasks` / `task_attempts` 已不在此循环里——它们的 SQL 全部归
+      // `ModelTaskSlice`（见 removeProjectTasks），归属判据由守卫按表名锁住。
+      // 剩下这两张属 telemetry 片，同类缺陷登记在下一片。
+      for (const table of ["model_invocations", "prompt_executions"]) {
         await client.query(`DELETE FROM ${table} WHERE project_id=$1 OR workflow_run_id IN (SELECT id FROM workflow_runs WHERE project_id=$1 UNION SELECT temporal_workflow_id FROM workflow_runs WHERE project_id=$1)`, [projectId]);
       }
       await client.query("DELETE FROM outbox_events WHERE project_id=$1", [projectId]);
-      await client.query("DELETE FROM task_attempts WHERE workflow_run_id IN (SELECT temporal_workflow_id FROM workflow_runs WHERE project_id=$1) OR workflow_run_id IN (SELECT id FROM workflow_runs WHERE project_id=$1)", [projectId]);
+      await this.modelTasks.removeProjectTasks(client, projectId);
       await client.query("DELETE FROM workflow_runs WHERE project_id=$1", [projectId]);
       await client.query("DELETE FROM learning_assessments WHERE project_id=$1", [projectId]);
       await client.query("DELETE FROM context_manifests WHERE project_id=$1", [projectId]);
@@ -1561,24 +1564,10 @@ export class NovelPostgresRepository {
    * `ymcp` 3 条 pending：2 条挂在 cancelled、1 条挂在 completed 的 run 上）。它们所在的 run
    * 早已终态，`reconcileStaleWorkflowRuns` 的候选集只挑**非终态** run，永远不会碰它们，于是
    * 编排者的任务队列里长期挂着领不走也关不掉的僵尸。
-   * 写入判据不在此重写：本方法只选出待收编的键，过期动作仍走 `expireForWorkflow`（同一份
-   * outstanding 词表、同样认两种键形态）。`submitted`/`failed` 不动——已交付与已放弃的结果是事实。
-   * 幂等：收编后不再命中，重放为 no-op。
+   * 选键与收编**都**在 `ModelTaskSlice.expireOrphaned`（整个概念一个家）；本层只委托。
    */
   async expireOrphanedModelTasks(reason = "run-already-terminal"): Promise<number> {
-    const orphans = await this.pool.query<{ key: string }>(
-      `SELECT DISTINCT t.workflow_run_id AS key
-         FROM model_tasks t
-        WHERE t.status IN (${OUTSTANDING_MODEL_TASK_STATUSES_SQL})
-          AND NOT EXISTS (
-            SELECT 1 FROM workflow_runs r
-            WHERE (r.temporal_workflow_id = t.workflow_run_id OR r.id = t.workflow_run_id)
-              AND r.status NOT IN (${TERMINAL_WORKFLOW_RUN_STATUSES_SQL})
-          )`,
-    );
-    let expired = 0;
-    for (const row of orphans.rows) expired += await this.modelTasks.expireForWorkflow(row.key, reason);
-    return expired;
+    return this.modelTasks.expireOrphaned(reason);
   }
 
   /**
@@ -2009,7 +1998,7 @@ export class NovelPostgresRepository {
     const eligible = await this.pool.query<WorkflowRunRow>(`
       SELECT id,workflow_type,project_id,temporal_workflow_id,status,payload,created_at,updated_at
       FROM workflow_runs
-      WHERE status IN ('completed','succeeded') AND updated_at<$1
+      WHERE status IN (${SUCCEEDED_WORKFLOW_RUN_STATUSES_SQL}) AND updated_at<$1
         AND (workflow_type='chapter-review' OR payload#>>'{intent,target,kind}'='chapter' OR payload->>'documentId' IS NOT NULL)
         AND NOT (payload ? 'diagnosticsCleanedAt')
       ORDER BY updated_at LIMIT 100
@@ -2034,8 +2023,7 @@ export class NovelPostgresRepository {
           await client.query("UPDATE manuscript_revisions SET artifact_id=NULL WHERE artifact_id=ANY($1::text[])", [artifactIds]);
           await client.query("DELETE FROM artifacts WHERE id=ANY($1::text[])", [artifactIds]);
         }
-        await client.query("DELETE FROM task_attempts WHERE workflow_run_id=$1 OR workflow_run_id=$2", [current.id, current.temporal_workflow_id]);
-        await client.query("DELETE FROM model_tasks WHERE workflow_run_id=$1", [current.temporal_workflow_id]);
+        await this.modelTasks.removeRunTasks(client, { id: current.id, temporalWorkflowId: current.temporal_workflow_id });
         await client.query("DELETE FROM outbox_events WHERE (aggregate_type='workflow-run' AND aggregate_id=$1) OR payload->>'workflowId'=$1 OR payload->>'runId'=$1", [current.temporal_workflow_id]);
         const compactPayload = {
           documentId, finalScore: typeof current.payload.finalScore === "number" ? current.payload.finalScore : undefined,

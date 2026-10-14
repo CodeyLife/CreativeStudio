@@ -1,8 +1,7 @@
-import { useEffect, useState } from "react";
 import { Modal, Spin, Typography, Tag, Space, Empty } from "antd";
 import { FileTextOutlined } from "@ant-design/icons";
 import { artifactKindMeta, artifactPreview, relativeTime, shortId } from "./presentation";
-import { novelFetch } from "../../lib/novelApi";
+import { useNovelArtifactText } from "../../lib/novelApi";
 
 /**
  * 产物内容查看器。
@@ -11,7 +10,7 @@ import { novelFetch } from "../../lib/novelApi";
  * 用户反馈产物 ID 展示无用，应直接展示产物内容或提供按钮快速查看。
  *
  * 该组件负责：
- * 1. 调用 /v2/artifacts/:artifactId/content 拉取产物正文
+ * 1. 经 `useNovelArtifactText` 取产物正文（缓存与去重由 react-query 提供）
  * 2. 用 artifactPreview 给出语义化摘要
  * 3. 在 Modal 中以可滚动正文形式展示，避免裸 ID/JSON 暴露
  */
@@ -31,49 +30,19 @@ export interface ArtifactContentModalProps {
   onClose: () => void;
 }
 
-interface ArtifactContentResponse {
-  text: string;
-  kind: string;
-  artifactId: string;
-  wordCount: number;
-}
-
-async function fetchArtifactContent(artifactId: string): Promise<ArtifactContentResponse> {
-  return novelFetch<ArtifactContentResponse>(`/v2/artifacts/${encodeURIComponent(artifactId)}/content`);
-}
-
 export default function ArtifactContentModal({ artifact, open, onClose }: ArtifactContentModalProps) {
-  const [content, setContent] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [errorText, setErrorText] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (!open || !artifact) {
-      setContent(null);
-      setErrorText(null);
-      return;
-    }
-    let cancelled = false;
-    setLoading(true);
-    setErrorText(null);
-    setContent(null);
-    fetchArtifactContent(artifact.id)
-      .then((data) => {
-        if (cancelled) return;
-        setContent(data.text);
-      })
-      .catch((err: unknown) => {
-        if (cancelled) return;
-        const msg = err instanceof Error ? err.message : String(err);
-        setErrorText(msg);
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [open, artifact?.id]);
+  /**
+   * 数据访问走既有的具名 hook（`novelKeys` 里 `["novel","artifact",id,"text"]`）。
+   *
+   * 原实现自己 `novelFetch` + 三个 useState + `cancelled` 卸载保护——那套东西 react-query
+   * 已经提供，且手工版没有任何缓存：同一个产物每次打开都重新从对象存储读一遍。
+   *
+   * `enabled` 保持原请求时机（弹窗打开且确实有产物才取数），不改变网络行为。
+   */
+  const contentQ = useNovelArtifactText(open ? artifact?.id : undefined);
+  const content = contentQ.data?.text ?? null;
+  const loading = contentQ.isLoading;
+  const errorText = contentQ.error ? (contentQ.error instanceof Error ? contentQ.error.message : String(contentQ.error)) : null;
 
   const kindMeta = artifact ? artifactKindMeta(artifact.kind) : { label: "产物", icon: <FileTextOutlined /> };
   const preview = artifact ? artifactPreview(artifact.kind, artifact.structuredData) : "";
@@ -179,6 +148,3 @@ export function ArtifactCard({
     </div>
   );
 }
-
-// 导出 fetchArtifactContent 供外部直接调用（如错误提示场景）
-export { fetchArtifactContent };

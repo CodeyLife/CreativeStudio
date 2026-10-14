@@ -1,9 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type { Client } from "@temporalio/client";
 import type { BookSynopsisWorkflowRepositoryAccess } from "../repository-capabilities";
+import { isOpenWorkflowRunStatus } from "../run-lifecycle";
 import { bookSynopsisSourceFingerprint, bookTitleSourceFingerprint, missingSynopsisPlanStages } from "./book-synopsis";
-
-const ACTIVE_STATUSES = new Set(["accepted", "pending", "running", "waiting-external"]);
 
 export async function startBookSynopsisGeneration(
   repository: BookSynopsisWorkflowRepositoryAccess,
@@ -18,7 +17,7 @@ export async function startBookSynopsisGeneration(
   const missing = missingSynopsisPlanStages(sections);
   if (missing.length) throw new Error(`全书规划尚未全部确认：${missing.join("、")}`);
   const sourceFingerprint = bookSynopsisSourceFingerprint({ projectTitle: project.title, sections });
-  const active = runs.find((run) => run.workflowType === "book-synopsis" && ACTIVE_STATUSES.has(run.status) && run.payload.sourceFingerprint === sourceFingerprint);
+  const active = runs.find((run) => run.workflowType === "book-synopsis" && isOpenWorkflowRunStatus(run.status) && run.payload.sourceFingerprint === sourceFingerprint);
   if (active) return { workflowId: active.temporalWorkflowId, status: active.status, sourceFingerprint, reused: true };
 
   const workflowId = `book-synopsis-${randomUUID()}`;
@@ -55,7 +54,7 @@ export async function startBookTitleCandidateGeneration(
   const missing = missingSynopsisPlanStages(sections);
   if (missing.length) throw new Error(`全书规划尚未全部确认：${missing.join("、")}`);
   const sourceFingerprint = bookTitleSourceFingerprint(sections);
-  const active = runs.find((run) => run.workflowType === "book-title-candidates" && ACTIVE_STATUSES.has(run.status) && run.payload.sourceFingerprint === sourceFingerprint);
+  const active = runs.find((run) => run.workflowType === "book-title-candidates" && isOpenWorkflowRunStatus(run.status) && run.payload.sourceFingerprint === sourceFingerprint);
   if (active) return { workflowId: active.temporalWorkflowId, status: active.status, sourceFingerprint, reused: true };
 
   const workflowId = `book-title-candidates-${randomUUID()}`;

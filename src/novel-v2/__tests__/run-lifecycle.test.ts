@@ -1,5 +1,6 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { randomUUID } from "node:crypto";
+import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { NovelPostgresRepository } from "../postgres-repository";
@@ -15,15 +16,33 @@ import {
   TERMINAL_REDRIVE_WORKFLOW_RUN_STATUS,
   WAITING_EXTERNAL_WORKFLOW_RUN_STATUS,
   WAITING_EXTERNAL_WORKFLOW_RUN_STATUS_SQL,
+  OPEN_WORKFLOW_RUN_STATUSES,
+  OPEN_WORKFLOW_RUN_STATUSES_SQL,
+  SUCCEEDED_WORKFLOW_RUN_STATUSES,
+  SUCCEEDED_WORKFLOW_RUN_STATUSES_SQL,
+  ABANDONED_WORKFLOW_RUN_STATUSES,
   WORKFLOW_RUN_STATUSES,
+  FAILED_WORKFLOW_RUN_STATUSES,
+  isAbandonedWorkflowRunStatus,
+  isFailedWorkflowRunStatus,
   isForbiddenTerminalOverwrite,
   isHumanGateWorkflowRunStatus,
+  isOpenWorkflowRunStatus,
+  isSucceededWorkflowRunStatus,
   isTerminalWorkflowRunStatus,
   isWorkflowRunStatus,
   terminalOverwriteGuardSql,
   type WorkflowRunStatus,
 } from "../run-lifecycle";
 import { isTerminalWorkflowStatus, withTerminalOutcome } from "../terminal-outcome";
+
+/**
+ * 源码锁的判据必须落在**代码**上，不是注释上：本仓的注释里大量引用被删掉的手写集
+ * （例如 terminal-outcome.ts 记着"此处曾手写 `["completed","failed","cancelled"]`"），
+ * 不剥注释就会把"记录历史"误判成"又写了一份"。剥离只可能让守卫更宽松，不会造出假阳性。
+ */
+const stripComments = (text: string): string =>
+  text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
 
 /**
  * run 生命周期词表守卫。
@@ -53,7 +72,188 @@ describe("workflow_runs 生命周期词表", () => {
     expect(ACTIVE_WORKFLOW_RUN_STATUSES_SQL).toBe(sqlOf(ACTIVE_WORKFLOW_RUN_STATUSES));
     expect(TERMINAL_WORKFLOW_RUN_STATUSES_SQL).toBe(sqlOf(TERMINAL_WORKFLOW_RUN_STATUSES));
     expect(HUMAN_GATE_WORKFLOW_RUN_STATUSES_SQL).toBe(sqlOf(HUMAN_GATE_WORKFLOW_RUN_STATUSES));
+    expect(OPEN_WORKFLOW_RUN_STATUSES_SQL).toBe(sqlOf(OPEN_WORKFLOW_RUN_STATUSES));
     expect(WAITING_EXTERNAL_WORKFLOW_RUN_STATUS_SQL).toBe(`'${WAITING_EXTERNAL_WORKFLOW_RUN_STATUS}'`);
+  });
+
+  /**
+   * 未结账（轮询口径）是本片新增的**第二个**分类轴，与 ACTIVE（对账口径）不同名不同义。
+   *
+   * 双向锁：终态侧必须全 false、非终态侧必须全 true；幽灵状态必须 false。只锁一侧时，
+   * 把判据写成恒真或恒假都能骗过一条正向用例。
+   */
+  it("未结账态与终态严格互补，且幽灵状态一律判 false（双向）", () => {
+    expect([...OPEN_WORKFLOW_RUN_STATUSES].sort()).toEqual(
+      WORKFLOW_RUN_STATUSES.filter((status) => !isTerminalWorkflowRunStatus(status)).sort(),
+    );
+    expect(OPEN_WORKFLOW_RUN_STATUSES.length + TERMINAL_WORKFLOW_RUN_STATUSES.length).toBe(WORKFLOW_RUN_STATUSES.length);
+
+    for (const status of WORKFLOW_RUN_STATUSES) {
+      expect(isOpenWorkflowRunStatus(status), `${status} 的未结账判定`).toBe(!isTerminalWorkflowRunStatus(status));
+    }
+
+    // 等待外部与三个人工门态必须落在未结账一侧——这正是本片修掉的漂移：
+    // 它们此前在 8 处手写判据里被判为「已结束」，于是轮询停摆、总览不显示、去重会再起重复 run。
+    for (const status of [...HUMAN_GATE_WORKFLOW_RUN_STATUSES, WAITING_EXTERNAL_WORKFLOW_RUN_STATUS]) {
+      expect(isOpenWorkflowRunStatus(status), `${status} 应继续轮询`).toBe(true);
+    }
+
+    // 幽灵状态：这些字符串在消费方历史代码里被当作 run 状态用过，但不在词表内。
+    for (const phantom of ["pending", "paused", "received", "succeeded", "terminated", "blocked"]) {
+      expect(isOpenWorkflowRunStatus(phantom), `${phantom} 不是 run 状态`).toBe(false);
+    }
+    expect(isOpenWorkflowRunStatus(undefined)).toBe(false);
+    expect(isOpenWorkflowRunStatus("")).toBe(false);
+  });
+
+  /**
+   * 消费方不得再手写「未结账」成员集——本文件 :7-11 记的根因（每处重述一遍就必然
+   * 漏掉一处）在 8 处判据里各发生过一次。守卫按**集合签名**判，不按标识符判：
+   * 同一字面量集合里同时出现 accepted 与 waiting-external，就是一份手写的未结账集。
+   *
+   * `__tests__` 排除在外：测试里写死成员是正当夹具（例如 terminal-outcome.test.ts
+   * 故意把幽灵状态 pending 混进非终态清单，用来证明判据是真分类而非字符串透传）。
+   */
+  it("单一真源之外零手写未结账集，且旧标识符不得复活", () => {
+    const walk = (dir: string): string[] => readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) return entry.name === "node_modules" ? [] : walk(full);
+      return entry.name.endsWith(".ts") || entry.name.endsWith(".tsx") ? [full] : [];
+    });
+    const files = walk(join(process.cwd(), "src"))
+      .filter((file) => !file.endsWith("run-lifecycle.ts") && !file.includes("__tests__"));
+    const rel = (file: string) => relative(process.cwd(), file).replace(/\\/g, "/");
+
+    const handWritten = files.filter((file) => {
+      const text = stripComments(readFileSync(file, "utf8"));
+      return /["']accepted["'][\s\S]{0,80}?["']waiting-external["']/.test(text)
+        || /["']waiting-external["'][\s\S]{0,80}?["']accepted["']/.test(text);
+    });
+    expect(handWritten.map(rel), "这些文件又手写了一份未结账集").toEqual([]);
+
+    const revived = files.filter((file) => /\b(isActiveStatus|ACTIVE_STATUSES|RUN_ACTIVE_STATUSES)\b/.test(readFileSync(file, "utf8")));
+    expect(revived.map(rel), "旧的活跃态标识符复活了").toEqual([]);
+  });
+
+  /**
+   * 失败轴（终态的子集）与它的源码锁。
+   *
+   * 成员判据刻意**不等价于终态**：`completed` 是成功，`abandoned` 是作者主动放弃。
+   * 双向锁要求两侧都断言——只锁正向时，把成员集扩成"全部终态"仍会通过正向用例，
+   * 而那样会把成功的 run 报成"运行异常"。
+   */
+  it("失败态是终态的真子集，且作者放弃与成功都不算失败（双向）", () => {
+    for (const status of FAILED_WORKFLOW_RUN_STATUSES) {
+      expect(isFailedWorkflowRunStatus(status), `${status} 应判失败`).toBe(true);
+      expect(isTerminalWorkflowRunStatus(status), `${status} 应是终态`).toBe(true);
+    }
+    expect(FAILED_WORKFLOW_RUN_STATUSES.length).toBeLessThan(TERMINAL_WORKFLOW_RUN_STATUSES.length);
+
+    // 反向：成功与作者主动放弃都不是"异常"。
+    for (const notFailed of ["completed", "abandoned"]) {
+      expect(isFailedWorkflowRunStatus(notFailed), `${notFailed} 不是失败`).toBe(false);
+    }
+    // 未结账侧一律不是失败。
+    for (const status of OPEN_WORKFLOW_RUN_STATUSES) {
+      expect(isFailedWorkflowRunStatus(status), `${status} 还没结账，不是失败`).toBe(false);
+    }
+    // 幽灵状态：它们不是 run 状态，且分别属于审校裁决（blocked）与 craft-rule 候选（rolled-back/promoted）。
+    for (const phantom of ["terminated", "blocked", "succeeded", "rolled-back", "promoted", "passed", "pending", "paused", "received"]) {
+      expect(isFailedWorkflowRunStatus(phantom), `${phantom} 不是 run 状态`).toBe(false);
+    }
+    expect(isFailedWorkflowRunStatus(undefined)).toBe(false);
+    expect(isFailedWorkflowRunStatus("")).toBe(false);
+  });
+
+  it("单一真源之外零手写失败集与幽灵 terminated（源码签名锁）", () => {
+    const walk = (dir: string): string[] => readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) return entry.name === "node_modules" ? [] : walk(full);
+      return entry.name.endsWith(".ts") || entry.name.endsWith(".tsx") ? [full] : [];
+    });
+    const files = walk(join(process.cwd(), "src"))
+      .filter((file) => !file.endsWith("run-lifecycle.ts") && !file.includes("__tests__"));
+    const rel = (file: string) => relative(process.cwd(), file).replace(/\\/g, "/");
+
+    const handWritten = files.filter((file) => {
+      const text = stripComments(readFileSync(file, "utf8"));
+      // 手写失败集的签名：逗号相邻的 failed+rejected / failed+cancelled，或正则形态的 failed|rejected。
+      return /["']failed["']\s*,\s*["'](rejected|cancelled)["']/.test(text)
+        || /["'](rejected|cancelled)["']\s*,\s*["']failed["']/.test(text)
+        || /failed\s*\|\s*rejected/.test(text);
+    });
+    expect(handWritten.map(rel), "这些文件又手写了一份失败集").toEqual([]);
+
+    // `terminated` 不是任何实体的状态（全仓无生产者），被引号包裹即说明有人又把它当 run 状态。
+    const terminated = files.filter((file) => /["']terminated["']/.test(stripComments(readFileSync(file, "utf8"))));
+    expect(terminated.map(rel), "幽灵状态 terminated 被当作状态字面量使用了").toEqual([]);
+
+    const revived = files.filter((file) => /\b(FAILED_STATUSES|RUN_FAILURE_STATUSES)\b/.test(readFileSync(file, "utf8")));
+    expect(revived.map(rel), "旧的失败态标识符复活了").toEqual([]);
+  });
+
+  /**
+   * 成功终态轴。词表里只有一个成员，但"只有一个"本身要被锁住：把 `abandoned`
+   * （作者主动放弃）混进来，就会把放弃的 run 渲染成"全部阶段已完成 + 成功横幅"。
+   */
+  it("成功终态恰为 completed，且与失败/未结账/人工门三轴互斥（双向）", () => {
+    expect([...SUCCEEDED_WORKFLOW_RUN_STATUSES]).toEqual(["completed"]);
+    expect(SUCCEEDED_WORKFLOW_RUN_STATUSES_SQL).toBe(`'completed'`);
+
+    expect(isSucceededWorkflowRunStatus("completed")).toBe(true);
+    for (const status of WORKFLOW_RUN_STATUSES.filter((item) => item !== "completed")) {
+      expect(isSucceededWorkflowRunStatus(status), `${status} 不是成功终态`).toBe(false);
+    }
+    for (const phantom of ["succeeded", "terminated", "blocked", "passed", "promoted", "rolled-back", "pending", "paused", "received"]) {
+      expect(isSucceededWorkflowRunStatus(phantom), `${phantom} 不是 run 状态`).toBe(false);
+    }
+    expect(isSucceededWorkflowRunStatus(undefined)).toBe(false);
+    expect(isSucceededWorkflowRunStatus("")).toBe(false);
+
+    /**
+     * 四轴穷尽且互斥：每个词表成员恰好落进「成功终态 / 失败态 / 作者放弃 / 未结账」之一，
+     * 人工门是未结账的子集故单列校验。这条锁两件事：① 某状态被两个轴同时认领（同一次 run
+     * 既显示成功又显示异常）；② 某状态**谁都不认领**（消费方只能落进兜底分支）——
+     * 本片首跑就是靠这条发现 `abandoned` 三轴皆空，于是补出第四轴。
+     */
+    for (const status of WORKFLOW_RUN_STATUSES) {
+      const buckets = [
+        isSucceededWorkflowRunStatus(status),
+        isFailedWorkflowRunStatus(status),
+        isAbandonedWorkflowRunStatus(status),
+        isOpenWorkflowRunStatus(status),
+      ].filter(Boolean).length;
+      expect(buckets, `${status} 应恰好归属一个轴`).toBe(1);
+      if (isHumanGateWorkflowRunStatus(status)) expect(isOpenWorkflowRunStatus(status), `${status} 人工门属未结账`).toBe(true);
+    }
+
+    // 四轴并集恰好等于词表（与 :44 那条三分类穷尽性同型）。
+    const flat = [
+      ...SUCCEEDED_WORKFLOW_RUN_STATUSES,
+      ...FAILED_WORKFLOW_RUN_STATUSES,
+      ...ABANDONED_WORKFLOW_RUN_STATUSES,
+      ...OPEN_WORKFLOW_RUN_STATUSES,
+    ];
+    expect(new Set(flat).size).toBe(flat.length);
+    expect([...flat].sort()).toEqual([...WORKFLOW_RUN_STATUSES].sort());
+  });
+
+  it("单一真源之外零手写成功判据（源码签名锁）", () => {
+    const walk = (dir: string): string[] => readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) return entry.name === "node_modules" ? [] : walk(full);
+      return entry.name.endsWith(".ts") || entry.name.endsWith(".tsx") ? [full] : [];
+    });
+    const files = walk(join(process.cwd(), "src"))
+      .filter((file) => !file.endsWith("run-lifecycle.ts") && !file.includes("__tests__"));
+
+    // 手写成功判据的签名：completed 与幽灵 succeeded 相邻成对（逗号或 | 分隔）。
+    const offenders = files.filter((file) => {
+      const text = stripComments(readFileSync(file, "utf8"));
+      return /["']completed["']\s*[,|]\s*["']succeeded["']/.test(text)
+        || /["']succeeded["']\s*[,|]\s*["']completed["']/.test(text);
+    });
+    expect(offenders.map((file) => relative(process.cwd(), file).replace(/\\/g, "/")), "这些文件又手写了一份成功判据").toEqual([]);
   });
 
   it("终态吸收规则的三条边界都按观测收口（复活挡、重申与重驱动放）", () => {

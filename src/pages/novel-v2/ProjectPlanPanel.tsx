@@ -12,7 +12,8 @@ import {
   SyncOutlined,
 } from "@ant-design/icons";
 import { motion } from "motion/react";
-import { novelFetch as readJson } from "../../lib/novelApi";
+import { novelCommands, novelKeys, novelPaths, useNovelCommand, useNovelQuery, useUpdateNovelProject } from "../../lib/novelApi";
+import { isOpenWorkflowRunStatus } from "../../novel-v2/run-lifecycle";
 import { projectDisplayTitle } from "./presentation";
 import "../novel-v2.css";
 
@@ -127,8 +128,6 @@ export function PlanPayloadEditor({ payload, onChange }: { payload: PlanPayload;
 }
 
 export default function ProjectPlanPanel({ projectId, onProjectTitleChanged }: { projectId: string; onProjectTitleChanged?: (title: string) => void }) {
-  const [data, setData] = useState<PlanResponse>();
-  const [loading, setLoading] = useState(true);
   const [selectedKey, setSelectedKey] = useState<string>();
   const [objective, setObjective] = useState("建立可支撑长篇创作的完整全书规划");
   const [editPayload, setEditPayload] = useState<PlanPayload>();
@@ -143,27 +142,37 @@ export default function ProjectPlanPanel({ projectId, onProjectTitleChanged }: {
   const [selectedTitle, setSelectedTitle] = useState<string>();
   const [busy, setBusy] = useState<string>();
 
-  async function load(silent = false) {
-    if (!silent) setLoading(true);
-    try {
-      const next = await readJson<PlanResponse>(`/v2/projects/${encodeURIComponent(projectId)}/plan`);
-      setData(next);
-      setSelectedKey((current) => current ?? next.sections.find((section) => section.status !== "approved")?.taskKey ?? next.stages[0]?.taskKey);
-    } catch (error) {
-      if (!silent) message.error(error instanceof Error ? error.message : String(error));
-    } finally {
-      if (!silent) setLoading(false);
-    }
-  }
+  // 轮询判据原样搬进 pollWhile，间隔由原语统一（ACTIVE_RUN_POLL_MS），面板不再写数字。
+  const { data, isLoading, error } = useNovelQuery<PlanResponse>(
+    novelKeys.projectPlan(projectId),
+    novelPaths.projectPlan({ projectId }),
+    {
+      pollWhile: (next) => Boolean(
+        next?.sections.some((section) => section.status === "generating")
+        || isOpenWorkflowRunStatus(next?.synopsisGeneration?.status)
+        || isOpenWorkflowRunStatus(next?.titleGeneration?.status),
+      ),
+    },
+  );
 
-  useEffect(() => { void load(); }, [projectId]);
+  // 写路径只给业务入参；失效面由命令注册表声明（缺省即项目前缀，覆盖整族项目级 key）。
+  const startPlan = useNovelCommand<{ projectId: string; objective: string; idempotencyKey?: string }>(novelCommands.planStart);
+  const generatePlanSection = useNovelCommand<{ projectId: string; taskKey: string; instruction?: string }>(novelCommands.planSectionGenerate);
+  const approvePlanSection = useNovelCommand<{ projectId: string; taskKey: string }>(novelCommands.planSectionApprove);
+  const updatePlanSection = useNovelCommand<{ projectId: string; taskKey: string; payload: unknown }>(novelCommands.planSectionUpdate);
+  const generateSynopsisTask = useNovelCommand<{ projectId: string }>(novelCommands.planSynopsisGenerate);
+  const generateTitleCandidatesTask = useNovelCommand<{ projectId: string }>(novelCommands.planTitleCandidatesGenerate);
+  const selectTitleTask = useNovelCommand<{ projectId: string; title: string; sourceFingerprint?: string }>(novelCommands.planTitleSelect);
+  const updateProject = useUpdateNovelProject();
+
   useEffect(() => {
-    const synopsisRunning = data?.synopsisGeneration && ["accepted", "pending", "running", "waiting-external"].includes(data.synopsisGeneration.status);
-    const titleRunning = data?.titleGeneration && ["accepted", "pending", "running", "waiting-external"].includes(data.titleGeneration.status);
-    if (!data?.sections.some((section) => section.status === "generating") && !synopsisRunning && !titleRunning) return;
-    const timer = window.setInterval(() => void load(true), 2500);
-    return () => window.clearInterval(timer);
-  }, [data?.sections, data?.synopsisGeneration?.status, data?.titleGeneration?.status]);
+    if (error && !data) message.error(error instanceof Error ? error.message : String(error));
+  }, [error, data]);
+  // 首次拿到规划时给一个默认选中阶段（原来写在 load() 里，随数据访问一起搬出来）。
+  useEffect(() => {
+    if (!data) return;
+    setSelectedKey((current) => current ?? data.sections.find((section) => section.status !== "approved")?.taskKey ?? data.stages[0]?.taskKey);
+  }, [data]);
   useEffect(() => {
     if (synopsisBaseline === undefined) return;
     if (data?.synopsis?.generatedAt && data.synopsis.generatedAt !== synopsisBaseline) {
@@ -194,22 +203,19 @@ export default function ProjectPlanPanel({ projectId, onProjectTitleChanged }: {
   const selectedStage = data?.stages.find((stage) => stage.taskKey === selectedKey);
   const selected = selectedKey ? sectionByKey.get(selectedKey) : undefined;
   const meta = selected ? STATUS_META[selected.status] : STATUS_META.locked;
-  const synopsisGenerating = Boolean(data?.synopsisGeneration && ["accepted", "pending", "running", "waiting-external"].includes(data.synopsisGeneration.status));
-  const titleGenerating = Boolean(data?.titleGeneration && ["accepted", "pending", "running", "waiting-external"].includes(data.titleGeneration.status));
+  const synopsisGenerating = isOpenWorkflowRunStatus(data?.synopsisGeneration?.status);
+  const titleGenerating = isOpenWorkflowRunStatus(data?.titleGeneration?.status);
 
   async function action(key: string, callback: () => Promise<unknown>) {
     setBusy(key);
-    try { await callback(); await load(true); }
+    try { await callback(); }
     catch (error) { message.error(error instanceof Error ? error.message : String(error)); }
     finally { setBusy(undefined); }
   }
 
   async function start() {
     await action("start", async () => {
-      await readJson(`/v2/projects/${encodeURIComponent(projectId)}/plan/start`, {
-        method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ objective, idempotencyKey: `${projectId}:web-plan:${crypto.randomUUID()}` }),
-      });
+      await startPlan.mutateAsync({ projectId, objective, idempotencyKey: `${projectId}:web-plan:${crypto.randomUUID()}` });
       message.success("全书规划已建立，请从项目定位开始");
     });
   }
@@ -217,9 +223,7 @@ export default function ProjectPlanPanel({ projectId, onProjectTitleChanged }: {
   async function generate(instruction?: string) {
     if (!selected) return;
     await action("generate", async () => {
-      await readJson(`/v2/projects/${encodeURIComponent(projectId)}/plan/sections/${encodeURIComponent(selected.taskKey)}/generate`, {
-        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ instruction }),
-      });
+      await generatePlanSection.mutateAsync({ projectId, taskKey: selected.taskKey, instruction });
       setRevisionOpen(false);
       setRevisionInstruction("");
     });
@@ -228,7 +232,7 @@ export default function ProjectPlanPanel({ projectId, onProjectTitleChanged }: {
   async function approve() {
     if (!selected) return;
     await action("approve", async () => {
-      await readJson(`/v2/projects/${encodeURIComponent(projectId)}/plan/sections/${encodeURIComponent(selected.taskKey)}/approve`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+      await approvePlanSection.mutateAsync({ projectId, taskKey: selected.taskKey });
       message.success(`${selectedStage?.label ?? "规划阶段"}已确认`);
     });
   }
@@ -236,9 +240,7 @@ export default function ProjectPlanPanel({ projectId, onProjectTitleChanged }: {
   async function saveEdit() {
     if (!selected || !editPayload) return;
     await action("edit", async () => {
-      await readJson(`/v2/projects/${encodeURIComponent(projectId)}/plan/sections/${encodeURIComponent(selected.taskKey)}`, {
-        method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ payload: editPayload }),
-      });
+      await updatePlanSection.mutateAsync({ projectId, taskKey: selected.taskKey, payload: editPayload });
       setEditPayload(undefined);
       message.success("当前规划已更新，请重新确认");
     });
@@ -248,11 +250,7 @@ export default function ProjectPlanPanel({ projectId, onProjectTitleChanged }: {
     await action("synopsis", async () => {
       setSynopsisBaseline(data?.synopsis?.generatedAt ?? "");
       try {
-        await readJson(`/v2/projects/${encodeURIComponent(projectId)}/plan/synopsis`, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: "{}",
-        });
+        await generateSynopsisTask.mutateAsync({ projectId });
       } catch (error) {
         setSynopsisBaseline(undefined);
         throw error;
@@ -275,7 +273,7 @@ export default function ProjectPlanPanel({ projectId, onProjectTitleChanged }: {
     await action("title-candidates", async () => {
       setTitleCandidatesBaseline(data?.titleCandidates?.generatedAt ?? "");
       try {
-        await readJson(`/v2/projects/${encodeURIComponent(projectId)}/plan/title-candidates`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+        await generateTitleCandidatesTask.mutateAsync({ projectId });
       } catch (error) {
         setTitleCandidatesBaseline(undefined);
         throw error;
@@ -287,11 +285,7 @@ export default function ProjectPlanPanel({ projectId, onProjectTitleChanged }: {
   async function applySelectedTitle() {
     if (!selectedTitle || !data?.titleCandidates) return;
     await action("select-title", async () => {
-      await readJson(`/v2/projects/${encodeURIComponent(projectId)}/plan/title`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ title: selectedTitle, sourceFingerprint: data.titleCandidates!.sourceFingerprint }),
-      });
+      await selectTitleTask.mutateAsync({ projectId, title: selectedTitle, sourceFingerprint: data.titleCandidates!.sourceFingerprint });
       setTitleCandidatesOpen(false);
       onProjectTitleChanged?.(selectedTitle);
       message.success(`作品书名已更新为《${selectedTitle}》`);
@@ -302,18 +296,14 @@ export default function ProjectPlanPanel({ projectId, onProjectTitleChanged }: {
     const title = manualTitle.trim();
     if (!title) return;
     await action("manual-title", async () => {
-      await readJson(`/v2/projects/${encodeURIComponent(projectId)}`, {
-        method: "PATCH",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ title }),
-      });
+      await updateProject.mutateAsync({ projectId, title });
       setManualTitleOpen(false);
       onProjectTitleChanged?.(title);
       message.success(`作品书名已更新为《${title}》`);
     });
   }
 
-  if (loading) return <div className="novel-plan-loading"><Spin /></div>;
+  if (isLoading) return <div className="novel-plan-loading"><Spin /></div>;
   if (!data?.sections.length) return (
     <motion.section className="novel-plan-empty" initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }}>
       <div className="novel-plan-empty-mark"><FileDoneOutlined /></div>

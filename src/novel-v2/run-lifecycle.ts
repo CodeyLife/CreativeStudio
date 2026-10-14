@@ -58,6 +58,24 @@ export const HUMAN_GATE_WORKFLOW_RUN_STATUSES = [
 export const ACTIVE_WORKFLOW_RUN_STATUSES = ["accepted", "running"] as const satisfies readonly WorkflowRunStatus[];
 
 /**
+ * 未结账态：run 还可能发生变化，消费方（轮询、总览、去重）应当继续关注。
+ *
+ * 这是**轮询口径**，与上面的 `ACTIVE_WORKFLOW_RUN_STATUSES`（**对账口径**：超时即
+ * 视为僵尸、收编为 failed）是两个概念，此前撞了同一个名字「活跃」。消费方按那个名字
+ * 各自手写近似集的直接后果：`waiting-external` 与三个人工门态
+ * （`manual-review-required` / `regression-validation-required` / `rebuild-requested`）
+ * 在 6 处判据里行为不一致——等待外部或人工门时轮询停摆、总览不显示、去重会再起一个
+ * 重复 run（详见 `.scratch/w1-run-status-open/spec.md`）。
+ *
+ * 从 `TERMINAL_WORKFLOW_RUN_STATUSES` **派生**而非手写成员：新增状态时自动落入正确
+ * 一侧。这正是本文件 :7-11 记下的「每处重述一遍就必然在某次新增状态时漏掉一处」的
+ * 正面写法。
+ */
+export const OPEN_WORKFLOW_RUN_STATUSES: readonly WorkflowRunStatus[] = WORKFLOW_RUN_STATUSES.filter(
+  (status) => !(TERMINAL_WORKFLOW_RUN_STATUSES as readonly string[]).includes(status),
+);
+
+/**
  * 人工门被外部提交裁决后的回写目标态。这是**唯一**允许工作流以外的写入者改的态，
  * 且必须配守卫（见 `resumeWorkflowRunFromHumanGate`）：信号送达后工作流可能已经
  * 自行推进甚至进入终态，无守卫的回写会把终态覆成 running，再被对账收编为 failed。
@@ -76,6 +94,7 @@ const asSqlList = (statuses: readonly string[]): string => statuses.map((status)
 export const ACTIVE_WORKFLOW_RUN_STATUSES_SQL = asSqlList(ACTIVE_WORKFLOW_RUN_STATUSES);
 export const TERMINAL_WORKFLOW_RUN_STATUSES_SQL = asSqlList(TERMINAL_WORKFLOW_RUN_STATUSES);
 export const HUMAN_GATE_WORKFLOW_RUN_STATUSES_SQL = asSqlList(HUMAN_GATE_WORKFLOW_RUN_STATUSES);
+export const OPEN_WORKFLOW_RUN_STATUSES_SQL = asSqlList(OPEN_WORKFLOW_RUN_STATUSES);
 
 export function isTerminalWorkflowRunStatus(status: string): status is (typeof TERMINAL_WORKFLOW_RUN_STATUSES)[number] {
   return (TERMINAL_WORKFLOW_RUN_STATUSES as readonly string[]).includes(status);
@@ -87,6 +106,87 @@ export function isHumanGateWorkflowRunStatus(status: string): status is (typeof 
 
 export function isWorkflowRunStatus(status: string): status is WorkflowRunStatus {
   return (WORKFLOW_RUN_STATUSES as readonly string[]).includes(status);
+}
+
+/**
+ * 未结账（轮询口径）判据——消费方唯一入口，禁止再手写成员集。
+ *
+ * 三段合取，缺一不可：
+ * ① 必须是**词表内**的状态。刻意不用 `!isTerminalWorkflowRunStatus(status)` 单条件：
+ *    那样任何未知字符串都会判为「未结账」，于是历史手写集里的幽灵成员
+ *    （`pending` / `paused` / `received` / `succeeded` / `terminated` / `blocked`）
+ *    会继续被当作在飞的 run —— 那正是本片要修掉的缺陷形态。未知状态没有生命周期
+ *    位置，判 false（停止轮询）比判 true（永远轮询）诚实且省资源。
+ * ② 非终态。
+ * ③ 接受 `undefined` 并返回 false：调用点大量传可选字段（`selectedRun?.status`、
+ *    `query.state.data?.status`），这样替换时调用点零改动。
+ */
+export function isOpenWorkflowRunStatus(status: string | undefined): boolean {
+  return typeof status === "string" && isWorkflowRunStatus(status) && !isTerminalWorkflowRunStatus(status);
+}
+
+/**
+ * 失败态：run 结束在「没做成」这一侧，供总览/看板判「运行异常」。
+ *
+ * 这是**终态的子集**，不是终态本身：`completed` 是成功，`abandoned` 是作者主动放弃
+ * （deliberate 动作，不该被报成异常）。此前 5 处消费方各自手写，值域三个版本且全部夹带
+ * 幽灵成员——`terminated` / `succeeded` 全仓无生产者，`blocked` 是**审校裁决**的取值
+ * （`reviewVerdict`），`rolled-back` / `promoted` 是 **craft-rule 候选**的状态
+ * （`src/novel-v2/craft-rule/index.ts:98`），都不是 run 状态。
+ *
+ * 成员刻意与「未结账」不同构：`isFailedWorkflowRunStatus` 是**枚举**（不是某集合的补集），
+ * 因为它回答的是"要不要把它报成异常"这一有取值的判断题。
+ */
+export const FAILED_WORKFLOW_RUN_STATUSES = ["failed", "rejected", "cancelled"] as const satisfies readonly WorkflowRunStatus[];
+
+/** 失败（异常）判据——消费方唯一入口。未知状态与 `undefined` 一律 false。 */
+export function isFailedWorkflowRunStatus(status: string | undefined): boolean {
+  return typeof status === "string" && (FAILED_WORKFLOW_RUN_STATUSES as readonly string[]).includes(status);
+}
+
+/**
+ * 失败态的 SQL 清单。定义位置必须在 `FAILED_WORKFLOW_RUN_STATUSES` **之后**——
+ * `asSqlList(...)` 在模块求值期即执行，`const` 不提升，放前面会 TDZ 报错（本片实测踩过）。
+ */
+export const FAILED_WORKFLOW_RUN_STATUSES_SQL = asSqlList(FAILED_WORKFLOW_RUN_STATUSES);
+
+/**
+ * 成功终态：run 结束在「做成了」这一侧。
+ *
+ * 词表里**只有一个**成员。刻意仍立成集合而非在消费方写死 `status === "completed"`：
+ * ① 给这个判断一个名字，消费方不必各自写 `=== "completed" || === "succeeded"`；
+ * ② 「只有一个」这件事记录在一处，将来若真出现第二种成功终态，改这里即全消费方生效，
+ *    守卫也会跟着覆盖。
+ *
+ * `succeeded` **不在**词表内：它是 `terminal-outcome.ts` 的子类型取值（另一个词表，
+ * 与 run 状态同名不同物），曾被误抄进 run 状态判据三处。
+ */
+export const SUCCEEDED_WORKFLOW_RUN_STATUSES = ["completed"] as const satisfies readonly WorkflowRunStatus[];
+
+/** 成功终态判据——消费方唯一入口。未知状态与 `undefined` 一律 false。 */
+export function isSucceededWorkflowRunStatus(status: string | undefined): boolean {
+  return typeof status === "string" && (SUCCEEDED_WORKFLOW_RUN_STATUSES as readonly string[]).includes(status);
+}
+
+/** 成功终态的 SQL 清单（同上：必须定义在集合之后，否则 TDZ 报错）。 */
+export const SUCCEEDED_WORKFLOW_RUN_STATUSES_SQL = asSqlList(SUCCEEDED_WORKFLOW_RUN_STATUSES);
+
+/**
+ * 作者放弃态：作者主动收手结束的 run。
+ *
+ * 单独立轴而**不并进失败态**，因为消费方对二者的呈现不同：失败要报「运行异常」并建议排障，
+ * 放弃是 deliberate 的作者动作、按"停在某一阶段"呈现（见 `NovelPipelineBoard.tsx` 的
+ * `abandoned` 分支）。`terminal-outcome.ts` 也早已为它派生了专属子类型
+ * `abandoned-by-author`。
+ *
+ * 它同时是**四轴穷尽性**的最后一块：`succeeded ∪ failed ∪ abandoned ∪ open` 恰好等于词表，
+ * 这条由 `run-lifecycle.test.ts` 锁定——新增状态若不归类即红。
+ */
+export const ABANDONED_WORKFLOW_RUN_STATUSES = ["abandoned"] as const satisfies readonly WorkflowRunStatus[];
+
+/** 作者放弃判据——消费方唯一入口。未知状态与 `undefined` 一律 false。 */
+export function isAbandonedWorkflowRunStatus(status: string | undefined): boolean {
+  return typeof status === "string" && (ABANDONED_WORKFLOW_RUN_STATUSES as readonly string[]).includes(status);
 }
 
 /**
