@@ -755,6 +755,49 @@ seed 只在**服务启动**时由 `migrate()` 尾的 `seedWorkspaceSkills` 灌�
 - 改动：`migrate(dir, objects?)` 增可选对象存储参，派生指标回填归位 migrate 尾；`scripts/novel-v2-api.ts` 与 `scripts/novel-v2-worker.ts` 均传 `objectStore`（worker 此前完全不回填，是本缺陷的直接成因）。
 - 读者视角落地：`skills/novel-v2/prose-craft.yaml` 1.4.0 → 1.5.0，跨章清点/温度判定/数数收尾三类惯性进写作、审核、修订三面（详见文末读者视角附记）。
 - 验证（两批合计）：`npm run lint` 干净；`npm run test` → **142 files / 1292 tests 全绿**（新增 3 例：migrate 尾回填写双向、真库信号缺席/在场、清点惯性三面接线）；**反向实测**——摘除 migrate 尾的回填调用后两条新测试同时判红，摘除 prose-craft 写作侧清点段后三面接线用例判红（均已跑）。
+
+### 8.2 复核轮 round 3（2026-10-14）：段 ↔  provenance 映射漂移 + 判据常量双写
+
+以工程师视角复查 §7 第 5 项信号的**收据链**（receipt → sectionFingerprints → 渲染段 provenanceRefs），
+发现两处映射缺陷，均不抛错、不影响任何科目的通过与否，只是让上下文**悄悄失去可追溯性**或**悄悄说错数字**：
+
+**缺陷一"非空段零 provenance"**：`arc-context-serial-signals` 段的文本恒非空（`serialSignals`
+兜底文案 + ensemble / lengthDrift / dialogueDrift / payoffRhythm 四信号各自渲染），但其指纹登记条件是
+`serialFunctionRuns || lengthDrift || dialogueDrift`。三者皆缺而 ensembleSignal / payoffRhythm
+在场时（合法输入），段有内容而指纹不在册 ⇒ `sourceRefs` 取不到值 ⇒ **provenanceRefs 为空数组**。
+构造性复现实测（`tmp/state-audit/verify-serial-provenance-constructive.mts`）：段 314 字、含两个信号、
+引用为空。其余段（macro/recent/open-elements/…）的指纹无条件登记，独此一处是条件的。
+真库侧（`tmp/state-audit/verify-serial-section-provenance.mts`）本项目三信号俱全故条件恒真、暂不现形——
+**这正是它危险的原因**：缺陷只在合法输入的另一个分支上出现。
+
+**缺陷二"算了没人取的指纹"**：`payoff-rhythm` 指纹单独登记，而"跨弧回报节奏"信号实际渲染在
+serial-signals 段**内部**，渲染侧从未有人 `sourceRefs(receipt, "payoff-rhythm")`。指纹算了、
+receipt 里带着、没有任何消费方。构造性复现：`payoffRhythmFingerprintConsumedByAnySection: false`。
+
+**根因（同一处）**：**段标识与指纹键各自演进后漂移**——五个信号合成了一个段，指纹却按信号粒度登记
+（其中一个还漏了共享入口）。
+
+**修复（最低共享层 = 一张显式对应表）**：新增 `STORY_ARC_CONTEXT_SECTION_IDS`
+（`application/story-arc.ts`），左列渲染侧段 id、右列 receipt 指纹键；两侧都从本表取键。
+serial-signals 指纹改为**无条件登记**（该段恒非空，故无条件），并把 payoffRhythm 并入其指纹输入；
+移除 `payoff-rhythm` 死键；顺带补上 `secrets` 段原先漏登的指纹（该段条件渲染却无键 ⇒ 有段无引用）。
+不拆段：五信号同族（都是"近窗口确定性统计"），拆开只会稀释优先级并让读者在五段之间跳。
+
+**附带发现并修复：判据常量双写**（缺陷三）：`renderStoryArcLengthDrift` 把
+`LENGTH_DRIFT_POLICY.sparseFloor` 的值抄成字面量 `1800`。计数在仓储侧按常量算、句子在渲染侧按
+字面量说 ⇒ 改常量只改一边，提示里报的"低于单章下限 N 字"与真实计数线分叉。已改为取常量，
+并加源码级字面量扫描锁（剥注释行后 `prompts/story-arc.ts` 代码本体不得出现该常量值；
+反向确认锁没空转：渲染函数确实消费该常量）。
+
+**回归锁（`src/novel-v2/__tests__/prompts.test.ts` 新增 3 例）**：
+① 段 ↔ 指纹键对账（每个在场段都取其键、不得残留 `payoff-rhythm` 信号粒度键）；
+② 缺陷一显式夹具（段非空而键不入册 ⇒ 必须报零引用，**不造悬空引用**——零引用是可观测的
+"可追溯性缺失"，指向不存在指纹的引用是"假可追溯"，比原缺陷更坏）；
+③ 条件段无指纹时不给悬空 provenance 且空段不注入；
+④ 判据常量双写锁。
+**反向实测**：把 serial 段改取 `payoff-rhythm` 键（缺陷二形态）→ 对账用例判红；
+把 `${LENGTH_DRIFT_POLICY.sparseFloor}` 改回字面量 1800 → 双写锁判红（均已跑）。
+真库复验：`payoff-rhythm` 键消失、`serial-signals` 键恒在、`secrets` 补登、serial 段带真实引用。
 - 读者视角附记（本轮精读 049/051/056/059/062/064/067 等章）：主线文字质量为"冰山式克制"，问题不在句子而在**重复的可感知结构**——主角反复以同一套动作清点随身物件（废石/玉牌/丹/碎角/左膝/回执/草图，各配一次"凉"）、以指节敲纸排列日期、以"数呼吸/数天色"收尾。机械测量（`tmp/state-audit/measure-narrative-idioms.mts`，确定性、零模型调用）：道具盘点词族全书 862 处 / 每千字 2.16，最高 032 章 15.56/千字；"凉"族 317 处 / 每千字 0.78，最高 062 章 7.18/千字；数数收尾族 221 处 / 每千字 0.60。**分段均值揭示两族峰值都落在商业基准确诊的"死亡象限"内**：道具盘点族 21-40 章 5.30/千字（全书 6.6× 的 2.16）、41-60 章 4.79、61-80 章 3.81；温度族 61-80 章 1.52/千字（全书近 2× 的 0.78）。⇒ 与 §7 第 5 项的对白崩落**同源**：对手戏缺席，章节以物件清点与内省填充。该形态**不是单章缺陷而是跨章惯性**，属生成面指引问题而非事实记忆问题；已定稿章不回溯，故不动正文。
 - **本轮落地的生成面指引**（`skills/novel-v2/prose-craft.yaml` 1.4.0 → 1.5.0，三面同步）：写作侧要求"本章这次清点必须与以往任何一次不同——带来新信息（某件位置/状态真的变了）、新选择（据此决定下一步）或新代价（清点本身有风险），三者都不成立时改为写清点之后的那一个动作"，并把"以数数收束一章"并列为同类惯性（一处是留白，多处是模板）；审核侧列为必查项，且**要求报告指明它挤掉了什么**（本章缺的那次交锋、那次变化），把动刀理由钉在"该有的现场没发生"而非"这个动作出现太多次"；修订侧给出修法"不是删清单，而是给这次清点安上它缺失的功能"。判据用通用叙事模式描述（随身物件清点 + 同类温度/质感判定 + 数数收尾），不含任何本书专有物件名，跨题材复用。测试：`skill-runtime.test.ts` 新增一例，三面接线 + 写作侧三条件 + 审核侧"挤掉了什么"均在场；反向摘除写作侧该段即判红（本轮已实测）。
 

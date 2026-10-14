@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
 import { buildChapterDraftPromptPackage, buildFoundationContextMarkdown } from "../prompts/chapter-draft";
 import { dedupeNarrativeRhythmMemory } from "../prompts/chapter-planning-context";
 import { buildFoundationPrompt } from "../prompts/foundation";
@@ -6,6 +7,8 @@ import { buildFoundationReviewPrompt } from "../prompts/foundation-review";
 import { getReviewFocus, isStaleExcerptIssue, toReview } from "../prompts/chapter-review";
 import Ajv from "ajv";
 import { buildStoryArcChaptersPrompt, buildStoryArcPlanningContextSections, buildStoryArcPrompt, buildStoryArcRebasePrompt, buildStoryArcReviewPrompt, buildStoryArcRevisionPrompt, storyArcBundleSchema } from "../prompts/story-arc";
+import { STORY_ARC_CONTEXT_SECTION_IDS } from "../application/story-arc";
+import { LENGTH_DRIFT_POLICY } from "../word-count";
 
 describe("long-form prompt contracts", () => {
   it("keeps prose constraints short and leaves chapter length to natural completion", () => {
@@ -404,6 +407,138 @@ describe("long-form prompt contracts", () => {
     expect(sections.map((section) => section.id)).not.toContain("arc-context-secrets");
   });
 
+  /**
+   * 段 ↔ 指纹键对账（2026-10-14 复核轮，两处缺陷的回归锁）。
+   *
+   * 缺陷一"非空段零 provenance"：serial-signals 段文本恒非空，但其指纹登记条件是
+   * `serialFunctionRuns || lengthDrift || dialogueDrift`。构造性复现（只用合法输入：
+   * ensembleSignal 与 payoffRhythm 在场、三个触发键皆缺）实测段 314 字含两个信号，
+   * provenanceRefs 却是空数组——段在、引用不在。
+   * 缺陷二"算了没人取的指纹"：`payoff-rhythm` 键单独登记，而"跨弧回报节奏"渲染在
+   * serial-signals 段**内部**，渲染侧从未有人取那个键。
+   *
+   * 两条锁的都是**映射关系**而非具体数值，故不需要真库：
+   *  ① 每个段 id 的指纹键必须能在 STORY_ARC_CONTEXT_SECTION_IDS 里找到（防漂移）；
+   *  ② 非空段必须有 provenanceRefs（空数组即缺陷一复现）；
+   *  ③ 每个登记的指纹键都必须被某个段实际取用（防"算了没人取"）。
+   */
+  it("每个非空段都有 provenance，且每个登记的指纹键都被某个段取用", () => {
+    const sections = buildStoryArcPlanningContextSections({
+      projectTitle: "对账项目",
+      macro: [{ taskKey: "architecture", title: "结构", summary: "阶段边界" }],
+      recentChapters: [{ order: 3, summary: "上一章", unresolvedThreads: ["thread-1"] }],
+      openThreads: [],
+      // 复刻缺陷一的合法输入：三个触发键皆缺，ensemble 与 payoffRhythm 在场。
+      ensembleSignal: { soloOnlyOrders: [4], longestSoloRun: 2, windowSize: 6 },
+      payoffRhythm: [{ arcOrdinal: 7, title: null, finalChapters: 6, payoffCount: 0 }],
+      contextReceipt: {
+        narrativeCutoff: 3,
+        sourceArtifactIds: ["artifact-1"],
+        sourceRevisionIds: ["revision-3"],
+        // 复刻修复后仓储侧的登记：无条件段恒入册，故 serial-signals 必有键。
+        sectionFingerprints: {
+          [STORY_ARC_CONTEXT_SECTION_IDS.macro.fingerprintKey]: "macro-fp",
+          [STORY_ARC_CONTEXT_SECTION_IDS.recent.fingerprintKey]: "recent-fp",
+          [STORY_ARC_CONTEXT_SECTION_IDS.openElements.fingerprintKey]: "open-fp",
+          [STORY_ARC_CONTEXT_SECTION_IDS.feedbackState.fingerprintKey]: "feedback-fp",
+          [STORY_ARC_CONTEXT_SECTION_IDS.serialSignals.fingerprintKey]: "serial-fp",
+        },
+        fingerprint: "context-fp",
+        legacy: false,
+      },
+    });
+
+    const serial = sections.find((section) => section.id === STORY_ARC_CONTEXT_SECTION_IDS.serialSignals.id);
+    expect(serial).toBeDefined();
+    expect(serial!.text.trim().length).toBeGreaterThan(0);
+    // 缺陷一：非空段必须有引用，且引用指向的是共享段的键。
+    expect(serial!.provenanceRefs).toContain(`story-arc-section:${STORY_ARC_CONTEXT_SECTION_IDS.serialSignals.fingerprintKey}:serial-fp`);
+    // 段内必须真的渲染了那两个信号，否则本用例退化成"只有兜底文案也算非空"的弱断言。
+    expect(serial!.text).toContain("跨弧回报节奏");
+    expect(serial!.text).toContain("群像");
+
+    // 缺陷二：对应表里每个指纹键都必须有至少一个段在取用它——新增键而没人取用即红。
+    const presentIds = new Set(sections.map((section) => section.id));
+    for (const entry of Object.values(STORY_ARC_CONTEXT_SECTION_IDS)) {
+      if (!presentIds.has(entry.id)) continue;
+      // 前缀匹配而非 includes：引用形如 `story-arc-section:<key>:<fingerprint>`，
+      // 指纹值是 64 位十六进制，用 includes 判整段相等会恒 false（本用例首版的错）。
+      const consumed = sections.some((section) => (section.provenanceRefs ?? []).some((ref) => ref.startsWith(`story-arc-section:${entry.fingerprintKey}:`)));
+      expect(consumed, `段 ${entry.id} 在场却没有取其指纹键 ${entry.fingerprintKey}`).toBe(true);
+    }
+    // 反向：不得残留信号粒度的遗留键（payoffRhythm 曾单独占一个 payoff-rhythm）。
+    const keys = Object.values(STORY_ARC_CONTEXT_SECTION_IDS).map((entry) => entry.fingerprintKey);
+    expect(keys).not.toContain("payoff-rhythm");
+  });
+
+  /**
+   * 缺陷一的**显式反向夹具**：serial-signals 段非空而其指纹键不入册时，段必须报出
+   * 可观测的"零引用"状态（而不是悄悄继续）。
+   *
+   * 原实现的失效形态正是这个：文本恒非空（兜底文案 + ensemble/payoffRhythm），
+   * 指纹却挂在 `serialFunctionRuns || lengthDrift || dialogueDrift` 条件上。
+   * 本夹具把三个触发键全部留在册外、只给 ensemble 与 payoffRhythm 制造内容，
+   * 于是段有 300+ 字而 provenanceRefs 为空——这正是缺陷一的复现条件。
+   * 断言"零引用"而非"必须有引用"：修复的落点是仓储侧无条件登记（另一条锁守住），
+   * 渲染层这里只保证**不造悬空引用**，且该状态是可观测的。
+   */
+  it("serial-signals 段非空而键不入册时报零引用，不造悬空 provenance", () => {
+    const sections = buildStoryArcPlanningContextSections({
+      projectTitle: "缺陷一复现",
+      macro: [],
+      recentChapters: [],
+      openThreads: [],
+      ensembleSignal: { soloOnlyOrders: [2, 5], longestSoloRun: 3, windowSize: 6 },
+      payoffRhythm: [{ arcOrdinal: 9, title: null, finalChapters: 6, payoffCount: 0 }],
+      contextReceipt: {
+        narrativeCutoff: 6,
+        sourceArtifactIds: [],
+        sourceRevisionIds: [],
+        // 三个触发键的指纹一个都不给——复刻原仓储侧的条件登记未命中。
+        sectionFingerprints: { macro: "m", recent: "r", "open-elements": "o", "feedback-state": "f" },
+        fingerprint: "ctx",
+        legacy: false,
+      },
+    });
+    const serial = sections.find((section) => section.id === STORY_ARC_CONTEXT_SECTION_IDS.serialSignals.id);
+    expect(serial).toBeDefined();
+    expect(serial!.text.trim().length).toBeGreaterThan(0);
+    expect(serial!.text).toContain("跨弧回报节奏");
+    expect(serial!.text).toContain("群像");
+    // 零引用是缺陷的**可观测形态**；若哪天这里变成非空且带着一个指向不存在指纹的
+    // 引用，那是把"可追溯性缺失"升级成"假可追溯"，比原缺陷更坏。
+    expect(serial!.provenanceRefs).toEqual([]);
+    // 同时确认段里没有半个指向 serial-signals 键的残留引用。
+    expect(serial!.provenanceRefs.some((ref) => ref.startsWith(`story-arc-section:${STORY_ARC_CONTEXT_SECTION_IDS.serialSignals.fingerprintKey}:`))).toBe(false);
+  });
+
+  /**
+   * 条件段的另一半纪律顺带锁住：段在场而 receipt 无该键时不得给悬空 provenance。
+   * 零引用是"可追溯性缺失"（可观测），指向不存在指纹的引用是"假可追溯"（更坏）。
+   */
+  it("条件段无指纹时不给悬空 provenance，且空段不注入", () => {
+    const sections = buildStoryArcPlanningContextSections({
+      projectTitle: "条件段项目",
+      macro: [],
+      recentChapters: [],
+      openThreads: [],
+      cast: [{ id: "char-a", name: "甲" }],
+      contextReceipt: {
+        narrativeCutoff: 1,
+        sourceArtifactIds: [],
+        sourceRevisionIds: [],
+        sectionFingerprints: {},
+        fingerprint: "ctx",
+        legacy: false,
+      },
+    });
+    const cast = sections.find((section) => section.id === STORY_ARC_CONTEXT_SECTION_IDS.cast.id);
+    expect(cast).toBeDefined();
+    expect(cast!.provenanceRefs).toEqual([]);
+    expect(sections.map((section) => section.id)).not.toContain(STORY_ARC_CONTEXT_SECTION_IDS.secrets.id);
+    expect(sections.map((section) => section.id)).not.toContain(STORY_ARC_CONTEXT_SECTION_IDS.dueLedger.id);
+  });
+
   it("injects the undisclosed-secrets ledger into arc planning context and arms the review check (PL-8③)", () => {
     const sections = buildStoryArcPlanningContextSections({
       projectTitle: "测试项目",
@@ -608,6 +743,10 @@ describe("long-form prompt contracts", () => {
     expect(serial?.text).toContain("均章 1620 字");
     expect(serial?.text).toContain("4 章低于单章下限");
     expect(serial?.text).toContain("不得系统性延续低声明");
+    // 渲染出的下限必须与判据常量同源：`sparseCount` 的计数在仓储侧按
+    // LENGTH_DRIFT_POLICY.sparseFloor 算，渲染侧若另抄一个字面量，改策略时只会改
+    // 一边——句子说的下限与真实计数口径分叉，且不报错、只是悄悄说错话。
+    expect(serial?.text).toContain(`${LENGTH_DRIFT_POLICY.sparseFloor} 字`);
     // 反例 1：健康窗口（无低量章）→ 只报统计不提示
     const healthy = buildStoryArcPlanningContextSections({ ...base, lengthDrift: { windowSize: 6, avgChars: 2600, sparseCount: 0, minChars: 2100 } });
     expect(healthy.find((section) => section.id === "arc-context-serial-signals")?.text).toContain("无低于单章下限的章");
@@ -615,6 +754,29 @@ describe("long-form prompt contracts", () => {
     // 反例 2：窗口不足 3 章 → 整体不注入（宁缺毋伪）
     const none = buildStoryArcPlanningContextSections({ ...base, lengthDrift: { windowSize: 2, avgChars: 1200, sparseCount: 2, minChars: 1100 } });
     expect(none.find((section) => section.id === "arc-context-serial-signals")?.text).not.toContain("篇幅信号");
+  });
+
+  /**
+   * 判据常量双写锁（2026-10-14 复核轮，state-audit §8.2）。
+   *
+   * 失效形态：渲染层把 `LENGTH_DRIFT_POLICY.sparseFloor` 的值抄成字面量 1800。
+   * 计数在仓储侧按常量算、句子在渲染侧按字面量说，改常量只改一边 ⇒ 提示里报的
+   * "低于单章下限 N 字"与真实计数线分叉。这类缺陷不抛错、不改变任何科目的通过与否，
+   * 只是让规划器与审核器读到一个**说谎的数字**——比没有提示更坏。
+   *
+   * 锁法是源码级字面量扫描（比单测断言更强：换任何 fixture 都躲不过）：
+   * prompts/story-arc.ts 的**代码本体**不得出现 sparseFloor 的字面量值。
+   * 注释里的 1800 是"为什么取这个值"的说明，按仓内既有口径剥掉注释行再判。
+   */
+  it("渲染层不得把稀疏线下限抄成字面量（判据常量唯一真源）", () => {
+    const source = readFileSync("src/novel-v2/prompts/story-arc.ts", "utf8")
+      .split(/\r?\n/)
+      .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+      .join("\n");
+    expect(source).not.toContain(String(LENGTH_DRIFT_POLICY.sparseFloor));
+    // 反向确认锁没空转：渲染函数确实消费该常量（否则"代码里没有字面量"可能只是因为
+    // 它连下限都不报，那是另一种缺陷）。
+    expect(source).toContain("LENGTH_DRIFT_POLICY.sparseFloor");
   });
 
   it("审核面携带内容稀疏检查，章长本身不是病（2026-09-22 2E）", () => {

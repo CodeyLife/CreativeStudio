@@ -73,7 +73,7 @@ import type { ObjectStoreIdentity } from "./object-store";
 import { normalizeManuscriptStructuralReview } from "./application/manuscript-structure";
 import { arcCompletionPredicateSql, auditEmotionalContractCarriage, auditNamedReferences, auditStoryArcBatchRanges, canonicalReferenceId, findEmbeddedInternalIdentifiers, normalizeThreadResponsibilityReferences, parseExplicitNewReference, planThreadForeshadowingBindings, resolveNamedReference, sanitizeReferenceToken, type NamedReferenceCandidate, type StoryArcIntegrityIssue } from "./application/story-arc-integrity";
 import { auditFullBookArchitecture } from "./application/full-book-architecture";
-import { CHAPTER_NARRATIVE_FUNCTIONS, canGenerateNextStoryArcBatch, inspectStoryArcEnsemble, MAX_STORY_ARC_BATCH_WINDOW, normalizeChapterPlanningContext, parseStoryArcBundle, parseStoryArcPlan, planningContextFingerprint, resolveArcPhase, validateStoryArcPlanContracts, type ArcPlanningStatus, type ChapterBlueprint, type ChapterBlueprintRecord, type ChapterPlanningContext, type ChapterSceneBlueprint, type NarrativeArcPlan, type StoryArcBatchRecord, type StoryArcBundle, type StoryArcContextReceipt, type StoryArcPlotOutline, type StoryArcRebaseTarget, type StoryArcRecord } from "./application/story-arc";
+import { CHAPTER_NARRATIVE_FUNCTIONS, canGenerateNextStoryArcBatch, inspectStoryArcEnsemble, MAX_STORY_ARC_BATCH_WINDOW, normalizeChapterPlanningContext, parseStoryArcBundle, parseStoryArcPlan, planningContextFingerprint, resolveArcPhase, STORY_ARC_CONTEXT_SECTION_IDS, validateStoryArcPlanContracts, type ArcPlanningStatus, type ChapterBlueprint, type ChapterBlueprintRecord, type ChapterPlanningContext, type ChapterSceneBlueprint, type NarrativeArcPlan, type StoryArcBatchRecord, type StoryArcBundle, type StoryArcContextReceipt, type StoryArcPlotOutline, type StoryArcRebaseTarget, type StoryArcRecord } from "./application/story-arc";
 import type { StoryArcReviewOutput } from "./prompts/story-arc";
 import { aggregateChapterReviews, isEvidencePresentInText, markEvidenceUnverified, reviewIssueFingerprint, type ChapterReviewIssueStatus } from "./chapter-review-snapshot";
 import {
@@ -4617,15 +4617,30 @@ export class NovelPostgresRepository {
       ...openElements.foreshadowings.map((item) => item.plantedRevisionId),
       ...openElements.promises.map((item) => item.sourceRevisionId),
     ])];
+    // 段 ↔ 指纹对应关系见 application/story-arc.ts 的 STORY_ARC_CONTEXT_SECTION_IDS。
+    // 三条纪律（2026-10-14 复核轮，两处缺陷的修复依据）：
+    //  ① **指纹按段登记，不按段内信号登记**：serial-signals 段内的五个信号
+    //     （功能游程 / 群像 / 回报节奏 / 篇幅 / 对白）共用同一个指纹键。原实现按信号
+    //     粒度登记，于是 payoffRhythm 单独占一个 "payoff-rhythm" 键却没有任何渲染方
+    //     读取它（算了没人取），而共享段的键又挂在"三个信号之一在场"的条件上
+    //     （段非空而指纹不在册 ⇒ provenanceRefs 为空）。
+    //  ② **无条件渲染的段就不设条件**：serial-signals 段的文本恒非空（serialSignals
+    //     恒有兜底文案），故其指纹无条件入册；条件入册的只有"空段不注入"的那几个。
+    //  ③ "payoff-rhythm" 键已移除：信号粒度的遗留，其回收读点在 serial-signals 段内。
+    //  ④ secrets 的指纹原先是**漏登**的（该段条件渲染却无指纹键 ⇒ 有段无引用），
+    //     此处补齐，判据与 cast / dueLedger 同型：投影非空才入册。
+    //     特意**不含 dormancy**：`narrativeDormancy` 由调用方（activities）在拿到
+    //     本返回值之后注入（`loadNarrativeDormancy` 需全章正文，仓储层不读对象存储），
+    //     本处拿不到它的值，为其登记指纹只会造出第二个"算了没人取"的键。
     const sectionFingerprints = {
-      macro: canonicalSha256(contextData.macro),
-      recent: canonicalSha256(contextData.recentChapters),
-      "open-elements": canonicalSha256({ openThreads: contextData.openThreads, openForeshadowings: contextData.openForeshadowings, openPromises: contextData.openPromises }),
-      "feedback-state": canonicalSha256({ planningFeedback: contextData.planningFeedback, narrativeState: contextData.narrativeState }),
-      ...(contextData.serialFunctionRuns || contextData.lengthDrift || contextData.dialogueDrift ? { "serial-signals": canonicalSha256({ runs: contextData.serialFunctionRuns, ensembleSignal: contextData.ensembleSignal, lengthDrift: contextData.lengthDrift, dialogueDrift: contextData.dialogueDrift }) } : {}),
-      ...(contextData.payoffRhythm ? { "payoff-rhythm": canonicalSha256(contextData.payoffRhythm) } : {}),
-      ...(contextData.cast ? { cast: canonicalSha256(contextData.cast) } : {}),
-      ...(contextData.dueLedger ? { "due-ledger": canonicalSha256(contextData.dueLedger) } : {}),
+      [STORY_ARC_CONTEXT_SECTION_IDS.macro.fingerprintKey]: canonicalSha256(contextData.macro),
+      [STORY_ARC_CONTEXT_SECTION_IDS.recent.fingerprintKey]: canonicalSha256(contextData.recentChapters),
+      [STORY_ARC_CONTEXT_SECTION_IDS.openElements.fingerprintKey]: canonicalSha256({ openThreads: contextData.openThreads, openForeshadowings: contextData.openForeshadowings, openPromises: contextData.openPromises }),
+      [STORY_ARC_CONTEXT_SECTION_IDS.feedbackState.fingerprintKey]: canonicalSha256({ planningFeedback: contextData.planningFeedback, narrativeState: contextData.narrativeState }),
+      [STORY_ARC_CONTEXT_SECTION_IDS.serialSignals.fingerprintKey]: canonicalSha256({ runs: contextData.serialFunctionRuns, ensembleSignal: contextData.ensembleSignal, payoffRhythm: contextData.payoffRhythm, lengthDrift: contextData.lengthDrift, dialogueDrift: contextData.dialogueDrift }),
+      ...(contextData.cast ? { [STORY_ARC_CONTEXT_SECTION_IDS.cast.fingerprintKey]: canonicalSha256(contextData.cast) } : {}),
+      ...(contextData.dueLedger ? { [STORY_ARC_CONTEXT_SECTION_IDS.dueLedger.fingerprintKey]: canonicalSha256(contextData.dueLedger) } : {}),
+      ...(contextData.undisclosedSecrets?.length ? { [STORY_ARC_CONTEXT_SECTION_IDS.secrets.fingerprintKey]: canonicalSha256(contextData.undisclosedSecrets) } : {}),
     };
     const receiptBase: Omit<StoryArcContextReceipt, "fingerprint"> = { narrativeCutoff, sourceArtifactIds, sourceRevisionIds, sectionFingerprints, legacy: false };
     const contextReceipt: StoryArcContextReceipt = { ...receiptBase, fingerprint: canonicalSha256(receiptBase) };

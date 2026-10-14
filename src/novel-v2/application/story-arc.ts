@@ -522,6 +522,46 @@ export interface StoryArcContextReceipt {
 }
 
 /**
+ * 弧规划上下文的**段标识 ↔ 指纹键**对应表（渲染侧与指纹侧的唯一共同真源）。
+ *
+ * 为什么需要它（2026-10-14 复核轮实测 + 构造性复现的两处缺陷）：
+ *  ① **非空段零 provenance**：`arc-context-serial-signals` 段的文本恒非空
+ *     （`serialSignals` 兜底文案，加上 ensemble / lengthDrift / dialogueDrift /
+ *     payoffRhythm 四个信号各自渲染），但其指纹的登记条件是
+ *     `serialFunctionRuns || lengthDrift || dialogueDrift`——三者皆缺而
+ *     ensembleSignal / payoffRhythm 在场时（合法输入，构造性复现实测：段 314 字、
+ *     provenanceRefs 为空数组），段有内容而 `sectionFingerprints["serial-signals"]`
+ *     不在册，`sourceRefs` 取不到值。其余段（macro/recent/open-elements/…）的指纹
+ *     都是无条件登记的，独此一处是条件的。
+ *  ② **算了没人取的指纹**：`payoff-rhythm` 指纹单独登记，但渲染层从未有人
+ *     `sourceRefs(receipt, "payoff-rhythm")`——"跨弧回报节奏"信号实际渲染在
+ *     serial-signals 段**内部**。指纹算了、receipt 里带着、没有任何消费方。
+ *
+ * 根因是**段标识与指纹键各自演进后漂移**：五个信号合成了一个段，指纹却按信号粒度
+ * 登记（其中一个还漏了共享入口）。修法不是给每个信号拆段（会把五个同族小信号撑成
+ * 五段、稀释优先级，读者还要在五段之间跳），而是把对应关系收成**一张显式表**：
+ * 左列是渲染侧的段 id（下游测试与消费方按它认段），右列是 receipt 里的指纹键。
+ * 两侧都从本表取键，任何一侧不同步由对账测试直接判红。
+ *
+ * 边界：这是一张**段 ↔ 指纹键**对应表，不是信号清单——它只声明"哪些段有指纹"，
+ * 不声明段内渲染哪些信号（那由 `buildStoryArcPlanningContextSections` 决定）。
+ */
+export const STORY_ARC_CONTEXT_SECTION_IDS = {
+  cast: { id: "arc-context-cast", fingerprintKey: "cast" },
+  macro: { id: "arc-context-macro", fingerprintKey: "macro" },
+  recent: { id: "arc-context-recent", fingerprintKey: "recent" },
+  secrets: { id: "arc-context-secrets", fingerprintKey: "secrets" },
+  dueLedger: { id: "arc-context-due-ledger", fingerprintKey: "due-ledger" },
+  dormancy: { id: "arc-context-dormancy", fingerprintKey: "dormancy" },
+  openElements: { id: "arc-context-open-elements", fingerprintKey: "open-elements" },
+  feedbackState: { id: "arc-context-feedback-state", fingerprintKey: "feedback-state" },
+  /** 功能游程、群像独处游程、回报节奏、篇幅与对白密度五个信号共用的那一个段。 */
+  serialSignals: { id: "arc-context-serial-signals", fingerprintKey: "serial-signals" },
+} as const;
+
+export type StoryArcContextSectionId = typeof STORY_ARC_CONTEXT_SECTION_IDS[keyof typeof STORY_ARC_CONTEXT_SECTION_IDS]["id"];
+
+/**
  * 群像结构信号（2026-09-16 全量审校确诊的机制端落点）。
  *
  * 根因证据：126 章蓝图 44% 全部场景参与者 ≤1（弧 12-13、15、18 达 5/7），产出正文

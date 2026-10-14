@@ -1,4 +1,4 @@
-import { CHAPTER_NARRATIVE_FUNCTIONS, MAX_CHAPTER_HINTS, MAX_EXPECTED_CHAPTER_COUNT, inspectStoryArcEnsemble, storyArcAuthorityPaths, type StoryArcBundle, type StoryArcContextReceipt, type StoryArcPlotOutline, type StoryArcRebaseTarget } from "../application/story-arc";
+import { CHAPTER_NARRATIVE_FUNCTIONS, MAX_CHAPTER_HINTS, MAX_EXPECTED_CHAPTER_COUNT, inspectStoryArcEnsemble, storyArcAuthorityPaths, STORY_ARC_CONTEXT_SECTION_IDS, type StoryArcBundle, type StoryArcContextReceipt, type StoryArcPlotOutline, type StoryArcRebaseTarget } from "../application/story-arc";
 import type { StoryArcReviewOutput } from "../application/story-arc-review-policy";
 import { TEXT_REVIEW_PASSED_MARKER } from "../text-review";
 import type { NarrativeStateSnapshot } from "../protocol";
@@ -240,7 +240,10 @@ export function renderStoryArcEnsembleSignal(signal: StoryArcPromptInput["ensemb
  */
 export function renderStoryArcLengthDrift(drift: StoryArcPromptInput["lengthDrift"]): string {
   if (!drift || drift.windowSize < 3) return "";
-  const lines = [`近 ${drift.windowSize} 章篇幅信号（确定性统计）：均章 ${drift.avgChars} 字，最短 ${drift.minChars} 字${drift.sparseCount ? `，${drift.sparseCount} 章低于单章下限 ${1800} 字` : "，无低于单章下限的章"}。`];
+  // 稀疏线取策略常量，不写字面量：判据（`sparseCount` 的计数）在仓储侧同一个常量上算，
+  // 渲染侧若另抄一个 1800，改策略时只会改一边——读者看到的下限与真实计数口径分叉，
+  // 而这类分叉不报错、只是悄悄说错话（AGENTS.md"量化指标失准"的同类）。
+  const lines = [`近 ${drift.windowSize} 章篇幅信号（确定性统计）：均章 ${drift.avgChars} 字，最短 ${drift.minChars} 字${drift.sparseCount ? `，${drift.sparseCount} 章低于单章下限 ${LENGTH_DRIFT_POLICY.sparseFloor} 字` : "，无低于单章下限的章"}。`];
   if (drift.sparseCount >= 2) {
     lines.push("篇幅信号提示：近窗口出现连续低量章——逐章对声明目标达标不等于全书内容密度合格（'拆事件凑章数'会让每章都过门而读者看到的是碎片化）。本批次声明 targetWordCount 时回到各章信息量的诚实估计；除非个别章功能确需短章（planningRationale 声明），不得系统性延续低声明。");
   }
@@ -372,15 +375,19 @@ export function buildStoryArcPlanningContextSections(input: StoryArcPromptInput)
   const dueLedgerText = renderStoryArcDueLedger(input.dueLedger);
   const dormancyText = renderStoryArcNarrativeDormancy(input.narrativeDormancy);
   const base = [
-    ...(castText ? [{ id: "arc-context-cast" as const, kind: "fact" as const, title: "人物登记表（POV 与参与者的权威名册）", text: castText, priority: "required" as const, provenanceRefs: sourceRefs(receipt, "cast") }] : []),
-    { id: "arc-context-macro", kind: "planning" as const, title: "故事弧宏观规划", text: macro, priority: "required" as const, provenanceRefs: sourceRefs(receipt, "macro", receipt?.sourceArtifactIds ?? []) },
-    { id: "arc-context-recent", kind: "fact" as const, title: "已定稿章节与叙事截止点", text: recent, priority: "required" as const, provenanceRefs: sourceRefs(receipt, "recent", receipt?.sourceRevisionIds ?? []) },
-    ...(secretsText ? [{ id: "arc-context-secrets", kind: "planning" as const, title: "未揭示作者秘密", text: secretsText, priority: "required" as const, provenanceRefs: sourceRefs(receipt, "secrets") }] : []),
-    ...(dueLedgerText ? [{ id: "arc-context-due-ledger", kind: "planning" as const, title: "窗口上界已过的伏笔账", text: dueLedgerText, priority: "required" as const, provenanceRefs: sourceRefs(receipt, "due-ledger") }] : []),
-    ...(dormancyText ? [{ id: "arc-context-dormancy", kind: "planning" as const, title: "线索静默账（曾活跃、现已静默）", text: dormancyText, priority: "required" as const, provenanceRefs: sourceRefs(receipt, "dormancy") }] : []),
-    { id: "arc-context-open-elements", kind: "planning" as const, title: "开放线索、伏笔与承诺候选", text: open, priority: "normal" as const, provenanceRefs: sourceRefs(receipt, "open-elements") },
-    { id: "arc-context-feedback-state", kind: "review" as const, title: "机制反馈与叙事状态", text: feedback, priority: "normal" as const, provenanceRefs: sourceRefs(receipt, "feedback-state", receipt?.sourceRevisionIds ?? []) },
-    { id: "arc-context-serial-signals", kind: "review" as const, title: "跨章序列信号（功能游程、群像独处游程、回报节奏、篇幅与对白密度信号）", text: [serialSignals, renderStoryArcEnsembleSignal(input.ensembleSignal), renderStoryArcPayoffRhythm(input.payoffRhythm), renderStoryArcLengthDrift(input.lengthDrift), renderStoryArcDialogueDrift(input.dialogueDrift)].filter(Boolean).join("\n\n"), priority: "normal" as const, provenanceRefs: sourceRefs(receipt, "serial-signals") },
+    ...(castText ? [{ id: STORY_ARC_CONTEXT_SECTION_IDS.cast.id, kind: "fact" as const, title: "人物登记表（POV 与参与者的权威名册）", text: castText, priority: "required" as const, provenanceRefs: sourceRefs(receipt, STORY_ARC_CONTEXT_SECTION_IDS.cast.fingerprintKey) }] : []),
+    { id: STORY_ARC_CONTEXT_SECTION_IDS.macro.id, kind: "planning" as const, title: "故事弧宏观规划", text: macro, priority: "required" as const, provenanceRefs: sourceRefs(receipt, STORY_ARC_CONTEXT_SECTION_IDS.macro.fingerprintKey, receipt?.sourceArtifactIds ?? []) },
+    { id: STORY_ARC_CONTEXT_SECTION_IDS.recent.id, kind: "fact" as const, title: "已定稿章节与叙事截止点", text: recent, priority: "required" as const, provenanceRefs: sourceRefs(receipt, STORY_ARC_CONTEXT_SECTION_IDS.recent.fingerprintKey, receipt?.sourceRevisionIds ?? []) },
+    ...(secretsText ? [{ id: STORY_ARC_CONTEXT_SECTION_IDS.secrets.id, kind: "planning" as const, title: "未揭示作者秘密", text: secretsText, priority: "required" as const, provenanceRefs: sourceRefs(receipt, STORY_ARC_CONTEXT_SECTION_IDS.secrets.fingerprintKey) }] : []),
+    ...(dueLedgerText ? [{ id: STORY_ARC_CONTEXT_SECTION_IDS.dueLedger.id, kind: "planning" as const, title: "窗口上界已过的伏笔账", text: dueLedgerText, priority: "required" as const, provenanceRefs: sourceRefs(receipt, STORY_ARC_CONTEXT_SECTION_IDS.dueLedger.fingerprintKey) }] : []),
+    ...(dormancyText ? [{ id: STORY_ARC_CONTEXT_SECTION_IDS.dormancy.id, kind: "planning" as const, title: "线索静默账（曾活跃、现已静默）", text: dormancyText, priority: "required" as const, provenanceRefs: sourceRefs(receipt, STORY_ARC_CONTEXT_SECTION_IDS.dormancy.fingerprintKey) }] : []),
+    { id: STORY_ARC_CONTEXT_SECTION_IDS.openElements.id, kind: "planning" as const, title: "开放线索、伏笔与承诺候选", text: open, priority: "normal" as const, provenanceRefs: sourceRefs(receipt, STORY_ARC_CONTEXT_SECTION_IDS.openElements.fingerprintKey) },
+    { id: STORY_ARC_CONTEXT_SECTION_IDS.feedbackState.id, kind: "review" as const, title: "机制反馈与叙事状态", text: feedback, priority: "normal" as const, provenanceRefs: sourceRefs(receipt, STORY_ARC_CONTEXT_SECTION_IDS.feedbackState.fingerprintKey, receipt?.sourceRevisionIds ?? []) },
+    // 五个串行信号共用这一段（不拆段：它们同族、都是"近窗口确定性统计"，拆开只会
+    // 稀释优先级并让读者在五段之间跳）。指纹也按段登记（见仓储侧 sectionFingerprints
+    // 与 STORY_ARC_CONTEXT_SECTION_IDS 的说明）——原实现把 payoffRhythm 单独登一个键
+    // 却无读点，而共享键又挂在条件上，造成"非空段零 provenance"。
+    { id: STORY_ARC_CONTEXT_SECTION_IDS.serialSignals.id, kind: "review" as const, title: "跨章序列信号（功能游程、群像独处游程、回报节奏、篇幅与对白密度信号）", text: [serialSignals, renderStoryArcEnsembleSignal(input.ensembleSignal), renderStoryArcPayoffRhythm(input.payoffRhythm), renderStoryArcLengthDrift(input.lengthDrift), renderStoryArcDialogueDrift(input.dialogueDrift)].filter(Boolean).join("\n\n"), priority: "normal" as const, provenanceRefs: sourceRefs(receipt, STORY_ARC_CONTEXT_SECTION_IDS.serialSignals.fingerprintKey) },
     { id: "arc-context-receipt", kind: "background" as const, title: "上下文来源收据", text: receiptText, priority: "normal" as const, provenanceRefs: receipt ? [receipt.fingerprint] : ["legacy-context"] },
   ];
   return outlineSection ? [outlineSection, ...base] : base;
