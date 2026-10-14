@@ -31,7 +31,7 @@ CreativeStudio 是一个面向小说、图像和游戏素材制作的本地优�
 | 图像工具集 | 本地超分 4K、格式导出、透明裁切、调色板提取、帧表合成、拼接、像素化和缩放 |
 | 素材库/历史记录 | 管理生成结果和处理结果，可重新预览、下载或作为图生图参考图 |
 
-图像 Blob、历史记录和本地超分模型缓存使用浏览器 IndexedDB；不需要为了使用这些本地工具先启动 Novel V2 服务。
+图片 Blob 和本地超分模型缓存使用浏览器 IndexedDB；历史记录与素材库的元数据、提示词收藏和界面偏好由 localStorage（Zustand 持久化）保存。不需要为了使用这些本地工具先启动 Novel V2 服务。
 
 ### Novel V2 小说创作
 
@@ -80,7 +80,7 @@ flowchart LR
 - React 19、TypeScript、Vite。
 - Ant Design、Motion、GSAP。
 - Zustand 管理界面状态和素材工作集。
-- IndexedDB 保存图片 Blob、历史记录和本地模型缓存。
+- 浏览器本地存储：IndexedDB 保存图片 Blob 与本地模型缓存；localStorage（Zustand 持久化）保存历史记录/素材库元数据、提示词收藏和界面偏好。
 - `src/App.tsx` 定义工作台、AI 生图、小说、素材工具、历史和设置等路由。
 
 ### Novel V2 服务端

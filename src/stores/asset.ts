@@ -1,6 +1,10 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
-import { deleteImage } from "@/lib/imageStore";
+import { prependWithCap } from "@/lib/cappedList";
+import { deleteImagesQuietly } from "@/lib/imageStore";
+
+/** 素材库保留上限。TODO: 魔法值，后续如需按存储配额调整应提取为可配置项。 */
+const MAX_ASSET_ITEMS = 500;
 
 export interface AssetGroup {
   id: string;
@@ -55,25 +59,32 @@ export const useAssetStore = create<AssetState>()(
     (set) => ({
       items: [],
       groups: [],
-      add: (item) => set((s) => ({ items: [item, ...s.items].slice(0, 500) })),
+      add: (item) =>
+        set((s) => {
+          const { kept, evicted } = prependWithCap(s.items, item, MAX_ASSET_ITEMS);
+          // 超出上限被淘汰的旧素材：清理其 IndexedDB 图片，避免孤儿 Blob
+          if (evicted.length > 0) {
+            deleteImagesQuietly(evicted.map((a) => a.imageId));
+          }
+          return { items: kept };
+        }),
       remove: (id) =>
         set((s) => {
           const target = s.items.find((i) => i.id === id);
-          if (target) deleteImage(target.imageId).catch(() => {});
+          if (target) deleteImagesQuietly([target.imageId]);
           return { items: s.items.filter((i) => i.id !== id) };
         }),
       removeMany: (ids) =>
         set((s) => {
           if (ids.length === 0) return s;
           const idSet = new Set(ids);
-          s.items.forEach((i) => {
-            if (idSet.has(i.id)) deleteImage(i.imageId).catch(() => {});
-          });
+          const removed = s.items.filter((i) => idSet.has(i.id));
+          deleteImagesQuietly(removed.map((i) => i.imageId));
           return { items: s.items.filter((i) => !idSet.has(i.id)) };
         }),
       clear: () =>
         set((s) => {
-          s.items.forEach((i) => deleteImage(i.imageId).catch(() => {}));
+          deleteImagesQuietly(s.items.map((i) => i.imageId));
           return { items: [] };
         }),
       addTag: (id, tag) =>
@@ -93,7 +104,7 @@ export const useAssetStore = create<AssetState>()(
       removeByHistoryId: (historyId) =>
         set((s) => {
           const targets = s.items.filter((i) => i.metadata.historyId === historyId);
-          targets.forEach((t) => deleteImage(t.imageId).catch(() => {}));
+          deleteImagesQuietly(targets.map((t) => t.imageId));
           return {
             items: s.items.filter((i) => i.metadata.historyId !== historyId),
           };

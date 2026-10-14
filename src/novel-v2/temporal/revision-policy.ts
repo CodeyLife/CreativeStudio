@@ -2,6 +2,7 @@ import type { ChapterChangeScope, Review } from "../protocol";
 import { reviewExecutionsForScope } from "../application/review-concurrency";
 import type { ManuscriptStructuralReport } from "../application/manuscript-structure";
 import { buildRevisionBrief } from "../application/revision-brief";
+import { MIN_LENGTH_RATIO } from "../word-count";
 
 /**
  * 历史常量（E4 前"三类 reviewer 全量"的同义词）。评审面单一真源已移至
@@ -161,8 +162,7 @@ export function evaluateCommitGate(
   // 系统可推导事实，reject→重出路径两次产出 1.4k 字骨架稿全绿过审——审校面（叙事
   // 质量）对计划兑现欠账失明。比率进 gate（拦而不杀：作者通道仍可批准），与
   // complete 旗/窗口同族：可推导事实不留裁量权。
-  // TODO 可配置意图：0.6 为连载章对声明目标的最小可接受兑现率，按题材/发布节奏可调。
-  const MIN_LENGTH_RATIO = 0.6;
+  // 兑现率常量住 word-count.ts（唯一事实源）：项目级声明下限由它与稀疏线推导，两侧不得各持一份。
   const lengthUnderTarget = Boolean(
     length?.targetWordCount && length.targetWordCount >= 500
     && length.plainTextLength < Math.floor(length.targetWordCount * MIN_LENGTH_RATIO),

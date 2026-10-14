@@ -66,7 +66,13 @@ describe("Skill runtime resolution", () => {
     expect(title.skills.every((skill) => skill.executionPoints?.includes("chapter.title"))).toBe(true);
     // 反向：蓝图执行点仍解析到蓝图契约（storyArcChapters 改绑后的真实供给面）。
     const blueprint = await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint: "chapter.blueprint", role: "planner" });
-    expect(renderSkillInstruction(blueprint, "chapter.blueprint")).toContain("选择窗口");
+    const blueprintText = renderSkillInstruction(blueprint, "chapter.blueprint");
+    expect(blueprintText).toContain("选择窗口");
+    // 2026-10-13（state-audit-20261013.md §7 第 4 项）：title 由蓝图路径产出，命名技艺必须同点可达。
+    // 此前 chapter-naming 只声明 chapter.title，而该执行点只被手动"AI 更名"工作流消费——
+    // 实测本项目 168 章零次 chapter-title 工作流运行，全部标题出自蓝图，故命名指引从未生效。
+    expect(blueprintText).toContain("命名\"这一章\"而不是\"这一类情节\"");
+    expect(blueprint.skills.some((skill) => skill.skillId === "chapter-naming")).toBe(true);
   });
 
   it("keeps workspace Skill execution points aligned with the live reviewer contract", async () => {

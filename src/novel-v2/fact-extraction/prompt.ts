@@ -52,7 +52,8 @@ export function buildFactExtractionPrompt(input: FactExtractionPromptInput): str
     `- 角色的知识/信息边界（谁知道什么）由专门的角色富化通道提取并按人物知识范围落库；本通道不提取"某人知晓/得知某事"类认知事实。人物获得/失去物件、位置移动、伤势与状态变化仍按"持有/位于/状态变化"等谓词正常提取。`,
     `- 一次性动作、临时站位、普通行程过程、服饰、天气、表情和无后续影响的环境细节不提取；只有它们改变持续状态或形成后续约束时才提取变化后的事实。`,
     `- 同一持续状态在后续章节被再次提及但没有变化时必须省略，不得换一种谓词重复写入。`,
-    `- subject.kind 限定为：project/entity/relation/outline/scene/thread/foreshadowing/timeline。`,
+    `- subject.kind 限定为：project/character/entity/relation/outline/scene/thread/foreshadowing/timeline。`,
+    `- 人物（有名有姓或有稳定指称的角色）一律用 character；地点、物件、机构、典籍等非人物可指认对象用 entity 或 scene；两者不可混用。`,
     `- subject.id 必须是正文中可指认的对象（人物名、地点名、关系名等）；不得用"主角""反派"等代词。`,
     ...(input.canonicalCharacters?.length ? [
       ``,

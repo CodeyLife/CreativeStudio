@@ -464,7 +464,8 @@ _Avoid_: 普通修订、自动优化
 - Temporal 负责可恢复的长时间运行任务；正文内容通过明确配置的 MinIO/S3 或 file object store 保存
 - Qdrant 只保存可重建的语义索引，PostgreSQL 中的事实断言和章节记忆才是检索真源
 - Foundation、Story Arc、章节生成、章节审校、事实审批、commit 和 character enrichment 统一走 `src/novel-v2` 的正式 workflow/activity 链路
-- 浏览器 IndexedDB 仅用于视觉创作的本地历史与素材缓存，不承载 Novel V2 的权威小说状态
+- 浏览器本地存储仅用于视觉创作的本地历史与素材缓存：图片 Blob 在 IndexedDB，历史/素材元数据与界面偏好在 localStorage（Zustand 持久化），不承载 Novel V2 的权威小说状态
+- 本地图片 Blob 生命周期不变式：元数据条目被删除或被容量上限淘汰时，必须同步清理其 `imageId` 指向的 Blob（`src/lib/cappedList.ts` 的 `prependWithCap` 计算淘汰项，`src/lib/imageStore.ts` 的 `deleteImagesQuietly` 统一清理并留痕）；历史/素材上限为 200/500，元数据与 Blob 不得各自独立淘汰
 - 旧浏览器/SQLite 小说 runtime、旧 NovelStudio 页面和 V1 工作区不再作为兼容入口；历史数据库迁移仅用于读取或升级已有持久化数据
 
 ## Flagged ambiguities

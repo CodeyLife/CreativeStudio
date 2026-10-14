@@ -116,6 +116,9 @@ describe("summarizeDormancy 账本汇总", () => {
     expect(ledger.unmeasurable).toBe(1); // d
     expect(ledger.measured).toBe(3);
     expect(ledger.silent.length + ledger.neverMentioned.length + ledger.running + ledger.unmeasurable).toBe(4);
+    // atRiskIds 是注入通道的过滤集：三类"不在近期在场"（静默/从未提及/无法判定）之和，
+    // running 不进——仍在推进的线交给检索与预算竞价，不再无条件强注。
+    expect([...ledger.atRiskIds].sort()).toEqual(["b", "c", "d"]);
   });
 
   it("静默清单按沉默章数降序（最久的先面对规划者）", () => {

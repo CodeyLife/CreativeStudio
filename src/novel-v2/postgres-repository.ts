@@ -68,7 +68,7 @@ import { ModelTaskSlice } from "./repository/model-task-slice";
 import { TelemetrySlice } from "./repository/telemetry-slice";
 import type { ModelRoutingConfig, ModelRoutingSnapshot, ModelTaskRecord, ModelWorkPackage } from "./model-routing";
 import type { ObjectStoreAdapter } from "./object-store";
-import { countNovelCharacters, effectiveTargetWordCount, LENGTH_DRIFT_POLICY, normalizeTargetWordCount } from "./word-count";
+import { countDialogueCharacters, countNovelCharacters, effectiveTargetWordCount, inspectDialogueDrift, LENGTH_DRIFT_POLICY, normalizeTargetWordCount } from "./word-count";
 import type { ObjectStoreIdentity } from "./object-store";
 import { normalizeManuscriptStructuralReview } from "./application/manuscript-structure";
 import { arcCompletionPredicateSql, auditEmotionalContractCarriage, auditNamedReferences, auditStoryArcBatchRanges, canonicalReferenceId, findEmbeddedInternalIdentifiers, normalizeThreadResponsibilityReferences, parseExplicitNewReference, planThreadForeshadowingBindings, resolveNamedReference, sanitizeReferenceToken, type NamedReferenceCandidate, type StoryArcIntegrityIssue } from "./application/story-arc-integrity";
@@ -735,9 +735,17 @@ export class NovelPostgresRepository {
     return result.rowCount ?? 0;
   }
 
+  /**
+   * content_blobs 派生正文指标回补（字数 + 对白量）。
+   *
+   * 两个指标都是"从正文派生、可复用、内容寻址天然去重"的结构量，故共用同一次正文读取：
+   * 逐行取对象存储原文，只补仍为 NULL 的列（`word_count` / `dialogue_characters` 各自
+   * 独立判定，避免其中一个已有值时另一个漏补）。对白量口径见
+   * src/novel-v2/word-count.ts 的 `countDialogueCharacters`。
+   */
   async backfillMissingContentWordCounts(objects: ObjectStoreAdapter): Promise<{ updated: number; failed: number }> {
     const result = await this.pool.query<{ content_hash: string; object_key: string }>(
-      "SELECT content_hash,object_key FROM content_blobs WHERE word_count IS NULL ORDER BY created_at,content_hash",
+      "SELECT content_hash,object_key FROM content_blobs WHERE word_count IS NULL OR dialogue_characters IS NULL ORDER BY created_at,content_hash",
     );
     let updated = 0;
     let failed = 0;
@@ -745,8 +753,11 @@ export class NovelPostgresRepository {
       try {
         const text = await objects.getText(row.object_key);
         const update = await this.pool.query(
-          "UPDATE content_blobs SET word_count=$2 WHERE content_hash=$1 AND word_count IS NULL",
-          [row.content_hash, countNovelCharacters(text)],
+          `UPDATE content_blobs
+              SET word_count=COALESCE(word_count,$2),
+                  dialogue_characters=COALESCE(dialogue_characters,$3)
+            WHERE content_hash=$1 AND (word_count IS NULL OR dialogue_characters IS NULL)`,
+          [row.content_hash, countNovelCharacters(text), countDialogueCharacters(text)],
         );
         updated += update.rowCount ?? 0;
       } catch {
@@ -1944,7 +1955,7 @@ export class NovelPostgresRepository {
       const revision = Number(current.rows[0].current_revision) + 1;
       const revisionId = randomUUID();
       if (current.rows[0].current_revision_id) await client.query("UPDATE manuscript_revisions SET retention_class='rolling',expires_at=COALESCE(expires_at,now()+interval '30 days') WHERE id=$1 AND retention_class<>'named'", [current.rows[0].current_revision_id]);
-      await client.query("INSERT INTO content_blobs(content_hash,object_key,byte_length,word_count) VALUES($1,$2,$3,$4) ON CONFLICT(content_hash) DO UPDATE SET word_count=COALESCE(content_blobs.word_count,EXCLUDED.word_count)", [input.contentHash, input.objectKey, Buffer.byteLength(input.text, "utf8"), countNovelCharacters(input.text)]);
+      await client.query("INSERT INTO content_blobs(content_hash,object_key,byte_length,word_count,dialogue_characters) VALUES($1,$2,$3,$4,$5) ON CONFLICT(content_hash) DO UPDATE SET word_count=COALESCE(content_blobs.word_count,EXCLUDED.word_count), dialogue_characters=COALESCE(content_blobs.dialogue_characters,EXCLUDED.dialogue_characters)", [input.contentHash, input.objectKey, Buffer.byteLength(input.text, "utf8"), countNovelCharacters(input.text), countDialogueCharacters(input.text)]);
       await client.query(`
         INSERT INTO manuscript_revisions(id,project_id,document_id,revision,base_revision,content_hash,retention_class,label,expires_at)
         VALUES($1,$2,$3,$4,$5,$6,$7,$8,CASE WHEN $7='named' THEN NULL ELSE now()+interval '30 days' END)
@@ -4353,8 +4364,8 @@ export class NovelPostgresRepository {
     // length-under-target（对声明目标），本信号只让"连续低量"成为规划与审核
     // 看得见的数字。判据校准与口径见 LENGTH_DRIFT_POLICY。
     const lengthRows = narrativeCutoffForSerial > 0
-      ? await this.pool.query<{ narrative_order: string | number; word_count: string | number }>(
-        `SELECT d.narrative_order, cb.word_count
+      ? await this.pool.query<{ narrative_order: string | number; word_count: string | number; dialogue_characters: string | number | null }>(
+        `SELECT d.narrative_order, cb.word_count, cb.dialogue_characters
          FROM chapters c
          JOIN manuscript_documents d ON d.id=c.document_id AND d.project_id=c.project_id
          JOIN manuscript_revisions mr ON mr.id=d.current_revision_id
@@ -4365,7 +4376,7 @@ export class NovelPostgresRepository {
          LIMIT $3`,
         [projectId, narrativeCutoffForSerial, LENGTH_DRIFT_POLICY.window],
       )
-      : { rows: [] as Array<{ narrative_order: string | number; word_count: string | number }> };
+      : { rows: [] as Array<{ narrative_order: string | number; word_count: string | number; dialogue_characters: string | number | null }> };
     const lengthWindow = lengthRows.rows
       .map((row) => ({ order: Number(row.narrative_order), chars: Number(row.word_count) }))
       .filter((row) => Number.isFinite(row.chars) && row.chars > 0)
@@ -4378,6 +4389,26 @@ export class NovelPostgresRepository {
         minChars: lengthWindow.reduce((min, row) => Math.min(min, row.chars), Number.MAX_SAFE_INTEGER),
       }
       : undefined;
+    // 正文对白密度漂移信号（2026-10-13，state-audit-20261013.md §7 第 5 项，作者裁决选项 A）：
+    // 与 lengthDrift 共用同一次窗口查询（同窗口、同"只做描述性统计"纪律）。
+    //
+    // 为什么需要它：上游的 ensembleSignal 只能看见"蓝图参与者数"，看不见"正文实际对白"——
+    // 两者之间此前没有任何回读，2026-09-22 商业基准对照确诊的 051-080「死亡象限」
+    // （对白密度崩落）只能靠一次性人工复盘发现。本信号让"对手戏正在被挤出正文"成为
+    // 规划面与审核面看得见的数字。
+    //
+    // 口径与边界见 word-count.ts 的 DIALOGUE_DRIFT_POLICY：不设绝对下限、不做逐章门、
+    // 不引入"应有对白"的题材假设；dialogue_characters 为 NULL（历史 blob 未回补）的章
+    // 一律按"不可测"排除出分母，不当作 0% 对白。
+    const dialogueDrift = inspectDialogueDrift(
+      lengthRows.rows.flatMap((row) => {
+        if (row.dialogue_characters === null || row.dialogue_characters === undefined) return [];
+        const characters = Number(row.word_count);
+        const dialogueCharacters = Number(row.dialogue_characters);
+        if (!Number.isFinite(characters) || !Number.isFinite(dialogueCharacters)) return [];
+        return [{ order: Number(row.narrative_order), characters, dialogueCharacters }];
+      }),
+    );
     // 窗口上界已过的账（P1，2026-09-16 起，2026-09-18 修正语义）：
     // 规划者需要看见"哪些线索的兑现窗口上界已经过去"，但**不把它叫超期债务**——
     // 实测 244 条上界已过中 238 条仍在活跃推进，对连载而言这是常态而非欠账。
@@ -4481,6 +4512,7 @@ export class NovelPostgresRepository {
       dueLedger?: { currentOrder: number; windowElapsedCount: number; agedOpenCount: number; items: Array<{ id: string; description: string; horizonOrder: number; plantedOrder: number | null }> };
       payoffRhythm?: Array<{ arcOrdinal: number; title: string | null; finalChapters: number; payoffCount: number }>;
       lengthDrift?: { windowSize: number; avgChars: number; sparseCount: number; minChars: number };
+      dialogueDrift?: { windowSize: number; avgRatio: number; hintBelowRatio: number; silentOrders: number[]; minRatio: number };
     } = {
       projectTitle: project.rows[0].title,
       macro: macro.map((artifact) => ({ taskKey: foundationTaskKey(artifact) ?? "unknown", title: typeof artifact.structuredData?.title === "string" ? artifact.structuredData.title : "", summary: typeof artifact.structuredData?.summary === "string" ? artifact.structuredData.summary : "" })),
@@ -4497,6 +4529,7 @@ export class NovelPostgresRepository {
       ...(dueLedger ? { dueLedger } : {}),
       ...(payoffRhythm.length ? { payoffRhythm } : {}),
       ...(lengthDrift ? { lengthDrift } : {}),
+      ...(dialogueDrift ? { dialogueDrift } : {}),
     };
     // PL-8③：未揭示秘密清单投影（plot-design informationBoundaries.hidden）。别名迁移
     // 在 flat 归一层内完成（散文时代成员升为 {claim}）；plot-design 缺失或形态非法时返回
@@ -4565,7 +4598,7 @@ export class NovelPostgresRepository {
       recent: canonicalSha256(contextData.recentChapters),
       "open-elements": canonicalSha256({ openThreads: contextData.openThreads, openForeshadowings: contextData.openForeshadowings, openPromises: contextData.openPromises }),
       "feedback-state": canonicalSha256({ planningFeedback: contextData.planningFeedback, narrativeState: contextData.narrativeState }),
-      ...(contextData.serialFunctionRuns || contextData.lengthDrift ? { "serial-signals": canonicalSha256({ runs: contextData.serialFunctionRuns, ensembleSignal: contextData.ensembleSignal, lengthDrift: contextData.lengthDrift }) } : {}),
+      ...(contextData.serialFunctionRuns || contextData.lengthDrift || contextData.dialogueDrift ? { "serial-signals": canonicalSha256({ runs: contextData.serialFunctionRuns, ensembleSignal: contextData.ensembleSignal, lengthDrift: contextData.lengthDrift, dialogueDrift: contextData.dialogueDrift }) } : {}),
       ...(contextData.payoffRhythm ? { "payoff-rhythm": canonicalSha256(contextData.payoffRhythm) } : {}),
       ...(contextData.cast ? { cast: canonicalSha256(contextData.cast) } : {}),
       ...(contextData.dueLedger ? { "due-ledger": canonicalSha256(contextData.dueLedger) } : {}),
@@ -5785,6 +5818,62 @@ export class NovelPostgresRepository {
   async recordArtifact(artifact: Artifact) {
     await this.pool.query("INSERT INTO artifacts(id,project_id,task_id,attempt_id,kind,content_hash,object_key,base_revision,fingerprint,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(id) DO NOTHING", [artifact.id, artifact.projectId, artifact.taskId, artifact.attemptId, artifact.kind, artifact.contentHash, artifact.objectKey ?? "", artifact.baseRevision, artifact.fingerprint, artifact.structuredData ?? {}]);
     await this.appendOutbox("artifact", artifact.id, `artifact.${artifact.kind}.ready`, { projectId: artifact.projectId, artifactId: artifact.id, taskId: artifact.taskId, fingerprint: artifact.fingerprint });
+  }
+
+  /**
+   * 登记事实提取遇到的名册外主体为待补全实体（state-audit-20261013 §3.6 主体碎片治理）。
+   *
+   * 根因：prompt.ts 的规范人物名册段已向模型承诺"名册之外的人物以正文原名作 subject.id，
+   * 由系统登记为待补全实体"，但出口归一此前只兑现了名册的一半（命中才重写），未命中键
+   * 从未落库，于是同一主体反复以不同键形态写入，identityHash 分槽、矛盾核验与槽位时效
+   * 排序双双看不见它们。
+   *
+   * 写入形态与 character-enrichment 的"关系目标实体"占位（payload.pendingEnrichment=true）
+   * 完全同构，并沿用同一条引用完整性边界：ON CONFLICT DO NOTHING——已存在的实体（含已富化
+   * 档案）绝不被 stub 覆盖。kind 固定为 character：身份索引（loadCharacterIdentityRegistry）
+   * 只解析 kind='character'，用其它 kind 登记等于登记了也解析不到，无法消除碎片化。
+   * status 由 payload.pendingEnrichment 决定，故这些行不会进入 prompt 的规范名册
+   * （名册只列 status='identified'），也不会被当作已富化角色消费。
+   *
+   * 刻意不覆盖：非 entity 的 subject kind（project/outline/thread/foreshadowing/timeline
+   * 各有自己的表与键空间；relation 由 relations 表承载；scene/地点物件归 §5.4 的非人物主体
+   * 注册 P2）；不做拼音/近义合并（语义判定超出共享层职责，见审计 §5.5）。
+   */
+  async registerPendingSubjects(input: {
+    projectId: string;
+    subjects: ReadonlyArray<{ id: string; kind: string }>;
+    sourceRevisionId?: string;
+    narrativeOrder?: number;
+    source?: string;
+  }): Promise<number> {
+    let registered = 0;
+    for (const subject of input.subjects) {
+      const id = subject.id.trim();
+      if (!id) continue;
+      const entityId = `entity:${input.projectId}:character:${id}`;
+      const result = await this.pool.query(
+        `INSERT INTO entities(id, project_id, kind, name, payload)
+         VALUES($1, $2, 'character', $3, $4)
+         ON CONFLICT(id) DO NOTHING`,
+        [
+          entityId,
+          input.projectId,
+          id,
+          {
+            autoCreated: true,
+            autoCreatedFrom: input.source ?? "fact-extraction",
+            pendingEnrichment: true,
+            sourceRevisionId: input.sourceRevisionId,
+            narrativeOrder: input.narrativeOrder,
+            canonicalCharacterId: id,
+            displayName: id,
+            displayNameStatus: "pending",
+          },
+        ],
+      );
+      registered += result.rowCount ?? 0;
+    }
+    return registered;
   }
 
   async recordFactExtraction(input: {
@@ -7591,7 +7680,7 @@ export class NovelPostgresRepository {
       if (existing.rowCount) { await client.query("COMMIT"); return existing.rows[0].result; }
       const project = await client.query<{ current_revision: string }>("SELECT current_revision FROM novel_projects WHERE id=$1 FOR UPDATE", [input.projectId]);
       if (!project.rowCount || Number(project.rows[0].current_revision) !== input.baseRevision) throw new Error("正式稿基线已变化，需要重新生成和审核");
-      await client.query("INSERT INTO content_blobs(content_hash,object_key,byte_length,word_count) VALUES($1,$2,$3,$4) ON CONFLICT(content_hash) DO UPDATE SET word_count=COALESCE(content_blobs.word_count,EXCLUDED.word_count)", [input.contentHash, input.objectKey, Buffer.byteLength(input.text, "utf8"), countNovelCharacters(input.text)]);
+      await client.query("INSERT INTO content_blobs(content_hash,object_key,byte_length,word_count,dialogue_characters) VALUES($1,$2,$3,$4,$5) ON CONFLICT(content_hash) DO UPDATE SET word_count=COALESCE(content_blobs.word_count,EXCLUDED.word_count), dialogue_characters=COALESCE(content_blobs.dialogue_characters,EXCLUDED.dialogue_characters)", [input.contentHash, input.objectKey, Buffer.byteLength(input.text, "utf8"), countNovelCharacters(input.text), countDialogueCharacters(input.text)]);
       await client.query("INSERT INTO artifacts(id,project_id,task_id,attempt_id,kind,content_hash,object_key,base_revision,fingerprint,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(id) DO NOTHING", [input.artifact.id, input.projectId, input.artifact.taskId, input.artifact.attemptId, input.artifact.kind, input.contentHash, input.objectKey, input.baseRevision, input.artifact.fingerprint, input.artifact.structuredData ?? {}]);
       // 修复：显式 JSON.stringify，与 putReview 一致。
       // 原因：review.issues 是 ReviewIssue[]，pg 直接传数组到 jsonb 列时，

@@ -46,3 +46,18 @@ export async function deleteManyImages(ids: string[]): Promise<void> {
 export async function clearAllImages(): Promise<void> {
   await clear(imageStore);
 }
+
+/**
+ * 清理一批图片 Blob，失败只留痕、不抛出。
+ *
+ * 调用点都位于 zustand 的同步 set 回调里，无法 await；删除失败（例如其他标签页
+ * 占用、配额或事务异常）不应阻断元数据更新。但失败必须可见，否则「元数据已删、
+ * Blob 仍在」的孤儿数据会无声累积——这正是历史/素材截断路径曾经的形态。
+ */
+export function deleteImagesQuietly(ids: readonly string[]): void {
+  const targets = [...new Set(ids)].filter((id) => id.length > 0);
+  if (targets.length === 0) return;
+  deleteManyImages(targets).catch((error: unknown) => {
+    console.warn("[imageStore] 图片 Blob 清理失败，可能产生孤儿数据", targets, error);
+  });
+}

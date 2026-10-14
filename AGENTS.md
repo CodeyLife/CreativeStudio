@@ -46,3 +46,17 @@ LLM 回显指令、注入元注释、包裹代码围栏等问题，须在结构�
 ## 语言
 
 所有对话回复必须用中文。
+
+## Agent skills
+
+### Issue tracker
+
+Issue 与 spec 以 markdown 文件存放于 `.scratch/<feature-slug>/`。见 `docs/agents/issue-tracker.md`。
+
+### Triage labels
+
+五个 canonical triage 角色沿用默认 label 字符串。见 `docs/agents/triage-labels.md`。
+
+### Domain docs
+
+单上下文：根目录一份 `GLOSSARY.md` 加 `docs/adr/`。见 `docs/agents/domain.md`。

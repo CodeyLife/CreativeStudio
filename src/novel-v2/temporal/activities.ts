@@ -180,20 +180,23 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
    * 信号是"曾活跃→近 N 章消失"，而这个判定必须看全量正文，只有本活动有对象存储。
    * 失败软降级返回 undefined（不注入该段），与 loadPriorChapterEndings 同型。
    *
-   * 按 projectId 记忆化：一次工作流内定稿集不变、结果相同，而弧规划/蓝图/审核
-   * 三处都要用，重复扫描全书正文代价过高。null 为"已试算且无结果"哨兵。
+   * 按 projectId + 定稿末章序记忆化：同一定稿集内结果相同（弧规划/蓝图/审核三处都要用，
+   * 重复扫描全书正文代价过高），而定稿集一旦推进静默账就变——只按 projectId 记忆化会把
+   * 上一章算出的"末次提及"一路复用到全书结束，故键必须含 currentOrder。
+   * null 为"已试算且无结果"哨兵。
    */
   const loadNarrativeDormancy = async (projectId: string): Promise<DormancyLedger | undefined> => {
-    const cached = narrativeDormancyCache.get(projectId);
-    if (cached !== undefined) return cached ?? undefined;
     if (typeof deps.repository.listFinalChapterContentRefs !== "function" || typeof deps.repository.listOpenForeshadowingPresenceInputs !== "function") return undefined;
     try {
       const [refs, items] = await Promise.all([
         deps.repository.listFinalChapterContentRefs(projectId),
         deps.repository.listOpenForeshadowingPresenceInputs(projectId),
       ]);
-      if (!refs.length || !items.length) { narrativeDormancyCache.set(projectId, null); return undefined; }
+      if (!refs.length || !items.length) return undefined;
       const currentOrder = refs[refs.length - 1]!.narrativeOrder;
+      const cacheKey = `${projectId}:${currentOrder}`;
+      const cached = narrativeDormancyCache.get(cacheKey);
+      if (cached !== undefined) return cached ?? undefined;
       const chapterTexts: Array<{ narrativeOrder: number; text: string }> = [];
       for (const ref of refs) {
         try {
@@ -206,15 +209,16 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       // 误判为静默。此时宁可不产出账，也不产出偏高的静默数。
       if (chapterTexts.length < refs.length) {
         console.warn(`[dormancy] 有 ${refs.length - chapterTexts.length} 章正文不可得，静默账本次不产出（避免失真）`);
-        narrativeDormancyCache.set(projectId, null);
+        narrativeDormancyCache.set(cacheKey, null);
         return undefined;
       }
       const ledger = summarizeDormancy(items, chapterTexts, currentOrder);
-      narrativeDormancyCache.set(projectId, ledger);
+      narrativeDormancyCache.set(cacheKey, ledger);
       return ledger;
     } catch (error) {
+      // 不写哨兵：此处拿不到 cacheKey（失败可能发生在取定稿集之前），且失败多为瞬时
+      // （对象存储/DB 抖动），下次调用重试即可，不该把一次抖动固化成"无账"。
       console.warn(`[dormancy] 线索静默扫描失败，该通道本次不注入：${(error as Error).message}`);
-      narrativeDormancyCache.set(projectId, null);
       return undefined;
     }
   };
@@ -402,11 +406,31 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
         }
       }
       // 开放伏笔/承诺注入（workflow-map.md §6.2：retrieveMemory 须组合开放伏笔/承诺）
+      //
+      // 只注入"不在近期在场"的伏笔：线索静默账（narrative-dormancy）把每条 open 伏笔判为
+      // 从未再被提及 / 曾活跃现已静默 / 仍在推进 / 无法判定，本通道取前三类。
+      // 实测依据（docs/novel-v2/state-audit-20261013.md §4.1 与 §4.6）：整本 open 账无条件
+      // 注入占记忆预算的 71.3%（425 条 / 69,845 token），把真事实层挤出预算（真事实 token
+      // 在第 60 章达峰后崩落一个数量级）。按静默账过滤后，注入集与"生产静默账 atRisk ∩
+      // cutoff 内候选"完全相等（79 条 / 12,138 token，71.3% → 12.4%），腾出的预算足以让
+      // 此前因 budget 落选的真事实与章记忆全部进来。仍在推进的线交给检索与预算竞价，
+      // 不再无条件强注。
+      // 静默账不可得时（全书正文未读全或读取失败）不注入：无判定即全量注入正是被修的缺陷。
       if (typeof input.plan.narrativeCutoff === "number") {
         try {
           const { foreshadowings, promises } = await deps.repository.getOpenForeshadowingAndPromises(input.projectId, input.plan.narrativeCutoff);
+          const dormancy = await loadNarrativeDormancy(input.projectId);
+          const atRisk = dormancy ? new Set(dormancy.atRiskIds) : undefined;
+          const dormantForeshadowings = atRisk ? foreshadowings.filter((f) => atRisk.has(f.id)) : [];
+          if (!atRisk) {
+            console.warn(`[memory] 线索静默账不可得，跳过开放伏笔注入（${foreshadowings.length} 条）：没有静默判定就注入等于把整本 open 账压进记忆预算`);
+          }
+          // score 0 / semanticRank 0：这些条目不是检索命中，没有相关度证据，在 ranked-fill 里
+          // 排到证据排序的候选之后，绝不抢在它们之前占预算。线索连续性由 required facet 的
+          // 章节记忆（每章 unresolvedThreads + 20 章 rollup 汇总，上限 80 条）兜底，本通道
+          // 只是"预算还宽裕时的提醒"，被淘汰不等于线索丢失。
           openNarrativeHits = [
-            ...foreshadowings.map((f) => ({
+            ...dormantForeshadowings.map((f) => ({
               id: f.id,
               projectId: input.projectId,
               kind: "working" as const,
@@ -419,12 +443,14 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
               sourceRevisionIds: [f.plantedRevisionId],
               contentHash: f.id,
               supersedes: [],
-              score: 1.0,
+              score: 0,
               matchedFacet: "foreshadowing",
               matchedFacets: ["foreshadowing"],
               reason: "open-foreshadowing-injection",
-              semanticRank: 1.0,
+              semanticRank: 0,
             })),
+            // 承诺不按静默过滤：静默账只登记伏笔（foreshadowing）的触发关键词，承诺没有
+            // 可比信号；且全库 open 承诺实测仅 15 条 / 约 1K token，不构成预算风险。
             ...promises.map((p) => ({
               id: p.id,
               projectId: input.projectId,
@@ -438,11 +464,11 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
               sourceRevisionIds: [p.sourceRevisionId],
               contentHash: p.id,
               supersedes: [],
-              score: 1.0,
+              score: 0,
               matchedFacet: "foreshadowing",
               matchedFacets: ["foreshadowing"],
               reason: "open-promise-injection",
-              semanticRank: 1.0,
+              semanticRank: 0,
             })),
           ];
         } catch (error) {
@@ -1066,6 +1092,16 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
           console.warn(`[fact-verification] ${result.verification.contradictions.length} 条新事实与冻结表同槽异值且未声明覆盖，已强制候选待裁决：${result.verification.contradictions.map((item) => item.claimId).join("、")}`);
         }
         await deps.repository.recordFactExtraction({ projectId: input.projectId, artifact: factArtifact, claims: result.claims, lifecycleStatus: "staged", documentId: input.documentId, workflowId: input.workflowId, narrativeOrder: input.narrativeOrder });
+        // 名册外主体登记（§3.6）：prompt 已向模型承诺"由系统登记为待补全实体"，此处兑现。
+        // 登记失败不阻塞事实落库——键一致性是后续收益，不是本章产出的前置条件。
+        if (result.unregisteredSubjects.length) {
+          try {
+            const registered = await deps.repository.registerPendingSubjects({ projectId: input.projectId, subjects: result.unregisteredSubjects, narrativeOrder: input.narrativeOrder, source: "fact-extraction" });
+            if (registered) console.info(`[fact-extraction] 登记 ${registered} 个名册外主体为待补全实体（候选 ${result.unregisteredSubjects.length} 个）：${result.unregisteredSubjects.map((subject) => subject.id).join("、")}`);
+          } catch (error) {
+            console.warn(`[fact-extraction] 名册外主体登记失败（不阻塞）：${(error as Error).message}`);
+          }
+        }
         return { kind: "completed", artifact: { ...factArtifact, structuredData: { ...factArtifact.structuredData, narrativeElements: result.narrativeElements, verification: result.verification } } };
       } catch (error) {
         if (!(error instanceof ExternalMcpRequiredError)) throw error;
@@ -1089,6 +1125,16 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       const identityContext = await loadExtractionIdentityContext(input.projectId);
       const projected = projectFactExtractionOutput({ projectId: input.projectId, artifact: input.artifact, text: input.text, existingClaimsDigest: extractionContext.claimsDigest, existingContentHashes: extractionContext.contentHashes, existingClaimsIndex: extractionContext.claimsIndex, existingValueHashById: extractionContext.valueHashById, narrativeOrder: input.narrativeOrder, identityIndex: identityContext?.identityIndex }, task.result!.value as ChapterStateDelta);
       await deps.repository.recordFactExtraction({ projectId: input.projectId, artifact: input.artifact, claims: projected.claims, lifecycleStatus: "staged", documentId: input.documentId, workflowId: task.workflowRunId, narrativeOrder: input.narrativeOrder });
+      // 名册外主体登记（§3.6）：外部 MCP 提取路径与内部路径共用同一出口归一，
+      // 因此也必须共用同一登记动作，否则两条路径的键一致性会分叉。
+      if (projected.unregisteredSubjects.length) {
+        try {
+          const registered = await deps.repository.registerPendingSubjects({ projectId: input.projectId, subjects: projected.unregisteredSubjects, narrativeOrder: input.narrativeOrder, source: "fact-extraction-external" });
+          if (registered) console.info(`[fact-extraction] 登记 ${registered} 个名册外主体为待补全实体（候选 ${projected.unregisteredSubjects.length} 个）：${projected.unregisteredSubjects.map((subject) => subject.id).join("、")}`);
+        } catch (error) {
+          console.warn(`[fact-extraction] 名册外主体登记失败（不阻塞）：${(error as Error).message}`);
+        }
+      }
       return { ...input.artifact, structuredData: { ...input.artifact.structuredData, narrativeElements: projected.narrativeElements, verification: projected.verification } };
     },
     approveFacts: (input: { workflowId: string; projectId: string; artifact: Artifact }) =>

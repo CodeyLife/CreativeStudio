@@ -11,8 +11,8 @@
  *      检索层合并键退化为 id 键——按与现役代码同构的公式回填；
  *    - fact-extraction 行主体被归一且为单主体时，按（entity 主体 + 规范谓词）重算 identity_hash
  *      （value_hash 无法从存储行忠实重建——object 结构未持久化——保持原值）。
- * 3. Foundation 投影代际退役：同一 taskKey 只有最新 foundation artifact 的投影保持
- *    active 并 supersedes 其余 active 同槽位投影；被退役行保留审计历史。
+ * 3. Foundation 投影代际退役：段级单例行（foundation:<projectId>:<taskKey>）supersedes
+ *    其余 active 同槽位投影；被退役行保留审计历史。
  *
  * 用法：
  *   node --import tsx scripts/novel-v2-memory-governance-backfill.ts            # dry-run，只打印计划
@@ -27,6 +27,7 @@ import { Pool } from "pg";
 import { buildCharacterIdentityIndex, uniqueCharacterIdentities, type CharacterIdentityIndex, type FoundationCharacter } from "../src/novel-v2/character-identity";
 import { canonicalizeFactPredicate, factIdentityHash, factValueHash } from "../src/novel-v2/fact-extraction/fingerprint";
 import { mergeRetiredEntityPayload } from "../src/novel-v2/character-enrichment";
+import { foundationClaimId } from "../src/novel-v2/foundation-memory";
 
 function option(name: string): string | undefined {
   const index = process.argv.indexOf(name);
@@ -137,24 +138,39 @@ async function backfillProject(pool: Pool, projectId: string, plan: Plan): Promi
     }
   }
 
-  // Foundation 投影代际退役：同 taskKey 最新 artifact 的投影 supersedes 其余 active 同槽位投影。
+  // Foundation 投影代际退役：段级单例（foundation:<projectId>:<taskKey>）supersedes
+  // 其余 active 同槽位投影。
+  //
+  // 勘误（2026-10-13，state-audit-20261013 §7-3）：本步此前按 pre-singleton 的
+  // per-artifact 形态拼 `foundation:<artifactId>` 作为存活行（见 foundation-memory.ts:23-31
+  // 的单例化说明）。单例化后 recordFoundationClaim 不再为非最新 artifact 落投影行
+  // （postgres-repository.ts:5714-5718），于是该 id 常常根本没有对应行——UPDATE 命中 0 行、
+  // 静默无操作；即便命中，写的也是已被单例 supersedes 的陈旧行，把代际方向写反。
+  // 现改为以单例 id 为目标，并在单例行不存在时跳过（此时该 taskKey 尚未单例化，
+  // 退役由 recordFoundationClaim 落单例时完成）。
   const artifacts = await pool.query<{ id: string; task_key: string | null }>(
     `SELECT id, payload->>'taskKey' AS task_key
      FROM artifacts WHERE project_id=$1 AND kind='foundation' ORDER BY created_at ASC, id ASC`,
     [projectId],
   );
-  const latestByTaskKey = new Map<string, string>();
+  const taskKeys = new Set<string>();
   for (const artifact of artifacts.rows) {
-    if (artifact.task_key) latestByTaskKey.set(artifact.task_key, artifact.id);
+    if (artifact.task_key) taskKeys.add(artifact.task_key);
   }
-  for (const [taskKey, artifactId] of latestByTaskKey) {
-    const latestClaimId = `foundation:${artifactId}`;
-    // 幂等：排除已记录在最新投影行 supersedes 中的 id，重复执行计划为零。
+  for (const taskKey of taskKeys) {
+    const latestClaimId = foundationClaimId(projectId, taskKey);
+    // 单例行是唯一合法存活行；不存在则该槽位无可退役目标（幂等：重复执行计划为零）。
+    const singleton = await pool.query<{ supersedes: string[] | null }>(
+      "SELECT supersedes FROM memory_claims WHERE project_id=$1 AND id=$2",
+      [projectId, latestClaimId],
+    );
+    if (!singleton.rows.length) continue;
+    const alreadySuperseded = singleton.rows[0].supersedes ?? [];
     const prior = await pool.query<{ id: string }>(
       `SELECT id FROM memory_claims
        WHERE project_id=$1 AND lifecycle_status='active' AND subject_refs && $2::text[] AND id <> $3
-         AND id <> ALL(COALESCE((SELECT supersedes FROM memory_claims WHERE id=$4), '{}'::text[]))`,
-      [projectId, [`foundation:${taskKey}`], latestClaimId, latestClaimId],
+         AND id <> ALL($4::text[])`,
+      [projectId, [`foundation:${taskKey}`], latestClaimId, alreadySuperseded],
     );
     const supersededIds = prior.rows.map((row) => row.id);
     if (supersededIds.length) {

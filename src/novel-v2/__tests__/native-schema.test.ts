@@ -80,4 +80,13 @@ describe("native structured schema compatibility", () => {
     expect(plan.properties).not.toHaveProperty("thematicQuestions");
     expect(phases.items.properties).not.toHaveProperty("exitCondition");
   });
+
+  it("keeps the blueprint chapter title floor aligned with the naming contract", () => {
+    // 2026-10-13（state-audit-20261013.md §7 第 4 项）：蓝图 title 与 CHAPTER_TITLE_SCHEMA 是同一条
+    // 产物（manuscript_documents.title）的两条生产路径，结构下限必须一致，否则命名路径会拒绝的
+    // 单字标题能从蓝图路径流出去。
+    const chapters = (storyArcChaptersOutputSchema.properties as Record<string, unknown>).chapters as { items: { properties: Record<string, unknown> } };
+    expect(chapters.items.properties.title).toMatchObject({ type: "string", minLength: CHAPTER_TITLE_SCHEMA.properties.title.minLength });
+    expect(CHAPTER_TITLE_SCHEMA.properties.title.minLength).toBe(2);
+  });
 });

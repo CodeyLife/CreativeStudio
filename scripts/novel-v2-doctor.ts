@@ -9,6 +9,8 @@ import { detectMemoryIndexDrift } from "../src/novel-v2/memory-index-drift";
 import { loadRuntimeEnv } from "./runtime-env.mjs";
 import { publicRuntimeIdentity, resolveNovelRuntimeConfig } from "../src/novel-v2/runtime-config";
 import { isOrphanExperimentSchemaResidue, listOrphanExperimentSchemas, ORPHAN_SCHEMA_INFLIGHT_GRACE_MS } from "../src/novel-v2/evaluation/experiment-workspace";
+import { compareSkillProjections } from "../src/novel-v2/skill-hygiene";
+import { compareSkillVersions, createWorkspaceSkillProvider, listCurrentSkillDescriptors, normalizeSkillDescriptor } from "../src/novel-v2/skill-runtime";
 
 Object.assign(process.env, loadRuntimeEnv(process.cwd()));
 const runtime = resolveNovelRuntimeConfig(process.env);
@@ -125,6 +127,29 @@ try {
       data: { dirty: dirty.map(compact).slice(0, 10), underIndexed: rows.filter((row) => row.missingRowIds.length > 0).map(compact).slice(0, 10) },
     });
   } catch (error) { set("memory-index-drift", { ok: false, detail: (error as Error).message }); }
+
+  // 技能漂移：workspace seed yaml 与 skill_definitions 运行真源的对账。判据（"seed 领先 =
+  // 漂移"与"学习闭环晋升领先 = 允许"两条）在 skill-hygiene.ts，本处只取数打印。
+  // 为什么必须进常态门：seed 只在服务启动时 `migrate()` 尾被灌库，而观测面命令（check）
+  // 按设计**不得** migrate（否则比对发生在写入之后，漂移被命令自己抹平——2026-09-19 实证）。
+  // 于是"seed 已改、库没重灌、服务又没重启"三者同时成立时，漂移可以长期静默：2026-10-12
+  // 实测 narrative-continuity seed 1.1.0 / 库 1.0.2，而当时没有任何自动化门会报它。
+  // 本检查只读不写（写库属于 sync/patch 的显式语义）。
+  try {
+    const workspaceSkills = await listCurrentSkillDescriptors(createWorkspaceSkillProvider(), "");
+    const databaseSkills = (await repository.listSkills("")).map((row) => normalizeSkillDescriptor(row)).filter((skill) => !("invalidExecutionPoints" in skill));
+    const projection = compareSkillProjections(
+      workspaceSkills.map((skill) => ({ skillId: skill.skillId, version: skill.version, contentFingerprint: skill.contentFingerprint })),
+      databaseSkills.map((skill) => ({ skillId: skill.skillId, version: skill.version, contentFingerprint: skill.contentFingerprint })),
+      compareSkillVersions,
+    );
+    const drift = projection.drift;
+    set("skill-drift", {
+      ok: drift.length === 0,
+      detail: `workspace ${workspaceSkills.length} / database ${databaseSkills.length}；漂移 ${drift.length} 个${drift.length ? " ⇒ 跑 pnpm novel:skills:sync --target database --project <projectId> 重灌 seed（服务启动的 migrate 也会自动灌）" : ""}；晋升领先 ${projection.promotionAhead.length} 个（学习闭环产物，允许）`,
+      data: { drift, promotionAhead: projection.promotionAhead },
+    });
+  } catch (error) { set("skill-drift", { ok: false, detail: (error as Error).message }); }
 
   try {
     const connection = await Connection.connect({ address: runtime.temporalAddress });

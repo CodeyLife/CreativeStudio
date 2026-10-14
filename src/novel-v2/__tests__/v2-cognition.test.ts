@@ -4,6 +4,39 @@ import type { MemoryProvider, NovelIntent, SkillProvider } from "../protocol";
 
 const intent: NovelIntent = { id: "intent-1", projectId: "p1", source: "web", objective: "续写第 12 章，保持主角对秘密尚未知情", target: { kind: "chapter", id: "doc-12", order: 12 }, requestedStage: "drafting", createdAt: 1, idempotencyKey: "k1" };
 
+/**
+ * 构造同一身份槽位的一条取值断言。谓词、身份槽、叙事位置与权威等级是唯一变量，其余字段固定，
+ * 使夹具形状本身不参与被测条件（同一夹具同时用于状态类与累积型，只切换 predicate）。
+ */
+function slotValueClaim(input: { id: string; predicate: string; identityHash: string; start?: number; authority: "approved" | "derived" }) {
+  return {
+    id: input.id,
+    projectId: "p1",
+    kind: "episodic" as const,
+    title: `${input.predicate}取值`,
+    content: `${input.predicate}在叙事位置 ${input.start ?? "未知"} 的取值`,
+    subjectRefs: ["hero"],
+    predicate: input.predicate,
+    narrativeRange: input.start === undefined ? undefined : { start: input.start },
+    knowledgeScope: "author" as const,
+    authority: input.authority,
+    confidence: 1,
+    sourceRevisionIds: [`r-${input.id}`],
+    contentHash: `hash-${input.id}`,
+    valueHash: `hash-${input.id}`,
+    identityHash: input.identityHash,
+    supersedes: [],
+    score: 1,
+    matchedFacet: "fact" as const,
+    reason: "test",
+  };
+}
+
+/** 起草第 168 章的预检计划：narrativeCutoff = 167，故所有叙事位置 ≤ 167 的取值都可见。 */
+function lateChapterPlan() {
+  return createPreflightPlan(intent, { projectId: "p1", currentRevision: 170, targetDocumentOrder: 168 });
+}
+
 describe("V2 cognition compiler", () => {
   it("creates retrieval facets before an execution blueprint", () => {
     const plan = createPreflightPlan(intent, { projectId: "p1", currentRevision: 7, targetDocumentId: "doc-12", targetDocumentOrder: 12, povCharacterId: "hero" });
@@ -55,6 +88,63 @@ describe("V2 cognition compiler", () => {
     for (const excluded of slotClaims.slice(3).map((claim) => claim.id)) {
       expect(bundle.selectionReceipts).toContainEqual(expect.objectContaining({ claimId: excluded, status: "excluded", reason: "identity-slot-quota" }));
     }
+  });
+
+  it("prefers the newest value inside a state-like identity slot", async () => {
+    // 状态类谓词的槽位取值是同一状态维度的逐章快照（state-audit-20261013 §3：主角"持有"槽
+    // 165 条 active 全是库存快照）。早期 approved 快照与晚期 derived 当前值并存时，
+    // 槽位配额必须让当前值入选，否则模型读到的是 160 章前的家当。
+    const claims = [
+      slotValueClaim({ id: "holding-2", predicate: "持有", identityHash: "hero:holding", start: 2, authority: "approved" }),
+      slotValueClaim({ id: "holding-5", predicate: "持有", identityHash: "hero:holding", start: 5, authority: "approved" }),
+      slotValueClaim({ id: "holding-6", predicate: "持有", identityHash: "hero:holding", start: 6, authority: "approved" }),
+      slotValueClaim({ id: "holding-160", predicate: "持有", identityHash: "hero:holding", start: 160, authority: "derived" }),
+      slotValueClaim({ id: "holding-163", predicate: "持有", identityHash: "hero:holding", start: 163, authority: "derived" }),
+    ];
+    const bundle = await buildMemoryBundle(lateChapterPlan(), { projectId: "p1", provider: { search: async () => claims } });
+
+    const selected = bundle.claims.map((claim) => claim.id);
+    expect(selected).toHaveLength(3);
+    expect(selected).toEqual(expect.arrayContaining(["holding-163", "holding-160", "holding-6"]));
+    // 被挤掉的是最旧的 approved 快照，原因是槽位配额而非预算。
+    expect(bundle.selectionReceipts).toContainEqual(expect.objectContaining({ claimId: "holding-2", status: "excluded", reason: "identity-slot-quota" }));
+    expect(bundle.selectionReceipts).toContainEqual(expect.objectContaining({ claimId: "holding-5", status: "excluded", reason: "identity-slot-quota" }));
+  });
+
+  it("keeps authority-first ordering for accumulating identity slots", async () => {
+    // 反向：累积型谓词的多个取值可以同时为真（知道 A 与知道 B 并存），
+    // 因此不得因叙事位置更新而顶掉已核准断言。夹具与上例完全相同，只切换谓词。
+    const claims = [
+      slotValueClaim({ id: "knows-2", predicate: "知晓", identityHash: "hero:knows", start: 2, authority: "approved" }),
+      slotValueClaim({ id: "knows-5", predicate: "知晓", identityHash: "hero:knows", start: 5, authority: "approved" }),
+      slotValueClaim({ id: "knows-6", predicate: "知晓", identityHash: "hero:knows", start: 6, authority: "approved" }),
+      slotValueClaim({ id: "knows-160", predicate: "知晓", identityHash: "hero:knows", start: 160, authority: "derived" }),
+      slotValueClaim({ id: "knows-163", predicate: "知晓", identityHash: "hero:knows", start: 163, authority: "derived" }),
+    ];
+    const bundle = await buildMemoryBundle(lateChapterPlan(), { projectId: "p1", provider: { search: async () => claims } });
+
+    const selected = bundle.claims.map((claim) => claim.id);
+    expect(selected).toHaveLength(3);
+    expect(selected).toEqual(expect.arrayContaining(["knows-2", "knows-5", "knows-6"]));
+    expect(bundle.selectionReceipts).toContainEqual(expect.objectContaining({ claimId: "knows-163", status: "excluded", reason: "identity-slot-quota" }));
+  });
+
+  it("canonicalizes state-like aliases and treats undated values as oldest", async () => {
+    // "拥有"是"持有"的别名，须经 canonicalizeFactPredicate 命中同一分类；
+    // 无 narrativeRange 的取值拿不到叙事位置，按最旧处理，不抢占配额。
+    const claims = [
+      slotValueClaim({ id: "alias-163", predicate: "拥有", identityHash: "hero:owns", start: 163, authority: "derived" }),
+      slotValueClaim({ id: "alias-90", predicate: "拥有", identityHash: "hero:owns", start: 90, authority: "derived" }),
+      slotValueClaim({ id: "alias-3", predicate: "拥有", identityHash: "hero:owns", start: 3, authority: "derived" }),
+      slotValueClaim({ id: "alias-undated", predicate: "拥有", identityHash: "hero:owns", start: undefined, authority: "approved" }),
+    ];
+    const bundle = await buildMemoryBundle(lateChapterPlan(), { projectId: "p1", provider: { search: async () => claims } });
+
+    const selected = bundle.claims.map((claim) => claim.id);
+    expect(selected).toHaveLength(3);
+    expect(selected).toEqual(expect.arrayContaining(["alias-163", "alias-90", "alias-3"]));
+    // 无叙事位置的 approved 断言也不因权威等级挤掉有位置的当前值。
+    expect(bundle.selectionReceipts).toContainEqual(expect.objectContaining({ claimId: "alias-undated", status: "excluded", reason: "identity-slot-quota" }));
   });
 
   it("marks a final target revision as a replacement boundary without moving the narrative cutoff", () => {

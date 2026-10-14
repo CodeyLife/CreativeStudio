@@ -479,6 +479,7 @@ describe("long-form prompt contracts", () => {
       silentBands: [{ fromOrder: 120, toOrder: 139, count: 37 }, { fromOrder: 140, toOrder: 159, count: 16 }],
       running: 346,
       unmeasurable: 0,
+      atRiskIds: ["f2", "f1"],
     };
     const sections = buildStoryArcPlanningContextSections({ ...base, narrativeDormancy: dormancy });
     const seg = sections.find((section) => section.id === "arc-context-dormancy");

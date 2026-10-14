@@ -18,6 +18,7 @@ import type { ChapterPlanningContext } from "./application/story-arc";
 import { CHAPTER_CHANGE_SCOPES } from "./prompts/chapter-review";
 import { canonicalSha256 } from "./canonical-json";
 import { estimateBudgetTokens } from "./token-estimate";
+import { isStateLikePredicate } from "./fact-extraction/fingerprint";
 
 export { createConfiguredSkillProvider, createDatabaseSkillProvider, createWorkspaceSkillProvider, renderSkillInstruction, resolveStageSkillBundle, skillPromptSection } from "./skill-runtime";
 
@@ -32,6 +33,48 @@ function compareCandidates(left: MemoryHit, right: MemoryHit): number {
     || right.confidence - left.confidence
     || tokenDifference
     || left.id.localeCompare(right.id);
+}
+
+/**
+ * 状态类槽位的槽位内次序：按叙事位置降序（越新越靠前）。
+ *
+ * 设计依据（state-audit-20261013 §3）：同一身份槽位下，替换型状态的旧值与当前值会并存为
+ * active 断言。槽位配额（MAX_PER_IDENTITY_SLOT）此前只按全局 authority→score 序取前 N 条，
+ * 于是起草第 168 章时"持有"槽的 3 个名额被第 2/5/6 章的 approved 库存占满（approved 排序
+ * 先于 derived），而当前库存的断言拿不到名额——模型读到的是 160 章前的家当。
+ *
+ * 实现取"槽位占位重填"而非"改全局比较器"：把该槽位在 ordered 中占据的位置集合原样保留，
+ * 只把这批位置按叙事位置降序重新分配给槽位成员。跨槽位的先后关系完全不变（任何其他槽位
+ * 或非槽位候选的名次都不动）。之所以不写一个"同槽位比叙事位置、跨槽位比 authority"的比较器，
+ * 是因为那种关系不满足严格弱序（A、B 同槽且 A 新，B、C 同槽且 B 新，而 A、C 跨槽时可能反向），
+ * Array.sort 在非传递比较器下的次序不可预测。
+ *
+ * 边界：无 narrativeRange.start 的成员按最旧处理（拿不到叙事位置就不抢占位）；槽位成员全部
+ * 无 start 时该变换是恒等变换。非状态类谓词（含项目自定谓词）不参与重排。
+ */
+function orderStateLikeSlotsByRecency(claims: MemoryHit[]): MemoryHit[] {
+  const slotPositions = new Map<string, number[]>();
+  claims.forEach((claim, index) => {
+    if (!claim.identityHash || !isStateLikePredicate(claim.predicate)) return;
+    const positions = slotPositions.get(claim.identityHash);
+    if (positions) positions.push(index);
+    else slotPositions.set(claim.identityHash, [index]);
+  });
+  if (!slotPositions.size) return claims;
+  const reordered = [...claims];
+  for (const positions of slotPositions.values()) {
+    if (positions.length < 2) continue;
+    const members = positions
+      .map((position) => claims[position])
+      .sort((left, right) => {
+        const leftStart = left.narrativeRange?.start ?? Number.NEGATIVE_INFINITY;
+        const rightStart = right.narrativeRange?.start ?? Number.NEGATIVE_INFINITY;
+        if (leftStart !== rightStart) return rightStart - leftStart;
+        return compareCandidates(left, right);
+      });
+    positions.forEach((position, offset) => { reordered[position] = members[offset]; });
+  }
+  return reordered;
 }
 
 function selectionReceipt(claim: MemoryHit, status: MemorySelectionReceipt["status"], reason: MemorySelectionReceipt["reason"]): MemorySelectionReceipt {
@@ -259,7 +302,7 @@ export async function buildMemoryBundle(plan: PreflightPlan, input: { projectId:
       sourceRevisionIds: [...new Set([...existing.sourceRevisionIds, ...claim.sourceRevisionIds])],
     });
   }
-  const ordered = [...deduplicated.values()].sort(compareCandidates);
+  const ordered = orderStateLikeSlotsByRecency([...deduplicated.values()].sort(compareCandidates));
   let spent = 0;
   const selected = new Map<string, { claim: MemoryHit; reason: MemorySelectionReceipt["reason"] }>();
   // 同 identity 槽位配额（memory-governance-audit-20260909 §5.3.3）：

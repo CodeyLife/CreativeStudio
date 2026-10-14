@@ -4,6 +4,7 @@ import { TEXT_REVIEW_PASSED_MARKER } from "../text-review";
 import type { NarrativeStateSnapshot } from "../protocol";
 // 线索静默账类型与窗口参数（叶子纯模块，无 node 依赖——workflow bundle 可安全引用）。
 import { DORMANCY_POLICY, type DormancyLedger } from "../narrative-dormancy";
+import { DEFAULT_TARGET_WORD_COUNT, LENGTH_DECLARATION_POLICY, LENGTH_DRIFT_POLICY, MIN_LENGTH_RATIO, inspectLengthDeclarations } from "../word-count";
 
 export type { StoryArcReviewOutput } from "../application/story-arc-review-policy";
 
@@ -59,7 +60,15 @@ const storyArcChaptersSchema = {
     type: "object", additionalProperties: false,
     required: ["index", "title", "narrativeFunction", "povCharacterId", "targetWordCount", "stateTransition", "scenes", "continuityConstraints", "unresolvedAtClose"],
     properties: {
-      index: { type: "integer", minimum: 1 }, title: { type: "string", minLength: 1 },
+      index: { type: "integer", minimum: 1 },
+      // 2026-10-13（docs/novel-v2/state-audit-20261013.md §7 第 4 项「章名退化」）：下限由 1 抬到 2，
+      // 与项目自己的命名契约对齐——CHAPTER_TITLE_SCHEMA（application/chapter-title.ts:22）要求
+      // minLength 2，normalizeChapterTitle（同文件 :66）对不足 2 字直接抛错。此前蓝图侧允许 1 字，
+      // 于是同一条产物（manuscript_documents.title）有两条生产路径、两种结构下限：实测 168 章里
+      // 有 2 章落成单字标题，而命名路径会直接拒绝这种输出。
+      // 这是结构性对齐，不是文学阈值：二字仍是合法下限，辨识度由 chapter-naming skill 的
+      // chapter.blueprint 段指引承担（本轮同步把该执行点接上），不在此处变成硬检查表。
+      title: { type: "string", minLength: 2 },
       narrativeFunction: { enum: [...CHAPTER_NARRATIVE_FUNCTIONS, "unspecified"] }, povCharacterId: { type: "string" },
       // 2026-09-17 根因修复（docs/novel-v2/ai-taint-diagnosis-20260917.md F1/§四）：
       // 本字段此前**只存在于 TypeScript 类型**（ChapterBlueprint.targetWordCount），
@@ -175,6 +184,15 @@ export type StoryArcPromptInput = {
    * "连续低量 + 蓝图延续低声明"的判断归审核面。
    */
   lengthDrift?: { windowSize: number; avgChars: number; sparseCount: number; minChars: number };
+  /**
+   * 正文对白密度信号（2026-10-13，state-audit-20261013.md §7 第 5 项，作者裁决选项 A）：
+   * 近窗口定稿章的"引号内有效字 / 有效字"统计 + 零对白章清单。
+   *
+   * 补的是上游 `ensembleSignal` 的盲区——它只能看见蓝图参与者数，看不见正文实际对白。
+   * 只做描述性统计（判据边界见 word-count.ts DIALOGUE_DRIFT_POLICY）；不设绝对下限、
+   * 不做逐章门，判断归审核面。
+   */
+  dialogueDrift?: { windowSize: number; avgRatio: number; hintBelowRatio: number; silentOrders: number[]; minRatio: number };
 };
 
 /**
@@ -225,6 +243,26 @@ export function renderStoryArcLengthDrift(drift: StoryArcPromptInput["lengthDrif
   const lines = [`近 ${drift.windowSize} 章篇幅信号（确定性统计）：均章 ${drift.avgChars} 字，最短 ${drift.minChars} 字${drift.sparseCount ? `，${drift.sparseCount} 章低于单章下限 ${1800} 字` : "，无低于单章下限的章"}。`];
   if (drift.sparseCount >= 2) {
     lines.push("篇幅信号提示：近窗口出现连续低量章——逐章对声明目标达标不等于全书内容密度合格（'拆事件凑章数'会让每章都过门而读者看到的是碎片化）。本批次声明 targetWordCount 时回到各章信息量的诚实估计；除非个别章功能确需短章（planningRationale 声明），不得系统性延续低声明。");
+  }
+  return lines.join("\n");
+}
+
+/**
+ * 正文对白密度信号渲染（描述性统计；判据边界见 word-count.ts DIALOGUE_DRIFT_POLICY）。
+ *
+ * 措辞纪律（与 reader-emotion 的"不要为了制造追更感机械添加情绪宣言"一致）：
+ * 本信号**不是"补对白"指令**。它只把"正文里还有多少人在说话"这个此前完全不可见的
+ * 事实摆到台面——上游群像配额管的是蓝图参与者数，管不到正文实际把对手戏写没写出来。
+ * 因此提示只针对"整窗口对白稀薄"这一**批的形态**，并显式承认安静章/余波章以低对白
+ * 成立；判断（哪一章该有对手戏）留给审核面与规划者。
+ */
+export function renderStoryArcDialogueDrift(drift: StoryArcPromptInput["dialogueDrift"]): string {
+  if (!drift || drift.windowSize < 3) return "";
+  const avg = `${(drift.avgRatio * 100).toFixed(2)}%`;
+  const min = `${(drift.minRatio * 100).toFixed(2)}%`;
+  const lines = [`近 ${drift.windowSize} 章正文对白密度（确定性统计）：均对白字占比 ${avg}（引号内有效字 / 有效字），最低 ${min}${drift.silentOrders.length ? `，其中 ${drift.silentOrders.length} 章全章没有任何含引号的段落（第${drift.silentOrders.join("、")}章）` : "，每章都有对白"}。`];
+  if (drift.silentOrders.length >= 2 || drift.avgRatio < drift.hintBelowRatio) {
+    lines.push("对白密度提示：对手戏是读者追读的主引擎，而本信号的度量面是**正文实际写出来的台词**——上游群像配额只约束蓝图参与者数，写不写得出交锋仍取决于本章的编排。近窗口对白稀薄时，逐章审查通常各自达标（每章都能自证其静），只有窗口统计能看出整批正在把对手戏挤出正文。分配章节时回到'这一章谁在向谁要东西'：让有欲望、有代价的第二意志进场并把代价落到对白上。安静章、余波章、内省章以低对白成立是合法形态（本信号不是补对白指令，不为凑密度加台词）。");
   }
   return lines.join("\n");
 }
@@ -342,7 +380,7 @@ export function buildStoryArcPlanningContextSections(input: StoryArcPromptInput)
     ...(dormancyText ? [{ id: "arc-context-dormancy", kind: "planning" as const, title: "线索静默账（曾活跃、现已静默）", text: dormancyText, priority: "required" as const, provenanceRefs: sourceRefs(receipt, "dormancy") }] : []),
     { id: "arc-context-open-elements", kind: "planning" as const, title: "开放线索、伏笔与承诺候选", text: open, priority: "normal" as const, provenanceRefs: sourceRefs(receipt, "open-elements") },
     { id: "arc-context-feedback-state", kind: "review" as const, title: "机制反馈与叙事状态", text: feedback, priority: "normal" as const, provenanceRefs: sourceRefs(receipt, "feedback-state", receipt?.sourceRevisionIds ?? []) },
-    { id: "arc-context-serial-signals", kind: "review" as const, title: "跨章序列信号（功能游程、群像独处游程、回报节奏与篇幅信号）", text: [serialSignals, renderStoryArcEnsembleSignal(input.ensembleSignal), renderStoryArcPayoffRhythm(input.payoffRhythm), renderStoryArcLengthDrift(input.lengthDrift)].filter(Boolean).join("\n\n"), priority: "normal" as const, provenanceRefs: sourceRefs(receipt, "serial-signals") },
+    { id: "arc-context-serial-signals", kind: "review" as const, title: "跨章序列信号（功能游程、群像独处游程、回报节奏、篇幅与对白密度信号）", text: [serialSignals, renderStoryArcEnsembleSignal(input.ensembleSignal), renderStoryArcPayoffRhythm(input.payoffRhythm), renderStoryArcLengthDrift(input.lengthDrift), renderStoryArcDialogueDrift(input.dialogueDrift)].filter(Boolean).join("\n\n"), priority: "normal" as const, provenanceRefs: sourceRefs(receipt, "serial-signals") },
     { id: "arc-context-receipt", kind: "background" as const, title: "上下文来源收据", text: receiptText, priority: "normal" as const, provenanceRefs: receipt ? [receipt.fingerprint] : ["legacy-context"] },
   ];
   return outlineSection ? [outlineSection, ...base] : base;
@@ -396,6 +434,7 @@ function context(input: StoryArcPromptInput): string {
     renderStoryArcNarrativeDormancy(input.narrativeDormancy),
     renderStoryArcPayoffRhythm(input.payoffRhythm),
     renderStoryArcLengthDrift(input.lengthDrift),
+    renderStoryArcDialogueDrift(input.dialogueDrift),
     `全局规划引用：${input.macro.map((item) => `[${item.taskKey}] ${item.title}: ${item.summary}`).join("\n") || "无"}`,
     `最近章节位置：${input.recentChapters.map((item) => `第${item.order}章 ${item.summary}；未解=${item.unresolvedThreads.join("、") || "无"}`).join("\n") || "无"}`,
     `开放剧情线（threadRef 只能填下列 id 的精确值、不带名称；确需新建剧情线用“new:<名称>”显式表达）：\n${input.openThreads.map((item) => `- id: ${item.id}\n  名称: ${item.title}${renderThreadPayload(item.payload)}`).join("\n") || "无"}`,
@@ -475,7 +514,7 @@ export function buildStoryArcChaptersPrompt(input: StoryArcPromptInput & { arc: 
     // 无法输出——写作端因此拿不到权威篇幅，只能靠 instruction 手写等量段配额代偿，
     // 产出全书段长趋同（cv 0.62，ch167 仅 0.07）。此契约要求**逐章给出并允许有差异**：
     // 篇幅是本章信息量的函数，不是全弧的常数。
-    "目标篇幅契约：每章都要给出 targetWordCount（可见字符数，整数）。它是**本章**信息量与场景数的函数，不是全弧常数——推进章、对峙章、高潮章可以更长；安静章、余波章、过渡章可以更短。同一批次内若各章目标完全相等，说明没有按章估量，应重估。给出后，正文写作与提交门会共用这个数字（缺省才回落系统默认值），因此不要写明显偏离本章实际承载能力的数。篇幅信号显示近窗口连续低量时（见上下文篇幅信号段），除非个别章功能确需短章（planningRationale 声明），不得系统性延续低声明——逐章达标不等于全书内容密度合格。",
+    `目标篇幅契约：每章都要给出 targetWordCount（可见字符数，整数）。它是**本章**信息量与场景数的函数，不是全弧常数——推进章、对峙章、高潮章可以更长；安静章、余波章、过渡章可以更短。同一批次内若各章目标完全相等，说明没有按章估量，应重估。给出后，正文写作与提交门会共用这个数字（缺省才回落系统默认值），因此不要写明显偏离本章实际承载能力的数。篇幅信号显示近窗口连续低量时（见上下文篇幅信号段），除非个别章功能确需短章（planningRationale 声明），不得系统性延续低声明——逐章达标不等于全书内容密度合格。项目级下限：每章 targetWordCount 不得低于 ${LENGTH_DECLARATION_POLICY.floor} 字（提交门按声明目标的 ${Math.round(MIN_LENGTH_RATIO * 100)}% 执法，该下限保证门限不跌破项目单章稀疏线 ${LENGTH_DRIFT_POLICY.sparseFloor} 字）；个别章功能确需更短时在 planningRationale 声明理由并如实给出目标，但整批不得过半低于此下限。`,
     target ? "" : "群像配额（蓝图结构契约，先于正文存在）：本批次章节窗口中至少三分之一（向上取整）的章节要包含两名及以上参与者互相作用的场景——对方有自己的欲望与代价、其行动改变彼此处境，不是道具或背景板；纯独处章每批至多一章，且该场景的 planningRationale 必须写明这章的静在与不在场的谁对话。安静、余波、内省章两人同场依然合法——静不等于独。",
     target ? "" : "第二意志契约（2026-09-17 全量复扫确诊：参与者计数与\"有人可交锋\"是两个解耦事实——全书 108 章参与者≥2，其中 52 章的 opposition 全指向\"格法/旧例/环境/他自己的判断\"，人在场却只执行工序、彼此不索取任何东西，正文因此读成一个人对着制度做分析）：凡某章场景参与者≥2，该章至少一个场景的 opposition 必须写清**谁**（具名或具体差称）**想要什么**、**他的行动如何改变对方的可选集合**。只写\"格法不许\"\"旧例如此\"\"他不能问\"\"两人都不能明说\"不算第二意志——那仍是环境压力。对手的欲望可以是小的、日常的、甚至出于善意的（想早点收工、不想担责、想保一个人），但必须是他自己的、且与主角的意图不完全一致。单人静章不受此约束。",
     // 收束形态轮换契约（2026-09-22 商业基准对照确诊，docs/novel-v2/commercial-benchmark-review-20260922.md）：
@@ -508,9 +547,21 @@ export function buildStoryArcReviewPrompt(bundle: StoryArcBundle, contextText: s
   const ensembleReport = bundle.chapters.length >= 3
     ? `群像结构信号（确定性统计，非审美判定）：本批 ${ensemble.ensembleChapterIndexes.length}/${bundle.chapters.length} 章含两名及以上参与者互动场景（配额 ≥${ensemble.ensembleQuota} 章）；纯独处章${ensemble.soloOnlyChapterIndexes.length ? `：第${ensemble.soloOnlyChapterIndexes.join("、")}章` : "无"}；最长连续独处游程 ${ensemble.longestSoloRun} 章。`
     : "";
+  // 声明侧篇幅信号（2026-10-13，state-audit-20261013.md §7 第 4 项）：与群像配额同族——
+  // "整批在下调标准"是批的属性，逐章审查看不出来（每章都合法），只有批级占比能测到。
+  // 判据常量住 word-count.ts（LENGTH_DECLARATION_POLICY），此处只渲染信号，判断留给审核面。
+  //
+  // **刻意不设批内章数闸门**（与上面 ensembleReport 的 `>= 3` 不同，不是漏改）：
+  // 该 spec 明写"仅 1 章声明且低于下限的批次也会被判系统性（占 1/1）——有意的保守取向，
+  // 让审核问一句而非静默通过"。`inspectLengthDeclarations` 对 1/1 即判 systematic，
+  // 若在此处按章数吞掉整段信号，小批次就重新变成静默通过，与该取向相反。
+  const declarations = inspectLengthDeclarations(bundle.chapters);
+  const declaredCount = declarations.anchored.length + declarations.underDeclared.length;
+  const declarationReport = `声明侧篇幅信号（确定性统计，非审美判定）：本批 ${bundle.chapters.length} 章中 ${declarations.undeclared.length} 章未声明目标（回落系统默认 ${DEFAULT_TARGET_WORD_COUNT} 字），已声明 ${declaredCount} 章${declarations.averageDeclared === undefined ? "" : `均声明 ${declarations.averageDeclared} 字`}；其中 ${declarations.underDeclared.length} 章低于项目下限 ${declarations.floor} 字${declarations.underDeclared.length ? `：第${declarations.underDeclared.join("、")}章` : ""}。`;
   return [
     "审核故事弧的结构可靠性，不替正文规定审美。先按整弧检查承诺、入口/退出状态、阶段边界、线索责任和终局空间，再逐章检查状态连续、场景因果、人物选择、世界规则压力、知识边界和章节功能。逐章逐项检查，不要抽样概括：当前批次共 " + bundle.chapters.length + " 章，每章都要覆盖状态连续、场景因果、章节功能与权威边界。",
     ...(ensembleReport ? [`${ensembleReport}审核契约：独处编排是正文对白崩落的上游病灶（已实证），当配额未满足或最长独处游程≥4 时，检查是否复现"单人内心节目单"形态——本弧承诺的读者体验是否因缺对手戏而受损；受损则报告节奏问题，并指出最小修改：把哪一章的独处解码事件改造为一名有欲望有代价的第二意志进场的交锋。个别功能静章（planningRationale 已声明与谁对话）不构成问题。**第二意志缺口检查（独立于配额）**：凡某章场景参与者≥2，至少一个场景的 opposition 必须写清谁（具名或具体差称）想要什么、他的行动如何改变对方的可选集合；若该章的 opposition 全部指向"格法不许/旧例如此/环境/他自己的判断"，即使参与者数达标，也按 major 报告并给出最小修改：为哪一章补一名带着自身目的进场的对手（欲望可以小、可以善意，但必须是他自己的、且与主角意图不完全一致）。另核对每章 povCharacterId 是否精确命中『人物登记表』中的 id——变体名（截短、改拼、用显示名）会导致 POV 作用域的记忆召回静默失效，按 major 报告并给出登记表中的正确 id。`] : []),
+    ...(declarationReport ? [`${declarationReport}审核契约：单章低于项目下限可能是功能性静章（schema 明示"安静章可低于推进章"），不单独判问题；但已声明章中过半低于下限时，蓝图整体在下调标准——提交门按声明目标的 ${Math.round(MIN_LENGTH_RATIO * 100)}% 执法，低声明会把欠量下限一并下移，逐章达标不等于内容密度合格。${declarations.systematic ? `本批已构成系统性低声明（${declarations.underDeclared.length}/${declaredCount} 章低于下限）：按 major 报告，逐条指出哪些章应提高声明，或说明该章 planningRationale 已声明的功能理由为何成立。` : "本批未构成系统性低声明，仅作信号记录，不据此判 revise。"}`] : []),
     "把‘没有事件’与‘没有变化’区分开：安静章节可以通过关系温度、理解、信息分布、资源条件、心理方向或余波完成自身功能；只有在当前功能需要而正文/蓝图没有承载时才报告问题。",
     "检查节奏时看目标、阻力、期待、揭示、结果和余波的波形，以及重复冲突/反转造成的疲劳，不用固定章数、钩子密度、爽点数量或持续升级作为硬标准。同时按弧设计契约检查（契约是检查方向，不是必须全部成立的硬门）：development 各阶段是否呈承接的子问题链而非并列步骤，场景 outcome 是否成为下一场景 situation 的触发条件或承担独立体验/理解修正功能，安静章是否让读者获得可感知的新东西（关系温度/风险判断/物品易主/理解修正/情绪确认/余波承载），推进型弧的退出状态相对入口是否有身份、资源、知识、关系或威胁级别中的可感知变化。安静、关系、背景、铺垫和余波弧与行动弧同样合法，只要其功能有可感知证据；只有契约缺失且确实损害了本弧承诺功能的证据时才报告 major。",
     // 收束形态分布检查（2026-09-22 章末仪式 38/168 章窗口命中的审核面落点）：
@@ -521,6 +572,10 @@ export function buildStoryArcReviewPrompt(bundle: StoryArcBundle, contextText: s
     // 逐章对声明目标达标 ≠ 全书内容密度合格——"拆事件凑章数"（一个事件拆三日内心戏
     // 三章的实证病例 ch121）每章都过 length-under-target 门而读者看到碎片化。
     "内容稀疏检查（通用，语义判断）：以上下文『篇幅信号』段为准（无该段时跳过）——近窗口连续低量章，且本批蓝图 targetWordCount 又延续低声明、而各章承载的仍是单个可并置事件或单次内心解码时，检查是否复现'拆事件凑章数'形态；是则按节奏问题报告并给出最小修改：合并哪些章，或为哪几章补充实际承载（第二人进场、事件推进、可感知回报）。个别功能静章（planningRationale 已声明）与安静章不构成问题；章长本身不是病，碎片化才是。",
+    // 对白密度检查（2026-10-13 商业面缺口确诊的审核面落点；判据边界见 DIALOGUE_DRIFT_POLICY）：
+    // 上游群像配额管的是蓝图参与者数，管不到正文实际写没写出交锋——本段是两者之间
+    // 唯一的回读。逐章都能自证其静，只有窗口统计看得见整批把对手戏挤出正文。
+    "对白密度检查（通用，语义判断）：以上下文『正文对白密度』段为准（无该段时跳过）——近窗口对白稀薄（多章无含引号段落，或均对白字占比低于密度提示线）时，检查本批蓝图是否延续同一形态：各章虽有参与者，但 opposition 全是环境/旧例/他自己的判断，或场景只写主角独自解码。是则按节奏问题报告，并给出最小修改：指出哪一章应当让一名有欲望、有代价的第二意志进场，并把代价落到对白上。安静章、余波章、内省章以低对白成立是合法形态，单章低对白不单独判问题；本检查不是补对白指令，不得为凑密度要求添加台词或情绪宣言。",
     "以目标读者视角检查本弧的读者回报：entryState/objective 承诺了什么体验（解决问题、关系升温、世界揭秘、认知落差、情绪确认），exitState 与 development 是否真的交付了这种体验；若弧结束时读者只经历了过程而没有获得解决、成长、理解、情绪或新问题中的任何回报，报告为节奏问题。安静弧的回报可以是理解修正或关系温度，不要求每弧交付事件性高潮。",
     "故事弧按批次滚动审核：当 batch.complete=false 或当前章节窗口少于 arc.expectedChapterCount 时，未到达 arc.exitState、后续阶段尚未交汇或长线尚未收束是预期的未决状态，不能仅因未来证据尚未出现而报告问题。只有当前窗口改写边界、提前消费答案、破坏责任传递或声称已完成却没有证据时才报告。",
     "对未知物质、装置、痕迹或局部反应执行同一证据边界：湿度、颜色、气味、声音、光亮或接触变化只能支持当下可观察现象，不能单凭一次反应推出用途、成分、机制、追踪/筛选/警示功能或排除某种用途。若蓝图把局部现象写成角色尚未获得的功能结论，必须列为问题并要求修订保留未知状态。",

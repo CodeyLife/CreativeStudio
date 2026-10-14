@@ -1,6 +1,10 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
-import { deleteImage } from "@/lib/imageStore";
+import { prependWithCap } from "@/lib/cappedList";
+import { deleteImagesQuietly } from "@/lib/imageStore";
+
+/** 历史记录保留上限。TODO: 魔法值，后续如需按存储配额调整应提取为可配置项。 */
+const MAX_HISTORY_ITEMS = 200;
 
 export interface HistoryItem {
   id: string;
@@ -34,35 +38,32 @@ export const useHistoryStore = create<HistoryState>()(
       items: [],
       add: (item) =>
         set((s) => {
-          const next = [item, ...s.items].slice(0, 200);
-          // 被 slice 截断的旧条目：异步清理其 IndexedDB 图片
-          const dropped = s.items.slice(next.length);
-          if (dropped.length > 0) {
-            dropped.forEach((h) => h.imageIds.forEach((id) => deleteImage(id).catch(() => {})));
+          const { kept, evicted } = prependWithCap(s.items, item, MAX_HISTORY_ITEMS);
+          // 超出上限被淘汰的旧条目：清理其 IndexedDB 图片，避免孤儿 Blob
+          if (evicted.length > 0) {
+            deleteImagesQuietly(evicted.flatMap((h) => h.imageIds));
           }
-          return { items: next };
+          return { items: kept };
         }),
       remove: (id) =>
         set((s) => {
           const target = s.items.find((i) => i.id === id);
-          if (target) target.imageIds.forEach((iid) => deleteImage(iid).catch(() => {}));
+          if (target) deleteImagesQuietly(target.imageIds);
           return { items: s.items.filter((i) => i.id !== id) };
         }),
       removeMany: (ids) =>
         set((s) => {
           if (ids.length === 0) return s;
           const idSet = new Set(ids);
-          // 清理被删除项的图片
-          s.items.forEach((i) => {
-            if (idSet.has(i.id)) i.imageIds.forEach((iid) => deleteImage(iid).catch(() => {}));
-          });
+          const removed = s.items.filter((i) => idSet.has(i.id));
+          deleteImagesQuietly(removed.flatMap((i) => i.imageIds));
           return { items: s.items.filter((i) => !idSet.has(i.id)) };
         }),
       removeImage: (historyId, imageId) =>
         set((s) => {
           const target = s.items.find((i) => i.id === historyId);
           if (!target) return s;
-          deleteImage(imageId).catch(() => {});
+          deleteImagesQuietly([imageId]);
           const newImageIds = target.imageIds.filter((id) => id !== imageId);
           if (newImageIds.length === 0) {
             // 该历史项无图，整体删除
@@ -74,7 +75,7 @@ export const useHistoryStore = create<HistoryState>()(
         }),
       clear: () =>
         set((s) => {
-          s.items.forEach((i) => i.imageIds.forEach((iid) => deleteImage(iid).catch(() => {})));
+          deleteImagesQuietly(s.items.flatMap((i) => i.imageIds));
           return { items: [] };
         }),
     }),

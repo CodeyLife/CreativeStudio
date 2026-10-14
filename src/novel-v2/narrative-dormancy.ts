@@ -114,6 +114,16 @@ export interface DormancyLedger {
   /** 关键词缺失/过短、无法扫描的条目数 */
   unmeasurable: number;
   /**
+   * 需要"强注"的条目 id：埋设后从未被提及、曾活跃现已静默、以及无法判定在场三类之和。
+   *
+   * 用途：正文起草面的开放伏笔注入按此集合过滤——只强注模型已经跟丢的线，仍在推进
+   * （running）的线交给检索与预算竞价。实测依据（docs/novel-v2/state-audit-20261013.md
+   * §4.5）：整本 open 账无条件注入占 98K 记忆预算的 71%（425 条 / 69,845 token），
+   * 把 24 条真事实断言挤出预算。无法判定在场者（关键词缺失/过短、埋设章序缺失）保守
+   * 留在集合内：无法证明它近期在场，就不该当作"仍在推进"而丢弃。
+   */
+  atRiskIds: string[];
+  /**
    * 静默带：以 20 章为桶统计"末次提及章"的分布，用于识别**成片失线**
    * （某一段之后集中断线，比零散失线更可能是规划层的结构性遗漏）。
    */
@@ -134,6 +144,7 @@ export function summarizeDormancy(
 ): DormancyLedger {
   const neverMentioned: DormancyLedgerEntry[] = [];
   const silent: DormancyLedgerEntry[] = [];
+  const atRiskIds: string[] = [];
   let running = 0;
   let unmeasurable = 0;
 
@@ -146,9 +157,9 @@ export function summarizeDormancy(
       lastMentionOrder: presence.lastMentionOrder,
       silentFor: presence.silentFor,
     };
-    if (presence.status === "unmeasurable") unmeasurable += 1;
-    else if (presence.status === "never-mentioned") neverMentioned.push(entry);
-    else if (presence.status === "silent") silent.push(entry);
+    if (presence.status === "unmeasurable") { unmeasurable += 1; atRiskIds.push(entry.id); }
+    else if (presence.status === "never-mentioned") { neverMentioned.push(entry); atRiskIds.push(entry.id); }
+    else if (presence.status === "silent") { silent.push(entry); atRiskIds.push(entry.id); }
     else running += 1;
   }
 
@@ -170,6 +181,7 @@ export function summarizeDormancy(
     silent,
     running,
     unmeasurable,
+    atRiskIds,
     silentBands,
     currentOrder,
   };

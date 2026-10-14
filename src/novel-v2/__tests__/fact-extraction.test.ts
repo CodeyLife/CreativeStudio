@@ -396,6 +396,88 @@ describe("fact-extraction identity normalization (memory-governance-audit-202609
     expect(result.claims[0].subjectRefs).toEqual(["自造_ID"]);
   });
 
+  it("resolves machine-id prefix variants of a registered key to the same identity slot", () => {
+    // 实测根因（state-audit-20261013 §3.6）：主角两条互斥死因分属 `char_chu_heng` 与
+    // `chu_heng` 两个槽，使矛盾核验与槽位时效重排双双看不见它们。
+    const index = buildCharacterIdentityIndex("p1", [], [{ id: "char_chu_heng", name: "楚衡" }]);
+    const prefixed = projectFactExtractionOutput(
+      { projectId: "p1", artifact, text: "正文略。", identityIndex: index },
+      { facts: [fact({ subject: { kind: "entity", id: "char_chu_heng" }, humanReadable: "楚衡身死" })], narrativeElements: { foreshadowings: [], promises: [], payoffs: [] } },
+    );
+    const bare = projectFactExtractionOutput(
+      { projectId: "p1", artifact, text: "正文略。", identityIndex: index },
+      { facts: [fact({ subject: { kind: "entity", id: "chu_heng" }, humanReadable: "楚衡身死" })], narrativeElements: { foreshadowings: [], promises: [], payoffs: [] } },
+    );
+    expect(bare.claims[0].subjectRefs).toEqual(["char_chu_heng"]);
+    expect(bare.claims[0].identityHash).toBe(prefixed.claims[0].identityHash);
+    // 归一后不再是"待登记主体"：键已可解析，登记它会凭空造出重复实体。
+    expect(bare.unregisteredSubjects).toEqual([]);
+  });
+
+  it("normalizes separator and case variants of a registered key", () => {
+    const index = buildCharacterIdentityIndex("p1", [], [{ id: "char_qi_xing_ren", name: "齐姓人" }]);
+    const result = projectFactExtractionOutput(
+      { projectId: "p1", artifact, text: "正文略。", identityIndex: index },
+      { facts: [fact({ subject: { kind: "entity", id: "Char-Qi_Xing-Ren" }, humanReadable: "齐姓人交付布袋" })], narrativeElements: { foreshadowings: [], promises: [], payoffs: [] } },
+    );
+    expect(result.claims[0].subjectRefs).toEqual(["char_qi_xing_ren"]);
+  });
+
+  it("collects unregistered character subjects for pending registration", () => {
+    const output: ChapterStateDelta = {
+      facts: [
+        fact({ subject: { kind: "character", id: "送草的孩子" }, humanReadable: "送草的孩子放下草料" }),
+        fact({ subject: { kind: "character", id: "送草的孩子" }, humanReadable: "送草的孩子转身离开", evidence: "他放下草料便转身出了院子。" }),
+      ],
+      narrativeElements: { foreshadowings: [], promises: [], payoffs: [] },
+    };
+    const result = projectFactExtractionOutput({ projectId: "p1", artifact, text: "正文略。", identityIndex }, output);
+    expect(result.unregisteredSubjects).toEqual([{ id: "送草的孩子", kind: "character" }]);
+  });
+
+  it("does not register non-character subjects (places and objects stay out of the roster)", () => {
+    // 地点/物件用 entity/scene：登记它们会把"补发房""玉牌"混进角色名册与知识工作台。
+    const output: ChapterStateDelta = {
+      facts: [
+        fact({ subject: { kind: "entity", id: "补发房" }, humanReadable: "补发房在功德司西跨院" }),
+        fact({ subject: { kind: "scene", id: "老槐树" }, humanReadable: "老槐树立在哨位旁" }),
+        fact({ subject: { kind: "entity", id: "玉牌" }, humanReadable: "玉牌刻着阅字" }),
+      ],
+      narrativeElements: { foreshadowings: [], promises: [], payoffs: [] },
+    };
+    const result = projectFactExtractionOutput({ projectId: "p1", artifact, text: "正文略。", identityIndex }, output);
+    expect(result.unregisteredSubjects).toEqual([]);
+  });
+
+  it("folds the character discriminator out of the identity fingerprint", () => {
+    // 判别位只服务登记决策：旧数据 entity、新数据 character 必须落进同一身份槽，
+    // 否则"新增判别位"本身就会制造新的碎片化。
+    const asCharacter = fact({ subject: { kind: "character", id: "char_chu_heng" } });
+    const asEntity = fact({ subject: { kind: "entity", id: "char_chu_heng" } });
+    expect(factIdentityHash(asCharacter)).toBe(factIdentityHash(asEntity));
+  });
+
+  it("does not collect non-entity subject kinds (own tables and key spaces)", () => {
+    const output: ChapterStateDelta = {
+      facts: [
+        fact({ subject: { kind: "relation", id: "relation_chu_qi_deal" }, humanReadable: "楚齐两人立约" }),
+        fact({ subject: { kind: "thread", id: "thread-1" }, humanReadable: "线索尚未收束" }),
+      ],
+      narrativeElements: { foreshadowings: [], promises: [], payoffs: [] },
+    };
+    const result = projectFactExtractionOutput({ projectId: "p1", artifact, text: "正文略。", identityIndex }, output);
+    expect(result.unregisteredSubjects).toEqual([]);
+  });
+
+  it("collects nothing when no identity index is provided (registry unavailable)", () => {
+    const output: ChapterStateDelta = {
+      facts: [fact({ subject: { kind: "character", id: "陌生人" }, humanReadable: "陌生人经过" })],
+      narrativeElements: { foreshadowings: [], promises: [], payoffs: [] },
+    };
+    const result = projectFactExtractionOutput({ projectId: "p1", artifact, text: "正文略。" }, output);
+    expect(result.unregisteredSubjects).toEqual([]);
+  });
+
   it("injects the canonical character roster into the prompt when provided", () => {
     const prompt = buildFactExtractionPrompt({
       artifact,
@@ -405,6 +487,12 @@ describe("fact-extraction identity normalization (memory-governance-audit-202609
     expect(prompt).toContain("规范人物名册");
     expect(prompt).toContain("char_hero｜显示名：主角");
     expect(prompt).toContain("禁止使用显示名、拼音转写或自造 ID");
+  });
+
+  it("teaches the character/entity discriminator so only people get registered", () => {
+    const prompt = buildFactExtractionPrompt({ artifact, text: "正文略。" });
+    expect(prompt).toContain("人物（有名有姓或有稳定指称的角色）一律用 character");
+    expect(prompt).toContain("非人物可指认对象用 entity 或 scene");
   });
 
   it("omits the roster section when no canonical characters are provided", () => {

@@ -90,6 +90,14 @@ export interface ExtractFactsResult {
    */
   narrativeElements: FactExtractionOutput["narrativeElements"];
   /**
+   * 待登记主体（§3.6 主体碎片治理）：未命中身份注册表、且 kind 属于可登记集的 subject 键。
+   *
+   * 可登记集**只有 `character`**（判据见下方 `REGISTRABLE_SUBJECT_KINDS` 的说明）——
+   * 身份注册表只解析人物键，把 `entity` 一并登记会让地点/物件混进角色名册。此处早先
+   * 误写成"kind 可登记（`entity`）"，与实现相反，已按代码订正。
+   */
+  unregisteredSubjects: UnregisteredSubject[];
+  /**
    * 确定性矛盾核验结果（迭代 2）：与冻结表同槽异值且未声明覆盖的候选清单。
    * 这些候选已被强制 authority=candidate（须人工裁决后晋升，不进检索面）。
    */
@@ -178,29 +186,113 @@ export function normalizeFactExtractionOutput(output: FactExtractionModelOutput 
 }
 
 /**
- * 按人物身份注册索引归一事实主体 ID。
+ * 主体键等价索引：在身份注册索引之上补一层确定性键归一。
+ *
+ * 设计依据：state-audit-20261013 §3.6 实测——active 断言里 171 个 subject 键有 132 个永不命中
+ * 身份注册表，主角自己的两条互斥死因就分属 `char_chu_heng` 与 `chu_heng` 两个 identity 槽，
+ * 使确定性矛盾核验（按 identityHash 对账）与槽位时效重排双双看不见这对硬矛盾。
+ *
+ * 归一只有三级，全部是确定性等价，不含语义猜测：
+ * 1. 精确别名命中（canonicalId/displayName/entityId/实体名）——原有行为；
+ * 2. 键书写等价：NFKC + 去空白 + 分隔符归一 + 小写（`char-qi` ≡ `char_qi`）；
+ * 3. 机器 ID 前缀等价：`char_X` 与裸键 `X` 视为同一键（`chu_heng` → `char_chu_heng`）。
+ * 刻意不做拼音/近义/模糊匹配（`qi` ≡ `齐姓人` 属语义判定，超出共享层职责，见审计 §5.5）。
+ */
+export interface SubjectKeyIndex {
+  readonly identity: CharacterIdentityIndex;
+  readonly normalized: Map<string, string>;
+}
+
+const CHARACTER_ID_PREFIX = /^char[-_](.+)$/u;
+
+function normalizeSubjectKey(value: string): string {
+  return value.normalize("NFKC").trim().replace(/\s+/gu, "").replace(/[-_]+/gu, "_").toLowerCase();
+}
+
+export function buildSubjectKeyIndex(identityIndex: CharacterIdentityIndex): SubjectKeyIndex {
+  const normalized = new Map<string, string>();
+  const register = (key: string, canonicalId: string): void => {
+    if (key && !normalized.has(key)) normalized.set(key, canonicalId);
+  };
+  for (const [alias, identity] of identityIndex) {
+    const key = normalizeSubjectKey(alias);
+    register(key, identity.canonicalId);
+    const bare = CHARACTER_ID_PREFIX.exec(key)?.[1];
+    if (bare) register(bare, identity.canonicalId);
+  }
+  return { identity: identityIndex, normalized };
+}
+
+/**
+ * 解析主体键到规范 ID；未命中返回 undefined（不发明新键）。
+ */
+function resolveCanonicalSubjectId(rawId: string, index: SubjectKeyIndex): string | undefined {
+  const trimmed = rawId.trim();
+  if (!trimmed) return undefined;
+  const exact = index.identity.get(trimmed);
+  if (exact) return exact.canonicalId;
+  return index.normalized.get(normalizeSubjectKey(trimmed));
+}
+
+/**
+ * 可登记为主体的 subject.kind：只认 `character`。
+ *
+ * prompt 要求人物一律用 `character`，地点/物件/机构等非人物用 `entity`/`scene`——
+ * 身份注册表只解析 kind='character'（所有生产加载器都按它过滤），因此只有人物键
+ * 才该登记；把 `entity` 一并登记会让"补发房""玉牌""门框"这类地点物件混进角色名册
+ * 与知识工作台，是语义错误。指纹层把 `character` 折叠为 `entity`（见 fingerprint.ts
+ * 的 normalizeSubjectKind），故判别位不影响身份槽。其余 kind（project/outline/thread/
+ * foreshadowing/timeline）属系统命名空间，relation 由 relations 表承载，scene 归
+ * §5.4 的非人物主体注册（P2）。
+ */
+const REGISTRABLE_SUBJECT_KINDS: ReadonlySet<string> = new Set(["character"]);
+
+/**
+ * 按身份注册索引归一事实主体 ID。
  *
  * 设计依据：memory-governance-audit-20260909 §M2/§5.1.1——fact-extraction 的 subject.id
  * 此前由模型即兴生成（显示名/拼音转写/自造 ID 并存），同一人物多种键形态使 identityHash
- * 聚簇、跨章去重与所有按主体键过滤的消费方失明。归一规则：仅当原始 ID 精确命中注册索引
- * 别名（canonicalId/displayName/entityId/实体名）时重写为规范 ID；未命中键原样保留，
- * 不在共享层发明新实体或猜测映射（语义等价的模糊判定交由外部事实梳理审核，见审计 §5.5）。
+ * 聚簇、跨章去重与所有按主体键过滤的消费方失明。命中（含键等价）时重写为规范 ID；
+ * 未命中键原样保留，但会被收集为"待登记主体"，由调用方按 pendingEnrichment 规则登记实体
+ * ——这正是 prompt.ts 规范人物名册段已向模型承诺的"名册之外的人物以正文原名作 subject.id，
+ * 由系统登记为待补全实体"。此前只兑现了名册的一半，未命中侧从未落库。
  */
-function normalizeFactSubjectId(fact: FactExtractionOutput["facts"][number], identityIndex: CharacterIdentityIndex): FactExtractionOutput["facts"][number] {
+function normalizeFactSubjectId(fact: FactExtractionOutput["facts"][number], index: SubjectKeyIndex): FactExtractionOutput["facts"][number] {
   const rawId = fact.subject.id;
   if (typeof rawId !== "string") return fact;
-  const identity = identityIndex.get(rawId.trim());
-  if (!identity || identity.canonicalId === rawId) return fact;
-  return { ...fact, subject: { ...fact.subject, id: identity.canonicalId } };
+  const canonicalId = resolveCanonicalSubjectId(rawId, index);
+  if (!canonicalId || canonicalId === rawId) return fact;
+  return { ...fact, subject: { ...fact.subject, id: canonicalId } };
+}
+
+/** 待登记主体：未命中注册表、且 kind 属于可登记命名空间的 subject 键（按 id 去重）。 */
+export interface UnregisteredSubject {
+  readonly id: string;
+  readonly kind: string;
 }
 
 export function projectFactExtractionOutput(input: Omit<ExtractFactsInput, "model">, output: FactExtractionModelOutput | ChapterStateDelta): ExtractFactsResult {
   const normalized = normalizeFactExtractionOutput(output);
   // 身份归一必须发生在指纹计算与批内去重之前：同一事实以"显示名"与"规范 ID"两种主体
   // 出现在同一批提取结果时，归一后才会命中同指纹去重（dedupe L2/L3），否则照旧落两行。
-  const facts = input.identityIndex
-    ? normalized.facts.map((fact) => normalizeFactSubjectId(fact, input.identityIndex!))
+  const subjectKeyIndex = input.identityIndex ? buildSubjectKeyIndex(input.identityIndex) : undefined;
+  const facts = subjectKeyIndex
+    ? normalized.facts.map((fact) => normalizeFactSubjectId(fact, subjectKeyIndex))
     : normalized.facts;
+  // 待登记主体（未命中注册表且 kind 可登记）：随提取结果上浮，由 activity 层按
+  // pendingEnrichment 规则登记实体，使该键下次可被解析——不发明第三种键形态。
+  const unregisteredSubjects: UnregisteredSubject[] = [];
+  if (subjectKeyIndex) {
+    const seen = new Set<string>();
+    for (const fact of facts) {
+      const rawId = fact.subject.id;
+      if (typeof rawId !== "string" || !REGISTRABLE_SUBJECT_KINDS.has(fact.subject.kind)) continue;
+      const trimmed = rawId.trim();
+      if (!trimmed || seen.has(trimmed) || resolveCanonicalSubjectId(trimmed, subjectKeyIndex)) continue;
+      seen.add(trimmed);
+      unregisteredSubjects.push({ id: trimmed, kind: fact.subject.kind });
+    }
+  }
   const deduped = dedupeFactCandidates({
     candidates: facts,
     existingContentHashes: input.existingContentHashes,
@@ -229,6 +321,9 @@ export function projectFactExtractionOutput(input: Omit<ExtractFactsInput, "mode
     claims,
     // Phase 3.1: 透传 narrativeElements 给 activity 层，由其调用 recordNarrativeElements
     narrativeElements: normalized.narrativeElements,
+    // 待登记主体（§3.6 主体碎片治理）：activity 层据此按 pendingEnrichment 规则建实体行，
+    // 兑现 prompt.ts 规范人物名册段"由系统登记为待补全实体"的承诺。
+    unregisteredSubjects,
     // 确定性矛盾核验审计面（迭代 2）：结构化冲突清单随提取结果上浮，
     // activity 层落 factArtifact.structuredData.verification，不静默。
     verification: {

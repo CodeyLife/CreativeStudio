@@ -102,7 +102,7 @@ export const factExtractionSchema = {
             additionalProperties: false,
             required: ["kind", "id"],
             properties: {
-              kind: { enum: ["project", "entity", "relation", "outline", "scene", "thread", "foreshadowing", "timeline"] },
+              kind: { enum: ["project", "character", "entity", "relation", "outline", "scene", "thread", "foreshadowing", "timeline"] },
               id: { type: "string", minLength: 1 },
             },
           },
