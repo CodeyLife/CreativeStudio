@@ -13,7 +13,7 @@ import {
   renderSkillInstruction,
   resolveStageSkillBundle,
 } from "../skill-runtime";
-import type { SkillDescriptor } from "../protocol";
+import type { SkillDescriptor, SkillExecutionPoint } from "../protocol";
 
 const temporaryDirectories: string[] = [];
 
@@ -106,7 +106,7 @@ describe("Skill runtime resolution", () => {
     for (const skillId of ["prose-craft", "reader-emotion", "plot-causality"]) {
       // 守卫值随 workspace yaml 版本演进（prose-craft 曾升 1.4.0 未同步本守卫，属存量断链修复）；
       // 断言的仍是"清单能解析出版本与指纹"这一契约，非具体措辞。
-      expect(byId.get(skillId)?.version).toBe(skillId === "prose-craft" ? "1.4.0" : "1.1.0");
+      expect(byId.get(skillId)?.version).toBe(skillId === "prose-craft" ? "1.5.0" : "1.1.0");
       expect(byId.get(skillId)?.contentFingerprint).toBeTruthy();
     }
 
@@ -141,6 +141,46 @@ describe("Skill runtime resolution", () => {
     expect(reviewText).toContain("当前功能失效");
     expect(reviewText).toContain("信息差");
     expect(reviewText).toContain("摘要式结论");
+  });
+
+  /**
+   * 跨章清点惯性（2026-10-14 复核轮读者视角实测，state-audit §8.1）三面接线。
+   *
+   * 读者证据：主角独处章反复以同一套动作序列清点随身物件并逐件配同类温度/质感判定，
+   * 章级密度实测道具盘点族全书均值 2.16/千字而 21-40 章达 5.30（6.6× 全书），
+   * 温度族 61-80 章 1.52/千字——两族峰值正好落在商业基准对照确诊的"死亡象限"。
+   * 该形态与对白崩落同源：对手戏缺席，章节以物件与内省填充。
+   *
+   * 三面必须都有，否则规则只落在写作侧而审核侧看不见（或反之无法执行）。
+   * 断言的是"判据在三面都在场"，不是具体措辞——措辞可演进，缺席即回归。
+   */
+  it("跨章清点惯性判据在写作、审核、修订三面都在场", async () => {
+    const provider = createWorkspaceSkillProvider(path.resolve(process.cwd(), "skills", "novel-v2"));
+    const faces: Array<[SkillExecutionPoint, string]> = [
+      ["chapter.drafting", "writer"],
+      ["chapter.review.prose", "prose-reviewer"],
+      ["chapter.revision", "reviser"],
+    ];
+    for (const [executionPoint, role] of faces) {
+      const bundle = await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint, role });
+      const text = renderSkillInstruction(bundle, executionPoint);
+      expect(text, `${executionPoint} 缺少清点惯性判据`).toContain("清点");
+    }
+    // 写作侧的定性：这是"该有的现场没发生"，不是动作出现次数禁令——
+    // 写成禁用表即违反 prose-craft 自身的"不以固定句式、字词禁用表代替判断"。
+    const draftText = renderSkillInstruction(
+      await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint: "chapter.drafting", role: "writer" }),
+      "chapter.drafting",
+    );
+    expect(draftText).toContain("新信息");
+    expect(draftText).toContain("新选择");
+    expect(draftText).toContain("新代价");
+    // 审核侧必须要求指明"挤掉了什么"，否则动刀理由会退化成频率统计。
+    const reviewText = renderSkillInstruction(
+      await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint: "chapter.review.prose", role: "prose-reviewer" }),
+      "chapter.review.prose",
+    );
+    expect(reviewText).toContain("挤掉了什么");
   });
 
   it("gives foundation review its own role-specific evidence Skill without changing planning resolution", async () => {
