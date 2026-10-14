@@ -80,17 +80,16 @@ type ReviewSubmitInput = ReviewSubmitCommand["review"];
 type ReviewIssueShape = ReviewSubmitInput["issues"][number];
 
 const repository = new NovelPostgresRepository(runtime.databaseUrl);
-await repository.migrate(runtime.migrationsDir);
-const skillProvider = createConfiguredSkillProvider({ source: process.env.NOVEL_SKILL_SOURCE, databaseList: (projectId) => repository.listSkills(projectId) });
 const objectStore = new ContentObjectStore();
+// 派生正文指标回填随 migrate 尾跑（对象存储在此构造，先于启动路径），worker 同路径。
+await repository.migrate(runtime.migrationsDir, objectStore);
+const skillProvider = createConfiguredSkillProvider({ source: process.env.NOVEL_SKILL_SOURCE, databaseList: (projectId) => repository.listSkills(projectId) });
 await bindRuntimeObjectStore(repository, objectStore, "api");
 const { configStore: modelConfigStore, gateway: model } = await createRuntimeModelGateway(repository, objectStore);
 const qdrant = new QdrantClient({ url: runtime.qdrantUrl });
 const qdrantMemory = new QdrantMemoryProvider(qdrant, model, runtime.qdrantCollection, runtime.embeddingDimension,
   // 语义检索的存活判定接回库内可见集（payload 是索引时刻的副本，不能作数）。
   (projectId, rowIds) => repository.filterIndexableMemoryRowIds(projectId, rowIds));
-const wordCountBackfill = await repository.backfillMissingContentWordCounts(objectStore);
-if (wordCountBackfill.updated || wordCountBackfill.failed) console.log("[word-count] content blob backfill", wordCountBackfill);
 // API 入口的 commitService 也启用 chapter memory 创建（与 worker 保持一致）
 // 设计依据：AGENTS.md「commit-stage 对新 DocumentRevision 创建 chapter memory」契约
 const commitService = new CommitService(repository, objectStore, { model, memoryIndex: qdrantMemory });

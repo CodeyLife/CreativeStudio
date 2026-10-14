@@ -486,7 +486,21 @@ export class NovelPostgresRepository {
     if (result.rowCount) throw new Error(`故事弧已有活动工作流：${result.rows[0].temporal_workflow_id}`);
   }
 
-  async migrate(migrationsDir = process.env.NOVEL_V2_MIGRATIONS_DIR ?? join(process.cwd(), "deploy", "postgres")) {
+  /**
+   * 应用迁移 + 启动写路径尾部修复。
+   *
+   * `objects` 可选：传入对象存储适配器时，尾部会一并跑派生正文指标回填
+   * （`backfillMissingContentWordCounts`）。**为什么在 migrate 尾而不是调用方**：
+   * 迁移新增的可空派生列（对白量）由消费方按"NULL = 不可测"排除，而历史上
+   * 回填只挂在 API 入口的启动代码上——worker 同样调 migrate、同样消费该信号，
+   * 却永远不回填。于是"迁移已落地、信号恒为空"可以长期静默：实测迁移 098
+   * 增列后运行库 424/424 个历史 blob 的 dialogue_characters 全为 NULL，
+   * 对白密度信号对规划面与弧审核面始终不可见（docs/novel-v2/state-audit-20261013.md
+   * §7 第 5 项的机制在自己的部署面上空转）。migrate 是 API 与 worker 唯一共同调用
+   * 的启动路径，与既有的 6 条启动修复同层，故回填归于此处；调用方缺省不传即
+   * 保持既有行为（测试库不接对象存储）。
+   */
+  async migrate(migrationsDir = process.env.NOVEL_V2_MIGRATIONS_DIR ?? join(process.cwd(), "deploy", "postgres"), objects?: ObjectStoreAdapter) {
     const files = readMigrationFiles(migrationsDir);
     if (!files.length) throw new Error(`没有找到 V2 数据库迁移：${migrationsDir}`);
     const manifest = readMigrationManifest(migrationsDir);
@@ -527,6 +541,12 @@ export class NovelPostgresRepository {
     await this.repairForeshadowingPayoffLedger();
     await this.repairStoryArcBatchCompleteFlags();
     await this.repairForeshadowingLedgerDuplicates();
+    if (objects) {
+      // 派生正文指标回填（内容寻址、逐行 try/catch，对象不可读只计失败不抛）。
+      // 幂等：已回填的行不再进选择集，故每次启动为零行扫描。
+      const derived = await this.backfillMissingContentWordCounts(objects);
+      if (derived.updated || derived.failed) console.warn(`[migrate] content blob 派生指标回填更新 ${derived.updated} 行、失败 ${derived.failed} 行`);
+    }
     await this.seedWorkspaceSkills();
     const expiredOrphanTasks = await this.expireOrphanedModelTasks();
     if (expiredOrphanTasks) console.warn(`[migrate] 收编 run 已终态/缺失的未交付外部任务 ${expiredOrphanTasks} 条`);
@@ -742,6 +762,10 @@ export class NovelPostgresRepository {
    * 逐行取对象存储原文，只补仍为 NULL 的列（`word_count` / `dialogue_characters` 各自
    * 独立判定，避免其中一个已有值时另一个漏补）。对白量口径见
    * src/novel-v2/word-count.ts 的 `countDialogueCharacters`。
+   *
+   * 调用点只有 `migrate()` 尾（传入 objects 时）：见该处的根因说明——回填必须落在
+   * API 与 worker 共同经过的启动路径上，只挂一个入口会让另一侧的消费方永远看不见
+   * 这批派生指标。
    */
   async backfillMissingContentWordCounts(objects: ObjectStoreAdapter): Promise<{ updated: number; failed: number }> {
     const result = await this.pool.query<{ content_hash: string; object_key: string }>(

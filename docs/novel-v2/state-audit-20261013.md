@@ -660,6 +660,34 @@ seed 只在**服务启动**时由 `migrate()` 尾的 `seedWorkspaceSkills` 灌�
    - 迁移：`deploy/postgres/098_content_blob_dialogue_characters.sql`（`content_blobs` 增列）。
    - 测试：`src/novel-v2/__tests__/dialogue-density-signal.test.ts`。
 
+   **部署面空转与修复（2026-10-14 复核轮实测，本项最严重的一处）**：以上链条在**代码层全通**，
+   但在运行库上**完全不可见**。实测（`tmp/state-audit/verify-dialogue-signal-liveness.mts`，只读）：
+   `content_blobs` 424 行中 `dialogue_characters IS NULL` 的有 **424 行**（同表 `word_count` 为 0 行 NULL），
+   近窗口 6 章（163-168）可测章数 **0** ⇒ `inspectDialogueDrift` 恒返回 `undefined` ⇒
+   `renderStoryArcDialogueDrift` 恒返回空串 ⇒ 本信号的规划面与弧审核面**从未收到过任何数字**。
+   同批实测：`schema_migrations` 无 098 行（列与约束已存在，账本行缺失），doctor `migrations` FAIL。
+   **根因（部署层，非算法层）**：`backfillMissingContentWordCounts` 本身正确且有测试，但其唯一调用点
+   挂在 `scripts/novel-v2-api.ts` 的启动代码里；`scripts/novel-v2-worker.ts` 同样调 `migrate()`、
+   同样经 `getStoryArcPlanningInput` 消费该信号，却**永远不回填**。而"观测命令不得 migrate"
+   （skill-drift 同款设计纪律）使 doctor 也不会顺手补上它。这与 §5 的技能漂移是同一形态：
+   **seed 已改、库没重灌、服务没重启 ⇒ 新机制静默空转**。
+   **为什么单测全绿而机制是死的**：`inspectDialogueDrift` 与渲染层的每个单测都自带
+   `dialogueCharacters`，没有一个用例走到"库里这一列是 NULL"这条真实路径；NULL 分支只有
+   `row.dialogue_characters === null → return []` 一行，属"不可测即排除"的正确实现，
+   没有任何断言覆盖"整库皆 NULL 时信号应当缺席"这件事。
+   **修复**：回填归位到 `migrate()` 尾（API 与 worker 唯一共同经过的启动路径，与既有 6 条
+   启动修复同层），`migrate(dir, objects?)` 第二参可选——调用方缺省不传即保持既有行为
+   （测试库不接对象存储）。两个入口都改为传 `objectStore`。
+   **修复后实测**：424/424 回填成功（失败 0）；`schema_migrations` 补上 098 行
+   （`ALTER TABLE … IF NOT EXISTS` 幂等，migrate 自愈）；doctor `migrations` 与 `skill-drift`
+   均由 FAIL 转 OK；近窗口信号 = `{windowSize:6, avgRatio:0.85%, silentOrders:[167], minRatio:0}`——
+   **低于 `hintBelowRatio`(1%) 且含一章零对白，"对白密度提示"自此会真的触发**。
+   同窗口用 `.novel-bench` 基线语料按 `countDialogueCharacters` 独立复算，与库内值**逐位相等**
+   ⇒ 口径无偏，回填写进去的就是准则函数会算出的数。
+   **回归锁**（`src/novel-v2/__tests__/serial-context-db.test.ts` 新增一例）：用真库行驱动，
+   断言"列为 NULL 时信号缺席（不是报假零对白）"与"回填后信号在场、窗口 6 章全可测、
+   均占比落在 (0,1) 开区间"；反向摘除 migrate 尾的调用即判红（本轮已实测双向）。
+
    **边界的裁决与落地（2026-10-14，作者裁选项 ①，已实施）**：本节原写"边界：只报告窗口统计与
    "零对白章"清单（结构事实，无审美阈值），不设绝对下限、不做逐章门"，而实现里 `story-arc.ts`
    有一个**渲染层触发阈值** `avgRatio < 0.01`，决定是否追加"对白密度提示"那段文案。
@@ -710,6 +738,24 @@ seed 只在**服务启动**时由 `migrate()` 尾的 `seedWorkspaceSkills` 灌�
 - Docker 基础设施 5 容器在跑：postgres(5432)、temporal(7233)、temporal-ui(8088)、minio(9000/9001)、qdrant(6333)。Novel V2 API(4770) 与 Worker 未运行。
 - 工作区既有未提交改动（与本轮无关）：`CONTEXT.md`、`README.md`、`src/lib/imageStore.ts`、`src/stores/asset.ts`、`src/stores/history.ts`，新增 `src/lib/cappedList.ts` 及三个测试文件。
 
+### 8.1 复核轮（2026-10-14）：一处"代码全通而机制空转"的部署缺陷
+
+本轮以严苛读者 + 工程师双视角复查上表全部行，重点验证"已落地"的机制是否**真的在运行库上生效**（而非仅代码层正确），发现并修复 §7 第 5 项对白密度信号的部署面空转（详见该节末段：424/424 派生列全 NULL ⇒ 窗口可测章数 0 ⇒ 信号恒 undefined ⇒ 规划面与弧审核面从未收到任何数字）。
+
+| 项 | 修复前 | 修复后 |
+|---|---|---|
+| `content_blobs.dialogue_characters IS NULL` | 424 / 424 | 0 / 424 |
+| 近窗口（163-168）可测章数 | 0 | 6 |
+| `inspectDialogueDrift` 实得 | `undefined` | `{windowSize:6, avgRatio:0.85%, silentOrders:[167], minRatio:0}` |
+| "对白密度提示"是否触发 | 从不 | 均占比 0.85% < 1% 且含一章零对白 ⇒ 触发 |
+| `schema_migrations` 098 行 | 缺失 | 已在（migrate 幂等自愈） |
+| doctor `migrations` / `skill-drift` | FAIL / FAIL | OK / OK |
+| 库内值 vs 基线语料独立复算 | 无值可比 | 逐位相等 |
+
+- 改动：`migrate(dir, objects?)` 增可选对象存储参，派生指标回填归位 migrate 尾；`scripts/novel-v2-api.ts` 与 `scripts/novel-v2-worker.ts` 均传 `objectStore`（worker 此前完全不回填，是本缺陷的直接成因）。
+- 验证：`npm run lint` 干净；`npm run test` → **141 files / 1291 tests 全绿**（新增 2 例：`migrate-tail-repairs` 的双向回填、`serial-context-db` 的真库信号缺席/在场）；**反向实测**——摘除 migrate 尾的调用，两条新测试同时判红（本轮已跑）；跑 sanctioned 启动路径后运行库 424 行全部回填、doctor 三项 FAIL 全部转 OK。
+- 读者视角附记（本轮精读 049/051/056/059/062/064/067 等章）：主线文字质量为"冰山式克制"，问题不在句子而在**重复的可感知结构**——主角反复以同一套动作清点随身物件（废石/玉牌/丹/碎角/左膝/回执/草图，各配一次"凉"）、以指节敲纸排列日期、以"数呼吸/数天色"收尾。机械测量（`tmp/state-audit/`）：道具盘点词族全书 862 处 / 每千字 1.89，最高 038 章 13.13/千字；"凉"字 276 处 / 每千字 0.68，最高 062 章 6.24/千字（15 次）。该形态**不是单章缺陷而是跨章惯性**，与 §7 第 5 项的对白崩落同源（对手戏缺席 → 以物件与内省填充章节），属生成面指引问题而非事实记忆问题；因已定稿章不回溯，本轮不改正文，记录为下一轮生成面指引的候选输入。
+
 ---
 
 ## 9. 取证路径备查
@@ -722,4 +768,5 @@ seed 只在**服务启动**时由 `migrate()` 尾的 `seedWorkspaceSkills` 灌�
 - 重复提取复测 SQL（§3.4）：① 被退役的提取工件 `SELECT count(*) FILTER (WHERE NOT EXISTS (SELECT 1 FROM memory_claim_sources s WHERE s.artifact_id=a.id)) AS no_sources, count(*) AS total FROM artifacts a WHERE a.project_id='<id>' AND a.kind='fact-extraction'`；② 多代际文档 `SELECT s.document_id FROM memory_claim_sources s JOIN artifacts a ON a.id=s.artifact_id WHERE s.project_id='<id>' AND s.lifecycle_status='active' AND a.kind='fact-extraction' GROUP BY s.document_id HAVING count(DISTINCT s.artifact_id)>1`；③ 陈旧来源按工件 kind 分解 `... JOIN manuscript_documents d ON d.id=s.document_id WHERE s.lifecycle_status='active' AND s.revision_id IS DISTINCT FROM d.current_revision_id GROUP BY a.kind`；④ 单章 revision 时间线 `SELECT r.revision, r.created_at, r.retention_class, (SELECT count(*) FROM memory_claim_sources s WHERE s.revision_id=r.id AND s.lifecycle_status='active') AS active_sources FROM manuscript_revisions r WHERE r.project_id='<id>' AND r.document_id=(SELECT id FROM manuscript_documents WHERE project_id='<id>' AND narrative_order=1) ORDER BY r.revision`。
 - 章名取证 SQL（§7 第 4 项）：① 标题长度分布 `SELECT char_length(title) AS len, count(*) FROM chapters WHERE project_id='<id>' GROUP BY 1 ORDER BY 1`；② 短标题清单 `SELECT ordinal, title FROM chapters WHERE project_id='<id>' AND char_length(title) <= 2 ORDER BY ordinal`；③ 标题是否出自蓝图 `SELECT count(*) FILTER (WHERE payload->>'title' = title) AS from_blueprint, count(*) FROM chapters WHERE project_id='<id>'`；④ 更名工作流是否跑过 `SELECT type, status, count(*) FROM workflow_runs GROUP BY 1,2`（查 `chapter-title`）与 `SELECT event_type, count(*) FROM outbox_events GROUP BY 1`（查 `chapter.title-generated`）。
 - 对白密度取证（§2 与 §7 第 5 项）：`node --import tsx tmp/state-audit/measure-dialogue-density.mts`（读 `.novel-bench/baselines/spiritcode-r363/chapters/*.txt`，确定性、零模型调用，输出分段对白字/段占比、全书均值与最低/最高 15 章）。判定"是否有测量通道"：`grep -rn "对话|引号|dialogue" src/novel-v2`（44 处，无正文对白统计）+ 读 `src/novel-v2/application/manuscript-structure.ts`（8 个结构通道里引号相关只有 `manuscript.quote-pairing`）+ `SELECT count(*) FROM style_contracts`（0 行 ⇒ 含 `dialogueRatio` 的文风契约未实例化）。
+- 对白密度**信号存活**取证（§7 第 5 项的 10-14 复核）：`node --import tsx tmp/state-audit/verify-dialogue-signal-liveness.mts`（只读，零模型调用）——输出 content_blobs 的 NULL 分布、窗口可测章数、`inspectDialogueDrift` 实得报告，以及用 `.novel-bench` 基线语料按 `countDialogueCharacters` **独立复算**的同窗口反事实报告。两者相等即"库内值 = 准则函数值"（口径无偏）。
 - 本轮新增/改动脚本与测试：`src/novel-v2/__tests__/length-contract-single-source.test.ts`（篇幅契约单源，3 例）、`src/novel-v2/__tests__/length-declaration-floor.test.ts`（声明侧项目级下限，6 例）、`src/novel-v2/__tests__/skill-runtime.test.ts`（SK-5/C5 用例扩展，+0 例）与 `src/novel-v2/__tests__/native-schema.test.ts`（章名下限对齐，+1 例）；`tmp/state-audit/verify-declaration-floor.mts`（按弧复算声明侧信号，只读）、`tmp/state-audit/verify-injection-e2e.mts`、`tmp/state-audit/verify-combined-ab.mts`、`tmp/state-audit/verify-subject-normalization.mts`、`tmp/state-audit/verify-holding-slot.mts`、`tmp/state-audit/verify-dormancy-filter.mts`（均为只读取证脚本）。

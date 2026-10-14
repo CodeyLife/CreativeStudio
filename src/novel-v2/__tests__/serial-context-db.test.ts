@@ -3,6 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { NovelPostgresRepository } from "../postgres-repository";
 import { isPostgresUnavailable } from "./test-db";
 import { serialContextFingerprint } from "../application/serial-context-fingerprint";
+import type { ObjectStoreAdapter } from "../object-store";
 import type { ChapterMemory } from "../protocol";
 
 const TEST_DB_URL = process.env.TEST_DATABASE_URL ?? "postgresql://ymcp:ymcp@127.0.0.1:5432/ymcp_test";
@@ -162,5 +163,49 @@ describe("serial context snapshot (L1)", () => {
     expect(deadline?.establishedAtOrder).toBe(8);
     const orphan = serial!.openPromises.find((item) => item.statement.includes("孤儿"));
     expect(orphan?.establishedAtOrder).toBeNull();
+  });
+
+  /**
+   * 对白密度信号必须真的从库里产出来，而不是只在单测夹具里活着。
+   *
+   * 这条锁的是 2026-10-14 在生产库实测到的空转形态：`inspectDialogueDrift` 的每个
+   * 单测都自带 `dialogueCharacters`，没有一个走到"库里是 NULL"这条真实路径；而运行库
+   * 424/424 个历史 blob 的该列全为 NULL（消费方按 NULL=不可测整章排除），于是窗口内
+   * 可测章数 0、信号恒 undefined——**所有单测全绿而机制完全不可见**。
+   * 故此处用真库行驱动，并把"可测章数"作为断言对象：NULL 形态必须被测成" Signal 缺席"，
+   * 已回填形态必须被测成"Signal 在场且数值与口径函数一致"。
+   */
+  it("对白密度信号由库内派生列产出；列为 NULL 时信号缺席而不是报假零", async () => {
+    if (!available) return;
+    // 本项目的 6 章 blob 全部 dialogue_characters IS NULL（建库时只插了 byte_length）。
+    const before = await repository.getStoryArcPlanningInput(projectId);
+    expect(before?.dialogueDrift).toBeUndefined();
+
+    // 回填：migrate 尾（传入对象存储）会按正文原文补上两个派生列。此处给每个 blob 一份
+    // 真实可读文本——一半在引号内，使"对白字占比"既非 0 也非 1，能分辨"算了"与"算错"。
+    const bodies = new Map<string, string>();
+    const objects = {
+      getText: async (key: string) => {
+        const body = bodies.get(key);
+        if (!body) throw new Error(`对象不可读：${key}`);
+        return body;
+      },
+    } as unknown as ObjectStoreAdapter;
+    for (let order = 7; order <= 12; order += 1) {
+      const key = `test/serial-content-${projectId}-${order}`;
+      bodies.set(key, `他推开门。他说：「第${order}章记下了。」窗外雨还在下，屋里没有人应声。`);
+    }
+    await repository.migrate(undefined, objects);
+
+    const after = await repository.getStoryArcPlanningInput(projectId);
+    expect(after?.dialogueDrift).toBeDefined();
+    const drift = after!.dialogueDrift!;
+    // 窗口内的章必须全部可测——少任何一章都说明该章的派生列没补上（半修正是要防的形态）。
+    expect(drift.windowSize).toBe(6);
+    expect(drift.silentOrders).toEqual([]);
+    // 均占比必须落在 (0,1) 开区间：报 0 说明把 NULL 当成了零对白，报 1 说明口径错。
+    expect(drift.avgRatio).toBeGreaterThan(0);
+    expect(drift.avgRatio).toBeLessThan(1);
+    expect(drift.minRatio).toBeGreaterThan(0);
   });
 });

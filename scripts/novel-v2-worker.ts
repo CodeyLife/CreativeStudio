@@ -19,9 +19,12 @@ Object.assign(process.env, loadRuntimeEnv(process.cwd()));
 const runtime = resolveNovelRuntimeConfig(process.env);
 
 const repository = new NovelPostgresRepository(runtime.databaseUrl);
-await repository.migrate(runtime.migrationsDir);
-const skillProvider = createConfiguredSkillProvider({ source: process.env.NOVEL_SKILL_SOURCE, databaseList: (projectId) => repository.listSkills(projectId) });
 const objectStore = new ContentObjectStore();
+// 派生正文指标（字数 / 对白量）回填随 migrate 尾跑。worker 是弧规划与章节生成的
+// 执行进程，也是对白密度信号的直接消费方——该回填此前只挂在 API 入口，于是 worker
+// 重启多少次都补不上历史 blob，信号对本进程恒为空（state-audit §7 第 5 项的空转形态）。
+await repository.migrate(runtime.migrationsDir, objectStore);
+const skillProvider = createConfiguredSkillProvider({ source: process.env.NOVEL_SKILL_SOURCE, databaseList: (projectId) => repository.listSkills(projectId) });
 await bindRuntimeObjectStore(repository, objectStore, "worker");
 const qdrant = new QdrantClient({ url: runtime.qdrantUrl });
 const { gateway: modelGateway } = await createRuntimeModelGateway(repository, objectStore);

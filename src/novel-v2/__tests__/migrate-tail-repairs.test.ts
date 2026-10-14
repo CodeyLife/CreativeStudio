@@ -3,7 +3,7 @@ import { isPostgresUnavailable } from "./test-db";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { NovelPostgresRepository } from "../postgres-repository";
 import type { ObjectStoreAdapter } from "../object-store";
-import { countNovelCharacters } from "../word-count";
+import { countDialogueCharacters, countNovelCharacters } from "../word-count";
 
 /**
  * migrate() 尾部启动写路径的双向回归（复核轮 F7）。
@@ -216,5 +216,62 @@ describe("migrate 尾启动修复路径", () => {
     // 选择判据要求"当前修订且 reviewed_content_hash 无匹配快照"，已在场即不得重复物化。
     const snapshots = await repository.pool.query<{ n: number }>("SELECT count(*)::int AS n FROM chapter_review_snapshots WHERE document_id=$1", [documentId]);
     expect(snapshots.rows[0].n).toBe(1);
+  });
+
+  /**
+   * 派生正文指标回填必须落在 migrate 尾，而不是某一个服务入口的启动代码上。
+   *
+   * 失败类（运行库 2026-10-14 实测，非推断）：迁移 098 给 content_blobs 增了可空的
+   * `dialogue_characters`，消费方（getStoryArcPlanningInput → inspectDialogueDrift）
+   * 按"NULL = 不可测"把该章整章排除出分母。回填函数 `backfillMissingContentWordCounts`
+   * 本身正确且有测试，但唯一调用点在 `scripts/novel-v2-api.ts` 的启动代码里——worker
+   * 同样调 migrate、同样消费这个信号，却永远不回填。结果：424/424 个历史 blob 的
+   * 该列全为 NULL，窗口内可测章数为 0，`inspectDialogueDrift` 恒返回 undefined，
+   * 对白密度信号对规划面与弧审核面**完全不可见**而所有单测全绿（信号层的夹具都自带
+   * dialogueCharacters，没有一个走到"库里是 NULL"这条真实路径）。
+   *
+   * 双向覆盖：
+   *   - 传入 objects ⇒ migrate 尾回填真修一次（历史 blob 补上两个派生列）；
+   *   - 重放 ⇒ 零变更（选择判据已不成立，连行版本都不抬，不制造每次启动的静默损耗）；
+   *   - 不传 objects ⇒ 既有调用方零回归（测试库不接对象存储时不因新依赖失败）。
+   */
+  it("migrate 尾补齐派生正文指标，缺对象存储时跳过而非失败", async () => {
+    if (!available) return;
+    // 本项目只为把 blob 挂到一个真实 project_id 下（外键需要），派生指标与项目无关。
+    await newProject("派生指标");
+    const contentHash = `derived-content-${suffix}`;
+    const objectKey = `tail/${contentHash}`;
+    // 混合文本：一部分在引号内（对白），一部分在外——两个派生列必须各自算对，
+    // 否则"补了一个没补另一个"这类半修会被本用例放过。
+    const text = "他推开门，屋里没有人。他说：「我记下了。」窗外的雨还在下。";
+    const objects = {
+      getText: async (key: string) => {
+        if (key !== objectKey) throw new Error(`意外读取 ${key}`);
+        return text;
+      },
+    } as unknown as ObjectStoreAdapter;
+    await repository.pool.query("INSERT INTO content_blobs(content_hash,object_key,byte_length) VALUES($1,$2,$3)", [contentHash, objectKey, Buffer.byteLength(text, "utf8")]);
+
+    // 第一向：migrate(objects) 真修——迁移已应用（beforeAll 跑过），此处只验回填尾。
+    const repaired = await repository.migrate(undefined, objects);
+    expect(repaired).toBeUndefined(); // migrate 不返回值；回填结果只进日志
+    const metrics = await repository.pool.query<{ word_count: string | null; dialogue_characters: string | null }>(
+      "SELECT word_count, dialogue_characters FROM content_blobs WHERE content_hash=$1",
+      [contentHash],
+    );
+    expect(Number(metrics.rows[0].word_count)).toBe(countNovelCharacters(text));
+    expect(Number(metrics.rows[0].dialogue_characters)).toBe(countDialogueCharacters(text));
+
+    // 第二向：重放零变更。判据用 xmin 而不是再读一次值——同值重写读起来一模一样，
+    // 只有行版本能证明"根本没再碰过"（与 books / blob 那几条同一判据）。
+    const versionOf = async () => (await repository.pool.query<{ v: string }>("SELECT xmin::text::bigint AS v FROM content_blobs WHERE content_hash=$1", [contentHash])).rows[0].v;
+    const afterFirst = await versionOf();
+    await repository.migrate(undefined, objects);
+    expect(await versionOf()).toBe(afterFirst);
+
+    // 第三向：缺 objects 不得抛。回填唯一的失败模式应是"没有对象存储可读"，
+    // 而那不是运行时不健康——启动路径不能因此停摆（测试库即此形态）。
+    await expect(repository.migrate(undefined)).resolves.toBeUndefined();
+    expect(await versionOf()).toBe(afterFirst);
   });
 });
