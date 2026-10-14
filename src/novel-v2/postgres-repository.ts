@@ -852,14 +852,14 @@ export class NovelPostgresRepository {
     return { projectId, status: "rebuild-requested" as const, requestedAt, consecutiveCriticalMisses: result.rows[0].consecutive_critical_misses, missingFacets: result.rows[0].last_missing_facets };
   }
 
-  async completeMemoryRebuild(projectId: string, indexedClaims: number) {
+  async completeMemoryRebuild(projectId: string, indexedClaims: number, removedStalePoints = 0) {
     await this.pool.query(`
       INSERT INTO memory_gate_states(project_id,consecutive_critical_misses,last_missing_facets,last_checked_at)
       VALUES($1,0,'{}',now())
       ON CONFLICT(project_id) DO UPDATE SET consecutive_critical_misses=0,last_missing_facets='{}',last_checked_at=now()
     `, [projectId]);
-    await this.appendOutbox("memory-gate", projectId, "memory.rebuild-completed", { projectId, indexedClaims });
-    return { projectId, status: "ready" as const, indexedClaims };
+    await this.appendOutbox("memory-gate", projectId, "memory.rebuild-completed", { projectId, indexedClaims, removedStalePoints });
+    return { projectId, status: "ready" as const, indexedClaims, removedStalePoints };
   }
 
   async backfillCurrentChapterReviewSnapshots(): Promise<number> {

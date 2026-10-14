@@ -798,6 +798,58 @@ serial-signals 指纹改为**无条件登记**（该段恒非空，故无条件�
 **反向实测**：把 serial 段改取 `payoff-rhythm` 键（缺陷二形态）→ 对账用例判红；
 把 `${LENGTH_DRIFT_POLICY.sparseFloor}` 改回字面量 1800 → 双写锁判红（均已跑）。
 真库复验：`payoff-rhythm` 键消失、`serial-signals` 键恒在、`secrets` 补登、serial 段带真实引用。
+
+### 8.3 复核轮 round 4（2026-10-14）："观测面报的病，它开的药方治不了"
+
+以工程师视角复查 doctor `memory-index-drift`（欠灌行 76 / 陈旧点 42 / 脏索引项目 1）的
+**处方链**，发现告警与修复路径脱节。三层取证（`tmp/state-audit/verify-stale-points.mts`、
+`verify-stale-point-consequences.mts`、`verify-stale-point-recall-budget.mts`，均只读）：
+
+**① 先问"告温是不是真的"**——42 个陈旧点索引时刻全是 `active`（derived 27 / approved 15，
+全部 `kind=episodic`），没有一个能对上当前可见行 id。按 payload.claim.id 回库分类：
+**行已删 15 / 行 active 但携带 supersedes 10 / 行 active 被可见杀手退役 12 / 行 staged 5**。
+⇒ 基线谓词没错，告温为真。
+
+**② 再问"后果有多实"**——`wouldBeRecalledAsLive = 0`：42 个点的 payload.claim.id
+**全部不在当前可见集**，召回侧 `filterIndexableMemoryRowIds` 会把它们全部丢弃。
+⇒ **不是正确性缺陷**（不会把退役内容当现行事实），这一条必须如实记录，不能夸成"读到假事实"。
+
+**③ 但代价是真的**——42 个点**全部会通过 Qdrant 服务端过滤器**（`lifecycleStatus=active`
+∧ `authority ∈ 可见集` 读的是**索引时刻的载荷副本**），于是真的进入 `limit: 64` 的
+top-K 召回窗，只在应用层才被丢弃。**名额是在服务端检索阶段就被占掉的，应用层丢弃救不回那 64 个位置。**
+叙事分布：41/42 的 `narrativeStart ≤ 139`，集中在第 1-32 章。⇒ 后果是"近期真事实被挤出召回窗"，
+与"读到假事实"是另一条路径（一个是读不到真的，一个是读到假的），量级小但方向真实。
+
+**④ 根因：处方链断裂**——doctor 的 detail 明写"陈旧点会把已退役内容当现行事实召回，走
+POST /v2/projects/:id/memory/rebuild 重建"，而该路由（`scripts/novel-v2-api.ts`）**只做补灌**：
+它 upsert 全部可见行，而 `upsertClaims` 只删**被本次 upsert 的行 supersedes** 的点——
+对"行已删 / 已 staged / 已被此后行退役"而点仍在索引里的陈旧点完全无动作。
+**⇒ doctor 报的正是 rebuild 修不了的那个方向**：补灌能修欠灌（76 条），陈旧点（42 个）一个都修不掉。
+这是"不抛错、不影响任何科目通过、只是让告警长期挂着无人能解"的又一件。
+
+**修复（最低共享层）**：
+- `memory-index-drift.ts` 新增 `staleMemoryPointIds(baseline, indexed)`：把"单项目陈旧点差集"
+  从 `detectMemoryIndexDrift` 的多项目对账里抽出，**与 doctor 共用同一判据**（不写第二套集合差）；
+  `indexed === null`（点集不可得）返回空——拿不到实有集合就不能安全删。
+- `memory/rebuild` 路由补上清理：基线取 `listIndexableMemoryRowIds`（与 doctor **同一函数**），
+  翻页走完才删（半个集合会把未翻到的现行点当陈旧点盲删），删点失败只 warn 不阻断
+  （PostgreSQL 是权威真源 + 召回侧有 filterLiveRowIds 兜底）；`completeMemoryRebuild`
+  增 `removedStalePoints` 计数，经 outbox 事件带出。
+- **为何按点 id 直删而不是走 `deleteClaims`**：后者的契约是"行 id → 内部散列"，
+  而陈旧点的行通常已不在基线里（这正是它成为陈旧点的原因），拿不到行 id。
+
+**运行库实修**（`tmp/state-audit/verify-stale-point-cleanup.mts`，会写 Qdrant）：
+陈旧点 **42 → 0**；索引内可见点 **2089 → 2089（零误删）**；欠灌 76 条留给 rebuild 补灌侧。
+二次运行 0 → 0（幂等）。doctor 复跑：`陈旧点 0 个（脏索引项目 0 个）`。
+**本条最需留意的判据**：误删判据不能说"expected 里的点不在 after 里就是丢了"——
+欠灌的 76 条本来就不在索引里，把它们算成丢失是验证脚本自己的假红（首版即如此，已修）；
+正确判据是"清理前在索引里的可见点，清理后必须还在"。
+
+**回归锁**（`prompt-execution-retention.test.ts` 新增 2 例）：① `staleMemoryPointIds`
+与 `detectMemoryIndexDrift` 的 `extraPointIds` **逐项相等**（同一判据），点集不可得返空、
+干净集返空；② 源码级路由锁——rebuild 段内必须出现 `staleMemoryPointIds` 与
+`listIndexableMemoryRowIds`，不得内联集合差，删除必须走 `qdrant.delete`。
+**反向实测**：把 rebuild 路由摘回"只补灌"形态，路由锁判红（已跑）。
 - 读者视角附记（本轮精读 049/051/056/059/062/064/067 等章）：主线文字质量为"冰山式克制"，问题不在句子而在**重复的可感知结构**——主角反复以同一套动作清点随身物件（废石/玉牌/丹/碎角/左膝/回执/草图，各配一次"凉"）、以指节敲纸排列日期、以"数呼吸/数天色"收尾。机械测量（`tmp/state-audit/measure-narrative-idioms.mts`，确定性、零模型调用）：道具盘点词族全书 862 处 / 每千字 2.16，最高 032 章 15.56/千字；"凉"族 317 处 / 每千字 0.78，最高 062 章 7.18/千字；数数收尾族 221 处 / 每千字 0.60。**分段均值揭示两族峰值都落在商业基准确诊的"死亡象限"内**：道具盘点族 21-40 章 5.30/千字（全书 6.6× 的 2.16）、41-60 章 4.79、61-80 章 3.81；温度族 61-80 章 1.52/千字（全书近 2× 的 0.78）。⇒ 与 §7 第 5 项的对白崩落**同源**：对手戏缺席，章节以物件清点与内省填充。该形态**不是单章缺陷而是跨章惯性**，属生成面指引问题而非事实记忆问题；已定稿章不回溯，故不动正文。
 - **本轮落地的生成面指引**（`skills/novel-v2/prose-craft.yaml` 1.4.0 → 1.5.0，三面同步）：写作侧要求"本章这次清点必须与以往任何一次不同——带来新信息（某件位置/状态真的变了）、新选择（据此决定下一步）或新代价（清点本身有风险），三者都不成立时改为写清点之后的那一个动作"，并把"以数数收束一章"并列为同类惯性（一处是留白，多处是模板）；审核侧列为必查项，且**要求报告指明它挤掉了什么**（本章缺的那次交锋、那次变化），把动刀理由钉在"该有的现场没发生"而非"这个动作出现太多次"；修订侧给出修法"不是删清单，而是给这次清点安上它缺失的功能"。判据用通用叙事模式描述（随身物件清点 + 同类温度/质感判定 + 数数收尾），不含任何本书专有物件名，跨题材复用。测试：`skill-runtime.test.ts` 新增一例，三面接线 + 写作侧三条件 + 审核侧"挤掉了什么"均在场；反向摘除写作侧该段即判红（本轮已实测）。
 

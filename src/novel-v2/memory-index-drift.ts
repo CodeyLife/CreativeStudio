@@ -52,3 +52,22 @@ export function detectMemoryIndexDrift(
   });
   return { rows, dirty: rows.filter((row) => row.extraPointIds.length > 0) };
 }
+
+/**
+ * 单项目的陈旧点点 id 清单（重建路径的清理输入）。
+ *
+ * 与 {@link detectMemoryIndexDrift} 共用同一套基线推导，只是把"按项目分组对账"
+ * 收成"给定一个项目的基线与实有点集，给出差集"。之所以单独成函数而不是让调用方
+ * 自己 `[...indexed].filter(...)`：重建路径（api 的 memory/rebuild）与 doctor 的
+ * 观测面必须对"什么是陈旧点"有同一份定义，否则又会出现"doctor 说旧、rebuild 说新"
+ * 的第二次口径分叉——那正是本模块存在的原因（见文件头注释的"比较的是集合"）。
+ *
+ * `indexed === null`（点集不可得）时返回空数组：拿不到实有集合就不能安全地删，
+ * 此时正确行为是"不删"而不是"全删"。
+ */
+export function staleMemoryPointIds(baseline: MemoryIndexBaseline, indexed: ReadonlySet<string> | null): string[] {
+  if (indexed === null) return [];
+  const rowIds = [...baseline.claimIds, ...baseline.chapterMemoryIds];
+  const expected = new Set(rowIds.map((rowId) => qdrantPointId(baseline.projectId, rowId)));
+  return [...indexed].filter((pointId) => !expected.has(pointId));
+}

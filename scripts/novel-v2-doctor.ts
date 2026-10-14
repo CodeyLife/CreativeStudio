@@ -121,9 +121,13 @@ try {
     const { rows, dirty } = detectMemoryIndexDrift(baseline, indexedByProject);
     const missing = rows.reduce((sum, row) => sum + row.missingRowIds.length, 0);
     const compact = (row: (typeof rows)[number]) => ({ projectId: row.projectId, expected: row.expected, indexed: row.indexed, missing: row.missingRowIds.length, extra: row.extraPointIds.length, extraSample: row.extraPointIds.slice(0, 5), missingSample: row.missingRowIds.slice(0, 5) });
+    const dirtyProjects = dirty.reduce((sum, row) => sum + row.extraPointIds.length, 0);
+    const staleAdvice = dirty.length
+      ? " ⇒ 陈旧点把召回名额让给已不可见内容（召回侧有存活判定兜底，不会读错事实），走 POST /v2/projects/:id/memory/rebuild 重建——该路由补灌欠灌并清理陈旧点两个方向；本检查只报不修"
+      : "";
     set("memory-index-drift", {
       ok: true,
-      detail: `项目 ${rows.length} 个；欠灌行 ${missing} 条；陈旧点 ${dirty.reduce((sum, row) => sum + row.extraPointIds.length, 0)} 个（脏索引项目 ${dirty.length} 个）${dirty.length ? " ⇒ 陈旧点会把已退役内容当现行事实召回，走 POST /v2/projects/:id/memory/rebuild 重建，本检查不自动修" : ""}`,
+      detail: `项目 ${rows.length} 个；欠灌行 ${missing} 条；陈旧点 ${dirtyProjects} 个（脏索引项目 ${dirty.length} 个）${staleAdvice}`,
       data: { dirty: dirty.map(compact).slice(0, 10), underIndexed: rows.filter((row) => row.missingRowIds.length > 0).map(compact).slice(0, 10) },
     });
   } catch (error) { set("memory-index-drift", { ok: false, detail: (error as Error).message }); }

@@ -57,6 +57,7 @@ import { parseStoryArcBundle } from "../src/novel-v2/application/story-arc";
 import { startStoryArcBatchPlanning, startStoryArcPlanning, startStoryArcReview } from "../src/novel-v2/application/story-arc-workflow";
 import { QdrantMemoryProvider } from "../src/novel-v2/qdrant-memory";
 import { chapterMemoryAsClaim } from "../src/novel-v2/chapter-memory";
+import { staleMemoryPointIds, type MemoryIndexBaseline } from "../src/novel-v2/memory-index-drift";
 import { countNovelCharacters } from "../src/novel-v2/word-count";
 import { ChapterStateRebuildConflictError, ChapterStateRebuildService } from "../src/novel-v2/application/chapter-state-rebuild";
 import { inspectManuscript } from "../src/novel-v2/application/manuscript-structure";
@@ -81,6 +82,62 @@ type ReviewIssueShape = ReviewSubmitInput["issues"][number];
 
 const repository = new NovelPostgresRepository(runtime.databaseUrl);
 const objectStore = new ContentObjectStore();
+/**
+ * 扫出某项目当前不在可见基线里的点 id（重建路径的清理输入）。
+ *
+ * **翻页必须走完，走不完就不删**：判据是集合差，半个集合会把"还没翻到的点"算成
+ * 陈旧点——那不是清理，是把现行事实从索引里盲删（召回侧虽仍有 filterLiveRowIds
+ * 兜底不会读错，但语义召回会静默丢事实，且丢的是最难归因的那批）。
+ *
+ * 与 doctor 的 drift 观测走同一套`翻页→集合差`形状，差别只在消费方向：
+ * doctor 只报不删，这里据同一判据执行删除。
+ */
+async function scrollProjectPointIds(client: QdrantClient, collection: string, projectId: string): Promise<Set<string> | null> {
+  const ids = new Set<string>();
+  let offset: string | number | undefined;
+  for (let page = 0; page < 200; page += 1) {
+    const result = await client.scroll(collection, {
+      filter: { must: [{ key: "projectId", match: { value: projectId } }] },
+      limit: 256,
+      with_payload: false,
+      with_vector: false,
+      ...(offset === undefined ? {} : { offset }),
+    });
+    const points = result.points;
+    if (!Array.isArray(points)) return null;
+    for (const point of points) ids.add(String(point.id));
+    // 翻页没走完（next_page_offset 有值却因故没有下一批 / 达上限）⇒ 判不可得，不删。
+    const next = result.next_page_offset;
+    if (!points.length || next == null || typeof next === "object") return ids;
+    offset = next;
+  }
+  return null;
+}
+
+/**
+ * 重建路径的陈旧点清理：基线取 `listIndexableMemoryRowIds`（与 doctor 的漂移判据
+ * **同一个函数**），差集按 `qdrantPointId` 对齐（同一个散列函数）。
+ *
+ * 为什么按**点 id**删而不是按行 id：陈旧点的成因正是它的行已不在基线里（被删 /
+ * 转 staged / 被此后行退役），所以拿不到行 id。`QdrantMemoryProvider.deleteClaims`
+ * 的契约是"行 id → 内部散列"，用不上；这里直接对 Qdrant 按点 id 删。
+ * 删除目标与 `detectMemoryIndexDrift` 的 `extraPointIds` 完全一致（同一判据），
+ * 不存在第二套"什么是陈旧点"的定义。
+ */
+async function collectStaleMemoryPointIds(
+  repository: NovelPostgresRepository,
+  client: QdrantClient,
+  collection: string,
+  projectId: string,
+): Promise<string[]> {
+  const baseline = (await repository.listIndexableMemoryRowIds()).find((row) => row.projectId === projectId);
+  if (!baseline) return [];
+  const indexed = await scrollProjectPointIds(client, collection, projectId);
+  // 点集不可得（非 2xx / 翻页没走完）⇒ 不删。宁可不修，不可误删。
+  if (indexed === null) return [];
+  return staleMemoryPointIds(baseline as MemoryIndexBaseline, indexed);
+}
+
 // 派生正文指标回填随 migrate 尾跑（对象存储在此构造，先于启动路径），worker 同路径。
 await repository.migrate(runtime.migrationsDir, objectStore);
 const skillProvider = createConfiguredSkillProvider({ source: process.env.NOVEL_SKILL_SOURCE, databaseList: (projectId) => repository.listSkills(projectId) });
@@ -1116,7 +1173,28 @@ const server = createServer(async (request, response) => {
       const indexable = [...claims, ...chapterMemories.map(chapterMemoryAsClaim)];
       const batchSize = 64;
       for (let offset = 0; offset < indexable.length; offset += batchSize) await qdrantMemory.upsertClaims(projectId, indexable.slice(offset, offset + batchSize));
-      return send(response, 200, await repository.completeMemoryRebuild(projectId, indexable.length));
+      // 陈旧点清理（2026-10-14 复核轮，state-audit §8.3）：
+      // 本路由此前只做"补灌"——upsertClaims 只删**被本次 upsert 的行 supersedes** 的点，
+      // 对"行已删 / 已 staged / 已被此后行退役"而点仍在索引里的陈旧点完全无动作。
+      // 后果：doctor `memory-index-drift` 报"陈旧点 N 个 ⇒ 走 memory/rebuild 重建"，
+      // 而 rebuild 恰好修不了它指的那个方向——观测面开的药方治不了观测面报的病。
+      // 运行库实测 42 个陈旧点全部会通过 Qdrant 服务端过滤器（载荷副本仍是
+      // active+可见 authority）并占满 top-64 召回名额，只在应用层被
+      // filterLiveRowIds 丢弃；41/42 集中在前 139 章。
+      //
+      // 判据与 doctor 同一函数（staleMemoryPointIds + listIndexableMemoryRowIds），
+      // 不另写一份可见性判据。基线不可得（翻页没走完/非 2xx）时不删——宁可不修。
+      const stalePointIds = await collectStaleMemoryPointIds(repository, qdrant, runtime.qdrantCollection, projectId);
+      if (stalePointIds.length) {
+        try {
+          await qdrant.delete(runtime.qdrantCollection, { points: stalePointIds, wait: true });
+        } catch (error) {
+          // 删点失败不阻断重建：PostgreSQL 是权威真源，召回侧有 filterLiveRowIds
+          // 兜底（陈旧点不会被当现行事实召回），最坏情况是继续占名额。
+          console.warn(`[memory-rebuild] 陈旧点清理失败 ${stalePointIds.length} 个：${(error as Error).message}`);
+        }
+      }
+      return send(response, 200, await repository.completeMemoryRebuild(projectId, indexable.length, stalePointIds.length));
     }
     if (request.method === "GET" && storyArcListMatch) {
       const projectId = decodeURIComponent(storyArcListMatch[1]);

@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { isPostgresUnavailable } from "./test-db";
 import { NovelPostgresRepository } from "../postgres-repository";
 import { promptExecutionRetentionDays } from "../repository/telemetry-slice";
-import { detectMemoryIndexDrift } from "../memory-index-drift";
+import { detectMemoryIndexDrift, staleMemoryPointIds } from "../memory-index-drift";
 import { qdrantPointId } from "../memory-point-id";
 
 const TEST_DB_URL = process.env.TEST_DATABASE_URL ?? "postgresql://ymcp:ymcp@127.0.0.1:5432/ymcp_test";
@@ -191,5 +191,65 @@ describe("memory index drift 判据", () => {
     const writer = readFileSync(new URL("../qdrant-memory.ts", import.meta.url), "utf8");
     expect(writer).toContain('import { qdrantPointId } from "./memory-point-id"');
     expect([...writer.matchAll(/function qdrantPointId/gu)].length, "写入侧不得再留一份实现").toBe(0);
+  });
+
+  /**
+   * 重建路径的陈旧点清理判据（2026-10-14 复核轮，state-audit §8.3）。
+   *
+   * 背景：`memory/rebuild` 此前只"补灌"——upsertClaims 只删被本次 upsert 的行
+   * supersedes 的点，对"行已删 / 已 staged / 已被此后行退役"而点仍在索引里的陈旧点
+   * 完全无动作。于是 doctor 报"陈旧点 N 个 ⇒ 走 memory/rebuild 重建"，
+   * 而 rebuild 恰好修不了它指的那个方向——**观测面开的药方治不了观测面报的病**。
+   *
+   * 双向覆盖：
+   *  - 命中面：差集与 detectMemoryIndexDrift 的 extraPointIds 完全一致（同一判据），
+   *    且覆盖三种成因（行已删 / 行 staged / 行 active 但被可见杀手退役）；
+   *  - 反例面：点集不可得（null）时**必须返回空**——宁可不修，不可误删现行事实。
+   */
+  it("staleMemoryPointIds 与 drift 判据同形，点集不可得时不删", () => {
+    const project = baseline[0]; // p-stale：9 claim + 1 chapter memory
+    const visible = pointSet(project.projectId, [...project.claimIds, ...project.chapterMemoryIds]);
+    // 三种成因各一个：行已删的点 / 行 staged 的点 / 与可见行同形但 id 不同的游离点。
+    const withStale = new Set([...visible, "deleted-row-point", "staged-row-point", "orphan-point"]);
+    expect(staleMemoryPointIds(project, withStale).sort()).toEqual(["deleted-row-point", "orphan-point", "staged-row-point"]);
+
+    // 与 drift 判据一致性：同输入的 extraPointIds 必须逐项相等（不得有第二套定义）。
+    const { dirty } = detectMemoryIndexDrift([project], new Map([[project.projectId, withStale]]));
+    expect(dirty[0]?.extraPointIds.sort()).toEqual(staleMemoryPointIds(project, withStale).sort());
+
+    // 反例：点集拿不到 ⇒ 空。这是删除路径的安全阀——半个集合会把未翻到的现行点
+    // 当陈旧点删掉，那比不修严重得多。
+    expect(staleMemoryPointIds(project, null)).toEqual([]);
+    // 干净集 ⇒ 空（rebuild 在无漂移时不得触发任何删除）。
+    expect(staleMemoryPointIds(project, visible)).toEqual([]);
+  });
+
+  /**
+   * 重建路由必须真的删陈旧点（源码级契约锁）。
+   *
+   * 失效形态（运行库 2026-10-14 实测）：`POST /v2/projects/:id/memory/rebuild` 只做
+   * 补灌，删点一步不存在；而 doctor 的 `memory-index-drift` 恰恰把"走 memory/rebuild
+   * 重建"当作陈旧点的唯一处方。**观测面报的病，它开的药方治不了**——这类缺陷不抛错、
+   * 不影响任何科目的通过与否，只是让告警长期挂着而无人能解。
+   *
+   * 为什么用源码锁而不是路由单测：api 入口是个 2000 行、无导出、无 handler 抽取的
+   * 顶层脚本，既有合同测试都走源码断言（本文件已有三条同形态锁）。锁的是两件：
+   * ① rebuild 段内必须出现陈旧点清理，且经共享判据（不得在内联写第二套集合差）；
+   * ② 基线取 `listIndexableMemoryRowIds`——与 doctor 同一个函数，否则又出现
+   *   "doctor 说旧、rebuild 说新"的第二次口径分叉。
+   */
+  it("memory/rebuild 路由必须删陈旧点，且判据取自共享层", () => {
+    const api = readFileSync(new URL("../../../scripts/novel-v2-api.ts", import.meta.url), "utf8");
+    const routeAt = api.indexOf('memoryRebuildMatch');
+    const routeEnd = api.indexOf("if (request.method === \"GET\" && storyArcListMatch)", routeAt);
+    const route = api.slice(routeAt, routeEnd);
+    expect(route.length, "rebuild 路由定位失败：锁会空转，必须修锁而非放行").toBeGreaterThan(200);
+    expect(route, "rebuild 必须删陈旧点——只补灌不删点，doctor 报的漂移永远修不掉").toContain("staleMemoryPointIds");
+    expect(route, "基线必须与 doctor 同一函数（listIndexableMemoryRowIds）").toContain("listIndexableMemoryRowIds");
+    // 不得在内联重算集合差：那会让"什么是陈旧点"出现第二份定义。
+    expect(route).not.toMatch(/\[\.\.\.indexed\]\.filter/u);
+    // 删除必须经 Qdrant 的 delete（点 id 直删），而不是 deleteClaims——后者的契约是
+    // "行 id → 内部散列"，而陈旧点的行通常已不在基线里，拿不到行 id。
+    expect(route).toContain("qdrant.delete");
   });
 });
