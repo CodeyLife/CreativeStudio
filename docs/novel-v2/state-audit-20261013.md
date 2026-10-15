@@ -1440,6 +1440,46 @@ arc.plan/chapter.blueprint/arc.review/arc.revision/chapter.title）全不传。
 软偏好不等于永不过滤）；④ 全被题材过滤掉 ⇒ 回退而非抛错。
 **反向实测**：把兜底改回 `: false` + 去掉回退 ⇒ 判红（已跑）。
 
+### 8.17 复核轮 round 18（2026-10-14）：预算挤掉的段只记不报——上下文可静默变薄
+
+前几轮查的是"名字解析不到目标"，本轮换一个面：**装配期被丢弃的内容**。
+
+**① 机制**（`stage-context.ts`）：段按优先级排序装配；`critical`/`required` 装不下 ⇒
+**抛 `StageContextBudgetError`**（响亮）；`normal`/`soft` 装不下 ⇒
+`receipt(section, "excluded", "budget")`，**静默丢弃**，只把条数记进 manifest 的
+`budgetExcludedSectionCount`。
+
+**② 缺陷：这个计数没有任何生产读取方**。全仓 grep `budgetExcludedSectionCount` 只有 4 处——
+类型声明（`protocol.ts:359`）、计算处（`stage-context.ts:155`）、两处测试断言。
+**没有 doctor 检查、没有日志、没有指标。** ⇒ 上下文静默变薄、无人知。
+危害不是"少一段背景"：审核面多处按"以上下文『X』段为准（**无该段时跳过**）"引用
+**normal 优先级**的段（跨章序列信号、开放线索、机制反馈等），被挤掉后那些检查会
+**静默失效**——报告上看起来"检查通过"，实际是"没检查"。
+
+**③ 修复（日志侧，刻意不动 manifest）**：在丢弃点报出被挤掉的段 id 与优先级、可用/已装 tokens。
+**为什么不能加成 manifest 字段**：`manifestBase` 参与 fingerprint，而 fingerprint 会与
+`contextRefs` 一起哈希进**外部任务的幂等键**（见 `estimatedInputTokensAuditBasis` 的既有注释）
+——给纯观测值加字段等于给在途运行换任务 id。故观测走日志，零指纹影响。
+
+**④ 诚实的量级实测（避免把小风险说成大风险）**：生产 33 个外部任务的
+`budgetExcludedSectionCount` **全为 0**；章节起草阶段实测技能段仅 **928 tokens**
+（4 个技能各一段，prose-craft 占 720），而可用预算约 **106,517**（128,000 − 10,000 输出预留
+− 11,483 schema 参照）⇒ 技能段占 **0.9%**，要涨到约 **115×** 才会吃满。
+⇒ **本轮补的是被静默堵死的通路，不是当下的错值**；风险是"学习闭环持续晋升技能后
+上下文开始悄悄掉段"，当前距离很远。如实记录，不夸大。
+
+**⑤ 本会话第七次"枚举/口径不全 ⇒ 假结论"**：本轮自查脚本首版报"4 个技能全部
+'解析到了但没渲染'"，看似又一个静默丢失。实际是我只拼了 `section.text` 去找 skillId，
+而 `buildSkillContextSections` 把 id 放在**段标题**里（`id: skill:<id>@<version>`）。
+逐段打印后 4 段齐全、合计 928 tokens。⇒ 同一族：**先确认"我量的东西是不是我以为的那个"。**
+（顺带纠正一个跨轮口径混淆：round 10 的"12 技能 27,897 tokens"是**全执行点全技能各段之和**，
+不是单个阶段 bundle 的占用；本轮的 928 才是预算口径。）
+
+**回归锁**（`stage-context.test.ts` 扩既有用例）：被挤掉的段必须报出且含段 id 与"预算挤掉"字样；
+**反例**：全部装得下时不得报警（否则日志被噪声淹没＝等于没报）。
+**反向实测**：去掉告警 ⇒ 判红（已跑）。
+
+
 
 
 

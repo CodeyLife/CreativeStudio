@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { readdirSync, readFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import ts from "typescript";
@@ -12,6 +12,18 @@ function productionTypeScriptFiles(root: string): string[] {
     return entry.isFile() && entry.name.endsWith(".ts") ? [path] : [];
   });
 }
+
+/** 收集 compileStageContext 报出的"预算挤掉"告警（2026-10-14 round 18 的回归锁用）。 */
+const droppedWarnings: string[] = [];
+const originalWarn = console.warn;
+beforeEach(() => {
+  droppedWarnings.length = 0;
+  console.warn = (...args: unknown[]) => {
+    const line = args.map((item) => String(item)).join(" ");
+    if (line.includes("预算挤掉")) droppedWarnings.push(line);
+  };
+});
+afterEach(() => { console.warn = originalWarn; });
 
 describe("stage context compiler", () => {
   it("deduplicates repeated content without dropping distinct claims from one artifact", () => {
@@ -88,6 +100,27 @@ describe("stage context compiler", () => {
     expect(soft.manifest.sections.find((item) => item.id === "soft")?.reason).toBe("budget");
     expect(soft.manifest.budgetExcludedSectionCount).toBe(1);
     expect(soft.manifest.requiredInputTokens).toBeLessThanOrEqual(soft.manifest.usableInputTokens);
+    // 被挤掉的段必须**报出来**（2026-10-14 round 18）：此前只记进 manifest 的
+    // budgetExcludedSectionCount，而全仓没有生产读取方 ⇒ 上下文静默变薄、无人知；
+    // 而审核面多处按"无该段时跳过"引用 normal 优先级的段，被挤掉会让那些检查静默失效。
+    expect(droppedWarnings).toHaveLength(1);
+    expect(droppedWarnings[0]).toContain("soft");
+    expect(droppedWarnings[0]).toContain("预算挤掉");
+    // 刻意不进 manifestBase（它参与 fingerprint，而 fingerprint 进外部任务幂等键）：
+    // 因此"被挤掉"这件事在 manifest 里只以既有计数体现，不得新增观测字段。
+    expect(Object.keys(soft.manifest)).not.toContain("budgetExcludedSectionIds");
+
+    // 反例：全部装得下时不得报警（否则日志会被噪声淹没，等于没报）。
+    droppedWarnings.length = 0;
+    compileStageContext({
+      projectId: "p1", workflowId: "wf3", purpose: "writing.draft", stage: "drafting",
+      maxInputTokens: 4_000, reservedOutputTokens: 20,
+      sections: [
+        { id: "required", kind: "manuscript", title: "正文", text: "正文".repeat(20), priority: "required", provenanceRefs: [] },
+        { id: "soft", kind: "background", title: "背景", text: "背景".repeat(20), priority: "soft", provenanceRefs: [] },
+      ],
+    });
+    expect(droppedWarnings, "全部装得下时不得报预算丢弃").toHaveLength(0);
 
     let error: unknown;
     try {

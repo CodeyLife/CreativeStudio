@@ -167,5 +167,19 @@ export function compileStageContext(request: StageContextRequest, now = Date.now
   if (missingRequired.length) {
     throw new StageContextBudgetError(manifest, requiredInputTokens);
   }
+  // 非必要段被预算挤掉：**必须在此处报出来**（2026-10-14 复核轮 round 18）。
+  // 此前这条事实只落在 manifest 的 `budgetExcludedSectionCount` 里，而全仓**没有任何生产
+  // 读取方**（只有类型声明与测试断言）⇒ 上下文静默变薄、无人知。危害不是"少了一段背景"：
+  // 审核面多处按"以上下文『X』段为准（**无该段时跳过**）"引用 normal 优先级的段
+  // （跨章序列信号、开放线索、机制反馈等），被挤掉后那些检查会**静默失效**——
+  // 看起来"检查通过"，实际是"没检查"。
+  //
+  // 刻意**不**把它加成 manifest 字段：`manifestBase` 参与 fingerprint，而 fingerprint 会与
+  // contextRefs 一起哈希进外部任务的幂等键（见上方 estimatedInputTokensAuditBasis 的注释），
+  // 给纯观测值加字段等于给在途运行换任务 id。故走日志这一侧，零指纹影响。
+  const budgetExcluded = receipts.filter((item) => item.reason === "budget");
+  if (budgetExcluded.length) {
+    console.warn(`[context] ${request.stage}/${request.purpose} 有 ${budgetExcluded.length} 段被预算挤掉（不会出现在 prompt 里）：${budgetExcluded.map((item) => `${item.id}(${item.priority})`).join("、")}；可用 ${usableTokens} tokens，已装 ${spent}。被挤掉的段若被审核面按"无该段时跳过"引用，对应检查会静默失效。`);
+  }
   return { system: request.system, instruction, schema: request.schema, goal: request.goal, sections: included, manifest };
 }
