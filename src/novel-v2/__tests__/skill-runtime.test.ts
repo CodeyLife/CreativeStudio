@@ -109,7 +109,7 @@ describe("Skill runtime resolution", () => {
     for (const skillId of ["prose-craft", "reader-emotion", "plot-causality"]) {
       // 守卫值随 workspace yaml 版本演进（prose-craft 曾升 1.4.0 未同步本守卫，属存量断链修复）；
       // 断言的仍是"清单能解析出版本与指纹"这一契约，非具体措辞。
-      expect(byId.get(skillId)?.version).toBe(skillId === "prose-craft" ? "1.8.0" : "1.1.0");
+      expect(byId.get(skillId)?.version).toBe(skillId === "prose-craft" ? "1.9.0" : "1.1.0");
       expect(byId.get(skillId)?.contentFingerprint).toBeTruthy();
     }
 
@@ -407,6 +407,43 @@ describe("Skill runtime resolution", () => {
    *
    * 三面接线 + 反例（不得写成词表禁用——表情本身完全合法）。
    */
+  /**
+   * 序数作推演编号是正面声音，不得被"理顺"（2026-10-14 复核轮 round 30）。
+   *
+   * 由来：直读最强章 ch103 时我一度把"第二遍/第三遍/第三十二步/四十七步"读成
+   * "用计数代替论证"的偷懒。按 round 20 的判据（先问"最强带是否也在用"）拆族实测后
+   * 结论**相反**：分析型计数在最强带 099-127 达 **1.23/千字**，是混合带 0.36 的 **3.4 倍**，
+   * 原始计数 326 处（非小样本）；而节律型 0.13、时间戳型 0.23 都与强度无关。
+   * 直读峰值章 ch123 确认机制：`第一遍，他先走量词的路／第二遍，他走另一条路` 是穷举假设，
+   * `第一步到第七步，檐影…第八步到第十九步，过井台` 是带证据的空间复原——**计数即论证**。
+   *
+   * 意义：一次善意的"把序号改成他想了想"的修订会删掉本书最可靠的严谨感。
+   * 这把锁防止那种退化（round 20 撤回数数禁令的同一逻辑，但方向相反：
+   * 那次是"别把声音当病"，这次是"别把机制当冗余"）。
+   */
+  it("序数作推演编号被列为正面声音：写作/审核/修订三面都不得建议改写成概述", async () => {
+    const provider = createWorkspaceSkillProvider(path.resolve(process.cwd(), "skills", "novel-v2"));
+    const faces: Array<[SkillExecutionPoint, string]> = [
+      ["chapter.drafting", "writer"],
+      ["chapter.review.prose", "prose-reviewer"],
+      ["chapter.revision", "reviser"],
+    ];
+    for (const [executionPoint, role] of faces) {
+      const text = renderSkillInstruction(
+        await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint, role }),
+        executionPoint,
+      );
+      expect(text, `${executionPoint} 缺少"序数作推演编号是正面声音"的判据`).toContain("序数作推演编号");
+    }
+    // 写作/修订侧必须写明不得改写成概述（这条是防退化的关键）。
+    const revisionText = renderSkillInstruction(
+      await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint: "chapter.revision", role: "reviser" }),
+      "chapter.revision",
+    );
+    expect(revisionText, "修订侧必须禁止把序数改成概述").toContain("不得");
+    expect(revisionText, "必须给出被禁止的改写形态（他想了想/反复推敲）").toMatch(/他想了想|反复推敲/);
+  });
+
   it("情绪节拍默认落在面部表情上的判据在写作、审核、修订三面都在场", async () => {
     const provider = createWorkspaceSkillProvider(path.resolve(process.cwd(), "skills", "novel-v2"));
     const faces: Array<[SkillExecutionPoint, string]> = [
