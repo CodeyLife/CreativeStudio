@@ -10,6 +10,7 @@ import { loadCharacterIdentityRegistry } from "../character-enrichment";
 import { uniqueCharacterIdentities, type CharacterIdentityIndex } from "../character-identity";
 import { buildChapterMemoryProjection, chapterMemoryAsClaim, generateChapterMemoryOutput } from "../chapter-memory";
 import { resolveStageSkillBundle } from "../skill-runtime";
+import { writeMemoryIndexWithTrace } from "../memory-index-drift";
 export { ChapterStateRebuildConflictError, HISTORICAL_CHAPTER_REBUILD_REQUIRES_CASCADE } from "./chapter-state-rebuild-conflict";
 
 export interface RebuildCommittedChapterStateResult {
@@ -123,16 +124,25 @@ export class ChapterStateRebuildService {
       await this.recordProjectionFailure(projectId, source.sourceRevisionId, "chapter-memory-rollup", error);
     }
     if (this.deps.memoryIndex) {
-      try {
-        if (claimSwap.removedClaimIds.length) await this.deps.memoryIndex.deleteClaims?.(projectId, claimSwap.removedClaimIds);
-        await this.deps.memoryIndex.upsertClaims(projectId, [
-          ...claimSwap.activatedClaims,
-          chapterMemoryAsClaim(chapterMemory),
-          ...(rollupClaim ? [rollupClaim] : []),
-        ]);
-      } catch (error) {
-        await this.recordProjectionFailure(projectId, source.sourceRevisionId, "memory-index", error);
-      }
+      // 不阻塞 + 留痕走共享包膜（§8.6 收口）。此处原本就落 projection_failures（八处里
+      // 唯一做对的一处），但形状是手写的；收口后与其余七处同源，防止下次各自演进。
+      // revisionId 先收成常量：第 40 行的运行期守卫 TS 看不见，闭包内会丢掉窄化。
+      const revisionId = source.sourceRevisionId;
+      await writeMemoryIndexWithTrace({
+        projectId,
+        aggregateId: revisionId,
+        projectionType: "memory-index:chapter-state-rebuild",
+        rowIds: [...claimSwap.removedClaimIds, ...claimSwap.activatedClaims.map((claim) => claim.id), chapterMemory.id],
+        write: async () => {
+          if (claimSwap.removedClaimIds.length) await this.deps.memoryIndex!.deleteClaims?.(projectId, claimSwap.removedClaimIds);
+          await this.deps.memoryIndex!.upsertClaims(projectId, [
+            ...claimSwap.activatedClaims,
+            chapterMemoryAsClaim(chapterMemory),
+            ...(rollupClaim ? [rollupClaim] : []),
+          ]);
+        },
+        record: (failure) => this.recordProjectionFailure(projectId, revisionId, failure.projectionType, new Error(failure.error)),
+      });
     }
     // staged 残骸对账（FM-2 修复③）：grooming 有诊断能力但缺自动触发，这里补上
     // 精确同文残骸的清理钩子；失败显式记录，不影响已成功的重建结果。

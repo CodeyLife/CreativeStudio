@@ -71,3 +71,55 @@ export function staleMemoryPointIds(baseline: MemoryIndexBaseline, indexed: Read
   const expected = new Set(rowIds.map((rowId) => qdrantPointId(baseline.projectId, rowId)));
   return [...indexed].filter((pointId) => !expected.has(pointId));
 }
+
+/**
+ * 索引写入的"不阻塞 + 留痕"包膜。
+ *
+ * 为什么需要它（state-audit-20261013 §8.4/§8.6）：本仓有 8 处"先写库、后写 Qdrant"的
+ * 写入点，其中 5 处曾只 `console.warn`。**"不阻塞主路径"与"不留痕迹"是两件事**——
+ * 前者是契约（瞬时 Qdrant 故障不该拦住作者创作），后者是缺口。只 warn 的后果是：
+ * 库里那一行此后在一切查询里都显得完全活着（可见性谓词认它、基线枚举含它、authority
+ * 正常），只有语义检索永远召不回它，没有任何科目因此变红，唯一暴露途径是 doctor 的
+ * 漂移检查，而它按设计"只报不修/不自动触发"——一次瞬时故障可以静默数周
+ * （运行库实测 6 条 current-revision 章记忆正是这个形态）。
+ *
+ * 收成一个函数的理由是**防再次分叉**：逐处手写 catch 时，形状会各自演进
+ * （本仓 8 处里有 3 种不同形态：只 warn / 返回 error 字段 / 落 projection_failures）。
+ * 包膜统一三件事：① 不抛（主路径继续）；② 落耐久账（recordProjectionFailure 优先，
+ *    它是带 upsert 与重试计数的既有表，比 audit_records 更贴合"待重做"语义）；
+ * ③ **记账自身失败也只 warn**——观测路径不能把生产路径带崩。
+ *
+ * 边界：包膜只负责"失败之后怎么办"，不改变写入顺序，也不承诺补偿
+ * （补偿仍是 rebuild 的补灌侧，或由待办账驱动的人工重放）。
+ */
+export async function writeMemoryIndexWithTrace<T>(input: {
+  projectId: string;
+  /** 账本聚合 id：通常是 revision id（重做该 revision 的投影即可修复）。 */
+  aggregateId: string;
+  /** 投影类型名，进 projection_failures.projection_type（与同表其他类型不撞）。 */
+  projectionType: string;
+  /** 待写入的行 id：落账供定向补灌。缺省时账本只记"不知道是哪几行"，补救成本高得多。 */
+  rowIds?: readonly string[];
+  write: () => Promise<T>;
+  record: (failure: { projectId: string; projectionType: string; aggregateId: string; payload: Record<string, unknown>; error: string }) => Promise<void>;
+}): Promise<{ ok: true; value: T } | { ok: false; error: string }> {
+  try {
+    return { ok: true, value: await input.write() };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[memory-index] ${input.projectionType} 索引写入失败（不阻塞主路径，已留痕）：${message}`);
+    try {
+      await input.record({
+        projectId: input.projectId,
+        projectionType: input.projectionType,
+        aggregateId: input.aggregateId,
+        payload: { rowIds: [...(input.rowIds ?? [])], rowCount: input.rowIds?.length ?? 0, projectionType: input.projectionType },
+        error: message,
+      });
+    } catch (recordError) {
+      // 观测路径不得把生产路径带崩；但这里必须留一句 warn，否则"留痕失败"再次静默。
+      console.warn(`[memory-index] ${input.projectionType} 失败记账自身失败（观测降级）：${(recordError as Error).message}`);
+    }
+    return { ok: false, error: message };
+  }
+}

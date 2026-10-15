@@ -37,6 +37,7 @@ import { reviewIssueFingerprint } from "../chapter-review-snapshot";
 import { buildRevisionBrief, shouldBlockRevisionForConflicts } from "../application/revision-brief";
 import { classifyRevisionEvidence } from "./revision-policy";
 import { buildSkillContextSections, resolveStageSkillBundle } from "../skill-runtime";
+import { writeMemoryIndexWithTrace } from "../memory-index-drift";
 import {
   BOOK_SYNOPSIS_SCHEMA,
   BOOK_TITLE_CANDIDATES_SCHEMA,
@@ -343,11 +344,17 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
     retrieveMemory: async (input: { projectId: string; plan: PreflightPlan }): Promise<MemoryBundle> => {
       const repairedFoundationClaims = await deps.repository.ensureFoundationMemoryClaims(input.projectId);
       if (repairedFoundationClaims.length && deps.memoryIndex) {
-        try {
-          await deps.memoryIndex.upsertClaims(input.projectId, repairedFoundationClaims);
-        } catch (error) {
-          console.warn(`[foundation-memory] 历史 projection 的 Qdrant 索引失败，PostgreSQL 真源已保留：${(error as Error).message}`);
-        }
+        // 不阻塞 + 留痕走共享包膜（§8.6 的第六处，由站点级扫描锁查出——文件级断言漏了它）。
+        // 这一处的后果最直接：`ensureFoundationMemoryClaims` 是规划事实的**补偿性补写**，
+        // 补写成功而索引没写上，等于补偿没发生，且此后每次检索都看不到这批规划约束。
+        await writeMemoryIndexWithTrace({
+          projectId: input.projectId,
+          aggregateId: input.projectId,
+          projectionType: "memory-index:foundation-memory-repair",
+          rowIds: repairedFoundationClaims.map((claim) => claim.id),
+          write: () => deps.memoryIndex!.upsertClaims(input.projectId, repairedFoundationClaims),
+          record: (failure) => deps.repository.recordProjectionFailure(failure),
+        });
       }
       // Phase 2.3 动态上下文预算：根据 taskClass + totalChapters 计算合理预算
       // 设计依据：Phase 2.3 计划——长篇后期需要更多前章记忆（chapter memory + 伏笔 + 角色状态）
@@ -1245,11 +1252,17 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       const approved = await deps.repository.approveFactClaims(input);
       const active = approved.filter((claim) => claim.lifecycleStatus !== "staged");
       if (active.length && deps.memoryIndex) {
-        try {
-          await deps.memoryIndex.upsertClaims(input.projectId, active);
-        } catch (error) {
-          console.warn(`[fact-approval] Qdrant 索引失败（PostgreSQL 真源已保留）：${(error as Error).message}`);
-        }
+        // 不阻塞 + 留痕走共享包膜（state-audit §8.6 的第三处）。此处只 warn 的代价最隐蔽：
+        // 裁决已经生效（库里 authority 已是 approved），但向量索引没有对应点 ⇒ 该事实
+        // 从此不出现在任何语义召回里，而所有查询都显示它已被批准。
+        await writeMemoryIndexWithTrace({
+          projectId: input.projectId,
+          aggregateId: input.ids.join(","),
+          projectionType: "memory-index:fact-approval",
+          rowIds: active.map((claim) => claim.id),
+          write: () => deps.memoryIndex!.upsertClaims(input.projectId, active),
+          record: (failure) => deps.repository.recordProjectionFailure(failure),
+        });
       }
       return approved;
     },
@@ -2231,11 +2244,17 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
           sourceArtifactId: artifact.id,
         });
         if (recordedClaims.length && deps.memoryIndex) {
-          try {
-            await deps.memoryIndex.upsertClaims(run.projectId, recordedClaims);
-          } catch (error) {
-            console.warn(`[foundation-memory] Qdrant 索引失败，PostgreSQL 真源已保留：${(error as Error).message}`);
-          }
+          // 不阻塞 + 留痕走共享包膜（state-audit §8.6 第四/第五处，两处 foundation-memory
+          // 同形）。规划事实只落库没进索引 ⇒ 后续章节的事实召回永久看不到这一条规划约束，
+          // 而规划面查询显示它已在库里。
+          await writeMemoryIndexWithTrace({
+            projectId: run.projectId,
+            aggregateId: artifact.id,
+            projectionType: "memory-index:foundation-memory",
+            rowIds: recordedClaims.map((claim) => claim.id),
+            write: () => deps.memoryIndex!.upsertClaims(run.projectId, recordedClaims),
+            record: (failure) => deps.repository.recordProjectionFailure(failure),
+          });
         }
 
         // attachArtifact 到 work item
@@ -2325,11 +2344,15 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
         sourceArtifactId: artifact.id,
       });
       if (recordedClaims.length && deps.memoryIndex) {
-        try {
-          await deps.memoryIndex.upsertClaims(run.projectId, recordedClaims);
-        } catch (error) {
-          console.warn(`[foundation-memory] Qdrant 索引失败，PostgreSQL 真源已保留：${(error as Error).message}`);
-        }
+        // 同上一处 foundation-memory：不阻塞 + 留痕（state-audit §8.6 第五处）。
+        await writeMemoryIndexWithTrace({
+          projectId: run.projectId,
+          aggregateId: artifact.id,
+          projectionType: "memory-index:foundation-memory",
+          rowIds: recordedClaims.map((claim) => claim.id),
+          write: () => deps.memoryIndex!.upsertClaims(run.projectId, recordedClaims),
+          record: (failure) => deps.repository.recordProjectionFailure(failure),
+        });
       }
       await creativeAttachArtifact(deps.repository, input.workItemId, artifact.id);
       return artifact;

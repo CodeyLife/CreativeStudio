@@ -4,6 +4,7 @@ import type { Artifact, MemoryClaim, SkillBundle } from "../protocol";
 import type { ModelGateway } from "../model-gateway";
 import type { ModelRoutingSnapshot } from "../model-routing";
 import type { CharacterEnrichmentRepositoryAccess } from "../repository-capabilities";
+import { writeMemoryIndexWithTrace } from "../memory-index-drift";
 import type { ContentObjectStore } from "../object-store";
 import type { MemoryIndex } from "../qdrant-memory";
 import { characterEnrichmentSchema, RELATION_PREDICATE_WORDS, type CharacterEnrichmentOutput } from "../prompts/schemas";
@@ -335,11 +336,17 @@ export async function persistCharacterEnrichment(input: { projectId: string; doc
       if (recorded.length) {
         knowledgeClaims.push(recorded[0]);
         if (deps.memoryIndex) {
-          try {
-            await deps.memoryIndex.upsertClaims(input.projectId, recorded);
-          } catch (error) {
-            console.warn(`[character-enrichment] Qdrant 索引失败（不阻塞）：${(error as Error).message}`);
-          }
+          // 不阻塞 + 留痕走共享包膜：此前只 console.warn（state-audit §8.6 记的第五处）。
+          // 角色知识边界声明若只落库没进索引，POV 过滤会静默漏掉这一条——
+          // 模型因此看不到该角色的知识边界，而不报任何错。
+          await writeMemoryIndexWithTrace({
+            projectId: input.projectId,
+            aggregateId: input.revisionId,
+            projectionType: "memory-index:character-enrichment",
+            rowIds: recorded.map((claim) => claim.id),
+            write: () => deps.memoryIndex!.upsertClaims(input.projectId, recorded),
+            record: (failure) => deps.repository.recordProjectionFailure(failure),
+          });
         }
       }
     }

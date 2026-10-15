@@ -47,25 +47,33 @@ export type ModelRuntimeRepositoryAccess = Pick<
 export type RuntimeObjectStoreGuardAccess = Pick<NovelPostgresRepository, "assertRuntimeObjectStoreIdentity" | "listReferencedObjectKeys">;
 
 /**
- * 章节记忆读写。
+ * 章节记忆读写 + 索引失败记账。
  *
- * `recordMemoryIndexWriteFailure` 在此的理由（state-audit-20261013 §8.4）：章节记忆是
- * "先写库、后写索引"的顺序，索引失败按不阻塞契约只 warn。若不把它记进耐久账，
- * 库里那一行此后在一切查询里都显得完全活着，只有语义检索永远召不回它——
- * 而唯一的暴露途径是 doctor 的漂移检查（按设计不自动触发）。
+ * `recordProjectionFailure` 在此的理由（state-audit-20261013 §8.4/§8.6）：章节记忆是
+ * "先写库、后写索引"的顺序，索引失败按不阻塞契约必须留耐久痕迹。留痕走共享包膜
+ * `writeMemoryIndexWithTrace` → 落 `projection_failures`（带 upsert 与重试计数）。
  */
 export type ChapterMemoryRepositoryAccess = Pick<
   NovelPostgresRepository,
-  "createChapterMemory" | "getChapterMemories" | "recordMemoryIndexWriteFailure" | "refreshChapterMemoryRollup"
+  "createChapterMemory" | "getChapterMemories" | "recordProjectionFailure" | "refreshChapterMemoryRollup"
 >;
 
-/** 角色富化：事实提取写入 + 连接面（回退查询）。 */
-export type CharacterEnrichmentRepositoryAccess = Pick<NovelPostgresRepository, "pool" | "recordFactExtraction">;
+/**
+ * 角色富化：事实提取写入 + 连接面（回退查询）+ 索引失败记账。
+ *
+ * `recordProjectionFailure` 于 2026-10-14 §8.6 加入：角色知识边界声明是"先写库、后写索引"，
+ * 索引失败原先只 console.warn。知识边界漏进索引**不报错**，只会让 POV 过滤静默漏掉这一条
+ * ——模型因此看不到该角色的知识边界。留痕走共享的 projection_failures 账本。
+ */
+export type CharacterEnrichmentRepositoryAccess = Pick<
+  NovelPostgresRepository,
+  "pool" | "recordFactExtraction" | "recordProjectionFailure"
+>;
 
 /** 提交链路：修订落库、叙事面记录，以及提交后同步章节记忆（向 chapter-memory 透传）。 */
 export type CommitServiceRepositoryAccess = Pick<
   NovelPostgresRepository,
-  "commitRevision" | "createChapterMemory" | "getApprovalEvidenceById" | "getChapterMemories" | "getChapterTargetWordCount" | "getDocumentNarrativeOrder" | "recordLearningAssessment" | "recordMemoryIndexWriteFailure" | "recordNarrativeElements" | "recordNarrativeStateSnapshot" | "recordProjectionFailure" | "refreshChapterMemoryRollup"
+  "commitRevision" | "createChapterMemory" | "getApprovalEvidenceById" | "getChapterMemories" | "getChapterTargetWordCount" | "getDocumentNarrativeOrder" | "recordLearningAssessment" | "recordNarrativeElements" | "recordNarrativeStateSnapshot" | "recordProjectionFailure" | "refreshChapterMemoryRollup"
 >;
 
 /** 作品简介工作流。 */
@@ -111,5 +119,5 @@ export type StoryArcWorkflowRepositoryAccess = Pick<
 /** 章节状态重建（事实面读写 + 投影收尾 + 向富化/章节记忆模块透传的需求）。 */
 export type ChapterStateRebuildRepositoryAccess = Pick<
   NovelPostgresRepository,
-  "applyCommittedChapterStateRebuild" | "assertChapterStateRebuildHead" | "createChapterMemory" | "getChapterMemories" | "getFactExtractionContext" | "getFinalDocumentContentRef" | "pool" | "reconcileStagedClaimDebris" | "recordFactApprovalPolicy" | "recordFactExtraction" | "recordMemoryIndexWriteFailure" | "recordProjectionFailure" | "refreshChapterMemoryRollup"
+  "applyCommittedChapterStateRebuild" | "assertChapterStateRebuildHead" | "createChapterMemory" | "getChapterMemories" | "getFactExtractionContext" | "getFinalDocumentContentRef" | "pool" | "reconcileStagedClaimDebris" | "recordFactApprovalPolicy" | "recordFactExtraction" | "recordProjectionFailure" | "refreshChapterMemoryRollup"
 >;

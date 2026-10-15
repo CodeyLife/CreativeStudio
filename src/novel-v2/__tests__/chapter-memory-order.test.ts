@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { NovelPostgresRepository } from "../postgres-repository";
+import { writeMemoryIndexWithTrace } from "../memory-index-drift";
 import { isPostgresUnavailable } from "./test-db";
 import type { ChapterMemory } from "../protocol";
 
@@ -87,75 +87,89 @@ describe("chapter memory recency", () => {
   });
 
   /**
-   * 索引写入失败必须留下耐久痕迹（state-audit-20261013 §8.4）。
+   * 索引写入的"不阻塞 + 留痕"包膜（state-audit-20261013 §8.6）。
    *
-   * 失效形态（运行库实测 6 条章记忆正是这个形态）：章节记忆"先写库、后写索引"，
-   * 索引失败按不阻塞契约只 console.warn。于是库里那一行此后在**一切查询里都显得
-   * 完全活着**（可见性谓词认它、基线枚举含它、authority 正常），只有语义检索永远
-   * 召不回它。没有任何科目因此变红，作者与审核面都看不到——一次瞬时 Qdrant 故障
-   * 可以这样静默数周，唯一的暴露途径是 doctor 的漂移检查，而它按设计不自动触发。
+   * 8 处"先写库、后写 Qdrant"的写入点里，曾有 5 处只 `console.warn`。
+   * **"不阻塞主路径"与"不留痕迹"是两件事**——前者是契约，后者是缺口。只 warn 的后果：
+   * 库里那一行此后在一切查询里都显得完全活着，只有语义检索永远召不回它，没有任何科目
+   * 因此变红，唯一暴露途径是 doctor 的漂移检查，而它按设计不自动触发——一次瞬时故障
+   * 可以静默数周（运行库实测 6 条 current-revision 章记忆正是这个形态）。
    *
    * 双向覆盖：
-   *  - 命中面：失败确实落审计记录 + outbox 事件（可查询、可告警）；
-   *  - 反例面：无失败行时不写任何记录（不能在成功路径上刷噪声，否则账本不可信）。
+   *  - 写入成功 ⇒ 原样返回值，且**不落任何账**（成功路径刷噪声会让账本不可信）；
+   *  - 写入失败 ⇒ 不抛（主路径继续）+ 落 projection_failures（带重试计数与行 id 清单）。
    */
-  it("索引写入失败落耐久痕迹，无失败时不写", async () => {
+  it("writeMemoryIndexWithTrace：成功不落账、失败不抛且留行 id 清单", async () => {
     if (!available) return;
     const before = await repository.pool.query<{ n: number }>(
-      "SELECT count(*)::int AS n FROM audit_records WHERE project_id=$1 AND action='memory.index-write-failed'",
+      "SELECT count(*)::int AS n FROM projection_failures WHERE project_id=$1 AND projection_type='memory-index:test-wrapper'",
       [projectId],
     );
-    await repository.recordMemoryIndexWriteFailure({
+
+    // 命中面一：成功路径零落账、原样返回值。
+    const ok = await writeMemoryIndexWithTrace({
       projectId,
-      rowIds: ["memory-1-1", "chapter-memory:rollup:x"],
-      reason: "Qdrant upsert timeout",
-      stage: "chapter-memory.persist",
+      aggregateId: "rev-ok",
+      projectionType: "memory-index:test-wrapper",
+      rowIds: ["row-a", "row-b"],
+      write: async () => "written",
+      record: (failure) => repository.recordProjectionFailure(failure),
     });
-    const after = await repository.pool.query<{ n: number; payload: { rowCount: number; rowIds: string[]; reason: string }; aggregate_type: string }>(
-      "SELECT count(*)::int AS n, (array_agg(payload ORDER BY created_at DESC))[1] AS payload, (array_agg(aggregate_type ORDER BY created_at DESC))[1] AS aggregate_type FROM audit_records WHERE project_id=$1 AND action='memory.index-write-failed'",
+    expect(ok).toEqual({ ok: true, value: "written" });
+    const afterOk = await repository.pool.query<{ n: number }>(
+      "SELECT count(*)::int AS n FROM projection_failures WHERE project_id=$1 AND projection_type='memory-index:test-wrapper'",
       [projectId],
     );
-    expect(after.rows[0].n).toBe(before.rows[0].n + 1);
-    // 载荷必须带**行 id 与条数**：这是"哪几行欠灌"的定向补救清单。
-    // 只有一句 reason 的话，运维仍不知道去补哪些行——那账本等于没记。
-    expect(after.rows[0].payload).toMatchObject({ rowCount: 2, rowIds: ["memory-1-1", "chapter-memory:rollup:x"] });
-    expect(after.rows[0].payload.reason).toBe("Qdrant upsert timeout");
-    // stage 走 aggregate_type（与同表其他 audit 记录同族），不塞进载荷。
-    expect(after.rows[0].aggregate_type).toBe("chapter-memory.persist");
+    expect(afterOk.rows[0].n).toBe(before.rows[0].n);
 
-    const events = await repository.pool.query<{ event_type: string; payload: { rowCount: number } }>(
-      "SELECT event_type, payload FROM outbox_events WHERE project_id=$1 AND event_type='memory.index-write-failed'",
+    // 命中面二：失败不抛、落账、载荷带行 id 与条数（只有一句 error 等于没记）。
+    const failed = await writeMemoryIndexWithTrace({
+      projectId,
+      aggregateId: "rev-fail",
+      projectionType: "memory-index:test-wrapper",
+      rowIds: ["row-a", "row-b"],
+      write: async () => { throw new Error("Qdrant upsert timeout"); },
+      record: (failure) => repository.recordProjectionFailure(failure),
+    });
+    expect(failed).toEqual({ ok: false, error: "Qdrant upsert timeout" });
+    const row = await repository.pool.query<{ payload: { rowIds: string[]; rowCount: number }; error_message: string; status: string; attempts: number }>(
+      "SELECT payload, error_message, status, attempts FROM projection_failures WHERE project_id=$1 AND projection_type='memory-index:test-wrapper' AND aggregate_id='rev-fail'",
       [projectId],
     );
-    expect(events.rows).toHaveLength(1);
-    expect(events.rows[0].payload.rowCount).toBe(2);
-
-    // 反例：空行集不写记录——成功路径上刷噪声会让账本失去可信度。
-    await repository.recordMemoryIndexWriteFailure({ projectId, rowIds: [], reason: "noop", stage: "test" });
-    const unchanged = await repository.pool.query<{ n: number }>(
-      "SELECT count(*)::int AS n FROM audit_records WHERE project_id=$1 AND action='memory.index-write-failed'",
+    expect(row.rows[0].payload).toMatchObject({ rowIds: ["row-a", "row-b"], rowCount: 2 });
+    expect(row.rows[0].error_message).toBe("Qdrant upsert timeout");
+    expect(row.rows[0].status).toBe("pending");
+    // 重复失败累加 attempts：待办账要能看出"这不是第一次"。
+    await writeMemoryIndexWithTrace({
+      projectId, aggregateId: "rev-fail", projectionType: "memory-index:test-wrapper", rowIds: ["row-a"],
+      write: async () => { throw new Error("again"); },
+      record: (failure) => repository.recordProjectionFailure(failure),
+    });
+    const retried = await repository.pool.query<{ attempts: number }>(
+      "SELECT attempts FROM projection_failures WHERE project_id=$1 AND projection_type='memory-index:test-wrapper' AND aggregate_id='rev-fail'",
       [projectId],
     );
-    expect(unchanged.rows[0].n).toBe(after.rows[0].n);
+    expect(retried.rows[0].attempts).toBe(2);
   });
 
   /**
-   * 接线锁： swallow 站点必须真的调用耐久记录（而不是只在一个没人调的方法里实现）。
+   * 记账自身失败也不得抛（观测路径不能把生产路径带崩）。
    *
-   * 上一条只验了 `recordMemoryIndexWriteFailure` 自身的行为。若 `persistChapterMemoryOutput`
-   * 的 catch 块仍只 console.warn（本修复前的形态），那条用例**照样全绿**——方法存在但没人调，
-   * 正是本仓反复清理的"谓词恒假的守卫"同族。故补一条源码级接线断言。
+   * 这一条是包膜的最后一道安全阀：若 recordProjectionFailure 自己抛（例如库抖动），
+   * 而包膜没有内层 catch，那么一次索引故障会升级成一次写入失败——把"降级静默"
+   * 换成"连带崩溃"，比原缺陷更坏。
    */
-  it("索引失败被吞处必须接通耐久记录（接线锁）", () => {
-    const source = readFileSync(new URL("../chapter-memory/index.ts", import.meta.url), "utf8");
-    const catchAt = source.indexOf("Qdrant 索引失败（不阻塞 Postgres 落库）");
-    expect(catchAt, "定位不到 swallow 站点：锁会空转，必须修锁而非放行").toBeGreaterThan(0);
-    const catchBlock = source.slice(catchAt, source.indexOf("return chapterMemory", catchAt));
-    expect(catchBlock, "catch 块必须调用 recordMemoryIndexWriteFailure——只 warn 等于让欠灌静默数周").toContain("recordMemoryIndexWriteFailure");
-    // 且必须带上行 id（否则运维不知道补哪些行）。
-    expect(catchBlock).toContain("rowIds:");
-    // 不得因记录失败而抛出：观测路径不能把生产路径带崩。
-    expect(catchBlock).toContain(".catch(");
+  it("writeMemoryIndexWithTrace：记账自身失败也只降级，不抛", async () => {
+    if (!available) return;
+    const outcome = await writeMemoryIndexWithTrace({
+      projectId,
+      aggregateId: "rev-record-fail",
+      projectionType: "memory-index:test-wrapper",
+      rowIds: ["row-a"],
+      write: async () => { throw new Error("index down"); },
+      record: async () => { throw new Error("db also down"); },
+    });
+    expect(outcome).toEqual({ ok: false, error: "index down" });
   });
 });
 

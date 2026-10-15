@@ -6,6 +6,7 @@ import type { ModelGateway } from "./model-gateway";
 import type { ModelRoutingSnapshot } from "./model-routing";
 import type { MemoryIndex } from "./qdrant-memory";
 import { createChapterMemoryFromRevision } from "./chapter-memory";
+import { writeMemoryIndexWithTrace } from "./memory-index-drift";
 import { evaluateCommitGate } from "./temporal/revision-policy";
 import type { FactExtractionOutput } from "./prompts/schemas";
 import { inspectManuscript, type ManuscriptStructuralReport } from "./application/manuscript-structure";
@@ -96,13 +97,23 @@ export class CommitService {
     const result = await this.repository.commitRevision({ ...input, contentHash: object.hash, objectKey: object.key, revisionId: randomUUID() });
 
     if (this.chapterMemoryDeps?.memoryIndex) {
-      try {
-        if (result.removedClaimIds?.length) await this.chapterMemoryDeps.memoryIndex.deleteClaims?.(input.projectId, result.removedClaimIds);
-        const retrievable = (result.activatedClaims ?? []).filter((claim) => ["approved", "author", "derived"].includes(claim.authority));
-        if (retrievable.length) await this.chapterMemoryDeps.memoryIndex.upsertClaims(input.projectId, retrievable);
-      } catch (error) {
-        console.warn(`[commit-service] 事实索引同步失败（PostgreSQL 已完成修订切换，可重建索引）：${(error as Error).message}`);
-      }
+      const retrievable = (result.activatedClaims ?? []).filter((claim) => ["approved", "author", "derived"].includes(claim.authority));
+      // 不阻塞 + 留痕走共享包膜（memory-index-drift.ts 的 writeMemoryIndexWithTrace）：
+      // 此前这里只 console.warn，与同函数内 narrative-elements / narrative-state-snapshot
+      // 两个失败点不同形。代价见 state-audit §8.4——chapter-memory 的索引失败同样只 warn，
+      // 运行库实测 6 条章记忆"在一切查询里都显得完全活着，只有语义检索永远召不回它"，
+      // 静默数周，唯一暴露途径是 doctor 的漂移检查，而它按设计不自动触发。
+      await writeMemoryIndexWithTrace({
+        projectId: input.projectId,
+        aggregateId: result.revisionId,
+        projectionType: "memory-index",
+        rowIds: [...(result.removedClaimIds ?? []), ...retrievable.map((claim) => claim.id)],
+        write: async () => {
+          if (result.removedClaimIds?.length) await this.chapterMemoryDeps!.memoryIndex!.deleteClaims?.(input.projectId, result.removedClaimIds);
+          if (retrievable.length) await this.chapterMemoryDeps!.memoryIndex!.upsertClaims(input.projectId, retrievable);
+        },
+        record: (failure) => this.repository.recordProjectionFailure(failure),
+      });
     }
 
     if (input.narrativeElements) {
