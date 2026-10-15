@@ -19,6 +19,17 @@ import { qdrantPointId } from "./memory-point-id";
  *   以 `missingRowIds` 具名给出（欠灌是"检索读不到"，与陈旧点的"读到假的"后果不同级）。
  * - 拿不到点集（集合不存在、非 2xx）：两向都不判，`indexed: null`。
  *
+ * **`missingRowIds` 是混合口径，读数时要拆分**（2026-10-14 round 28 实测补注）：
+ * 它同时含两类后果完全不同的行——
+ *   ① **真缺口**：该 identity 槽位的当前值没有点，语义检索真的读不到；
+ *   ② **不该灌**：同一 identity 槽位已灌了更新的可见值，旧值不入索引是**正确的**
+ *      （灌了反而让检索面同时看到新旧两个值）。
+ * `ymcp` 实测"欠灌 76"里 66 条属②、只有 **10 条**属①（且全在 ch13—ch98，中后期零缺口）。
+ * 区分需要 identityHash 与叙事位置，而本判据的入参基线只带行 id（`MemoryIndexBaseline`），
+ * 故不在判据内拆；要拆就用同源口径另行计算
+ * （见 `tmp/state-audit/verify-under-indexed-attribution-v2.mts`）。
+ * **因此"欠灌 N 条"不能直接当作待办总量**——这一点已写进 doctor 的 detail 文案。
+ *
  * 只报不修：重建整项目索引会重灌全部向量并触发一遍 embedding 调用，不该由一次体检顺手
  * 触发；修的路径是既有的 `POST /v2/projects/:id/memory/rebuild`。
  */

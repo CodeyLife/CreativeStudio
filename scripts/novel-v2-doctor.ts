@@ -125,9 +125,16 @@ try {
     const staleAdvice = dirty.length
       ? " ⇒ 陈旧点把召回名额让给已不可见内容（召回侧有存活判定兜底，不会读错事实），走 POST /v2/projects/:id/memory/rebuild 重建——该路由补灌欠灌并清理陈旧点两个方向；本检查只报不修"
       : "";
+    // 欠灌计数要附带口径说明（2026-10-14 round 28）：`missingRowIds` 含两类**后果完全不同**的行——
+    //   ① 该槽位的当前值没灌 ⇒ 语义检索真的读不到（真缺口，值得补灌）；
+    //   ② 同一 identity 槽位已灌了更新的可见值 ⇒ 灌旧值反而让检索面同时看到新旧两个值（**不该灌**）。
+    // 不区分时这个数长期虚高：`ymcp` 实测"欠灌 76"里 66 条属②、只有 10 条属①，多轮体检都把它
+    // 当待办总量。区分需要 identityHash 与叙事位置，而 `listIndexableMemoryRowIds` 的基线只带 id
+    // （改签名会波及多个调用点），故此处只在文案上标注，实测拆分另见
+    // `tmp/state-audit/verify-under-indexed-attribution-v2.mts`。
     set("memory-index-drift", {
       ok: true,
-      detail: `项目 ${rows.length} 个；欠灌行 ${missing} 条；陈旧点 ${dirtyProjects} 个（脏索引项目 ${dirty.length} 个）${staleAdvice}`,
+      detail: `项目 ${rows.length} 个；欠灌行 ${missing} 条（含"同槽已灌更新的可见值"这类**不该灌**的行，真缺口需拆分口径，见 scripts 内注释）；陈旧点 ${dirtyProjects} 个（脏索引项目 ${dirty.length} 个）${staleAdvice}`,
       data: { dirty: dirty.map(compact).slice(0, 10), underIndexed: rows.filter((row) => row.missingRowIds.length > 0).map(compact).slice(0, 10) },
     });
   } catch (error) { set("memory-index-drift", { ok: false, detail: (error as Error).message }); }
