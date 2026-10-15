@@ -386,10 +386,20 @@ export async function resolveStageSkillBundle(input: {
   // 抛错立刻打断三例与技能迭代无关的用例）。故错键走**报告面**：normalizeSkillDescriptor
   // 带出 `invalidPromptSectionKeys`，由 skills CLI 的 check 与 doctor 常态面报出——
   // 静默丢失被消除，但不把内容缺陷升级成流水线停摆。
-  const direct = available.filter((skill) => skill.enabled
+  // 题材（genre）匹配是**软偏好**，与 cognition.resolveSkillBundle 的 Phase 3.3 是同一契约
+  // （其注释明写"genre 匹配是软偏好：若无匹配 genre 的 skill，仍回退到题材无关的 skill"）。
+  // 2026-10-14 复核轮 round 17 修：此前本处把同一判据实现成**硬过滤**，且两处对"未传题材"
+  // 的兜底**方向相反**——cognition 是 `: true`（不知道就不排除），本处是 `: false`（不知道就排除）。
+  // 后果不是理论问题：学习闭环能把题材相关规则晋升为 skill（promotion-service 持久化
+  // applicable_genres，learning 提示词还明确要求模型填题材标签），而**本处是生产路径**——
+  // 晋升出来的题材规则会在"调用方没传 genre"时被静默排除、永不生效。故按已声明的契约改为：
+  // 未知题材不排除；全部被题材过滤掉时回退到未过滤集（软偏好，而非硬门）。
+  const base = available.filter((skill) => skill.enabled
     && skill.executionPoints?.includes(input.executionPoint)
-    && (!skill.roles?.length || !input.role || skill.roles.includes(input.role))
-    && (!skill.applicableGenres?.length || (input.genre ? skill.applicableGenres.includes(input.genre) : false)));
+    && (!skill.roles?.length || !input.role || skill.roles.includes(input.role)));
+  const genreMatched = base.filter((skill) => !skill.applicableGenres?.length
+    || (input.genre ? skill.applicableGenres.includes(input.genre) : true));
+  const direct = genreMatched.length ? genreMatched : base;
   if (!direct.length) throw new Error(`没有可用于 ${input.executionPoint}${input.role ? `/${input.role}` : ""} 的 Skill`);
 
   const byId = new Map(available.map((skill) => [skill.skillId, skill]));

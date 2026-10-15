@@ -163,14 +163,41 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
     await deps.repository.recordArtifact(artifact);
     return artifact;
   };
-  const resolveCurrentSkills = (input: { projectId: string; executionPoint: SkillExecutionPoint; role?: string; memory?: MemoryBundle; preflightId?: string; genre?: string; requestedCapabilities?: string[] }) => resolveStageSkillBundle({
+  /**
+   * 项目题材缓存（2026-10-14 复核轮 round 17）。
+   *
+   * 为什么需要：`applicableGenres` 是软偏好（题材无关的 skill 永远入选），但**题材已知时**
+   * 它才起作用。此前生产路径的 11 个 `resolveCurrentSkills` 调用点**一个都不传 genre**，
+   * 于是题材匹配在生产上从未生效——结合当时"未传题材即排除"的兜底，任何声明了
+   * `applicableGenres` 的 skill（学习闭环晋升出来的题材规则就会这样）都永不生效。
+   * 项目题材本来就在 `project.metadata.genre`（foundation 提示词已在使用），这里按
+   * 与其它 loader 相同的方式缓存，避免每章每阶段重复读项目行。
+   * null 为"已试算且无题材"哨兵。
+   */
+  const projectGenreCache = new Map<string, string | null>();
+  const loadProjectGenre = async (projectId: string): Promise<string | undefined> => {
+    const cached = projectGenreCache.get(projectId);
+    if (cached !== undefined) return cached ?? undefined;
+    try {
+      const project = await deps.repository.getProjectDetail(projectId);
+      const genre = typeof project?.metadata?.genre === "string" ? project.metadata.genre : null;
+      projectGenreCache.set(projectId, genre);
+      return genre ?? undefined;
+    } catch (error) {
+      // 不写哨兵：失败多为瞬时（DB 抖动），下次调用重试；题材拿不到时软偏好不排除任何技能。
+      console.warn(`[skills] 项目题材读取失败，题材匹配本次不生效：${(error as Error).message}`);
+      return undefined;
+    }
+  };
+  const resolveCurrentSkills = async (input: { projectId: string; executionPoint: SkillExecutionPoint; role?: string; memory?: MemoryBundle; preflightId?: string; genre?: string; requestedCapabilities?: string[] }) => resolveStageSkillBundle({
     projectId: input.projectId,
     provider: deps.skillProvider,
     executionPoint: input.executionPoint,
     role: input.role,
     memory: input.memory,
     preflightId: input.preflightId,
-    genre: input.genre,
+    // 显式传入优先；未传时回落到项目题材（题材匹配是软偏好，拿不到就不排除任何技能）。
+    genre: input.genre ?? await loadProjectGenre(input.projectId),
     requestedCapabilities: input.requestedCapabilities,
   });
   /**

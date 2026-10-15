@@ -1386,6 +1386,61 @@ skills CLI 的 `check`（`invalid-prompt-section-keys` 状态，抛错）与 doc
 **⑥ 词表两侧对账结果（洁净）**：11 个 role 全部既有技能声明、又有调用点会传；
 技能声明的 role 无一在词表外；调用点传的 role 无一在词表外。⇒ 生产无缺陷，**守卫与锁是补的**。
 
+### 8.16 复核轮 round 17（2026-10-14）：同一判据两处相反兜底——题材匹配在生产路径是硬门
+
+承接 round 16 的判据（开放词表 ⇒ 只能临时扫源码 ⇒ 扫漏即假结论），本轮把技能描述符里
+剩下的字段扫完，在 `applicableGenres` 上找到一处**真缺陷**。
+
+**① 先排除两个"看着像缺陷、实则不是"的**（避免把设计当缺陷改）：
+- `capabilities`：它**不是**封闭词表——`resolveStageSkillBundle` 把
+  `input.requestedCapabilities` 并入要求集，故调用方可以请求自定义标签，技能声明自定义
+  capability 是**有意的扩展点**。生产里 `narrative-continuity` 声明了词表外的 `continuity`，
+  但它从未被任何调用点请求过（全仓 grep 无命中）⇒ 是**惰性元数据**，无害。
+  （顺带核到：12/12 个技能都显式声明了 `priority`，故 `priorityOf` 的能力兜底在生产上
+  **从不触发**，"拼错 capability 导致优先级静默降级"这条路径实际不成立。）
+- `requiredMemoryKinds`：类型是封闭联合 `MemoryKind`（5 个）而归一化处是**纯 cast 零校验**，
+  拼错会让记忆门永不触发（required 技能会抛，normal/optional 则静默放行）。但生产
+  **12 个技能一个都没声明**该字段 ⇒ 门整条未被使用，属**预防性**缺口，记录不动手。
+
+**② 真缺陷：同一判据在两处实现成相反兜底**。`applicableGenres` 的匹配在两个解析路径里
+都出现，但对"**调用方没传 genre**"的兜底方向相反：
+
+| 路径 | 代码 | 未传 genre 时 |
+|---|---|---|
+| `cognition.resolveSkillBundle`（计划路径） | `input.genre ? includes(genre) : **true**` | **保留**；且全被过滤时 `genreMatched.length ? genreMatched : selected` **回退到全集** |
+| `skillRuntime.resolveStageSkillBundle`（**生产路径**） | `input.genre ? includes(genre) : **false**` | **排除**；全被过滤即 `throw "没有可用于 X 的 Skill"` |
+
+而 cognition 的 Phase 3.3 注释**已经写明契约**："genre 匹配是**软偏好**：若无匹配 genre 的
+skill，仍回退到题材无关的 skill"。⇒ 生产路径把它实现成了**硬门**，与该契约相反。
+后果不是理论问题：学习闭环**能**把题材相关规则晋升为 skill（`promotion-service` 持久化
+`applicable_genres`，learning 提示词还明确要求模型"若改进只适用于特定题材，填写题材标签数组"），
+而章节级阶段从不传 genre ⇒ **晋升出来的题材规则永不生效**。
+
+**③ 取证口径的一处自我纠正（本会话第六次"枚举不全 ⇒ 假结论"）**：首版用**按行** grep 抽
+调用点，报"11 个调用点一个都不传 genre"。改为**按配对括号**切完整实参后实测：
+**21 个调用点，2 个传 genre**（`activities.ts:612`、`:2232`，都是 foundation 路径），
+**19 个不传**——章节级阶段（drafting/review/revision/fact-extraction/character-enrichment/
+arc.plan/chapter.blueprint/arc.review/arc.revision/chapter.title）全不传。
+结论方向没变（生产基本不传），但数字全错。⇒ 与 round 16 同族：**按行匹配多行实参必然漏**。
+
+**④ 修复（两处，均在最低共享层）**：
+- `skill-runtime.ts`：把题材匹配改回**软偏好**——未知题材不排除（"不知道"≠"不匹配"），
+  全被题材过滤掉时回退到未过滤集（不再抛错）。与 cognition 同一契约。
+- `activities.ts`：新增 `loadProjectGenre`（按既有 loader 同形缓存，null 为"无题材"哨兵），
+  `resolveCurrentSkills` 在调用方未显式传 genre 时回落到**项目题材**
+  （生产项目实测 `metadata.genre = "仙侠/科幻"`）。**一处修复覆盖全部 19 个调用点**，
+  而不是逐个补参。
+
+**⑤ 今日影响为零、机制由死转活**：生产 12 个技能**无一**声明 `applicableGenres`，
+故两处改动当前都是 no-op；改的是"晋升出题材规则后能否生效"这条路径。
+这与 round 15/16 同类：**修的是被静默堵死的通路，不是当下的错值**。
+
+**回归锁**（`skill-runtime.test.ts` 新增 1 例，四向）：① 未知题材 ⇒ 保留；
+② 题材命中 ⇒ 保留；③ 题材不匹配且存在题材无关替代 ⇒ 排除特化技能（**防过度纠正**：
+软偏好不等于永不过滤）；④ 全被题材过滤掉 ⇒ 回退而非抛错。
+**反向实测**：把兜底改回 `: false` + 去掉回退 ⇒ 判红（已跑）。
+
+
 
 
 

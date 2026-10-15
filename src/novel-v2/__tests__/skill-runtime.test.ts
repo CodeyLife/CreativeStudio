@@ -353,6 +353,47 @@ describe("Skill runtime resolution", () => {
   });
 
   /**
+   * 题材匹配是**软偏好**，两条解析路径必须同口径（2026-10-14 复核轮 round 17）。
+   *
+   * 失效形态（实测）：同一判据在两处实现成**相反兜底**——
+   *   `cognition.resolveSkillBundle`：`input.genre ? ...includes(genre) : true`（不知道就不排除）
+   *   `skillRuntime.resolveStageSkillBundle`：`: false`（不知道就排除）
+   * 而后者是**生产路径**，且 21 个调用点里 19 个不传 genre（章节级阶段全不传）。
+   * ⇒ 任何声明了 `applicableGenres` 的 skill 在生产上**永不生效**。
+   * 这不是理论风险：学习闭环能把题材相关规则晋升为 skill
+   * （`promotion-service` 持久化 `applicable_genres`，learning 提示词还明确要求模型填题材标签）。
+   * cognition 的 Phase 3.3 注释已明写契约是"软偏好：若无匹配 genre 的 skill，仍回退到题材无关的 skill"。
+   *
+   * 四条判据（前两条是修复点，后两条防过度纠正）：
+   *  ① 未知题材 ⇒ 保留（"不知道"不等于"不匹配"）；
+   *  ② 题材命中 ⇒ 保留；
+   *  ③ 题材不匹配且**存在**题材无关替代 ⇒ 排除特化技能（软偏好的方向仍然生效）；
+   *  ④ 全被题材过滤掉 ⇒ 回退到未过滤集，**不抛错**（软偏好而非硬门）。
+   */
+  it("题材匹配是软偏好：未知题材不排除、全被过滤时回退（与 cognition 同口径）", async () => {
+    const restricted = { ...draftSkill("题材特化指引"), skillId: "genre-skill", applicableGenres: ["仙侠"] };
+    const generic = { ...draftSkill("题材无关指引"), skillId: "generic-skill", applicableGenres: [] };
+    const bundleOf = async (skills: SkillDescriptor[], genre?: string) => {
+      const provider = createDatabaseSkillProvider(async () => skills);
+      return renderSkillInstruction(
+        await resolveStageSkillBundle({ projectId: "p1", provider, executionPoint: "chapter.drafting", role: "writer", ...(genre === undefined ? {} : { genre }) }),
+        "chapter.drafting",
+      );
+    };
+
+    // ① 未知题材 ⇒ 保留（修复前此处抛错/排除）。
+    expect(await bundleOf([restricted]), "未知题材不得排除题材特化技能").toContain("题材特化指引");
+    // ② 题材命中 ⇒ 保留。
+    expect(await bundleOf([restricted], "仙侠")).toContain("题材特化指引");
+    // ③ 题材不匹配且有题材无关替代 ⇒ 排除特化技能，保留通用的。
+    const mismatched = await bundleOf([restricted, generic], "都市");
+    expect(mismatched, "题材不匹配时应让位给题材无关技能").not.toContain("题材特化指引");
+    expect(mismatched).toContain("题材无关指引");
+    // ④ 全被题材过滤掉 ⇒ 回退到未过滤集，不抛错。
+    expect(await bundleOf([restricted], "都市"), "全被题材过滤时应回退而非抛错").toContain("题材特化指引");
+  });
+
+  /**
    * promptSections 的"查不到的键"必须被检出（2026-10-14 复核轮 round 15）。
    *
    * 失效形态：渲染口径是 `promptSections[executionPoint] ?? promptSections[coarse]`，
