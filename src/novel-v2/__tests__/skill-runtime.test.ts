@@ -106,7 +106,7 @@ describe("Skill runtime resolution", () => {
     for (const skillId of ["prose-craft", "reader-emotion", "plot-causality"]) {
       // 守卫值随 workspace yaml 版本演进（prose-craft 曾升 1.4.0 未同步本守卫，属存量断链修复）；
       // 断言的仍是"清单能解析出版本与指纹"这一契约，非具体措辞。
-      expect(byId.get(skillId)?.version).toBe(skillId === "prose-craft" ? "1.5.0" : "1.1.0");
+      expect(byId.get(skillId)?.version).toBe(skillId === "prose-craft" ? "1.6.0" : "1.1.0");
       expect(byId.get(skillId)?.contentFingerprint).toBeTruthy();
     }
 
@@ -181,6 +181,44 @@ describe("Skill runtime resolution", () => {
       "chapter.review.prose",
     );
     expect(reviewText).toContain("挤掉了什么");
+  });
+
+  /**
+   * "数数"必须从清点惯性里除名（2026-10-14 复核轮 round 10 的误判撤回）。
+   *
+   * round 2 把"以数数收束一章"与清点惯性并列为同族病（"一处是留白，多处是模板"）。
+   * 可达性验证推翻了这个归类：数数与章节强度**正相关**——四个合格带均值 0.57/千字
+   * 高于含不合格的混合带 0.44；全书最强的 099-127 带 0.75 为各带最高；
+   * 质量最差的 001-014 带仅 0.05。直读最强带样本可见数数常是章的核心意象与认知
+   * 过程本身（ch124「数着自己的步子，又数着笔声的拍子」；ch123「翻出一串数字，
+   * 四十七…答案不是新路，答案是旧路」）。
+   *
+   * 若不撤回，规则会命令作者/审核面去"修"一个本该保留的声音特征——本书的克制底色
+   * 很大程度就建立在这种节律上。这与 AGENTS.md"禁止把个案固化成硬门"同族：
+   * **把有效声音误判成瑕疵**。
+   *
+   * 双向覆盖：
+   *  - 写作侧必须写明"数数不是同族惯性"，且给出数据依据的方向（不是禁令）；
+   *  - 审核侧必须写明"不得仅因又出现数数而报"；
+   *  - 反向：不得再把"一处是留白，多处是模板"这类**频率判据**套在数数上。
+   */
+  it("数数已从清点惯性除名（不得仅因频率报它）", async () => {
+    const provider = createWorkspaceSkillProvider(path.resolve(process.cwd(), "skills", "novel-v2"));
+    const draftText = renderSkillInstruction(
+      await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint: "chapter.drafting", role: "writer" }),
+      "chapter.drafting",
+    );
+    expect(draftText, "写作侧必须写明数数不是同族惯性").toContain("数数不是同族惯性");
+    expect(draftText, "必须给出它与质量正相关的方向，而非只说'撤回了'").toContain("与章节强度正相关");
+
+    const reviewText = renderSkillInstruction(
+      await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint: "chapter.review.prose", role: "prose-reviewer" }),
+      "chapter.review.prose",
+    );
+    expect(reviewText, "审核侧必须写明不得仅因频率报数数").toContain("不得仅因");
+    // 反向：频率式套话不得回来（round 2 的原措辞）。
+    expect(draftText, "数数不得再被套上'一处是留白，多处是模板'的频率判据").not.toContain("一处是留白，多处是模板");
+    expect(reviewText, "数数不得再被列为必报惯性").not.toContain("以数数收束一章而在近章已反复出现");
   });
 
   it("gives foundation review its own role-specific evidence Skill without changing planning resolution", async () => {
