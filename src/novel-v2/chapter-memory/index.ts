@@ -135,8 +135,21 @@ export async function persistChapterMemoryOutput(
     try {
       await deps.memoryIndex.upsertClaims(input.projectId, [chapterMemoryAsClaim(chapterMemory), rollupClaim]);
     } catch (error) {
-      // TODO P2: 接入 learning 闭环，把 Qdrant 索引失败作为 RuntimeLearningAssessment 的 symptom
-      console.warn(`[chapter-memory] Qdrant 索引失败（不阻塞 Postgres 落库）：${(error as Error).message}`);
+      // 不阻塞 commit 的契约保留（瞬时 Qdrant 故障不该拦住作者创作），但失败必须
+      // **留下耐久痕迹**：否则库里那一行在一切查询里都显得完全活着，只有语义检索
+      // 永远召不回它，而唯一的暴露途径是 doctor 的漂移检查——一次瞬时故障可以这样
+      // 静默数周（state-audit §8.4 实测 6 条章记忆正是这个形态）。
+      // TODO(可观测性)：把欠灌计数接入 learning 闭环的 symptom 面（本条先落地耐久记录）。
+      const reason = (error as Error).message;
+      console.warn(`[chapter-memory] Qdrant 索引失败（不阻塞 Postgres 落库）：${reason}`);
+      await deps.repository.recordMemoryIndexWriteFailure?.({
+        projectId: input.projectId,
+        rowIds: [chapterMemory.id, rollupClaim.id],
+        reason,
+        stage: "chapter-memory.persist",
+      }).catch((recordError: Error) => {
+        console.warn(`[chapter-memory] 欠灌事件记录失败：${recordError.message}`);
+      });
     }
   }
 

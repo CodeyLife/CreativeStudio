@@ -862,6 +862,36 @@ export class NovelPostgresRepository {
     return { projectId, status: "ready" as const, indexedClaims, removedStalePoints };
   }
 
+  /**
+   * 记录一次"库内已写、向量索引没写上"的欠灌事件（可观测性落点）。
+   *
+   * 根因（state-audit-20261013 §8.4，运行库实测 6 条章记忆如此）：章节记忆的写入顺序是
+   * **先 Postgres 后 Qdrant**（`chapter-memory/index.ts` 的 `persistChapterMemoryOutput`），
+   * 索引失败按"不阻塞 commit"契约只 `console.warn` 并挂着一句 TODO P2。
+   * 于是库里那一行此后在**任何查询里都显得完全活着**（可见性谓词认它、基线枚举含它），
+   * 只是语义检索永远召不回它——唯一的暴露途径是 doctor 的漂移检查，而它按设计
+   * "只报不修/不自动触发"，于是一次瞬时故障可以静默存在数周。
+   *
+   * 为什么落 `audit_records` 而不是新表：这是审计性事实（"某时刻某事失败"），
+   * 与同表其他 action 同族；且不引入新的迁移面。appendOutbox 同理——域事件账本已有
+   * 保留期清理，失败事件不该比业务事件活得更久或更短。
+   *
+   * 边界：只记事件，**不改写入顺序、不阻断 commit**（瞬时 Qdrant 故障不该拦住作者创作）；
+   * 补救仍是 rebuild 的补灌侧。本方法自身失败也只 warn——观测路径不能把生产路径带崩。
+   */
+  async recordMemoryIndexWriteFailure(input: { projectId: string; rowIds: string[]; reason: string; stage: string }): Promise<void> {
+    if (!input.rowIds.length) return;
+    try {
+      await this.pool.query(
+        "INSERT INTO audit_records(project_id,actor,action,aggregate_type,aggregate_id,payload) VALUES($1,$2,'memory.index-write-failed',$3,$4,$5)",
+        [input.projectId, "runtime", input.stage, input.projectId, { rowIds: input.rowIds.slice(0, 200), rowCount: input.rowIds.length, reason: input.reason.slice(0, 500) }],
+      );
+      await this.appendOutbox("memory-gate", input.projectId, "memory.index-write-failed", { projectId: input.projectId, rowCount: input.rowIds.length, stage: input.stage, reason: input.reason.slice(0, 500) });
+    } catch (error) {
+      console.warn(`[memory-index] 欠灌事件记录失败（不影响已完成的写入）：${(error as Error).message}`);
+    }
+  }
+
   async backfillCurrentChapterReviewSnapshots(): Promise<number> {
     const result = await this.pool.query<{ artifact_id: string }>(`
       SELECT DISTINCT mr.artifact_id
