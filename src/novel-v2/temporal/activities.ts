@@ -12,6 +12,7 @@ import { ExternalMcpRequiredError, type ModelExecutionProvenance, type ModelPurp
 import { ContentObjectStore } from "../object-store";
 import { assertStoryArcBatchWindow, normalizeStoryArcRebaseBundle, parseStoryArcBundle, storyArcBatchWindow, validateChapterExecutionContract, validateStoryArcExecutionContracts, validateStoryArcRebaseBundle, type ChapterPlanningContext, type StoryArcBundle } from "../application/story-arc";
 import { extractChapterEnding, extractChapterOpening, inspectManuscript, structuralReviewFromReport, type ManuscriptStructuralReport } from "../application/manuscript-structure";
+import { sourceRevisionIdsOf } from "../memory-visibility";
 import { summarizeDormancy, type DormancyLedger } from "../narrative-dormancy";
 import { buildStoryArcChaptersPrompt, buildStoryArcPlanPrompt, buildStoryArcPlanningContextSections, buildStoryArcReviewPrompt, buildStoryArcRevisionPrompt, storyArcBundleSchema, storyArcChaptersOutputSchema, storyArcPlanBatchSchema, type StoryArcReviewOutput } from "../prompts/story-arc";
 import { foundationArtifactToMemoryClaim } from "../foundation-memory";
@@ -175,6 +176,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
    * null 为"已试算且无题材"哨兵。
    */
   const projectGenreCache = new Map<string, string | null>();
+
   const loadProjectGenre = async (projectId: string): Promise<string | undefined> => {
     const cached = projectGenreCache.get(projectId);
     if (cached !== undefined) return cached ?? undefined;
@@ -471,7 +473,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
               knowledgeScope: "author",
               authority: "approved",
               confidence: 1,
-              sourceRevisionIds: [replaced.revisionId],
+              sourceRevisionIds: sourceRevisionIdsOf(replaced.revisionId),
               contentHash: canonicalSha256({ revisionId: replaced.revisionId, replacementFacts: replacementFacts.map((claim) => claim.contentHash), unresolvedThreads: replaced.unresolvedThreads }),
               supersedes: [],
               score: 1,
@@ -518,7 +520,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
               knowledgeScope: "author" as const,
               authority: "derived" as const,
               confidence: 0.9,
-              sourceRevisionIds: [f.plantedRevisionId],
+              sourceRevisionIds: sourceRevisionIdsOf(f.plantedRevisionId),
               contentHash: f.id,
               supersedes: [],
               score: 0,
@@ -539,7 +541,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
               knowledgeScope: "author" as const,
               authority: "derived" as const,
               confidence: 0.9,
-              sourceRevisionIds: [p.sourceRevisionId],
+              sourceRevisionIds: sourceRevisionIdsOf(p.sourceRevisionId),
               contentHash: p.id,
               supersedes: [],
               score: 0,

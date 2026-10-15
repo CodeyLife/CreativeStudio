@@ -24,6 +24,22 @@ export const VISIBLE_CLAIM_AUTHORITIES = ["approved", "author", "derived"] as co
 
 export type VisibleClaimAuthority = (typeof VISIBLE_CLAIM_AUTHORITIES)[number];
 
+/**
+ * 由"可能为空的来源 revision id"构造 claim 的 `sourceRevisionIds`（2026-10-14 round 22）。
+ *
+ * 失效形态：若干注入点直接写 `sourceRevisionIds: [x.revisionId]`，而该列在 schema 上
+ * 可为空（生产实测 `foreshadowing.planted_revision_id`：717 条里 **41 条为空**）。
+ * 于是数组里出现 `null` 并向下游传播——
+ *   memory_bundles.payload.sourceRevisionIds 含 null：**454 行**
+ *   context_manifests.source_revision_ids 含 NULL：**222 行**
+ * 影响：任何按 sourceRevisionIds 做集合运算/join 的消费方拿到 null（`= ANY(array)`
+ * 永远匹配不到；`unnest` 出来的 null 让悬空统计虚高——取证脚本就被它误导过一次）。
+ * 放在这个文件是因为它与 claim 的来源真址同属一层：**组装处就滤掉，不让 null 流到下游再各自防御。**
+ */
+export function sourceRevisionIdsOf(...ids: Array<string | null | undefined>): string[] {
+  return [...new Set(ids.filter((id): id is string => typeof id === "string" && id.length > 0))];
+}
+
 export function isVisibleClaimAuthority(authority: string | null | undefined): authority is VisibleClaimAuthority {
   return typeof authority === "string" && (VISIBLE_CLAIM_AUTHORITIES as readonly string[]).includes(authority);
 }

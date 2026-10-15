@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { foundationArtifactToMemoryClaim, foundationClaimId } from "./foundation-memory";
-import { CLAIM_PROJECTION_SET_SQL, retrievalVisibleClaimsSql, retiredByVisibleKillerSql } from "./memory-visibility";
+import { CLAIM_PROJECTION_SET_SQL, retrievalVisibleClaimsSql, retiredByVisibleKillerSql, sourceRevisionIdsOf } from "./memory-visibility";
 import { ACTIVE_WORKFLOW_RUN_STATUSES_SQL, HUMAN_GATE_RESUME_WORKFLOW_RUN_STATUS, OPEN_WORKFLOW_RUN_STATUSES_SQL, SUCCEEDED_WORKFLOW_RUN_STATUSES_SQL, WAITING_EXTERNAL_WORKFLOW_RUN_STATUS_SQL, terminalOverwriteGuardSql, type WorkflowRunStatus } from "./run-lifecycle";
 import { normalizeFoundationStructuredDataFlat, validateFoundationTaskContract } from "./application/foundation-contract";
 import { foundationContractFingerprint } from "./application/foundation-contract-fingerprint";
@@ -4937,18 +4937,18 @@ export class NovelPostgresRepository {
         `禁止提前消费：${snapshot.prohibitedEarlyConsumption.filter((item) => !item.startsWith("故事弧退出状态：")).join("；") || "无"}`,
       ].join("\n");
       const subjectRefs = latestMemory?.characterStates.map((item) => item.characterId) ?? [];
-      push({ id: snapshot.id, projectId: input.projectId, kind: "hierarchical", title: `第${snapshot.narrativeOrder}章叙事状态账本`, content, subjectRefs, narrativeRange: { start: snapshot.narrativeOrder, end: snapshot.narrativeOrder }, knowledgeScope: "author", authority: "derived", confidence: 1, sourceRevisionIds: [snapshot.revisionId], contentHash: snapshot.fingerprint, supersedes: [], matchedFacet: "thread", matchedFacets: ["thread", "entity"] });
+      push({ id: snapshot.id, projectId: input.projectId, kind: "hierarchical", title: `第${snapshot.narrativeOrder}章叙事状态账本`, content, subjectRefs, narrativeRange: { start: snapshot.narrativeOrder, end: snapshot.narrativeOrder }, knowledgeScope: "author", authority: "derived", confidence: 1, sourceRevisionIds: sourceRevisionIdsOf(snapshot.revisionId), contentHash: snapshot.fingerprint, supersedes: [], matchedFacet: "thread", matchedFacets: ["thread", "entity"] });
       const povForms = input.povCharacterId ? await this.characterRefForms(input.projectId, input.povCharacterId) : undefined;
       const povMatches = (characterId: string) => characterId === input.povCharacterId
         || Boolean(povForms && (characterId === povForms.shortId || characterId === povForms.name || characterId === povForms.uri));
       const povState = latestMemory?.characterStates.find((item) => povMatches(item.characterId));
       const povCanonical = povForms?.shortId ?? input.povCharacterId;
       if (povState && povCanonical) {
-        push({ id: `${snapshot.id}:pov:${povCanonical}`, projectId: input.projectId, kind: "working", title: `POV角色章末状态：${povForms?.name ?? povCanonical}`, content: povState.stateSnapshot, subjectRefs: [povCanonical], narrativeRange: { start: snapshot.narrativeOrder, end: snapshot.narrativeOrder }, knowledgeScope: { characterId: povCanonical }, authority: "derived", confidence: 1, sourceRevisionIds: [snapshot.revisionId], contentHash: createHash("sha256").update(`${snapshot.fingerprint}:${povCanonical}:${povState.stateSnapshot}`).digest("hex"), supersedes: [], matchedFacet: "entity" });
+        push({ id: `${snapshot.id}:pov:${povCanonical}`, projectId: input.projectId, kind: "working", title: `POV角色章末状态：${povForms?.name ?? povCanonical}`, content: povState.stateSnapshot, subjectRefs: [povCanonical], narrativeRange: { start: snapshot.narrativeOrder, end: snapshot.narrativeOrder }, knowledgeScope: { characterId: povCanonical }, authority: "derived", confidence: 1, sourceRevisionIds: sourceRevisionIdsOf(snapshot.revisionId), contentHash: createHash("sha256").update(`${snapshot.fingerprint}:${povCanonical}:${povState.stateSnapshot}`).digest("hex"), supersedes: [], matchedFacet: "entity" });
       }
     }
     for (const memory of memories) {
-      push({ id: `pinned:${memory.id}`, projectId: input.projectId, kind: "episodic", title: `第${memory.narrativeRange.end}章定稿记忆`, content: `${memory.summary}\n关键事件：${memory.keyEvents.join("；")}\n未解线索：${memory.unresolvedThreads.join("；")}`, subjectRefs: memory.characterStates.map((item) => item.characterId), narrativeRange: memory.narrativeRange, knowledgeScope: "author", authority: "derived", confidence: 0.95, sourceRevisionIds: [memory.revisionId], contentHash: memory.fingerprint, supersedes: [], matchedFacet: "chapter-memory" });
+      push({ id: `pinned:${memory.id}`, projectId: input.projectId, kind: "episodic", title: `第${memory.narrativeRange.end}章定稿记忆`, content: `${memory.summary}\n关键事件：${memory.keyEvents.join("；")}\n未解线索：${memory.unresolvedThreads.join("；")}`, subjectRefs: memory.characterStates.map((item) => item.characterId), narrativeRange: memory.narrativeRange, knowledgeScope: "author", authority: "derived", confidence: 0.95, sourceRevisionIds: sourceRevisionIdsOf(memory.revisionId), contentHash: memory.fingerprint, supersedes: [], matchedFacet: "chapter-memory" });
     }
     return hits;
   }

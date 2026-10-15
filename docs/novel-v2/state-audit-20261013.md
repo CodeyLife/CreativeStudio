@@ -1657,6 +1657,59 @@ round 19 建立了族级筛选的五步法（比值 → 核基数 → 排混杂 
 - 读者视角附记（本轮精读 049/051/056/059/062/064/067 等章）：主线文字质量为"冰山式克制"，问题不在句子而在**重复的可感知结构**——主角反复以同一套动作清点随身物件（废石/玉牌/丹/碎角/左膝/回执/草图，各配一次"凉"）、以指节敲纸排列日期、以"数呼吸/数天色"收尾。机械测量（`tmp/state-audit/measure-narrative-idioms.mts`，确定性、零模型调用）：道具盘点词族全书 862 处 / 每千字 2.16，最高 032 章 15.56/千字；"凉"族 317 处 / 每千字 0.78，最高 062 章 7.18/千字；数数收尾族 221 处 / 每千字 0.60。**分段均值揭示两族峰值都落在商业基准确诊的"死亡象限"内**：道具盘点族 21-40 章 5.30/千字（全书 6.6× 的 2.16）、41-60 章 4.79、61-80 章 3.81；温度族 61-80 章 1.52/千字（全书近 2× 的 0.78）。⇒ 与 §7 第 5 项的对白崩落**同源**：对手戏缺席，章节以物件清点与内省填充。该形态**不是单章缺陷而是跨章惯性**，属生成面指引问题而非事实记忆问题；已定稿章不回溯，故不动正文。
 - **本轮落地的生成面指引**（`skills/novel-v2/prose-craft.yaml` 1.4.0 → 1.5.0，三面同步）：写作侧要求"本章这次清点必须与以往任何一次不同——带来新信息（某件位置/状态真的变了）、新选择（据此决定下一步）或新代价（清点本身有风险），三者都不成立时改为写清点之后的那一个动作"，并把"以数数收束一章"并列为同类惯性（一处是留白，多处是模板）；审核侧列为必查项，且**要求报告指明它挤掉了什么**（本章缺的那次交锋、那次变化），把动刀理由钉在"该有的现场没发生"而非"这个动作出现太多次"；修订侧给出修法"不是删清单，而是给这次清点安上它缺失的功能"。判据用通用叙事模式描述（随身物件清点 + 同类温度/质感判定 + 数数收尾），不含任何本书专有物件名，跨题材复用。测试：`skill-runtime.test.ts` 新增一例，三面接线 + 写作侧三条件 + 审核侧"挤掉了什么"均在场；反向摘除写作侧该段即判红（本轮已实测）。
 
+### 8.21 复核轮 round 22（2026-10-14）：按"删除边界=引用边界"扫全库——数组引用列的第三次悬空
+
+round 21 修了 `memory_claims.supersedes`。本轮按同原则**扫全库**（112 处 DELETE 与
+全部数组列交叉），把这类"删被指向方不清指向方"的形态一次扫清。
+
+**① 扫出的候选与结论**（`tmp/state-audit/scan-array-reference-columns.mts`、`verify-other-array-refs.mts`）：
+
+| 数组列 | 指向 | 悬空数 | 结论 |
+|---|---|---|---|
+| `memory_claims.supersedes` | memory_claims | **94 → 0**（round 21 已修） | ✅ |
+| `memory_claims.source_revision_ids` | manuscript_revisions | 0 | ✅ 早已维护（`memory-visibility.ts:84` 投影里 COALESCE 重算） |
+| **`memory_bundles.payload.sourceRevisionIds`** | — | **454 行含 `null`** | ❌ **本轮真缺陷** |
+| `context_manifests.source_revision_ids` | manuscript_revisions | 222 行含 `null` + 1183 条已删 rev | ❌ 传播下游 + 档案语义 |
+| `chapter_planning_contexts.source_artifact_ids` | artifacts | 0 | ✅ |
+| `creative_work_items.artifact_refs` | artifacts | 0 | ✅ |
+
+**② 真缺陷：`[null]` 被写进 claim 的 sourceRevisionIds**。逐层溯源
+（`trace-null-revision-ids.mts`、`find-null-claims.mts`）：
+- `memory_claims.source_revision_ids`：**0 行含 null**（干净）
+- `memory_bundles.payload.sourceRevisionIds`：454 行含 null ⇒ **null 的出生地**
+- `context_manifests`：222 行 ⇒ 传播下游
+- 再往里挖：受影响 bundle 的 claims 里 `sourceRevisionIds == null` 的正是
+  **`foreshadowing:<project>:<hash>`（kind=working, matchedFacet=foreshadowing）**这一族
+- 根因：`activities.ts` 的开放伏笔注入写 `sourceRevisionIds: [f.plantedRevisionId]`，
+  而 `foreshadowing.planted_revision_id` **可为空**（生产实测 717 条里 **41 条为空**）
+  ⇒ 数组里出现 `null`。
+
+**③ 后果分级**：null 元素让 `= ANY(array)` 永远匹配不到该元素、`unnest` 出的 null 让
+**悬空统计虚高**（本轮自己的取证脚本就被它误导：一度把 222 条 NULL 当成"空串"报错）。
+另需与档案语义分开：`context_manifests` 里那 **1183 条 uuid 形态**悬空指向"装配时用过、
+其后被删"的 revision，是**档案语义、不该清**（该列无生产读者，只有 INSERT）。
+
+**④ 修复（最低共享层 + 存量已清）**：
+- 新增 `sourceRevisionIdsOf(...ids)`（`memory-visibility.ts`，与 claim 来源真址同层）：
+  滤掉 null/undefined/空串、去重、**全空时返回 `[]` 而不是 `[null]`**；
+- 五个组装点全部改用它（activities 的伏笔/承诺/替换 revision、postgres-repository 的
+  快照/POV/章记忆三处）。
+- 存量：`heal-null-revision-ids.mts` dry-run 后 apply ⇒ memory_bundles **454 行**、
+  context_manifests **403 行**修净，残留 null **0**；合法 id 全部保留
+  （bundle 48,743 个、manifest 29,326 个 id 元素一个没少）⇒ **只删 null，未动合法值**。
+
+**⑤ 回归锁 2 例（含一个"锁必须能咬人"的自检）**：
+- helper 单测：全空 ⇒ `[]`（不是 `[null]`/`[""]`）、合法 id 保留去重、混合输入顺序保持；
+- 接线锁：两文件都不得残留 `[x.…RevisionId]` 直写、且必须真的用了 helper。
+  **首版正则有洞**：只写 `\w+\.revisionId`，于是 `[f.plantedRevisionId]`、
+  `[p.sourceRevisionId]` **漏网**——反向复跑显示"未判红"，才发现锁根本不咬人。
+  改为 `[\w.]+[Rr]evisionId` 并**在测试里对三种历史形态做自检**
+  （`DIRECT_WRITE.test(...)` 必须为 true），否则等于没锁。
+
+**本轮可复用判据**：**"比值/结论"类的正则与判据，必须先证明它能抓住已知的反例再上线**。
+锁的失效形态不是"写错"，而是"**看起来覆盖了、实际有条形洞**"——本次若无反向复跑，
+一个从不判红的锁会被当成保护留存下去。
+
 ---
 
 ## 9. 取证路径备查

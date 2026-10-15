@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { NovelPostgresRepository } from "../postgres-repository";
 import { buildMemoryBundle, createPreflightPlan } from "../cognition";
-import { CLAIM_PROJECTION_SET_SQL, retrievalVisibleClaimsSql, retiredByVisibleKillerSql, isVisibleClaimAuthority } from "../memory-visibility";
+import { CLAIM_PROJECTION_SET_SQL, retrievalVisibleClaimsSql, retiredByVisibleKillerSql, isVisibleClaimAuthority, sourceRevisionIdsOf } from "../memory-visibility";
 import type { MemoryClaim, NovelIntent } from "../protocol";
 
 const TEST_DB_URL = process.env.TEST_DATABASE_URL ?? "postgresql://ymcp:ymcp@127.0.0.1:5432/ymcp_test";
@@ -295,6 +295,55 @@ describe("foundation segment singleton (A2/FM-6)", () => {
     // 且被删行确实不在了（否则这条用例什么都没验证）。
     const exists = await repository.pool.query("SELECT 1 FROM memory_claims WHERE project_id=$1 AND id=$2", [projectId, doomed]);
     expect(exists.rows).toHaveLength(0);
+  });
+
+  /**
+   * sourceRevisionIdsOf：可空的来源 revision id 不得把 null 带进 claim（round 22）。
+   *
+   * 失效形态（真库实测）：若干注入点写 `sourceRevisionIds: [x.revisionId]`，而
+   * `foreshadowing.planted_revision_id` 可为空（717 条里 41 条空）⇒ 数组里出现 null 并传播：
+   * memory_bundles.payload 含 null 454 行、context_manifests 列含 NULL 222 行。
+   * 后果：`= ANY(array)` 永远匹配不到该元素；`unnest` 出的 null 让悬空统计虚高。
+   *
+   * 双向：① null/undefined/空串被滤掉；② 合法 id 全部保留且去重；
+   * ③ **全空时返回空数组**（不是 [null]）——这是本条的核心。
+   */
+  it("sourceRevisionIdsOf 滤掉空 id：全空返回 [] 而不是 [null]", () => {
+    // ① 核心：全空 ⇒ []，不是 [null]/[""]。
+    expect(sourceRevisionIdsOf(null)).toEqual([]);
+    expect(sourceRevisionIdsOf(undefined)).toEqual([]);
+    expect(sourceRevisionIdsOf("")).toEqual([]);
+    expect(sourceRevisionIdsOf(null, undefined, "")).toEqual([]);
+    // ② 合法 id 保留且去重（重复不再放大数组）。
+    expect(sourceRevisionIdsOf("r1", "r2")).toEqual(["r1", "r2"]);
+    expect(sourceRevisionIdsOf("r1", "r1", "r2")).toEqual(["r1", "r2"]);
+    // ③ 混合：空值被剔除，合法值按首次出现顺序保留。
+    expect(sourceRevisionIdsOf("r1", null, "r2", undefined, "r1", "")).toEqual(["r1", "r2"]);
+    // 反例面：不得把空值"转成"占位符（历史缺陷形态是留下 null）。
+    for (const built of [sourceRevisionIdsOf(null), sourceRevisionIdsOf(undefined), sourceRevisionIdsOf("")]) {
+      expect(built).not.toContain(null);
+      expect(built).not.toContain("");
+      expect(built).toHaveLength(0);
+    }
+  });
+
+  it("接线锁：所有 claim 组装点都必须用 sourceRevisionIdsOf，不得直接 [x.revisionId]", () => {
+    // 该不变量与 round 21 的 supersedes 清理同族：**组装处就挡，不把 null 放下去再各自防御**。
+    const repositorySource = readFileSync(fileURLToPath(new URL("../postgres-repository.ts", import.meta.url)), "utf8");
+    const activitiesSource = readFileSync(fileURLToPath(new URL("../temporal/activities.ts", import.meta.url)), "utf8");
+    // 反例面：不得残留"单元素 revision/source id 直接进数组"的写法。
+    // 注意正则要覆盖**任何** <对象>.<…RevisionId> 形态——首版只写 \w+\.revisionId，
+    // 于是 [f.plantedRevisionId] / [p.sourceRevisionId] 漏网（实测反向验证因此没判红）。
+    const DIRECT_WRITE = /sourceRevisionIds:\s*\[\s*[\w.]+[Rr]evisionId\s*\]/u;
+    expect(repositorySource, "postgres-repository 残留 [x.…RevisionId] 直写").not.toMatch(DIRECT_WRITE);
+    expect(activitiesSource, "activities 残留 [x.…RevisionId] 直写").not.toMatch(DIRECT_WRITE);
+    // 且 helper 必须真的被用在这两处（否则锁空转）。
+    expect(repositorySource).toMatch(/sourceRevisionIds:\s*sourceRevisionIdsOf\(/u);
+    expect(activitiesSource).toMatch(/sourceRevisionIds:\s*sourceRevisionIdsOf\(/u);
+    // 反例面的自检：这个正则必须**确实能**抓住历史缺陷形态（否则等于没锁）。
+    expect(DIRECT_WRITE.test("sourceRevisionIds: [f.plantedRevisionId],")).toBe(true);
+    expect(DIRECT_WRITE.test("sourceRevisionIds: [p.sourceRevisionId],")).toBe(true);
+    expect(DIRECT_WRITE.test("sourceRevisionIds: [snapshot.revisionId],")).toBe(true);
   });
 
   it("regeneration refreshes the singleton in place instead of adding a row", async () => {
