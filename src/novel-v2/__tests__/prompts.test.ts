@@ -747,6 +747,48 @@ describe("long-form prompt contracts", () => {
   });
 
   /**
+   * 审核面的"段名指路"必须能解析到真实段标题（2026-10-14 复核轮 round 14）。
+   *
+   * 失效形态（实测）：审核 prompt 写"以上下文**『到期与老化伏笔账』段**为准
+   * （无该段时跳过）"，而该段的真实标题是 **"窗口上界已过的伏笔账"**——2026-09-18 的
+   * P1 修正**刻意**改了名（措辞纪律要求"不说超期/欠债"），但审核面的指路没跟着改。
+   * 于是审核员按"无该段"**跳过整条到期账处置检查**，而账其实就在上下文里。
+   * 这是"仪器说自己有、实际没有"同族，只是发生在**自然语言指路**这一层，没有门会报。
+   *
+   * 锁法：抽出发给审核面的所有『X』段引用，逐个与 `buildStoryArcPlanningContextSections`
+   * 实际产出的段标题对账——必须能互相包含（引用是标题的子串，或标题是引用的子串）。
+   * 判据只扫代码本体（剥注释）：解释这段历史的注释本身会引用旧名。
+   */
+  it("审核面引用的段名必须解析到真实段标题（段改名时指路要跟着改）", () => {
+    const source = readFileSync("src/novel-v2/prompts/story-arc.ts", "utf8")
+      .split(/\r?\n/)
+      .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+      .join("\n");
+    // 段引用 = 『X』后紧跟 段/清单/中的/里。
+    const references = [...new Set([...source.matchAll(/[『「]([^』」]{2,30})[』」](?=(?:段|清单|中的|里))/gu)].map((match) => match[1]))];
+    expect(references.length, "一个段引用都没扫到＝锁空转，须修锁").toBeGreaterThan(2);
+
+    // 用能逼出全部条件段的夹具取真实标题。
+    const titles = buildStoryArcPlanningContextSections({
+      projectTitle: "对账项目",
+      macro: [],
+      recentChapters: [],
+      openThreads: [],
+      cast: [{ id: "char-a", name: "甲" }],
+      undisclosedSecrets: [{ claim: "秘密", revealWindow: "第三卷后" }],
+      dueLedger: { currentOrder: 10, windowElapsedCount: 1, agedOpenCount: 0, items: [{ id: "f-1", description: "断刀", horizonOrder: 8, plantedOrder: 2 }] },
+      narrativeDormancy: { currentOrder: 10, running: 1, silent: [{ id: "f-2", description: "树洞蓝光", plantedOrder: 3, lastMentionOrder: 4, silentFor: 6 }], neverMentioned: [], silentBands: [], atRiskIds: ["f-2"] },
+      lengthDrift: { windowSize: 6, avgChars: 1620, sparseCount: 4, minChars: 1250 },
+      dialogueDrift: { windowSize: 6, avgRatio: 0.004, hintBelowRatio: 0.01, silentOrders: [3, 5], minRatio: 0 },
+      ensembleSignal: { soloOnlyOrders: [4], longestSoloRun: 2, windowSize: 6 },
+      payoffRhythm: [{ arcOrdinal: 7, title: null, finalChapters: 6, payoffCount: 0 }],
+    } as never).map((section) => section.title);
+
+    const unresolved = references.filter((reference) => !titles.some((title) => title.includes(reference) || reference.includes(title)));
+    expect(unresolved, `这些段名在真实标题里找不到对应，审核面会按"无该段"静默跳过：${unresolved.join("、")}`).toEqual([]);
+  });
+
+  /**
    * 独处配额的跨批限定（2026-10-14 复核轮 round 13）。
    *
    * 与 round 12 修起手 run 判据同族：**批次限定的 run/计数判据会被批界切断**。
