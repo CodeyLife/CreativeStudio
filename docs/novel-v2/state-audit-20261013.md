@@ -1335,6 +1335,58 @@ skills CLI 的 `check`（`invalid-prompt-section-keys` 状态，抛错）与 doc
 ③ 反例二——归一化补出的 coarse 别名不得被判非法（即"判定必须在归一化之前"）；
 ④ 反例三——生产技能真源体检零错键。**反向实测**：撤掉检出 ⇒ 判红（已跑）。
 
+### 8.15 复核轮 round 16（2026-10-14）：role 是开放词表，只能靠临时扫源码回答——把词表变成契约
+
+承接 round 14/15 的类别（**名字解析不到目标时静默失效**），本轮查 role 这一维，
+结果**先撞上自己的取证错误**，而那个错误本身才是本轮真正的产出。
+
+**① 首次取证得出错误结论（本会话第四次"枚举不全 ⇒ 假结论"）**：脚本扫 6 个源文件抽
+`role: "..."` 字面量，得出 `character-reviewer` / `prose-reviewer` / `skill-iterator`
+三个 role"声明了但无调用点会传"。**三个都是活的**，只是形态不同：
+- 审校三面经 `prompts/chapter-review.ts` 的 `ReviewerRole` 联合类型 +
+  `REVIEW_ROLE_EXECUTION_POINTS` 映射传入（`activities.ts:664` `reviewExecutionPoint(input.role)`）
+  ⇒ **不以字面量出现**，脚本抽不到；
+- `skill-iterator` 在 `evaluation/skill-iteration.ts:356` 传入 ⇒ 该文件不在脚本的扫描清单里。
+
+⇒ 与 round 4/9（错谓词）、round 12（空数据推结论）、round 15（拿归一化产物当原始键）同族。
+**四次的共同点不是"写错正则"，而是"回答一个全称问题（这个 role 有没有人用）却只看了部分证据"。**
+
+**② 根因不是我的脚本，而是 role 没有权威词表**：role 此前是**开放字符串**——
+调用点写字面量、审校面走联合类型、技能侧在 YAML 自行声明，**没有任何一处声明"合法 role 有哪些"**。
+故"某个 role 是不是活的"只能靠临时扫源码回答，**扫漏就必然得出错结论**，
+而这个错误对任何人都可复现（不是个人疏忽）。这正是 AGENTS.md 说的"应优先使用可复用契约、
+数据建模、校验"而非临时脚本的场景。
+
+**③ 修复（数据建模 + 校验，两侧闭合）**：
+- `skill-runtime.ts` 新增 `SKILL_ROLES`（11 个 role 的权威词表）+ `SkillRole` 类型；
+- `normalizeSkillDescriptor` 新增 `invalidRoles`（声明了词表外的 role ⇒ 该技能在那个
+  (执行点, 角色) 组合下被 `skill.roles.includes(input.role)` **静默排除**；若那是它在该
+  执行点的唯一绑定，指引永不抵达该阶段，而 `direct` 通常仍有别的技能命中、**不会抛错**）；
+- 与 round 15 同处置：检出 + 两个常态报告面（skills CLI `check` 的 `invalid-roles`、
+  doctor `skill-drift` 的 `invalidRoles`），**不在解析处抛**（不把内容缺陷升级成停摆）。
+
+**④ 把枚举固化成锁（关键：让"再犯"不可能静默）**：`skill-runtime.test.ts` 新增
+「role 词表闭合」一例，三条判据同时成立才算闭合——
+① 技能声明的 role ⊆ 词表；② 生产调用点传的 role ⊆ 词表（**显式枚举三种形态**：
+字面量、`ReviewerRole` 联合类型成员、`reviewExecutionPoint` 映射表键）；③ 词表 ⊆ 调用点实参
+（每个词条都必须真有人传，否则是死词条）。
+判据③是防再犯的核心：**将来新增调用点形态时它会判红**，逼作者把该形态纳入枚举。
+
+**⑤ 反向实测（两例，且第一版脚本本身也错了）**：
+- 反例 A（**复现本轮自己的错**）：从调用点清单里删掉 `skill-iteration.ts` ⇒ 判红
+  `词表里有调用点从不使用的 role（死词条）: expected [ 'skill-iterator' ]`。
+  ⇒ **锁能抓住"枚举不全"这个失败模式本身**，这是对判据③设计的最强验证。
+- 反例 B：给 `prose-craft.yaml` 的 roles 加拼错的 `prose-reviewr` ⇒ 判红
+  `技能声明了词表外的 role（该角色下会被静默排除）: expected [ 'prose-reviewr' ]`。
+- **反向脚本首版给出假阴性**：两例都报"通过（未判红）"。原因是脚本按 `\n` 做替换，
+  而这两个文件是 **CRLF**，替换根本没发生（测试从未被触发）；反例 B 还把 role 插到了
+  `executionPoints` 段而非 `roles` 段。改用 edit 工具（按读到的原文替换）后两例都正确判红。
+  ⇒ 与本轮①同族的第二类：**"验证没判红"要先确认验证真的跑到了，再当作结论**。
+
+**⑥ 词表两侧对账结果（洁净）**：11 个 role 全部既有技能声明、又有调用点会传；
+技能声明的 role 无一在词表外；调用点传的 role 无一在词表外。⇒ 生产无缺陷，**守卫与锁是补的**。
+
+
 
 
 

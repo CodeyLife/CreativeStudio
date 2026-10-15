@@ -101,6 +101,51 @@ export function compareSkillVersions(left: string, right: string): number {
   return 0;
 }
 
+/**
+ * 技能 role 的**唯一权威词表**（2026-10-14 复核轮 round 16）。
+ *
+ * 为什么需要：role 此前是**开放字符串**——调用点写 `role: "writer"` 这类字面量，
+ * 审校三面则通过 `chapter-review.ts` 的 `ReviewerRole` 联合类型传（故不出现在字面量里），
+ * 技能侧在 YAML 里自行声明。于是"某个 role 是不是活的"只能靠**临时扫源码**回答，
+ * 而扫漏文件就会得出错结论（本轮实测：漏了 `prompts/chapter-review.ts` 的枚举与
+ * `evaluation/skill-iteration.ts` 的调用点，于是把 `character-reviewer`/`prose-reviewer`/
+ * `skill-iterator` 三个**活的** role 误报成死声明）。
+ *
+ * 词表就是契约：技能声明的 role 必须在此表内（否则该技能在那个角色下被静默排除），
+ * 调用点传的 role 也必须在此表内（否则解析时因 direct 为空而抛错）。
+ * 由 `skill-runtime.test.ts` 的「role 词表闭合」锁机械校验两侧，取代临时扫描。
+ */
+export const SKILL_ROLES = [
+  "planner",
+  "writer",
+  "reviser",
+  "structure-reviewer",
+  "character-reviewer",
+  "prose-reviewer",
+  "fact-extractor",
+  "character-enricher",
+  "foundation-reviewer",
+  "learning-auditor",
+  "skill-iterator",
+] as const;
+
+export type SkillRole = (typeof SKILL_ROLES)[number];
+
+const SKILL_ROLE_SET = new Set<string>(SKILL_ROLES);
+
+/**
+ * 技能声明的、不在 {@link SKILL_ROLES} 里的 role。
+ *
+ * 后果与 promptSections 错键同族但更隐蔽：选择规则要求
+ * `skill.roles.includes(input.role)`，故一个拼错的 role 会让该技能在那个
+ * (执行点, 角色) 组合下**被静默排除**——若那是它在该执行点的唯一绑定，它的指引
+ * 永远不会到达该阶段。而 `direct` 通常仍有别的技能命中，故**不会抛错**。
+ * 与 round 15 的错键同处置：检出 + 常态面报告，不在解析处抛（不把内容缺陷升级成停摆）。
+ */
+function invalidRoles(input: { roles?: unknown }): string[] {
+  return [...new Set(asStringArray(input.roles).filter((role) => !SKILL_ROLE_SET.has(role)))];
+}
+
 function deriveExecutionPoints(input: { executionPoints?: unknown; applicableTasks?: unknown }): SkillExecutionPoint[] {
   const explicit = asStringArray(input.executionPoints);
   if (explicit.length) return [...new Set(explicit.filter((item): item is SkillExecutionPoint => item in SKILL_EXECUTION_POLICIES))];
@@ -155,6 +200,10 @@ export function normalizeSkillDescriptor(input: Partial<SkillDescriptor> & { ski
     ...invalidPromptSectionKeys(input),
     ...(input.invalidPromptSectionKeys ?? []),
   ])];
+  const invalidRoleNames = [...new Set([
+    ...invalidRoles(input),
+    ...(input.invalidRoles ?? []),
+  ])];
   const applicableTasks = asStringArray(input.applicableTasks) as PreflightPlan["taskClass"][];
   const normalized: SkillDescriptor = {
     skillId: input.skillId,
@@ -169,6 +218,7 @@ export function normalizeSkillDescriptor(input: Partial<SkillDescriptor> & { ski
     executionPoints,
     ...(invalidPoints.length ? { invalidExecutionPoints: invalidPoints } : {}),
     ...(invalidSectionKeys.length ? { invalidPromptSectionKeys: invalidSectionKeys } : {}),
+    ...(invalidRoleNames.length ? { invalidRoles: invalidRoleNames } : {}),
     roles: asStringArray(input.roles),
     dependsOn: asStringArray(input.dependsOn),
     priority: input.priority,

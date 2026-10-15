@@ -537,6 +537,15 @@ export interface SkillDescriptor {
    * 与 `invalidExecutionPoints` 同族（都是"名字解析不到真实目标"），故同样进解析守卫。
    */
   invalidPromptSectionKeys?: string[];
+  /**
+   * 非持久化诊断：`roles` 里不在 `SKILL_ROLES` 权威词表内的项。
+   *
+   * 选择规则要求 `skill.roles.includes(input.role)`，故拼错的 role 会让该技能在那个
+   * (执行点, 角色) 组合下被**静默排除**；若那是它在该执行点的唯一绑定，指引永远不会
+   * 到达该阶段，而 `direct` 通常仍有别的技能命中、**不会抛错**。与
+   * `invalidPromptSectionKeys` 同处置（检出 + 常态面报告，不在解析处抛）。
+   */
+  invalidRoles?: string[];
   roles?: string[];
   dependsOn?: string[];
   priority?: SkillPriority;

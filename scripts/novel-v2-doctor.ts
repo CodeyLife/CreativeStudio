@@ -158,13 +158,20 @@ try {
     const invalidSectionKeys = allDatabaseSkills.flatMap((skill) => skill.invalidPromptSectionKeys?.length
       ? [`${skill.skillId}@${skill.version}=[${skill.invalidPromptSectionKeys.join(", ")}]`]
       : []);
+    // 不在权威 role 词表内的声明（round 16）：该技能在那个角色下被静默排除。
+    const invalidRoles = allDatabaseSkills.flatMap((skill) => skill.invalidRoles?.length
+      ? [`${skill.skillId}@${skill.version}=[${skill.invalidRoles.join(", ")}]`]
+      : []);
     const sectionKeyNote = invalidSectionKeys.length
       ? `；**永不渲染的 promptSections 键 ${invalidSectionKeys.length} 个**（既非执行点也非 coarse 阶段，该段指引不会出现在任何 prompt 里）：${invalidSectionKeys.slice(0, 5).join("；")}${invalidSectionKeys.length > 5 ? ` …共 ${invalidSectionKeys.length} 个` : ""}`
       : "";
+    const roleNote = invalidRoles.length
+      ? `；**不在权威 role 词表内的声明 ${invalidRoles.length} 个**（该技能在那个角色下被静默排除）：${invalidRoles.slice(0, 5).join("；")}`
+      : "";
     set("skill-drift", {
       ok: drift.length === 0,
-      detail: `workspace ${workspaceSkills.length} / database ${databaseSkills.length}；漂移 ${drift.length} 个${drift.length ? " ⇒ 跑 pnpm novel:skills:sync --target database --project <projectId> 重灌 seed（服务启动的 migrate 也会自动灌）" : ""}；晋升领先 ${projection.promotionAhead.length} 个（学习闭环产物，允许）${sectionKeyNote}`,
-      data: { drift, promotionAhead: projection.promotionAhead, invalidPromptSectionKeys: invalidSectionKeys },
+      detail: `workspace ${workspaceSkills.length} / database ${databaseSkills.length}；漂移 ${drift.length} 个${drift.length ? " ⇒ 跑 pnpm novel:skills:sync --target database --project <projectId> 重灌 seed（服务启动的 migrate 也会自动灌）" : ""}；晋升领先 ${projection.promotionAhead.length} 个（学习闭环产物，允许）${sectionKeyNote}${roleNote}`,
+      data: { drift, promotionAhead: projection.promotionAhead, invalidPromptSectionKeys: invalidSectionKeys, invalidRoles },
     });
   } catch (error) { set("skill-drift", { ok: false, detail: (error as Error).message }); }
 

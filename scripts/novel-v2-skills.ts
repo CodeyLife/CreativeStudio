@@ -106,6 +106,14 @@ async function checkDatabase(): Promise<void> {
       print({ target: "database", status: "invalid-prompt-section-keys", invalidPromptSectionKeys });
       throw new Error(`Skill database 包含永远不会被渲染的 promptSections 键（既非执行点也非 coarse 阶段）：${JSON.stringify(invalidPromptSectionKeys)}`);
     }
+    // 不在权威 role 词表内的声明（2026-10-14 round 16）：该技能在那个角色下被静默排除。
+    const invalidRoles = loaded.skills.flatMap((skill) => skill.invalidRoles?.length
+      ? [{ skillId: skill.skillId, version: skill.version, invalidRoles: skill.invalidRoles }]
+      : []);
+    if (invalidRoles.length) {
+      print({ target: "database", status: "invalid-roles", invalidRoles });
+      throw new Error(`Skill database 包含不在权威词表内的 role（该技能在那个角色下会被静默排除）：${JSON.stringify(invalidRoles)}`);
+    }
     const projection = compareSkillProjections(
       workspace.map((skill) => ({ skillId: skill.skillId, version: skill.version, contentFingerprint: skill.contentFingerprint })),
       loaded.skills.map((skill) => ({ skillId: skill.skillId, version: skill.version, contentFingerprint: skill.contentFingerprint })),

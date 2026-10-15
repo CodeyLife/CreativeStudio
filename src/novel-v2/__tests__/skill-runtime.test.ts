@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -5,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { compileStageContext, StageContextBudgetError } from "../stage-context";
 import {
   SKILL_EXECUTION_POLICIES,
+  SKILL_ROLES,
   compareSkillVersions,
   createDatabaseSkillProvider,
   createWorkspaceSkillProvider,
@@ -292,6 +294,62 @@ describe("Skill runtime resolution", () => {
     expect(descriptor.invalidExecutionPoints).toEqual(["stale.execution-point"]);
     const provider = createDatabaseSkillProvider(async () => [descriptor]);
     await expect(resolveStageSkillBundle({ projectId: "p1", provider, executionPoint: "chapter.drafting", role: "writer" })).rejects.toThrow(/stale.execution-point/);
+  });
+
+  /**
+   * role 词表必须闭合（2026-10-14 复核轮 round 16）。
+   *
+   * 背景：role 此前是**开放字符串**——调用点写字面量（`role: "writer"`），审校三面通过
+   * `chapter-review.ts` 的 `ReviewerRole` 联合类型传（故**不出现在字面量里**），技能侧在
+   * YAML 里自行声明。于是"某个 role 是不是活的"只能靠临时扫源码回答，而**扫漏文件就会
+   * 得出错结论**：本轮首版漏了 `prompts/chapter-review.ts` 的枚举与
+   * `evaluation/skill-iteration.ts` 的调用点，把 `character-reviewer` / `prose-reviewer` /
+   * `skill-iterator` 三个**活的** role 误报成死声明。这是本会话第四次"枚举不全 ⇒ 假结论"。
+   *
+   * 故把词表变成契约（`SKILL_ROLES`），并**把枚举固化成测试**：三条判据同时成立才算闭合——
+   * ① 每个技能声明的 role 都在词表内（否则该技能在那个角色下被静默排除）；
+   * ② 每个生产调用点传的 role 都在词表内（含 `ReviewerRole` 联合类型与 `reviewExecutionPoint`
+   *    的映射键——**这两种形态不会以字面量出现，必须显式枚举，正是首版翻车处**）；
+   * ③ 词表里每个 role 都**确实有**调用点会传（否则是死词条，会诱使技能去声明一个永不匹配的 role）。
+   * 判据 ③ 是防"再犯"的关键：将来新增调用点形态时它会逼作者把该形态纳入枚举。
+   */
+  it("role 词表闭合：技能声明、调用点实参、词表三者互相覆盖", async () => {
+    const readSource = (file: string) => readFileSync(file, "utf8").split(/\r?\n/).filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line)).join("\n");
+
+    // ② 调用点实参——三种形态都要枚举。
+    const callSiteFiles = [
+      "src/novel-v2/temporal/activities.ts",
+      "src/novel-v2/evaluation/skill-iteration.ts",
+      "src/novel-v2/prompts/chapter-review.ts",
+    ];
+    const passed = new Set<string>();
+    for (const file of callSiteFiles) {
+      const source = readSource(file);
+      for (const match of source.matchAll(/role:\s*"([a-z-]+)"/gu)) passed.add(match[1]);
+    }
+    // 形态二：ReviewerRole 联合类型的成员（经 reviewExecutionPoint(input.role) 传入）。
+    const reviewSource = readSource("src/novel-v2/prompts/chapter-review.ts");
+    const reviewerUnion = reviewSource.match(/export type ReviewerRole =([^;]+);/u)?.[1] ?? "";
+    const reviewerRoles = [...reviewerUnion.matchAll(/"([a-z-]+)"/gu)].map((match) => match[1]);
+    expect(reviewerRoles.length, "ReviewerRole 联合类型没解析到，锁会空转").toBeGreaterThan(1);
+    for (const role of reviewerRoles) passed.add(role);
+    // 形态三：reviewExecutionPoint 映射表的键（与联合类型同源，防只改一处）。
+    for (const match of reviewSource.matchAll(/^\s*"([a-z-]+)":\s*"chapter\.review\./gmu)) passed.add(match[1]);
+
+    // ① 技能声明。
+    const provider = createWorkspaceSkillProvider(path.resolve(process.cwd(), "skills", "novel-v2"));
+    const declared = new Set<string>();
+    for (const skill of await listCurrentSkillDescriptors(provider, "p1")) for (const role of skill.roles ?? []) declared.add(role);
+
+    // ① 技能声明的 role 必须在词表内。
+    const registry = new Set<string>(SKILL_ROLES);
+    expect([...declared].filter((role) => !registry.has(role)).sort(), "技能声明了词表外的 role（该角色下会被静默排除）").toEqual([]);
+    // ② 调用点传的 role 必须在词表内。
+    expect([...passed].filter((role) => !registry.has(role)).sort(), "调用点传了词表外的 role").toEqual([]);
+    // ③ 词表每个成员都必须有调用点会传（否则是死词条）。
+    expect([...registry].filter((role) => !passed.has(role)).sort(), "词表里有调用点从不使用的 role（死词条）").toEqual([]);
+    // 反向兜底：技能声明的 role 必须真的有调用点会传（否则声明再合法也没用）。
+    expect([...declared].filter((role) => !passed.has(role)).sort(), "技能声明的 role 没有任何调用点会传").toEqual([]);
   });
 
   /**
