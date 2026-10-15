@@ -109,7 +109,7 @@ describe("Skill runtime resolution", () => {
     for (const skillId of ["prose-craft", "reader-emotion", "plot-causality"]) {
       // 守卫值随 workspace yaml 版本演进（prose-craft 曾升 1.4.0 未同步本守卫，属存量断链修复）；
       // 断言的仍是"清单能解析出版本与指纹"这一契约，非具体措辞。
-      expect(byId.get(skillId)?.version).toBe(skillId === "prose-craft" ? "1.7.0" : "1.1.0");
+      expect(byId.get(skillId)?.version).toBe(skillId === "prose-craft" ? "1.8.0" : "1.1.0");
       expect(byId.get(skillId)?.contentFingerprint).toBeTruthy();
     }
 
@@ -427,6 +427,9 @@ describe("Skill runtime resolution", () => {
     );
     // 写作侧必须给出"不可替代"这一可执行判据，而不是频率禁令。
     expect(draftText).toContain("这次表情是否不可替代");
+    // 形态覆盖两面：既有"表达式 + 释义"，也要覆盖"单一个表情标记草草收尾"
+    // （round 20 分解查出真正承载结论的是眼皮，其用法正是后者）。
+    expect(draftText).toContain("单一个表情标记草草收尾");
     // 反例：不得退化成词表禁用（表情本身合法）。
     expect(draftText).toContain("表情本身完全合法");
     const reviewText = renderSkillInstruction(
