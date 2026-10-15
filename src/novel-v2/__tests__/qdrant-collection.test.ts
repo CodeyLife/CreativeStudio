@@ -46,6 +46,69 @@ describe("Qdrant collection identity", () => {
     }));
   });
 
+  /**
+   * embedding 结果必须被校验后才写点（2026-10-14 复核轮 round 29）。
+   *
+   * 为什么补这条：round 28 定向补灌 10 条真缺口时失败于
+   * "Qdrant 集合 novel-memory-current 维度 1024 与 embedding 维度 3 不一致"——
+   * 这正是 `upsertClaims` 的护栏在拦一次**退化的 embedding**（端点不可用时
+   * gateway 返回空/异常向量）。护栏起作用了，但**没有任何测试锁住它**。
+   * 若无护栏，空的或错维度的向量会被写进集合，之后所有召回都在错误空间里比对。
+   *
+   * 两种失效形态都要锁：
+   *   ① **数量不匹配**：返回的向量数少于 claim 数 ⇒ 下游 `vectors[index]` 会取到 undefined；
+   *   ② **维度不匹配**：返回的向量维度与集合不同 ⇒ 写入时 Qdrant 会拒，或更糟——
+   *      部分客户端会静默接受并在检索时全量报错。
+   */
+  describe("embedding 护栏（round 29）", () => {
+    const claim: MemoryClaim = {
+      id: "foundation:character:配角",
+      projectId: "project-a",
+      kind: "canonical",
+      title: "配角",
+      content: "首次登场",
+      subjectRefs: ["character:配角"],
+      knowledgeScope: "author",
+      authority: "approved",
+      confidence: 1,
+      sourceRevisionIds: [],
+      contentHash: "content-hash",
+      supersedes: [],
+    };
+    const clientWith = (dimension: number) => ({
+      getCollection: vi.fn(async () => ({ config: { params: { vectors: { size: dimension } } } })),
+      upsert: vi.fn(),
+    }) as unknown as QdrantClient;
+
+    it("向量数量少于 claim 数 ⇒ 拒绝写入（否则 vectors[index] 取到 undefined）", async () => {
+      const client = clientWith(3);
+      const gateway = { embed: vi.fn(async () => ({ vectors: [[0.1, 0.2, 0.3]] })) } as unknown as ModelGateway;
+      await expect(
+        new QdrantMemoryProvider(client, gateway, "memory", 3).upsertClaims("project-a", [claim, { ...claim, id: "another" }]),
+      ).rejects.toThrow(/embedding 返回 1 个向量，要求 2 个/u);
+      expect(client.upsert as unknown as ReturnType<typeof vi.fn>).not.toHaveBeenCalled();
+    });
+
+    it("向量维度与集合不一致 ⇒ 拒绝写入（round 28 实测拦住的正是这一种）", async () => {
+      const client = clientWith(1024);
+      // 模拟端点退化：返回 3 维而不是集合要求的 1024 维。
+      const gateway = { embed: vi.fn(async () => ({ vectors: [[0.1, 0.2, 0.3]] })) } as unknown as ModelGateway;
+      await expect(
+        new QdrantMemoryProvider(client, gateway, "memory", 1024).upsertClaims("project-a", [claim]),
+      ).rejects.toThrow(/维度为 1024/u);
+      expect(client.upsert as unknown as ReturnType<typeof vi.fn>).not.toHaveBeenCalled();
+    });
+
+    it("反向哨兵：护栏本身会响（验证上两条不是恒真）", async () => {
+      // 同样的退化 embedding，若护栏被移除或写反，这条会绿而上两条会红。
+      const gateway = { embed: vi.fn(async () => ({ vectors: [[0.1, 0.2, 0.3]] })) } as unknown as ModelGateway;
+      const probes = await Promise.allSettled([
+        new QdrantMemoryProvider(clientWith(1024), gateway, "memory", 1024).upsertClaims("project-a", [claim]),
+      ]);
+      expect(probes[0]!.status, "退化 embedding 必须被拒绝——若它通过了，说明护栏已失效").toBe("rejected");
+    });
+  });
+
   it("召回侧按 payload 的 lifecycle/authority 预筛（服务端过滤，省召回名额）", async () => {
     const query = vi.fn(async () => ({ points: [] }));
     const client = {

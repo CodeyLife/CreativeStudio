@@ -1967,6 +1967,44 @@ provider 拿退化值去比对维度。**这不是代码缺陷，是环境前提
 3. **环境前提缺失时要如实记 blocker**，不要用退化路径绕过（本次没有为了"补灌成功"
    而改低维度或跳过分支——那会污染索引）。
 
+### 8.28 复核轮 round 29（2026-10-14）：语义召回端到端链路不可验证——并给拦过灾的护栏补上锁
+
+round 28 的定向补灌因 `embedding 维度 3 ≠ 集合维度 1024` 失败。本轮查这条链断在哪、
+断的时候有没有造成损害。
+
+**① 端到端召回链路此前从未被验证过**：`verify-recall-end-to-end.mts` 用**真库可见 claim**
+作正样本（自身作 query、标题关键词作 query）+ 明显不在本书里的词作反例。
+**结论是 SKIPPED**——`memory.embed` 端点不可用（`embed()` 返回空，实测维度 0 vs 期望 1024）。
+如实跳过，不伪造"召回为空"的结论（round 12 的教训：环境缺失 ≠ 行为为空）。
+
+**② 断点定位**（`diagnose-embedding-auth.mts`）：
+- 端点本身**可达**：直接打 `https://api.siliconflow.cn/v1/models` 得 HTTP 401
+  （网络通；且本仓 config 里该 profile 的 inline 密钥**有值**）；
+- `RoutedModelGateway.embed()` **不抛错但返回空 vectors**；
+- 配置从未入库（`git log` 对 `config/model-providers.local.yaml` 为空）⇒ 本地未纳管配置。
+
+**③ 关键结论：护栏起作用了，没有造成损害**。`qdrant-memory.ts:193` 的
+`if (vectors.length !== claims.length || …维度 !== this.dimension) throw`
+正是 round 28 失败信息的来源——它拦下了一次**退化的 embedding**，
+没让空/错维度的向量写进集合。若无这道护栏，错误空间的向量会污染全部后续召回。
+
+**④ 但护栏本身没有测试锁**（本轮真正的产出）。三种失效形态都会让索引进入错误空间：
+向量数少于 claim 数（下游 `vectors[index]` 取到 undefined）、维度不一致、护栏被整体移除。
+补 `qdrant-collection.test.ts` 三例：数量不匹配 ⇒ 拒绝写入且 `upsert` 未被调用；
+维度不一致 ⇒ 拒绝写入且 `upsert` 未被调用（**round 28 实测拦住的正是这一种**）；
+反向哨兵（退化 embedding 必须被拒，通过则说明护栏已失效）。
+**反向实测**：移除生产护栏 ⇒ **3 例全红**（`promise resolved "undefined" instead of rejecting`）；还原后全绿。
+
+**本轮可复用判据**：
+1. **"拦过灾的代码"和"被锁住的代码"是两件事**——护栏救过一次场（round 28）不等于它被验证。
+   凡被实测证据证明"起过作用"的守卫，第一优先补锁：价值已被证实，而失效尚无人会发现。
+2. **查不可用的链路时，先分清"端点不可达 / 鉴权失败 / 调用不抛错但返回空"**——三者结论完全不同
+   （网络 / 密钥 / **最危险的静默退化**）。本轮实测是第三种，而它恰好被下游护栏挡住，
+   所以只表现为"补灌失败"而不是"索引污染"。
+3. **验证脚本的前置探活要能如实跳过**：embed 探活失败时打印 `SKIPPED_embedding_unavailable`
+   并给出实测/期望维度，而不是把"探活失败"读成"召回为空"。
+
+
 
 
 
