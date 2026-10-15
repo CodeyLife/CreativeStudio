@@ -109,7 +109,7 @@ describe("Skill runtime resolution", () => {
     for (const skillId of ["prose-craft", "reader-emotion", "plot-causality"]) {
       // 守卫值随 workspace yaml 版本演进（prose-craft 曾升 1.4.0 未同步本守卫，属存量断链修复）；
       // 断言的仍是"清单能解析出版本与指纹"这一契约，非具体措辞。
-      expect(byId.get(skillId)?.version).toBe(skillId === "prose-craft" ? "1.9.0" : "1.1.0");
+      expect(byId.get(skillId)?.version).toBe(skillId === "prose-craft" ? "1.10.0" : "1.1.0");
       expect(byId.get(skillId)?.contentFingerprint).toBeTruthy();
     }
 
@@ -444,6 +444,55 @@ describe("Skill runtime resolution", () => {
     expect(revisionText, "必须给出被禁止的改写形态（他想了想/反复推敲）").toMatch(/他想了想|反复推敲/);
   });
 
+  /**
+   * 面部表情的病灶被窄化到"表情 + 释义"这一种机制（2026-10-14 复核轮 round 31）。
+   *
+   * round 19 把 `嘴角|眉头|眉心|眼神|眼底|眼皮|眼角` **按用词并成一族**，判它与章节强度
+   * 负相关并写了"情绪节拍不要默认落在面部表情"的指引。round 30 的判据（**拆族要按机制拆，
+   * 不按用词拆**）要求复查它。round 31 拆开后结论差别很大：
+   *
+   * | 机制 | 全书 | 合格带 | 混合带 | 最强带 099-127 | 混合/合格 |
+   * |---|---|---|---|---|---|
+   * | A 表情+释义 | 27 | 0.055 | 0.186 | **0.000** | 3.40 |
+   * | B 单标记不解释 | 76 | 0.133 | 0.278 | 0.051 | 2.09 |
+   * | C 表情捆在肢体里 | 22 | 0.027 | 0.166 | **0.000** | 6.05 |
+   *
+   * 且 A 的 27 处**全部落在 ch2—ch72、ch73 以后一处都没有**（逐章核过），
+   * 而 B 在 ch73 后仍有 26 处、合格带 30 处 vs 混合带 27 处（基本持平）。
+   *
+   * ⇒ **只有 A 是确凿病灶**；B/C 是稳定手艺。把 B/C 一并列进指引是"并族"造成的过宽——
+   * 若照旧执行，会抽掉本书可观察的线索。故判据收窄为：
+   * 写作/审核/修订三面都只针对"表情 + 一句解释它意味着什么"，且明确声明
+   * **单标记与肢体捆绑的表情不报**。
+   */
+  it("面部表情的判据只针对'表情+释义'，单标记与肢体捆绑的表情不报", async () => {
+    const provider = createWorkspaceSkillProvider(path.resolve(process.cwd(), "skills", "novel-v2"));
+    for (const [executionPoint, role] of [
+      ["chapter.drafting", "writer"],
+      ["chapter.review.prose", "prose-reviewer"],
+      ["chapter.revision", "reviser"],
+    ] as Array<[SkillExecutionPoint, string]>) {
+      const text = renderSkillInstruction(
+        await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint, role }),
+        executionPoint,
+      );
+      expect(text, `${executionPoint} 应只针对'表情+释义'这一种机制`).toMatch(/表情 \+ 一句(?:释义|解释)/u);
+    }
+    // 写作侧必须写明"单标记不解释"与"肢体捆绑"两种都**不**报（防并族退化）。
+    const draftText = renderSkillInstruction(
+      await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint: "chapter.drafting", role: "writer" }),
+      "chapter.drafting",
+    );
+    expect(draftText, "必须写明单标记不解释不是病").toMatch(/单一个标记不解释|单标记/u);
+    expect(draftText, "必须写明捆在肢体动作里的表情不是病").toMatch(/肢体/u);
+    // 审核侧：不得再把"又一个表情标记"当报点。
+    const reviewText = renderSkillInstruction(
+      await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint: "chapter.review.prose", role: "prose-reviewer" }),
+      "chapter.review.prose",
+    );
+    expect(reviewText, "审核侧须声明单标记与肢体捆绑的表情都不报").toMatch(/都不报|不报/u);
+  });
+
   it("情绪节拍默认落在面部表情上的判据在写作、审核、修订三面都在场", async () => {
     const provider = createWorkspaceSkillProvider(path.resolve(process.cwd(), "skills", "novel-v2"));
     const faces: Array<[SkillExecutionPoint, string]> = [
@@ -462,18 +511,15 @@ describe("Skill runtime resolution", () => {
       await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint: "chapter.drafting", role: "writer" }),
       "chapter.drafting",
     );
-    // 写作侧必须给出"不可替代"这一可执行判据，而不是频率禁令。
-    expect(draftText).toContain("这次表情是否不可替代");
-    // 形态覆盖两面：既有"表达式 + 释义"，也要覆盖"单一个表情标记草草收尾"
-    // （round 20 分解查出真正承载结论的是眼皮，其用法正是后者）。
-    expect(draftText).toContain("单一个表情标记草草收尾");
-    // 反例：不得退化成词表禁用（表情本身合法）。
-    expect(draftText).toContain("表情本身完全合法");
+    // 可执行判据：删掉这个表情，读者是失去可观察线索还是只失去一个标签。
+    expect(draftText).toContain("读者是会失去一个可观察的线索");
+    // round 31 窄化后的形态断言：只有"表情 + 一句释义"是病灶。
+    expect(draftText).toMatch(/表情 \+ 一句释义/u);
     const reviewText = renderSkillInstruction(
       await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint: "chapter.review.prose", role: "prose-reviewer" }),
       "chapter.review.prose",
     );
-    expect(reviewText, "审核侧必须写明表情本身合法、只在替代动作/对白时才报").toContain("面部表情本身合法");
+    expect(reviewText, "审核侧须只针对'表情+释义'并声明另两种不报").toMatch(/都不报|不报/u);
   });
 
   /**
