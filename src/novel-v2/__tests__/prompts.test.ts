@@ -713,6 +713,35 @@ describe("long-form prompt contracts", () => {
     expect(prompt).toContain("个别安静章的静收束不构成问题");
   });
 
+  /**
+   * 起手形态轮换（2026-10-14 全书扫描确诊，state-audit-20261013.md §8.7）。
+   *
+   * 读者视角实测：首段以时间标记起头的章占全书 31%，41-60 章一段达 55%（11/20），
+   * 且 41-43 连续三章落入同一个「时间标记 + 视角人物已经在/才…」三槽模板
+   * （直读对比：该带三章开头互为改写，而 81-84 带四章开头形态互不相同）。
+   * 与已治理的章尾收束仪式化（38/168）是同一 failure class 的另一半，
+   * 但起手侧此前**零覆盖**（无契约、无审核项、无测量通道）。
+   *
+   * 三面接线（生成契约 / 审核面 / 重基线不注入）+ 反例（不把时间起头本身判病）。
+   */
+  it("起手形态轮换进生成契约与审核面，重基线不注入", () => {
+    const base = { projectTitle: "测试项目", macro: [], recentChapters: [], openThreads: [] };
+    const arc = { title: "当前弧" } as never;
+    const batch = { batchIndex: 2, startChapterIndex: 11, complete: false };
+    const instruction = buildStoryArcChaptersPrompt({ ...base, arc, batch });
+    expect(instruction).toContain("起手形态轮换契约");
+    expect(instruction).toContain("连续三章以同一槽位序列起头");
+    // 反例：不得把"以时间起头"本身判成病（本书真声音的一部分，单章合法）。
+    expect(instruction).toContain("以时间起头合法的章不受此约束");
+
+    const review = buildStoryArcReviewPrompt({ arc: { title: "第一弧" }, chapters: [] } as never, "上下文");
+    expect(review).toContain("起手形态分布检查");
+    expect(review).toContain("连续 ≥3 章计划以同一槽位序列起头");
+
+    const rebase = buildStoryArcRebasePrompt({ ...base, arc, batch, target: { batchIndex: 2, startChapterIndex: 11, chapters: [] } } as never);
+    expect(rebase).not.toContain("起手形态轮换契约");
+  });
+
   it("正文契约携带收束轮换与计量克制度（2026-09-22 半X 738 处/31 章超线确诊）", () => {
     const instruction = buildChapterDraftPromptPackage({
       intent: { id: "intent-1", projectId: "p", source: "chapter-review", objective: "完成章节", createdAt: 1, idempotencyKey: "intent-1" },
