@@ -252,4 +252,43 @@ describe("memory index drift 判据", () => {
     // "行 id → 内部散列"，而陈旧点的行通常已不在基线里，拿不到行 id。
     expect(route).toContain("qdrant.delete");
   });
+
+  /**
+   * 诊断脚本的谓词完整性锁（2026-10-14 复核轮 round 9 的自我纠正）。
+   *
+   * 失效形态：本轮第一个槽位诊断脚本用 `lifecycle_status='active' AND authority IN (...)`
+   * 数高基数槽，**漏了 retiredByVisibleKillerSql**，于是得出"持有槽 155 条 active"。
+   * 运行库正确数字是 73——错谓词多算了 **82 条**（project 级：1987 naive = 155 retired + 1832 correct，
+   * 恒等式实测成立）。若不纠正，这个假数字会以"运行库实测"的身份写进文档，
+   * 成为后续所有判断的地基。
+   *
+   * 与 round 4"把 76 条欠灌算成误删"是同一族错误：**用错谓词的取证脚本报出假数字**。
+   * 区别是 round 4 的假红在验证脚本里（会被反向实测抓到），round 9 的假数字在诊断脚本里
+   * （没有任何机制会发现）——故这里补一道源码锁。
+   *
+   * 锁的是三处诊断/取证脚本的谓词形态：凡查 memory_claims 的 active 行且意图是
+   * "当前可见/应被索引/会被召回"，必须带退役谓词。用"禁止裸 active 谓词"的负向判据，
+   * 因为这正是本次出错的形式。
+   */
+  it("取证脚本查 active 行必须带退役谓词（防诊断脚本报出假数字）", () => {
+    const offenders: string[] = [];
+    for (const file of [
+      "tmp/state-audit/verify-fact-slot-vs-prose.mts",
+      "tmp/state-audit/verify-stale-point-consequences.mts",
+      "tmp/state-audit/verify-stale-points.mts",
+    ]) {
+      const source = readFileSync(new URL(`../../../${file}`, import.meta.url), "utf8");
+      // 找所有查 memory_claims 的 SQL 行：命中 active 谓词的必须同时命中退役谓词。
+      const sqlLines = source.split("\n").filter((line) => /FROM memory_claims|UPDATE memory_claims/i.test(line) || /lifecycle_status\s*=\s*'active'/u.test(line));
+      for (const line of sqlLines) {
+        if (!/lifecycle_status\s*=\s*'active'/u.test(line)) continue;
+        // 该行（或其后 12 行内）必须出现退役谓词的任一副本：
+        // ① shared SQL 片段引用（生产代码路径）；② NOT EXISTS(killer) 内联（取证脚本路径）。
+        const after = source.slice(source.indexOf(line), source.indexOf(line) + 600);
+        const hasKiller = /NOT EXISTS[\s\S]{0,400}supersedes/u.test(after) || /retrievalVisibleClaimsSql/u.test(after) || /ANY\(killer\.supersedes\)/u.test(after);
+        if (!hasKiller) offenders.push(`${file}: ${line.trim().slice(0, 70)}`);
+      }
+    }
+    expect(offenders, "裸 active 谓词会把已退役行算进可见集 ⇒ 诊断数字虚高").toEqual([]);
+  });
 });

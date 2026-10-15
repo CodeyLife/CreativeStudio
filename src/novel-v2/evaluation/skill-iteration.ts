@@ -28,6 +28,20 @@ import type { ExperimentWorkspaceHandle } from "./experiment-workspace";
 import { serializePromptSections } from "./prompt-sections";
 import { compileStageContext } from "../stage-context";
 import { buildSkillContextSections, createDatabaseSkillProvider, resolveStageSkillBundle } from "../skill-runtime";
+import { estimateBudgetTokens } from "../token-estimate";
+
+/**
+ * skills 段落的 token 预算上限。
+ *
+ * 取值依据（2026-10-14 实测）：生产库 12 个启用技能时本段约 27K token；留出到 40K 的
+ * 余量按"技能数上一个量级仍不顶穿"取。compileStageContext 的 maxInputTokens 是 128K、
+ * 预留输出 8K ⇒ 可用 119.8K；再扣 system+schema+skillSections 约 12K ⇒ 本段的实际上限
+ * 约 105K。取 40K 是"远超当前用量、又给增长留 2.5 倍余量"的保守值，不是按当前用量贴线
+ * （贴线会让下一次技能增长立即顶穿，那是把阈值当门用）。
+ *
+ * TODO: 随语料进 output-policy 配置化（本仓阈值常量的统一去向）。
+ */
+const DEFAULT_ITERATION_SKILLS_BUDGET_TOKENS = 40_000;
 
 // ===== 类型 =====
 
@@ -107,21 +121,69 @@ export function buildIterationPrompt(params: {
   skills: SkillDescriptor[];
   reviews: Review[];
   learningAssessment?: RuntimeLearningAssessmentV2;
+  /**
+   * skills 段落的 token 预算上限（超出按 token 从大到小裁掉整条技能）。
+   *
+   * 为什么需要（2026-10-14 实测）：本段把**每个启用技能的完整 promptSections** 全量塞进
+   * 必要上下文，成本随启用技能数线性无界增长。共享测试库 ymcp_test 被跨套件污染到 633 个
+   * enabled 技能（123 个 craft-patch + 123 个 evil-skill + 375 个其他测试技能），
+   * 本段单独就要 109,774 token，加上 schema 共 121,297 —— 顶穿 128K 预算，
+   * evaluation.test.ts 三例以 StageContextBudgetError 失败（isolate 到 12 个真实技能后
+   * 仅 27,897，回落到预算内）。
+   *
+   * 生产侧同样暴露这个缺口：生产库 12 个技能时 27K 正常，但技能数上一个量级就会顶穿。
+   * 判据是"必要上下文不得随启用技能数无界增长"。
+   *
+   * 裁整条而不是截断文本：半条技能的 prompt 对迭代器是误导（它会把截断处当成边界），
+   * 且 iteration 的输入是"哪些技能该改"，漏掉一个技能的完整 prompt 只是少一个候选，
+   * 而半条 prompt 会产出错误的迭代建议。
+   */
+  maxSkillsSectionTokens?: number;
 }): string {
-  // Skills 段落
-  const skillsSection = params.skills.length > 0
-    ? params.skills.map((skill) => {
-        const promptEntries = Object.entries(skill.promptSections ?? {});
-        const promptText = promptEntries.length > 0
-          ? promptEntries.map(([stage, text]) => `  [${stage}] ${text}`).join("\n")
-          : "  (无 prompt 定义)";
-        return `## Skill: ${skill.skillId}@${skill.version}
+  // Skills 段落（带预算：按渲染后的 token 从大到小裁整条技能）
+  //
+  // 计的是**渲染后的整块 token**（skillId/capabilities/gates + promptText），不是只算
+  // promptText：首版只算 promptText，633 个技能实测 49,750 而非封顶的 40,000——
+  // 差的 9,750 全是每条技能的元数据头。封顶若不覆盖自己实际渲染的东西，就不是封顶。
+  const skillsBudget = params.maxSkillsSectionTokens ?? DEFAULT_ITERATION_SKILLS_BUDGET_TOKENS;
+  const renderSkill = (skill: SkillDescriptor): string => {
+    const promptEntries = Object.entries(skill.promptSections ?? {});
+    const promptText = promptEntries.length > 0
+      ? promptEntries.map(([stage, text]) => `  [${stage}] ${text}`).join("\n")
+      : "  (无 prompt 定义)";
+    return `## Skill: ${skill.skillId}@${skill.version}
 - capabilities: ${skill.capabilities.join(", ") || "(无)"}
 - applicableTasks: ${skill.applicableTasks.join(", ") || "(无)"}
 - qualityGates: ${skill.qualityGates.join(", ") || "(无)"}
 - 当前 prompt：
 ${promptText}`;
-      }).join("\n\n")
+  };
+  const entries = params.skills
+    .map((skill) => ({ skill, tokens: estimateBudgetTokens(renderSkill(skill)) }))
+    // 大的优先保留：它更可能是被迭代的目标（prompt 越长越可能有可复用规则可提炼）。
+    .sort((left, right) => right.tokens - left.tokens);
+  let spent = 0;
+  const kept: SkillDescriptor[] = [];
+  for (const entry of entries) {
+    // 至少要留一条：全裁空会让 iteration 无对象可迭代（比超预算更糟）。
+    if (kept.length && spent + entry.tokens > skillsBudget) continue;
+    spent += entry.tokens;
+    kept.push(entry.skill);
+  }
+  // 恢复调用方给的顺序（不暴露"按大小排过"这个实现细节给 prompt 读者）。
+  const orderedSkills = params.skills.filter((skill) => kept.includes(skill));
+  // 封顶按**整段实测**收敛，不是按各块之和：estimateBudgetTokens 对整段与分块的粒度不同
+  // （首两版分别超 523 / 374 token），各块之和只是个估计。超了就从最小的开始退，
+  // 直到实测进预算——"实测超了继续退"比"把估计改准"简单且不会因估算公式变化而失效。
+  let dropIndex = orderedSkills.length - 1;
+  while (orderedSkills.length > 1) {
+    const rendered = orderedSkills.map(renderSkill).join("\n\n");
+    if (estimateBudgetTokens(rendered) <= skillsBudget) break;
+    orderedSkills.splice(dropIndex, 1);
+    dropIndex -= 1;
+  }
+  const skillsSection = orderedSkills.length > 0
+    ? orderedSkills.map(renderSkill).join("\n\n")
     : "(无激活的 skills)";
 
   // Issues 段落：从 reviews 中提取 blocker/major issues

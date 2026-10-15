@@ -38,6 +38,7 @@ import {
 } from "../evaluation/candidate-bundle";
 import { createPromotionService } from "../evaluation/promotion";
 import { buildIterationPrompt, runSkillIteration } from "../evaluation/skill-iteration";
+import { estimateBudgetTokens } from "../token-estimate";
 import { parseSerializedPromptSections, serializePromptSections } from "../evaluation/prompt-sections";
 import { runClosedLoop } from "../evaluation/closed-loop";
 import type {
@@ -379,6 +380,74 @@ describe("evaluation pure functions", () => {
       const prompt = buildIterationPrompt({ skills: [makeSkill()], reviews: [makeReview()] });
       expect(prompt).toContain("节奏拖沓");
       expect(prompt).toContain("major");
+    });
+
+    /**
+     * skills 段落必须带预算封顶（2026-10-14 实测修复）。
+     *
+     * 失效形态：本段把每个启用技能的完整 promptSections 全量塞进必要上下文，成本随
+     * 启用技能数线性无界增长。共享测试库被跨套件污染到 **633 个 enabled 技能**时
+     * （123 craft-patch + 123 evil-skill + 375 其他），本段单独 109,774 token，
+     * 加 schema 共 121,297 ⇒ 顶穿 128K 预算，evaluation.test.ts 三例以
+     * StageContextBudgetError 失败。生产库 12 个技能时 27K 正常，但技能数上一个
+     * 量级同样顶穿——判据是"必要上下文不得随启用技能数无界增长"。
+     *
+     * 双向覆盖：
+     *  - 技能少（≤ 预算）时全量保留，顺序不变；
+     *  - 技能多时按整块 token 从大到小裁，段实测进预算；
+     *  - 至少要留一条（全裁空会让 iteration 无对象可迭代）。
+     */
+    it("skills 段落实测进预算：少则全留、多则裁到封顶、至少留一条", () => {
+      // 多：封顶生效。夹具必须**大到让两个断言都咬得住**——首两版分别因“整段仅
+      // 204/340 token”和“只切到第一个技能头部”而恒真（相当于没测）。
+      // 故按“每条约 276 token × 200 条 ≈ 55K”造：既超 10K 显式封顶，也超 40K 默认封顶。
+      const many = Array.from({ length: 200 }, (_, index) => makeSkill({
+        skillId: `skill-${index}`,
+        promptSections: { drafting: "保持长篇连贯性的具体做法：每个场景都要让读者看到人物当下在做什么、感知到什么、付出什么代价。".repeat(index === 0 ? 40 : 12) },
+      }));
+
+      // 少：全量保留、顺序不变。
+      const few = [makeSkill({ skillId: "a", promptSections: { drafting: "甲" } }), makeSkill({ skillId: "b", promptSections: { drafting: "乙" } })];
+      const fewPrompt = buildIterationPrompt({ skills: few, reviews: [] });
+      expect(fewPrompt.indexOf("Skill: a@")).toBeLessThan(fewPrompt.indexOf("Skill: b@"));
+
+      const totalTokens = (() => {
+        const uncapped = buildIterationPrompt({ skills: many, reviews: [] });
+        const start = uncapped.indexOf("## 当前 skills");
+        let end = uncapped.length;
+        for (let index = uncapped.indexOf("\n## ", start); index >= 0; index = uncapped.indexOf("\n## ", index + 1)) {
+          if (!uncapped.slice(index + 4).startsWith("Skill: ")) { end = index; break; }
+        }
+        return estimateBudgetTokens(uncapped.slice(start, end));
+      })();
+      // 前置断言：夹具本身必须超封顶，否则下面的"裁到封顶"是空转。
+      expect(totalTokens).toBeGreaterThan(10_000);
+
+      // 段边界：skills 段从 "## 当前 skills" 起、到下一个**非 Skill 的**小节标题止。
+      // 不能只找 "\n## "——每个技能头部也是 "\n## Skill:"，首版如此切只切到第一个技能，
+      // 于是"段实测进预算"的断言恒真（锁定）。故按"下一个 `\n## ` 且其后不是 `Skill: `"判。
+      const sectionOf = (prompt: string): string => {
+        const start = prompt.indexOf("## 当前 skills");
+        const from = start < 0 ? 0 : start;
+        for (let index = prompt.indexOf("\n## ", from); index >= 0; index = prompt.indexOf("\n## ", index + 1)) {
+          if (!prompt.slice(index + 4).startsWith("Skill: ")) return prompt.slice(from, index);
+        }
+        return prompt.slice(from);
+      };
+      const capped = buildIterationPrompt({ skills: many, reviews: [], maxSkillsSectionTokens: 10_000 });
+      expect(estimateBudgetTokens(sectionOf(capped))).toBeLessThanOrEqual(10_000);
+      // 裁的是整条技能，不是半条：保留的每个技能必须是完整的（含 capabilities 行）。
+      // `skill-0` 是特意造大的那个（repeat 40），"大者优先"规则下它必须留在段内。
+      expect(capped).toContain("Skill: skill-0@");
+      expect(sectionOf(capped)).not.toMatch(/## Skill: skill-\d+@1\.0\.0\s*$/u);
+      // 反向：不传预算时也用默认封顶，不会无界增长（633 技能污染场景即此）。
+      const byDefault = buildIterationPrompt({ skills: many, reviews: [] });
+      expect(estimateBudgetTokens(sectionOf(byDefault))).toBeLessThanOrEqual(40_000);
+
+      // 单条超大技能：保留它（至少一条），哪怕超预算——全裁空比超预算更糟。
+      const huge = makeSkill({ skillId: "huge", promptSections: { drafting: "超长技能说明".repeat(4000) } });
+      const kept = buildIterationPrompt({ skills: [huge], reviews: [], maxSkillsSectionTokens: 1_000 });
+      expect(kept).toContain("Skill: huge@");
     });
   });
 });
