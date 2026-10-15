@@ -747,6 +747,40 @@ describe("long-form prompt contracts", () => {
   });
 
   /**
+   * 独处配额的跨批限定（2026-10-14 复核轮 round 13）。
+   *
+   * 与 round 12 修起手 run 判据同族：**批次限定的 run/计数判据会被批界切断**。
+   * 真库实测（生产批 7 章一弧）：有 **5 处**"上一批末章独处 ∧ 本批首章独处"
+   * （7|8、49|50、98|99、119|120、140|141），批内判据全看不见。
+   *
+   * 本条与起手那条的区别：**边界不需要新管线**——群像信号段已经把近窗口的独处章序
+   * （soloOnlyOrders）与最长连续独处游程（longestSoloRun）摆给规划器了，故只需把判据
+   * 写成跨批并指向该段。
+   *
+   * 双向覆盖：契约段与信号段都要写明跨批；两处都不得退回"每批至多一章"。
+   */
+  it("独处配额的跨批限定：契约段与信号段都写明，且不得退回批内", () => {
+    const base = { projectTitle: "测试项目", macro: [], recentChapters: [], openThreads: [] };
+    const arc = { title: "当前弧" } as never;
+    const batch = { batchIndex: 2, startChapterIndex: 11, complete: false };
+
+    // 契约段（群像配额）。
+    const instruction = buildStoryArcChaptersPrompt({ ...base, arc, batch });
+    expect(instruction).toContain("纯独处章至多一章，且这一限制跨批");
+    expect(instruction, "不得退回批内限定").not.toContain("纯独处章每批至多一章");
+
+    // 信号段（群像信号渲染）——规划器据此看前章独处情况。
+    const sections = buildStoryArcPlanningContextSections({
+      ...base,
+      ensembleSignal: { soloOnlyOrders: [4, 5], longestSoloRun: 2, windowSize: 6 },
+    });
+    const serial = sections.find((section) => section.id === "arc-context-serial-signals");
+    expect(serial?.text).toContain("纯独处章至多一章且跨批");
+    expect(serial?.text, "信号段要指出'看最后一章是否已独处'这个可执行判据").toContain("本批首章不得再是");
+    expect(serial?.text).not.toContain("纯独处章每批至多一章");
+  });
+
+  /**
    * 前章开头必须进到弧规划上下文（起手跨批判据的输入侧，2026-10-14 round 11/12）。
    *
    * 只改措辞不改输入等于没修：规划器若看不到前两章的开头，就无法判定"本批首章是否
