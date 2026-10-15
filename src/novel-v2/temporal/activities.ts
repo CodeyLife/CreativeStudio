@@ -11,7 +11,7 @@ import type { ModelGateway } from "../model-gateway";
 import { ExternalMcpRequiredError, type ModelExecutionProvenance, type ModelPurpose, type ModelRoutingSnapshot, type ModelTaskRecord, type ModelWorkPackage } from "../model-routing";
 import { ContentObjectStore } from "../object-store";
 import { assertStoryArcBatchWindow, normalizeStoryArcRebaseBundle, parseStoryArcBundle, storyArcBatchWindow, validateChapterExecutionContract, validateStoryArcExecutionContracts, validateStoryArcRebaseBundle, type ChapterPlanningContext, type StoryArcBundle } from "../application/story-arc";
-import { extractChapterEnding, inspectManuscript, structuralReviewFromReport, type ManuscriptStructuralReport } from "../application/manuscript-structure";
+import { extractChapterEnding, extractChapterOpening, inspectManuscript, structuralReviewFromReport, type ManuscriptStructuralReport } from "../application/manuscript-structure";
 import { summarizeDormancy, type DormancyLedger } from "../narrative-dormancy";
 import { buildStoryArcChaptersPrompt, buildStoryArcPlanPrompt, buildStoryArcPlanningContextSections, buildStoryArcReviewPrompt, buildStoryArcRevisionPrompt, storyArcBundleSchema, storyArcChaptersOutputSchema, storyArcPlanBatchSchema, type StoryArcReviewOutput } from "../prompts/story-arc";
 import { foundationArtifactToMemoryClaim } from "../foundation-memory";
@@ -150,6 +150,8 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
   // 正文代价高（弧规划/蓝图/审核三处都要用）。null 表示"已试算且无结果"，与
   // "未试算"（undefined）区分，避免失败后每处重试。
   const narrativeDormancyCache = new Map<string, DormancyLedger | null>();
+  /** 前章开头缓存（与 narrativeDormancyCache 同形：null 为"已试算且不可得"哨兵）。 */
+  const priorOpeningsCache = new Map<string, string[] | null>();
   const reviewerPurpose = (role: ReviewerRole): ModelPurpose => ({
     "structure-reviewer": "review.structure",
     "character-reviewer": "review.character",
@@ -220,6 +222,48 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       // 不写哨兵：此处拿不到 cacheKey（失败可能发生在取定稿集之前），且失败多为瞬时
       // （对象存储/DB 抖动），下次调用重试即可，不该把一次抖动固化成"无账"。
       console.warn(`[dormancy] 线索静默扫描失败，该通道本次不注入：${(error as Error).message}`);
+      return undefined;
+    }
+  };
+
+  /**
+   * 前两章的开头首段（供起手轮换契约跨批判定用）。
+   *
+   * 为什么需要（2026-10-14 复核轮 round 11/12）：起手轮换契约的 run 判据
+   * （"不得有连续三章以同一槽位序列起头"）此前**只在本批次内**生效，而生产批次是
+   * 7 章一弧（实测弧6=35-42 / 弧7=43-49）——全书唯一的真实 run（ch41-43）恰好跨在
+   * 弧6/弧7 边界上，两条批次限定判据都看不见它。**门一直在，对全书唯一的病灶失明。**
+   *
+   * 修法照搬章末仪式化的既有形态：跨章判据由调用方喂入前章语境
+   * （`ENDING_RITUAL_POLICY` 的 `priorEndings` 走同一条路）。这里只取首段而非全章
+   * （`extractChapterOpening` 是取段口径的唯一来源），故成本约两句话。
+   *
+   * 失败/缺章一律返回 undefined（契约退回批次内措辞），不编造前章语境——
+   * 宁可不跨批判定，也不给规划器一个假的前章开头。
+   */
+  const loadPriorChapterOpenings = async (projectId: string, count = 2): Promise<string[] | undefined> => {
+    if (typeof deps.repository.listFinalChapterContentRefs !== "function") return undefined;
+    try {
+      const refs = await deps.repository.listFinalChapterContentRefs(projectId);
+      if (refs.length < count) return undefined;
+      const cacheKey = `${projectId}:${refs[refs.length - 1]!.narrativeOrder}:${count}`;
+      const cached = priorOpeningsCache.get(cacheKey);
+      if (cached !== undefined) return cached ?? undefined;
+      const tail = refs.slice(-count);
+      const openings: string[] = [];
+      for (const ref of tail) {
+        try {
+          openings.push(extractChapterOpening(await objects.getText(ref.objectKey)));
+        } catch (error) {
+          console.warn(`[opening] 第 ${ref.narrativeOrder} 章正文读取失败，起手跨批判定本次不产出：${(error as Error).message}`);
+          priorOpeningsCache.set(cacheKey, null);
+          return undefined;
+        }
+      }
+      priorOpeningsCache.set(cacheKey, openings);
+      return openings;
+    } catch (error) {
+      console.warn(`[opening] 前章开头读取失败，起手跨批判定本次不产出：${(error as Error).message}`);
       return undefined;
     }
   };
@@ -1913,7 +1957,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
     generateStoryArcBundle: async (input: { workflowId: string; projectId: string; arcId: string; authorIntent?: string; routingSnapshot: ModelRoutingSnapshot; candidateStartIndex?: number; batchIndex?: number; startChapterIndex?: number; rebase?: boolean; arcPlan?: StoryArcPlanOutput }): Promise<GeneratedStoryArcResult> => {
       // 线索静默账（P1）：与 planning 一并取，供弧规划/审核/修订三面看到
       // "曾活跃现已静默"的线索。取不到（无定稿/正文不可得）时该段不注入。
-      const planning = { ...(await deps.repository.getStoryArcPlanningInput(input.projectId, input.arcId)), narrativeDormancy: await loadNarrativeDormancy(input.projectId) };
+      const planning = { ...(await deps.repository.getStoryArcPlanningInput(input.projectId, input.arcId)), narrativeDormancy: await loadNarrativeDormancy(input.projectId), priorChapterOpenings: await loadPriorChapterOpenings(input.projectId) };
       const skills = await resolveCurrentSkills({ projectId: input.projectId, executionPoint: "arc.plan", role: "planner" });
       const rebaseTarget = input.rebase ? await deps.repository.getStoryArcRebaseTarget(input.projectId, input.arcId) : undefined;
       const arc = input.batchIndex ? await deps.repository.getStoryArc(input.projectId, input.arcId) : undefined;
@@ -2019,7 +2063,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
     reviewStoryArcBundle: async (input: { workflowId: string; projectId: string; arcId: string; artifact: Artifact; bundle: StoryArcBundle; routingSnapshot: ModelRoutingSnapshot; candidateStartIndex?: number; rebase?: boolean }): Promise<GeneratedStoryArcReviewResult> => {
       // 线索静默账（P1）：与 planning 一并取，供弧规划/审核/修订三面看到
       // "曾活跃现已静默"的线索。取不到（无定稿/正文不可得）时该段不注入。
-      const planning = { ...(await deps.repository.getStoryArcPlanningInput(input.projectId, input.arcId)), narrativeDormancy: await loadNarrativeDormancy(input.projectId) };
+      const planning = { ...(await deps.repository.getStoryArcPlanningInput(input.projectId, input.arcId)), narrativeDormancy: await loadNarrativeDormancy(input.projectId), priorChapterOpenings: await loadPriorChapterOpenings(input.projectId) };
       const skills = await resolveCurrentSkills({ projectId: input.projectId, executionPoint: "arc.review", role: "structure-reviewer" });
       const rebaseTarget = input.rebase ? await deps.repository.getStoryArcRebaseTarget(input.projectId, input.arcId) : undefined;
       const prompt = buildStoryArcReviewPrompt(input.bundle, "", rebaseTarget);
@@ -2086,7 +2130,7 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
     reviseStoryArcBundle: async (input: { workflowId: string; projectId: string; arcId: string; artifact: Artifact; bundle: StoryArcBundle; review: StoryArcReviewOutput; routingSnapshot: ModelRoutingSnapshot; candidateStartIndex?: number; rebase?: boolean }): Promise<GeneratedStoryArcResult> => {
       // 线索静默账（P1）：与 planning 一并取，供弧规划/审核/修订三面看到
       // "曾活跃现已静默"的线索。取不到（无定稿/正文不可得）时该段不注入。
-      const planning = { ...(await deps.repository.getStoryArcPlanningInput(input.projectId, input.arcId)), narrativeDormancy: await loadNarrativeDormancy(input.projectId) };
+      const planning = { ...(await deps.repository.getStoryArcPlanningInput(input.projectId, input.arcId)), narrativeDormancy: await loadNarrativeDormancy(input.projectId), priorChapterOpenings: await loadPriorChapterOpenings(input.projectId) };
       const skills = await resolveCurrentSkills({ projectId: input.projectId, executionPoint: "arc.revision", role: "reviser" });
       const rebaseTarget = input.rebase ? await deps.repository.getStoryArcRebaseTarget(input.projectId, input.arcId) : undefined;
       const prompt = buildStoryArcRevisionPrompt(input.bundle, input.review, "", rebaseTarget);

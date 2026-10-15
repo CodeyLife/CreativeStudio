@@ -730,9 +730,13 @@ describe("long-form prompt contracts", () => {
     const batch = { batchIndex: 2, startChapterIndex: 11, complete: false };
     const instruction = buildStoryArcChaptersPrompt({ ...base, arc, batch });
     expect(instruction).toContain("起手形态轮换契约");
-    expect(instruction).toContain("连续三章以同一槽位序列起头");
+    expect(instruction).toContain("连续三章同槽位起头是跨批的");
     // 反例：不得把"以时间起头"本身判成病（本书真声音的一部分，单章合法）。
     expect(instruction).toContain("以时间起头合法的章不受此约束");
+    // 反向（2026-10-14 round 11/12）：判据不得再退回**批次内**限定——
+    // 生产批次是 7 章一弧，全书唯一的真实 run（ch41-43）恰好跨在弧6/弧7 边界上，
+    // 批次限定会让门对唯一的病灶失明（实测 6 章批次 28 批零违反）。
+    expect(instruction).not.toContain("同一批次内不得有连续三章");
 
     const review = buildStoryArcReviewPrompt({ arc: { title: "第一弧" }, chapters: [] } as never, "上下文");
     expect(review).toContain("起手形态分布检查");
@@ -740,6 +744,33 @@ describe("long-form prompt contracts", () => {
 
     const rebase = buildStoryArcRebasePrompt({ ...base, arc, batch, target: { batchIndex: 2, startChapterIndex: 11, chapters: [] } } as never);
     expect(rebase).not.toContain("起手形态轮换契约");
+  });
+
+  /**
+   * 前章开头必须进到弧规划上下文（起手跨批判据的输入侧，2026-10-14 round 11/12）。
+   *
+   * 只改措辞不改输入等于没修：规划器若看不到前两章的开头，就无法判定"本批首章是否
+   * 把同一模板延续成三连"。故锁两件：
+   *  - 传入 priorChapterOpenings 时，其内容真的出现在弧规划上下文里；
+   *  - 缺省（undefined/空）时整行不出现——既有调用方零影响，不注入占位噪声。
+   */
+  it("前章开头进弧规划上下文，缺省不注入", () => {
+    const base = { projectTitle: "测试项目", macro: [], recentChapters: [], openThreads: [] };
+    const withOpenings = buildStoryArcPlanningContextSections({
+      ...base,
+      priorChapterOpenings: ["第三日的日头落下去时，楚衡已经在老槐树底下站了两回。", "卯时的梆子敲过第三声，楚衡已经在值房外站了一炷香的功夫。"],
+    });
+    const recent = withOpenings.find((section) => section.id === "arc-context-recent");
+    expect(recent?.text, "前章开头必须进上下文，否则跨批判据无法执行").toContain("最近定稿章的开头首段");
+    expect(recent?.text).toContain("第三日的日头落下去时");
+    expect(recent?.text).toContain("卯时的梆子敲过第三声");
+
+    // 反例：缺省与空数组都不得出现该行（不注入占位噪声，既有调用方零影响）。
+    for (const priorChapterOpenings of [undefined, [] as string[]]) {
+      const sections = buildStoryArcPlanningContextSections({ ...base, priorChapterOpenings });
+      const text = sections.find((section) => section.id === "arc-context-recent")?.text ?? "";
+      expect(text).not.toContain("最近定稿章的开头首段");
+    }
   });
 
   it("正文契约携带收束轮换与计量克制度（2026-09-22 半X 738 处/31 章超线确诊）", () => {

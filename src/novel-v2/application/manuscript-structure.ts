@@ -123,6 +123,22 @@ export function extractChapterEnding(value: string): string {
 }
 
 /**
+ * 取一章正文的**首段**（未剥标点的原样文本），供跨章语境加载方复用。
+ *
+ * 与 {@link extractChapterEnding} 完全对称，理由也相同（2026-10-14 复核轮 round 11/12）：
+ * 起手轮换契约的 run 判据（"不得有连续三章以同一槽位序列起头"）此前**只在本批次内**
+ * 生效，而生产批次是 7 章一弧（实测弧6=35-42 / 弧7=43-49）——全书唯一的真实 run
+ * （ch41-43）恰好跨在弧6/弧7 边界上，两条批次限定判据都看不见它。
+ * 修法照搬章末仪式化判据的既有形态（`ENDING_RITUAL_POLICY.priorEndings`）：
+ * **跨批判据必须由调用方喂入前章语境**。本函数是那条链路的取段口径唯一来源，
+ * 避免"首段怎么切"在加载方与判据侧各写一份。
+ */
+export function extractChapterOpening(value: string): string {
+  const paragraphs = splitParagraphs(value).filter((item) => novelCharacterCount(item) > 0);
+  return paragraphs[0] ?? "";
+}
+
+/**
  * 末段内的句子切分（供章末仪式化判据使用）。
  * 用标点边界切句，与题材无关；过滤掉无有效字的残片（如残留的引号）。
  */
