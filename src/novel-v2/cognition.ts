@@ -52,7 +52,7 @@ function compareCandidates(left: MemoryHit, right: MemoryHit): number {
  * 边界：无 narrativeRange.start 的成员按最旧处理（拿不到叙事位置就不抢占位）；槽位成员全部
  * 无 start 时该变换是恒等变换。非状态类谓词（含项目自定谓词）不参与重排。
  */
-function orderStateLikeSlotsByRecency(claims: MemoryHit[]): MemoryHit[] {
+export function orderStateLikeSlotsByRecency(claims: MemoryHit[]): MemoryHit[] {
   const slotPositions = new Map<string, number[]>();
   claims.forEach((claim, index) => {
     if (!claim.identityHash || !isStateLikePredicate(claim.predicate)) return;
