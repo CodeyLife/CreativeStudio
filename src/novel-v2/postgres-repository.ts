@@ -3942,6 +3942,33 @@ export class NovelPostgresRepository {
           removedMemoryClaimIds.push(...deletedRollups.rows.map((row) => row.id));
         }
 
+        // 删除 claim 必须同时摘掉**别的行** supersedes 数组里指向它的死引用
+        // （2026-10-14 复核轮 round 21 实测：生产库 34 个 killer 攒了 94 条悬空引用，
+        // 全部来自这个删除块的两处 DELETE 只删行、不清引用）。
+        // 为什么必须清：`retiredByVisibleKillerSql` 用 `alias.id = ANY(killer.supersedes)`
+        // 判定"是否已被可见 killer 覆盖"。悬空引用**不影响检索正确性**（匹配不到任何行），
+        // 但会让任何走 supersedes 链的核查/统计看到幽灵目标——本轮自己的取证脚本首版
+        // 就因此报出"94 条悬空"，而真实结论是"覆盖关系部分失效、检索无恙"。
+        // 且数组只增不减，长期累积。放在同一事务内，删除与清理原子。
+        if (removedMemoryClaimIds.length) {
+          const stripped = await client.query<{ id: string }>(
+            `UPDATE memory_claims survivor
+                SET supersedes = (
+                  SELECT coalesce(array_agg(entry ORDER BY entry), '{}'::text[])
+                  FROM unnest(survivor.supersedes) AS entry
+                  WHERE entry <> ALL($2::text[])
+                )
+              WHERE survivor.project_id = $1
+                AND survivor.id <> ALL($2::text[])
+                AND survivor.supersedes && $2::text[]
+              RETURNING survivor.id`,
+            [projectId, removedMemoryClaimIds],
+          );
+          if (stripped.rows.length) {
+            console.warn(`[memory-governance] 清理 ${stripped.rows.length} 行里指向已删 claim 的死 supersedes 引用（删除 ${removedMemoryClaimIds.length} 行）`);
+          }
+        }
+
         if (removedRevisionIds.length) {
           // v1 遗留 `facts`/`fact_sources` 的清理分支已随迁移 095 撤表移除：两表在运行库与测试库
           // 都恒 0 行（真源早已是 memory_claims/memory_claim_sources），留着这段反而会在回滚路径上

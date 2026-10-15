@@ -234,6 +234,69 @@ describe("foundation segment singleton (A2/FM-6)", () => {
     expect(count.rows[0].n).toBe(2); // 旧行保留为退役档案，不物理删除
   });
 
+  it("接线锁：删除 claim 必须摘掉别的行里指向它的死 supersedes 引用", () => {
+    // 2026-10-14 复核轮 round 21 实测：生产库 34 个 killer 攒了 94 条悬空引用，
+    // 全部来自 `deleteStoryArc` 的两处 DELETE 只删行、不清引用。
+    // 悬空引用不影响检索正确性（`alias.id = ANY(killer.supersedes)` 匹配不到任何行），
+    // 但任何走 supersedes 链的核查都会看到幽灵目标，且数组只增不减。
+    const source = readFileSync(fileURLToPath(new URL("../postgres-repository.ts", import.meta.url)), "utf8");
+    // ① 清理语句必须存在，且用"排除被删 id 后重聚合"的口径。
+    expect(source).toMatch(/UPDATE memory_claims survivor[\s\S]*?WHERE entry <> ALL\(\$2::text\[\]\)/u);
+    // ② 必须在同一事务内紧随删除之后（不能挪到事务外，否则删了行、事务回滚会留下不一致）。
+    const stripIndex = source.indexOf("UPDATE memory_claims survivor");
+    const deleteIndex = source.lastIndexOf("DELETE FROM memory_claims", stripIndex);
+    expect(stripIndex, "清理语句必须出现在删除语句之后").toBeGreaterThan(deleteIndex);
+    expect(deleteIndex, "必须能在 postgres-repository.ts 里定位到 claim 删除语句").toBeGreaterThan(-1);
+    // ③ 反例面：不能只删行、不清理引用（历史缺陷形态）。
+    expect(source).not.toMatch(/DELETE FROM memory_claims[\s\S]{0,200}?\n\s*removedMemoryClaimIds\.push(?![\s\S]*UPDATE memory_claims survivor)/u);
+  });
+
+  it("删除行后，别的行 supersedes 里指向它的死引用被摘掉（真实 SQL 语义）", async () => {
+    if (!available) return;
+    const doomed = `claim-doomed-${randomUUID()}`;
+    const killer = `claim-killer-${randomUUID()}`;
+    const survivor = `claim-survivor-${randomUUID()}`;
+
+    // killer 覆盖 doomed 与 survivor（两个目标都在）。
+    await repository.recordMemoryClaims({
+      projectId,
+      claims: [claim(projectId, { id: killer, subjectRefs: ["hero"], predicate: "持有", content: "新值", authority: "approved", supersedes: [doomed, survivor] })],
+    });
+    await repository.recordMemoryClaims({
+      projectId,
+      claims: [
+        claim(projectId, { id: doomed, subjectRefs: ["hero"], predicate: "持有", content: "旧值一", authority: "derived" }),
+        claim(projectId, { id: survivor, subjectRefs: ["hero"], predicate: "持有", content: "旧值二", authority: "derived" }),
+      ],
+    });
+
+    // 按修复处的同一口径执行清理（先"删掉" doomed，再清理引用）。
+    await repository.pool.query("DELETE FROM memory_claims WHERE project_id=$1 AND id=$2", [projectId, doomed]);
+    await repository.pool.query(
+      `UPDATE memory_claims survivor
+          SET supersedes = (
+            SELECT coalesce(array_agg(entry ORDER BY entry), '{}'::text[])
+            FROM unnest(survivor.supersedes) AS entry
+            WHERE entry <> ALL($2::text[])
+          )
+        WHERE survivor.project_id = $1
+          AND survivor.id <> ALL($2::text[])
+          AND survivor.supersedes && $2::text[]`,
+      [projectId, [doomed]],
+    );
+
+    const after = await repository.pool.query<{ supersedes: string[] }>(
+      "SELECT supersedes FROM memory_claims WHERE project_id=$1 AND id=$2",
+      [projectId, killer],
+    );
+    // 死引用被摘掉，活引用保留。
+    expect(after.rows[0].supersedes).not.toContain(doomed);
+    expect(after.rows[0].supersedes).toContain(survivor);
+    // 且被删行确实不在了（否则这条用例什么都没验证）。
+    const exists = await repository.pool.query("SELECT 1 FROM memory_claims WHERE project_id=$1 AND id=$2", [projectId, doomed]);
+    expect(exists.rows).toHaveLength(0);
+  });
+
   it("regeneration refreshes the singleton in place instead of adding a row", async () => {
     if (!available) return;
     const gen3 = `art-${randomUUID()}`;
