@@ -111,6 +111,25 @@ function invalidExecutionPoints(input: { executionPoints?: unknown }): string[] 
   return [...new Set(asStringArray(input.executionPoints).filter((item) => !(item in SKILL_EXECUTION_POLICIES)))];
 }
 
+/**
+ * `promptSections` 里"查不到"的键（既不是执行点、也不是 coarse 阶段）。
+ *
+ * 渲染口径是 `skillPromptSection`：`promptSections[executionPoint] ?? promptSections[coarse]`。
+ * 故一个拼写错的键（如 `chapter.draftng`）永远不会被查到——**指引静默丢失**。
+ * 而 `resolveStageSkillBundle` 的"该执行点无 prompt 内容就抛"只在**完全无内容**时触发：
+ * 若同技能另有一个 coarse 键兜底，错键就藏在后面不被发现。
+ *
+ * **必须在归一化之前判**：`normalizePromptSections` 自己会为每个已声明执行点补 coarse
+ * 别名，拿归一化后的键做分类会把那些别名误判成非法（本仓 2026-10-14 的取证脚本正是
+ * 这么错的，11/12 个技能全报假死键）。故本函数只读 `input.promptSections` 的原始键。
+ */
+function invalidPromptSectionKeys(input: { promptSections?: unknown }): string[] {
+  const raw = input.promptSections;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
+  const validCoarseStages = new Set<string>(Object.values(COARSE_STAGE));
+  return [...new Set(Object.keys(raw as Record<string, unknown>).filter((key) => !(key in SKILL_EXECUTION_POLICIES) && !validCoarseStages.has(key)))];
+}
+
 function normalizePromptSections(raw: unknown, executionPoints: SkillExecutionPoint[]): Partial<Record<string, string>> {
   const sections: Partial<Record<string, string>> = {};
   if (raw && typeof raw === "object" && !Array.isArray(raw)) {
@@ -132,6 +151,10 @@ export function normalizeSkillDescriptor(input: Partial<SkillDescriptor> & { ski
     ...invalidExecutionPoints(input),
     ...(input.invalidExecutionPoints ?? []),
   ])];
+  const invalidSectionKeys = [...new Set([
+    ...invalidPromptSectionKeys(input),
+    ...(input.invalidPromptSectionKeys ?? []),
+  ])];
   const applicableTasks = asStringArray(input.applicableTasks) as PreflightPlan["taskClass"][];
   const normalized: SkillDescriptor = {
     skillId: input.skillId,
@@ -145,6 +168,7 @@ export function normalizeSkillDescriptor(input: Partial<SkillDescriptor> & { ski
     enabled: input.enabled !== false,
     executionPoints,
     ...(invalidPoints.length ? { invalidExecutionPoints: invalidPoints } : {}),
+    ...(invalidSectionKeys.length ? { invalidPromptSectionKeys: invalidSectionKeys } : {}),
     roles: asStringArray(input.roles),
     dependsOn: asStringArray(input.dependsOn),
     priority: input.priority,
@@ -305,6 +329,13 @@ export async function resolveStageSkillBundle(input: {
   if (invalid.length) {
     throw new Error(`Skill execution point 漂移：${invalid.map((skill) => `${skill.skillId}@${skill.version}=[${skill.invalidExecutionPoints!.join(", ")}]`).join("；")}`);
   }
+  // promptSections 的错键**不在此抛**（与执行点漂移刻意分档，2026-10-14 复核轮 round 15）：
+  // 执行点无效 ⇒ 技能根本挂不上任何阶段，是硬错；promptSections 错键 ⇒ 技能照常工作，
+  // 只是那一段指引不出现。若在此抛，一个测试夹具里的历史遗留行就能把整条解析链打断
+  // （实测：共享测试库里的 test-craft-skill 用 `chapter.review` 这个**不存在**的中间名，
+  // 抛错立刻打断三例与技能迭代无关的用例）。故错键走**报告面**：normalizeSkillDescriptor
+  // 带出 `invalidPromptSectionKeys`，由 skills CLI 的 check 与 doctor 常态面报出——
+  // 静默丢失被消除，但不把内容缺陷升级成流水线停摆。
   const direct = available.filter((skill) => skill.enabled
     && skill.executionPoints?.includes(input.executionPoint)
     && (!skill.roles?.length || !input.role || skill.roles.includes(input.role))

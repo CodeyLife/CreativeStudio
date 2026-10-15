@@ -681,6 +681,15 @@ export function buildStoryArcReviewPrompt(bundle: StoryArcBundle, contextText: s
   ].filter(Boolean).join("\n\n");
 }
 
+/**
+ * 故事弧修订 prompt。
+ *
+ * `contextText` 与 `buildStoryArcReviewPrompt` 同状（2026-10-14 复核轮 round 14/15）：
+ * 生产调用方传空串（`activities.reviseStoryArcBundle`），上下文由同处的
+ * `buildStoryArcPlanningContextSections(planning)` 经 `compileSinglePrompt` 的
+ * `contextSections` 渲染进 instruction。**不要因为看到空串就往这里再传一遍 context**
+ * （同一批段会渲染两次）。本 prompt 不引用任何具名段，故无段名失联风险。
+ */
 export function buildStoryArcRevisionPrompt(bundle: StoryArcBundle, review: StoryArcReviewOutput, contextText: string, rebaseTarget?: StoryArcRebaseTarget): string {
   return [
     "依据审核意见修订故事弧。先修复承载问题的最低层级：状态和事实边界优先于章节安排，因果与人物选择优先于抽象主题标签，线索责任优先于增加事件。",

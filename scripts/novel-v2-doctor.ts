@@ -141,17 +141,30 @@ try {
   // 本检查只读不写（写库属于 sync/patch 的显式语义）。
   try {
     const workspaceSkills = await listCurrentSkillDescriptors(createWorkspaceSkillProvider(), "");
-    const databaseSkills = (await repository.listSkills("")).map((row) => normalizeSkillDescriptor(row)).filter((skill) => !("invalidExecutionPoints" in skill));
+    const allDatabaseSkills = (await repository.listSkills("")).map((row) => normalizeSkillDescriptor(row));
+    const databaseSkills = allDatabaseSkills.filter((skill) => !("invalidExecutionPoints" in skill));
     const projection = compareSkillProjections(
       workspaceSkills.map((skill) => ({ skillId: skill.skillId, version: skill.version, contentFingerprint: skill.contentFingerprint })),
       databaseSkills.map((skill) => ({ skillId: skill.skillId, version: skill.version, contentFingerprint: skill.contentFingerprint })),
       compareSkillVersions,
     );
     const drift = projection.drift;
+    // promptSections 的"查不到的键"（2026-10-14 复核轮 round 15）：渲染口径是
+    // `promptSections[executionPoint] ?? promptSections[coarse]`，故既非执行点、也非 coarse
+    // 阶段的键**永远不被渲染**——那段指引静默丢失。它不阻断解析（技能照常工作），
+    // 故不进 ok 判据、不升级成停摆；但必须在常态面上具名报出，否则"静默丢失"仍是静默的。
+    // 实测首跑即抓到真实实例：共享测试库的 test-craft-skill 用 `chapter.review`
+    // 这个不存在的中间名（合法的是 chapter.review.structure/character/prose 与 coarse 的 review）。
+    const invalidSectionKeys = allDatabaseSkills.flatMap((skill) => skill.invalidPromptSectionKeys?.length
+      ? [`${skill.skillId}@${skill.version}=[${skill.invalidPromptSectionKeys.join(", ")}]`]
+      : []);
+    const sectionKeyNote = invalidSectionKeys.length
+      ? `；**永不渲染的 promptSections 键 ${invalidSectionKeys.length} 个**（既非执行点也非 coarse 阶段，该段指引不会出现在任何 prompt 里）：${invalidSectionKeys.slice(0, 5).join("；")}${invalidSectionKeys.length > 5 ? ` …共 ${invalidSectionKeys.length} 个` : ""}`
+      : "";
     set("skill-drift", {
       ok: drift.length === 0,
-      detail: `workspace ${workspaceSkills.length} / database ${databaseSkills.length}；漂移 ${drift.length} 个${drift.length ? " ⇒ 跑 pnpm novel:skills:sync --target database --project <projectId> 重灌 seed（服务启动的 migrate 也会自动灌）" : ""}；晋升领先 ${projection.promotionAhead.length} 个（学习闭环产物，允许）`,
-      data: { drift, promotionAhead: projection.promotionAhead },
+      detail: `workspace ${workspaceSkills.length} / database ${databaseSkills.length}；漂移 ${drift.length} 个${drift.length ? " ⇒ 跑 pnpm novel:skills:sync --target database --project <projectId> 重灌 seed（服务启动的 migrate 也会自动灌）" : ""}；晋升领先 ${projection.promotionAhead.length} 个（学习闭环产物，允许）${sectionKeyNote}`,
+      data: { drift, promotionAhead: projection.promotionAhead, invalidPromptSectionKeys: invalidSectionKeys },
     });
   } catch (error) { set("skill-drift", { ok: false, detail: (error as Error).message }); }
 

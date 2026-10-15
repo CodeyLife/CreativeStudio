@@ -97,6 +97,15 @@ async function checkDatabase(): Promise<void> {
       print({ target: "database", status: "invalid-execution-points", invalidExecutionPoints });
       throw new Error(`Skill database 包含未知 execution point：${JSON.stringify(invalidExecutionPoints)}`);
     }
+    // promptSections 的错键同报（2026-10-14 复核轮 round 15）：它不会让任何执行点"无内容"
+    // （coarse 兜底可能掩盖），只会让那段指引永远不被渲染——静默丢失比抛错难发现得多。
+    const invalidPromptSectionKeys = loaded.skills.flatMap((skill) => skill.invalidPromptSectionKeys?.length
+      ? [{ skillId: skill.skillId, version: skill.version, invalidPromptSectionKeys: skill.invalidPromptSectionKeys }]
+      : []);
+    if (invalidPromptSectionKeys.length) {
+      print({ target: "database", status: "invalid-prompt-section-keys", invalidPromptSectionKeys });
+      throw new Error(`Skill database 包含永远不会被渲染的 promptSections 键（既非执行点也非 coarse 阶段）：${JSON.stringify(invalidPromptSectionKeys)}`);
+    }
     const projection = compareSkillProjections(
       workspace.map((skill) => ({ skillId: skill.skillId, version: skill.version, contentFingerprint: skill.contentFingerprint })),
       loaded.skills.map((skill) => ({ skillId: skill.skillId, version: skill.version, contentFingerprint: skill.contentFingerprint })),

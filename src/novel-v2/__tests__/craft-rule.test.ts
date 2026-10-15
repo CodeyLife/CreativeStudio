@@ -241,10 +241,17 @@ describe("craft-rule integration", () => {
     if (!postgresAvailable) return;
 
     // 准备：创建项目 + skill_definition
+    //
+    // 键用**真实执行点** `chapter.review.prose`，不用 `chapter.review`
+    // （2026-10-14 复核轮 round 15）：后者不是执行点也不是 coarse 阶段，渲染口径
+    // `promptSections[executionPoint] ?? promptSections[coarse]` 永远查不到它 ⇒
+    // 那段指引静默丢失。夹具此前用的正是这个不存在的中间名，而它**每次跑都写进共享
+    // 测试库**（ON CONFLICT by skill_id），于是 normalizeSkillDescriptor 的
+    // `invalidPromptSectionKeys` 每次都报它。夹具是别人照抄的样板，不该示范错键。
     const projectId = `test-craft-skill-${randomUUID().slice(0, 8)}`;
     await repository.ensureProject(projectId, "Craft Rule Skill Test");
     const skillId = "test-craft-skill";
-    const beforeText = JSON.stringify({ drafting: "原始 skill prompt", "chapter.review": "原始 review prompt" });
+    const beforeText = JSON.stringify({ drafting: "原始 skill prompt", "chapter.review.prose": "原始 review prompt" });
     await repository.pool.query(
       `INSERT INTO skill_definitions(skill_id, version, prompt_sections)
        VALUES($1, '1.0.0', $2::jsonb)
@@ -326,7 +333,7 @@ describe("craft-rule integration", () => {
       [skillId],
     );
     expect(skillAfter.rows[0].version).toBe("1.0.1");
-    expect(skillAfter.rows[0].prompt_sections).toEqual({ ...JSON.parse(JSON.stringify({ drafting: "原始 skill prompt", "chapter.review": "原始 review prompt" })), ...JSON.parse(afterText) });
+    expect(skillAfter.rows[0].prompt_sections).toEqual({ ...JSON.parse(JSON.stringify({ drafting: "原始 skill prompt", "chapter.review.prose": "原始 review prompt" })), ...JSON.parse(afterText) });
 
     // 6. rollbackCraftRuleCandidate
     const rolledBack = await rollbackCraftRuleCandidate(repository, model, {

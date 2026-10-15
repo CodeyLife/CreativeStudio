@@ -9,6 +9,7 @@ import {
   createDatabaseSkillProvider,
   createWorkspaceSkillProvider,
   buildSkillContextSections,
+  listCurrentSkillDescriptors,
   normalizeSkillDescriptor,
   renderSkillInstruction,
   resolveStageSkillBundle,
@@ -291,6 +292,58 @@ describe("Skill runtime resolution", () => {
     expect(descriptor.invalidExecutionPoints).toEqual(["stale.execution-point"]);
     const provider = createDatabaseSkillProvider(async () => [descriptor]);
     await expect(resolveStageSkillBundle({ projectId: "p1", provider, executionPoint: "chapter.drafting", role: "writer" })).rejects.toThrow(/stale.execution-point/);
+  });
+
+  /**
+   * promptSections 的"查不到的键"必须被检出（2026-10-14 复核轮 round 15）。
+   *
+   * 失效形态：渲染口径是 `promptSections[executionPoint] ?? promptSections[coarse]`，
+   * 故一个拼写错的键（`chapter.draftng`）永远查不到 ⇒ **那段指引静默丢失**。
+   * 而既有的"该执行点无 prompt 内容就抛"（:343）**盖不住它**：只要同技能另有一个
+   * coarse 键（如 `drafting`）兜底，该执行点就有内容、不抛，错键就藏在后面。
+   *
+   * **分档（与执行点漂移刻意不同）**：执行点无效 ⇒ 技能挂不上任何阶段，是硬错、解析抛；
+   * promptSections 错键 ⇒ 技能照常工作、只是少一段指引，故**只报告不抛**。
+   * 理由：在解析处抛会让一个历史遗留夹具行打断整条链（实测：共享测试库的
+   * `test-craft-skill` 用 `chapter.review` 这个不存在的中间名，抛错立刻打断三例与
+   * 技能迭代无关的用例）。报告面是 skills CLI 的 check 与 doctor 的 skill-drift。
+   *
+   * 双向覆盖：
+   *  - 命中面：coarse 兜底在场时错键仍须被检出，且**解析照常成功**（不升级成停摆）；
+   *  - 反例一：合法键（执行点 + coarse）不得被误报；
+   *  - 反例二：归一化补出的 coarse 别名不得被判非法（判定必须在归一化之前）；
+   *  - 反例三：12 个生产技能真源体检零错键。
+   */
+  it("检出永远不会被渲染的 promptSections 键（coarse 兜底掩盖不住；只报告不抛）", async () => {
+    // 命中面：coarse 兜底在场（drafting），错键仍须被检出。
+    const typo = normalizeSkillDescriptor({
+      ...draftSkill("兜底内容"),
+      promptSections: { drafting: "兜底内容", "chapter.draftng": "拼错的键，永远不会被渲染" } as SkillDescriptor["promptSections"],
+    });
+    expect(typo.invalidPromptSectionKeys).toEqual(["chapter.draftng"]);
+    // 分档：解析**不得**因错键失败——技能照常工作，缺的只是那一段指引。
+    const provider = createDatabaseSkillProvider(async () => [typo]);
+    const bundle = await resolveStageSkillBundle({ projectId: "p1", provider, executionPoint: "chapter.drafting", role: "writer" });
+    expect(renderSkillInstruction(bundle, "chapter.drafting")).toContain("兜底内容");
+    // 且错键内容确实没进 prompt（证明它真的是死键，不是"其实渲染了"）。
+    expect(renderSkillInstruction(bundle, "chapter.drafting")).not.toContain("拼错的键");
+
+    // 反例一：合法键（执行点 + coarse）都不得被误报。
+    const valid = normalizeSkillDescriptor({
+      ...draftSkill("正文指引"),
+      promptSections: { drafting: "粗粒度兜底", "chapter.drafting": "正文指引", review: "审核指引", "chapter.review.prose": "散文审核" } as SkillDescriptor["promptSections"],
+    });
+    expect(valid.invalidPromptSectionKeys).toBeUndefined();
+
+    // 反例二：归一化补出的 coarse 别名不得被判非法（判定必须在归一化之前）。
+    const propagated = normalizeSkillDescriptor({ ...draftSkill("x"), promptSections: { "chapter.drafting": "x" } as SkillDescriptor["promptSections"] });
+    expect(propagated.promptSections.drafting, "归一化会补 coarse 别名").toBe("x");
+    expect(propagated.invalidPromptSectionKeys).toBeUndefined();
+
+    // 反例三：全部生产技能都不得有错键（真源体检）。
+    const workspace = createWorkspaceSkillProvider(path.resolve(process.cwd(), "skills", "novel-v2"));
+    const offenders = (await listCurrentSkillDescriptors(workspace, "p1")).filter((skill) => skill.invalidPromptSectionKeys?.length);
+    expect(offenders.map((skill) => `${skill.skillId}=[${skill.invalidPromptSectionKeys!.join(",")}]`)).toEqual([]);
   });
 
   it("rejects missing dependencies and conflicts", async () => {

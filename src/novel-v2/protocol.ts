@@ -528,6 +528,15 @@ export interface SkillDescriptor {
   executionPoints?: SkillExecutionPoint[];
   /** 非持久化诊断：来源 descriptor 声明但当前 Runtime 不认识的 execution point。 */
   invalidExecutionPoints?: string[];
+  /**
+   * 非持久化诊断：`promptSections` 里既不是 execution point、也不是 coarse 阶段的键。
+   *
+   * 这类键永远不会被 `skillPromptSection` 查到（它只按 executionPoint 或 coarse 阶段取），
+   * 即**指引静默丢失**——而 `resolveStageSkillBundle` 的"该执行点无 prompt 内容就抛"
+   * 只在**完全无内容**时触发：若同技能另有一个 coarse 键兜底，拼写错的键就能藏在后面不被发现。
+   * 与 `invalidExecutionPoints` 同族（都是"名字解析不到真实目标"），故同样进解析守卫。
+   */
+  invalidPromptSectionKeys?: string[];
   roles?: string[];
   dependsOn?: string[];
   priority?: SkillPriority;
