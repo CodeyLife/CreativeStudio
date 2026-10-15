@@ -109,7 +109,7 @@ describe("Skill runtime resolution", () => {
     for (const skillId of ["prose-craft", "reader-emotion", "plot-causality"]) {
       // 守卫值随 workspace yaml 版本演进（prose-craft 曾升 1.4.0 未同步本守卫，属存量断链修复）；
       // 断言的仍是"清单能解析出版本与指纹"这一契约，非具体措辞。
-      expect(byId.get(skillId)?.version).toBe(skillId === "prose-craft" ? "1.6.0" : "1.1.0");
+      expect(byId.get(skillId)?.version).toBe(skillId === "prose-craft" ? "1.7.0" : "1.1.0");
       expect(byId.get(skillId)?.contentFingerprint).toBeTruthy();
     }
 
@@ -391,6 +391,49 @@ describe("Skill runtime resolution", () => {
     expect(mismatched).toContain("题材无关指引");
     // ④ 全被题材过滤掉 ⇒ 回退到未过滤集，不抛错。
     expect(await bundleOf([restricted], "都市"), "全被题材过滤时应回退而非抛错").toContain("题材特化指引");
+  });
+
+  /**
+   * 情绪节拍不得默认落在面部表情上（2026-10-14 复核轮 round 19）。
+   *
+   * 读者视角实测（`tmp/state-audit/measure-gesture-idioms.mts`）：面部微表情族
+   * （嘴角/眉头/眉心/眼神/眼底/眼皮）密度与章节强度**负相关**——
+   * 含不合格的混合带 0.58/千字、全书最强的 099-127 带 0.05、全书均值 0.27，
+   * 且**已排除"独处章没有第二张脸可写"这一混杂**：非独处章层内 0.77 vs 0.27，差距不消失
+   * （`verify-gesture-confounded-by-solo.mts`）。原始计数 115 处，非小样本噪声。
+   *
+   * 与既有"叙述者不替读者论证"的分工：那条治的是**段落级**解释，
+   * 本条治**小句级**的"表情 + 一句说明它意味着什么"。
+   *
+   * 三面接线 + 反例（不得写成词表禁用——表情本身完全合法）。
+   */
+  it("情绪节拍默认落在面部表情上的判据在写作、审核、修订三面都在场", async () => {
+    const provider = createWorkspaceSkillProvider(path.resolve(process.cwd(), "skills", "novel-v2"));
+    const faces: Array<[SkillExecutionPoint, string]> = [
+      ["chapter.drafting", "writer"],
+      ["chapter.review.prose", "prose-reviewer"],
+      ["chapter.revision", "reviser"],
+    ];
+    for (const [executionPoint, role] of faces) {
+      const text = renderSkillInstruction(
+        await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint, role }),
+        executionPoint,
+      );
+      expect(text, `${executionPoint} 缺少面部表情节拍判据`).toContain("面部表情");
+    }
+    const draftText = renderSkillInstruction(
+      await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint: "chapter.drafting", role: "writer" }),
+      "chapter.drafting",
+    );
+    // 写作侧必须给出"不可替代"这一可执行判据，而不是频率禁令。
+    expect(draftText).toContain("这次表情是否不可替代");
+    // 反例：不得退化成词表禁用（表情本身合法）。
+    expect(draftText).toContain("表情本身完全合法");
+    const reviewText = renderSkillInstruction(
+      await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint: "chapter.review.prose", role: "prose-reviewer" }),
+      "chapter.review.prose",
+    );
+    expect(reviewText, "审核侧必须写明表情本身合法、只在替代动作/对白时才报").toContain("面部表情本身合法");
   });
 
   /**
