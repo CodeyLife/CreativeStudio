@@ -68,8 +68,14 @@ const CONTINUITY_PREDICATE_PATTERN = /身份|姓名|年龄|生死|死亡|存活|
  * 分类基于叙事功能（状态槽 vs 事件账）而非题材词表；边界：关系类（师徒/敌对）由
  * relations 表承载不在此列；未列入的谓词一律按事件累积处理（安全偏置——宁可少退役，
  * 由事实梳理/审批通道兜底），需要扩展时在此处按同一"单当前值"判据评估。
+ *
+ * 命名边界（与 `fingerprint.ts` 的 `isStateSnapshotPredicate` 区分）：两者都涉及"单值槽"，
+ * 但判据与消费方不同——本函数答"更新能否整槽清扫 supersedes"（成员 13，宽，且**不含**
+ * `状态变化`：它是事件账）；`isStateSnapshotPredicate` 答"多个取值是否属同一维度的逐时点
+ * 快照"（成员 3，窄，消费方是检索排序）。名字须各自说出判据，故不用近似的 `is*Slot*` /
+ * `is*State*` 泛称（2026-10-16 复核轮按此改名）。
  */
-const VALUE_SLOT_CANONICAL_PREDICATES = new Set([
+const EXCLUSIVE_VALUE_SLOT_PREDICATES = new Set([
   "持有",
   "位于",
   "隶属",
@@ -85,8 +91,8 @@ const VALUE_SLOT_CANONICAL_PREDICATES = new Set([
   "生死",
 ]);
 
-export function isValueSlotPredicate(predicate: string): boolean {
-  return VALUE_SLOT_CANONICAL_PREDICATES.has(canonicalizeFactPredicate(predicate));
+export function isExclusiveValueSlotPredicate(predicate: string): boolean {
+  return EXCLUSIVE_VALUE_SLOT_PREDICATES.has(canonicalizeFactPredicate(predicate));
 }
 
 /** Facts that can alter later causal/state decisions need stronger evidence. */
@@ -116,7 +122,7 @@ export function classifyFactRisk(params: {
   // 事件累积型谓词的多行同属不同事件，单条 update 不得清扫整槽，否则会把未提及的
   // 既有派生事实连带逐出检索面（实测资产账本断线根因）。
   let supersedes: string[] = [];
-  if (fact.novelty === "update" && params.existingClaimIndex && isValueSlotPredicate(fact.predicate)) {
+  if (fact.novelty === "update" && params.existingClaimIndex && isExclusiveValueSlotPredicate(fact.predicate)) {
     const key = `${normalizeFactToken(fact.subject.id)}|${canonicalizeFactPredicate(fact.predicate)}`;
     supersedes = params.existingClaimIndex.get(key) ?? [];
   }
@@ -140,7 +146,7 @@ export function classifyFactRisk(params: {
   //   （宁可少报，与 classify 的"安全偏置"同向）。
   let factContradiction = false;
   let contradictionFrozenIds: string[] = [];
-  if (!fact.conflict && fact.truthStatus === "objective" && fact.polarity === "affirmed" && !supersedes.length && params.existingClaimIndex && params.existingValueHashById && isValueSlotPredicate(fact.predicate)) {
+  if (!fact.conflict && fact.truthStatus === "objective" && fact.polarity === "affirmed" && !supersedes.length && params.existingClaimIndex && params.existingValueHashById && isExclusiveValueSlotPredicate(fact.predicate)) {
     const key = `${normalizeFactToken(fact.subject.id)}|${canonicalizeFactPredicate(fact.predicate)}`;
     const frozenIds = params.existingClaimIndex.get(key) ?? [];
     const knownFrozenHashes = frozenIds

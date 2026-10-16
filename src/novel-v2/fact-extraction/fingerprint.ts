@@ -51,13 +51,25 @@ export function canonicalizeFactPredicate(value: string): string {
  *   属累积型而非同一维度的时点序列。
  * - "隶属"刻意排除：运行库无 active 取值，且"能否同时隶属多个组织"是项目层设定，
  *   证据不足时不替项目裁决。
+ *
+ * 命名边界（与 `classify.ts` 的 `isExclusiveValueSlotPredicate` 区分）：两者都回答
+ * "这个谓词是不是单值槽"，但**判据与消费方都不同**，名字必须能区分开——
+ *   - 本函数（**状态快照序列**）：同一槽位的多个取值是**同一维度的逐时点快照**，
+ *     消费方是检索排序（`orderStateLikeSlotsByRecency`，让最新取值代表当前状态）。
+ *     成员只有三个：持有 / 位于 / 状态变化。
+ *   - `isExclusiveValueSlotPredicate`（**排他值槽**）：更新语义 = 旧值被取代，
+ *     消费方是写入侧的 supersedes 整槽清扫。成员 13 个，且**不含** `状态变化`
+ *     （它是事件账，单条 update 无权退役整槽）。
+ *   两组刻意不同构：前者窄（只有"当前值语义"确凿的三个），后者宽（凡排他当前值皆可清扫）。
+ *   此前两者名为 `isStateLikePredicate` / `isValueSlotPredicate`——名字近乎相同而成员集
+ *   相反，2026-10-16 复核轮按"名字须说出判据"改为现名。
  */
-const STATE_LIKE_PREDICATES: ReadonlySet<string> = new Set(["持有", "位于", "状态变化"]);
+const STATE_SNAPSHOT_PREDICATES: ReadonlySet<string> = new Set(["持有", "位于", "状态变化"]);
 
-/** 该谓词是否为单值状态维度（"当前值"语义）。未归类或缺失一律返回 false。 */
-export function isStateLikePredicate(predicate: string | undefined): boolean {
+/** 该谓词是否为逐时点状态快照维度（多个取值属同一维度、最新者代表当前值）。未归类或缺失一律返回 false。 */
+export function isStateSnapshotPredicate(predicate: string | undefined): boolean {
   if (!predicate) return false;
-  return STATE_LIKE_PREDICATES.has(canonicalizeFactPredicate(predicate));
+  return STATE_SNAPSHOT_PREDICATES.has(canonicalizeFactPredicate(predicate));
 }
 
 function normalizeFactValue(value: unknown): unknown {

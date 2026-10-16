@@ -83,8 +83,8 @@ export const ENDING_RITUAL_POLICY = {
  * 住叶子纯模块的理由同 ENDING_RITUAL_POLICY：getStoryArcPlanningInput（仓储层）
  * 与 prompts 渲染两侧共用，workflow bundle 只允许无 node 依赖的纯导入链。
  *
- * 判据形态（2026-09-22 用 168 章实测校准，见 tmp/diag-lengthdrift.txt 与
- * docs/novel-v2/improvement-plan-20260922.md §2E 修正记录）：
+ * 判据形态（校准记录见 docs/novel-v2/improvement-plan-20260922.md §2E，其中同时是
+ * "局部漂移门被推翻"的取证）：
  * **章长只做描述性统计（近窗口均长 / 低于下限计数），不做正文结构门**。
  * - 退役考古：`manuscript.length` 已退役，长度约束由提交门 `length-under-target`
  *   （revision-policy.ts，对蓝图声明目标的 60% 兑现率）承担——"绝对字数"不是病，

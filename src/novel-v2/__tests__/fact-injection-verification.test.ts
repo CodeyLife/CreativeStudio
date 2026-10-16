@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildFactRetrievalPlan, capDirectionPinnedClaims, MAX_DIRECTION_ENTITIES, MAX_DIRECTION_PINNED_TOTAL, mergeEntitiesByHeadSuffix } from "../fact-retrieval";
-import { classifyFactRisk, isValueSlotPredicate } from "../fact-extraction/classify";
+import { classifyFactRisk, isExclusiveValueSlotPredicate } from "../fact-extraction/classify";
 import { factValueHash } from "../fact-extraction/fingerprint";
 import { buildMemoryBundle, createPreflightPlan } from "../cognition";
 import { buildChapterDraftPromptPackage } from "../prompts/chapter-draft";
@@ -135,7 +135,7 @@ describe("迭代 2：确定性事实矛盾核验（classify 层，零模型调�
   });
 
   it("反例：事件累积型谓词（状态变化）同槽多值合法，不报矛盾", () => {
-    expect(isValueSlotPredicate("状态变化")).toBe(false);
+    expect(isExclusiveValueSlotPredicate("状态变化")).toBe(false);
     const eventIndex = new Map([["陈默|状态变化", ["claim-event-1"]]]);
     const eventHashes = new Map([["claim-event-1", "some-other-value-hash"]]);
     const classified = classifyFactRisk({

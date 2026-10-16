@@ -35,7 +35,7 @@ import { isPostgresUnavailable } from "./test-db";
 import { NovelPostgresRepository } from "../postgres-repository";
 import { retrievalVisibleClaimsSql } from "../memory-visibility";
 import { orderStateLikeSlotsByRecency } from "../cognition";
-import { isStateLikePredicate } from "../fact-extraction/fingerprint";
+import { isStateSnapshotPredicate } from "../fact-extraction/fingerprint";
 import type { MemoryClaim, MemoryHit } from "../protocol";
 
 const TEST_DB_URL = process.env.TEST_DATABASE_URL ?? "postgresql://ymcp:ymcp@127.0.0.1:5432/ymcp_test";
@@ -98,7 +98,7 @@ describe("state-slot recency ordering against live data（round 26）", () => {
     const hits = await loadHits();
     const slots = new Map<string, MemoryHit[]>();
     for (const hit of hits) {
-      if (!hit.identityHash || !isStateLikePredicate(hit.predicate)) continue;
+      if (!hit.identityHash || !isStateSnapshotPredicate(hit.predicate)) continue;
       const list = slots.get(hit.identityHash) ?? [];
       list.push(hit);
       slots.set(hit.identityHash, list);
@@ -124,7 +124,7 @@ describe("state-slot recency ordering against live data（round 26）", () => {
   it("② 直接调用被测函数：槽位内按叙事位置降序，且不篡改跨槽位次序", async () => {
     if (!available) return;
     const hits = await loadHits();
-    if (!hits.some((hit) => hit.identityHash && isStateLikePredicate(hit.predicate))) return; // 空库场景跳过
+    if (!hits.some((hit) => hit.identityHash && isStateSnapshotPredicate(hit.predicate))) return; // 空库场景跳过
 
     // 输入先按"旧口径"排（authority 升序，即旧实现的次序），这样函数的效果才可观测。
     const legacyOrdered = [...hits].sort((left, right) =>
@@ -141,7 +141,7 @@ describe("state-slot recency ordering against live data（round 26）", () => {
     // (b) **核心**：每个多值状态槽位占据的那批位置，内容必须按叙事位置**降序**。
     for (const [slot, ] of groupStateSlots(legacyOrdered)) {
       const positions = legacyOrdered
-        .map((hit, index) => (hit.identityHash === slot && isStateLikePredicate(hit.predicate) ? index : -1))
+        .map((hit, index) => (hit.identityHash === slot && isStateSnapshotPredicate(hit.predicate) ? index : -1))
         .filter((index) => index >= 0);
       if (positions.length < 2) continue;
       const starts = positions.map((index) => legacyOrdered[index]!.narrativeRange?.start ?? Number.NEGATIVE_INFINITY);
@@ -157,17 +157,17 @@ describe("state-slot recency ordering against live data（round 26）", () => {
 
     // (c) 跨槽位次序不变：非状态类候选的位置必须原样保留。
     const nonSlotBefore = legacyOrdered
-      .map((hit, index) => (hit.identityHash && isStateLikePredicate(hit.predicate) ? null : index))
+      .map((hit, index) => (hit.identityHash && isStateSnapshotPredicate(hit.predicate) ? null : index))
       .filter((index): index is number => index !== null);
     for (const index of nonSlotBefore) expect(after[index], `非槽位候选在第 ${index} 位不得被移动`).toBe(before[index]);
   }, 60_000);
 
   it("③ 谓词边界：状态类判据只认三个谓词（越权扩大会被抓）", () => {
-    expect(isStateLikePredicate("持有")).toBe(true);
-    expect(isStateLikePredicate("位于")).toBe(true);
-    expect(isStateLikePredicate("状态变化")).toBe(true);
-    expect(isStateLikePredicate("认识")).toBe(false);
-    expect(isStateLikePredicate("欠")).toBe(false);
+    expect(isStateSnapshotPredicate("持有")).toBe(true);
+    expect(isStateSnapshotPredicate("位于")).toBe(true);
+    expect(isStateSnapshotPredicate("状态变化")).toBe(true);
+    expect(isStateSnapshotPredicate("认识")).toBe(false);
+    expect(isStateSnapshotPredicate("欠")).toBe(false);
   });
 
   it("④ 构造最小病例自证：旧的 approved 不得挤掉新的 derived", async () => {
@@ -197,7 +197,7 @@ describe("state-slot recency ordering against live data（round 26）", () => {
 function groupStateSlots(hits: MemoryHit[]): Map<string, MemoryHit[]> {
   const slots = new Map<string, MemoryHit[]>();
   for (const hit of hits) {
-    if (!hit.identityHash || !isStateLikePredicate(hit.predicate)) continue;
+    if (!hit.identityHash || !isStateSnapshotPredicate(hit.predicate)) continue;
     const list = slots.get(hit.identityHash) ?? [];
     list.push(hit);
     slots.set(hit.identityHash, list);

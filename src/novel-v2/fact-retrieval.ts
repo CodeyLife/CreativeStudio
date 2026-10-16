@@ -5,7 +5,7 @@ import type { ChapterBlueprintRecord, StoryArcThreadResponsibility } from "./app
  * 方向驱动事实检索计划（improvement-plan-fact-injection-20260922 迭代 1）。
  *
  * 设计依据：docs/novel-v2/improvement-plan-fact-injection-20260922.md §1——
- * 020 账册日期 / 021 交易条款 / 024 玉牌归属三类硬矛盾的共同根因：相关冻结断言
+ * 三类硬矛盾（账册日期类、交易条款类、物件归属类）的共同根因：相关冻结断言
  * 在预算竞价中落选，没有被强制注入本章上下文，模型凭记忆重写。本模块把
  * "本章要写什么方向"翻译成"必须带上哪些实体/线程的冻结断言"（fact retrieval plan），
  * 由 retrieveMemory 据此定向检索并以 pinnedClaims 强制注入。

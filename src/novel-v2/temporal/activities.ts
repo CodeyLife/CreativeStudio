@@ -156,14 +156,16 @@ export function buildCraftRuleCandidateInput(assessment: RuntimeLearningAssessme
  * "描述性短语不要当 subject.id"），但 prompt 约束不保证旧数据与新模型都遵守，
  * 故这里兜一道运行时检测。
  *
- * **判定（round 65 修正切分口径）**：主体整串不在本章正文、且满足任一条 ⇒ 报：
+ * **判定（round 65 修正切分口径）**：主体整串不在本章正文、且**存在一个长度 ≥2 的
+ * 真前缀出现在正文** ⇒ 报。这条判据是两种形态的并集，而并集恰好退化成"前缀在正文"：
  *   - **可拼型**：存在一种前后切分，两段都在正文（`灰衣杂役` ← 灰衣 + 杂役）；
  *   - **前缀型**：某个真前缀在正文、而剩余部分作为整体不在正文
  *     （`补发房抄写人` ← "补发房抄"在正文，"写人"不在 ⇒ 仍是拼出来的称呼）。
- *     首版只查"两段切分"，漏掉了前缀型——因为"补发房抄"在正文而"写人"不在，
- *     任何 2 段切分都凑不齐"两段都在"，于是整条被跳过。
- *     round 65 实测：未覆盖的 5 个里有 2 个属此前漏掉的前缀型，
- *     且它们是**更严重**的整串幻觉。
+ *   尾部在不在正文不改变结果（尾部命中即前者、不命中即后者，二者穷尽），故实现只有
+ *   一个循环。首版真正漏掉的不是"某一类"而是**切分口径**：只查"两段都在"时不查前缀，
+ *   于是"补发房抄"在正文而"写人"不在的那条整条被跳过。
+ *   round 65 实测：未覆盖的 5 个里有 2 个属此前漏掉的前缀型，
+ *   且它们是**更严重**的整串幻觉。
  *
  * **故意不报**：整串不在、且所有片段也都不在正文的（`城南看物屋`、`屋内人`、
  * `挑水人`）——它们完全没出处，属更严重的一类，但判定需要语义（可能真是
@@ -183,14 +185,14 @@ export function detectCoinedSubjects(claims: ReadonlyArray<{ subjectRefs?: reado
     if (/^(?:character|foundation|facet|claim|memory|graph):/u.test(subject)) return false;
     if (chapterText.includes(subject)) return false;
 
-    // ① 可拼型：存在一种前后切分，两段都在正文。
+    // 判据：**存在一个长度 ≥2 的真前缀出现在正文**。
+    //
+    // 两个子形态的并集恰好退化成这一个条件：某个 cut 上前缀命中时，尾部命中属
+    // 「可拼型」、不命中属「前缀型」，二者穷尽。故尾部无需再查——首版写成两个循环
+    // 并在注释里声称 ② 覆盖了 ① 漏掉的一类，实际 ① 在尾部不命中时本就不成立，
+    // ② 是它的补集而非额外覆盖（2026-10-16 复核轮）。
     for (let cut = 2; cut <= subject.length - 2; cut += 1) {
-      if (chapterText.includes(subject.slice(0, cut)) && chapterText.includes(subject.slice(cut))) return true;
-    }
-    // ② 前缀型：某个真前缀在正文，而剩余部分作为整体不在正文。
-    for (let cut = 2; cut <= subject.length - 2; cut += 1) {
-      const tail = subject.slice(cut);
-      if (chapterText.includes(subject.slice(0, cut)) && !chapterText.includes(tail)) return true;
+      if (chapterText.includes(subject.slice(0, cut))) return true;
     }
     return false;
   });

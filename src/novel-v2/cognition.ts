@@ -18,7 +18,7 @@ import type { ChapterPlanningContext } from "./application/story-arc";
 import { CHAPTER_CHANGE_SCOPES } from "./prompts/chapter-review";
 import { canonicalSha256 } from "./canonical-json";
 import { estimateBudgetTokens } from "./token-estimate";
-import { isStateLikePredicate } from "./fact-extraction/fingerprint";
+import { isStateSnapshotPredicate } from "./fact-extraction/fingerprint";
 
 export { createConfiguredSkillProvider, createDatabaseSkillProvider, createWorkspaceSkillProvider, renderSkillInstruction, resolveStageSkillBundle, skillPromptSection } from "./skill-runtime";
 
@@ -55,7 +55,7 @@ function compareCandidates(left: MemoryHit, right: MemoryHit): number {
 export function orderStateLikeSlotsByRecency(claims: MemoryHit[]): MemoryHit[] {
   const slotPositions = new Map<string, number[]>();
   claims.forEach((claim, index) => {
-    if (!claim.identityHash || !isStateLikePredicate(claim.predicate)) return;
+    if (!claim.identityHash || !isStateSnapshotPredicate(claim.predicate)) return;
     const positions = slotPositions.get(claim.identityHash);
     if (positions) positions.push(index);
     else slotPositions.set(claim.identityHash, [index]);
