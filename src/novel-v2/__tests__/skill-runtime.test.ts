@@ -109,7 +109,7 @@ describe("Skill runtime resolution", () => {
     for (const skillId of ["prose-craft", "reader-emotion", "plot-causality"]) {
       // 守卫值随 workspace yaml 版本演进（prose-craft 曾升 1.4.0 未同步本守卫，属存量断链修复）；
       // 断言的仍是"清单能解析出版本与指纹"这一契约，非具体措辞。
-      expect(byId.get(skillId)?.version).toBe(skillId === "prose-craft" ? "1.13.0" : "1.1.0");
+      expect(byId.get(skillId)?.version).toBe(skillId === "prose-craft" ? "1.14.0" : "1.1.0");
       expect(byId.get(skillId)?.contentFingerprint).toBeTruthy();
     }
 
@@ -407,6 +407,32 @@ describe("Skill runtime resolution", () => {
    *
    * 三面接线 + 反例（不得写成词表禁用——表情本身完全合法）。
    */
+  /**
+   * "叙述者替读者论证"的实测定性：全书几乎绝迹，且不可被读成"可以总结"（round 36）。
+   *
+   * 实测（measure-reconstruction-density.mts）：全书 168 章里总结连接词
+   * （因此/所以/总之/说到底/这意味着/这便是/可见）共 **32 处（0.07/千字）**，
+   * 合格带 0.10 / 混合带 0.08 / 最强带 0.09——密度极低且与质量无关，
+   * 说明这条禁令**从未被真正触发过**（与 round 33 的问句收尾零计数同族）。
+   *
+   * 同时记录了**反向代理的失败**：用"可观察要素密度"（身体+接触+空间方位）测复原度
+   * 得到全书 102/千字、四带比值 0.92，毫无区分度——因为"左右/上下/里外"等单字
+   * 在中文里本就高频，代理被常用二元组淹没。⇒ 本条的可靠执行面仍是**语义判断**，
+   * 不得改成可计算的密度门。这把锁钉住这个"不可计算"的结论，
+   * 防止后人照那次失败的代理去立一个密度门。
+   */
+  it("复原判据注明：总结连接词全书绝迹，且反向代理已证失败（不得立密度门）", async () => {
+    const provider = createWorkspaceSkillProvider(path.resolve(process.cwd(), "skills", "novel-v2"));
+    const draftText = renderSkillInstruction(
+      await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint: "chapter.drafting", role: "writer" }),
+      "chapter.drafting",
+    );
+    expect(draftText, "必须带上总结连接词的实测零值").toContain("32 处");
+    expect(draftText, "必须写明不得据此认为可以写总结段").toContain("不可据此认为");
+    expect(draftText, "必须记录反向代理失败").toContain("反向代理");
+    expect(draftText, "结论须是执行面仍归语义判断、不得立密度门").toMatch(/语义判断|不得改成可计算的密度门/u);
+  });
+
   /**
    * 群像判据的实测定性：是已守住的基线，不是区分质量的杠杆（2026-10-14 复核轮 round 35）。
    *
