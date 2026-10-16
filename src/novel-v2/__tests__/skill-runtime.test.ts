@@ -109,7 +109,7 @@ describe("Skill runtime resolution", () => {
     for (const skillId of ["prose-craft", "reader-emotion", "plot-causality"]) {
       // 守卫值随 workspace yaml 版本演进（prose-craft 曾升 1.4.0 未同步本守卫，属存量断链修复）；
       // 断言的仍是"清单能解析出版本与指纹"这一契约，非具体措辞。
-      expect(byId.get(skillId)?.version).toBe(skillId === "prose-craft" ? "1.16.0" : skillId === "reader-emotion" ? "1.2.0" : skillId === "review-gate" ? "1.2.0" : "1.1.0");
+      expect(byId.get(skillId)?.version).toBe(skillId === "prose-craft" ? "1.16.1" : skillId === "reader-emotion" ? "1.2.1" : skillId === "review-gate" ? "1.2.1" : "1.1.0");
       expect(byId.get(skillId)?.contentFingerprint).toBeTruthy();
     }
 
@@ -647,6 +647,38 @@ describe("Skill runtime resolution", () => {
         }
       }
     });
+
+    /**
+     * C 泛化审计（AGENTS.md「泛化优先」）：skill 的 promptSections 是直接投给
+     * 写作/审核/修订模型的指引文本，判据必须用**通用叙事机制**描述，
+     * 不得嵌入样本书的稿件特征——章节索引（ch112 之类）、样本书自指（本书）、
+     * 样本口径的测量（"全书 32 处"）、维护者轮次与已失效的临时脚本路径（round N、tmp/...）。
+     *
+     * 失效形态（实测）：判据正文里带着"全书 168 章里……ch2—ch72……"这类取证出处，
+     * 模型会把它读成"这条规则只适用于那本书的那一段"，跨题材复用时规则失效；
+     * 而 tmp/ 路径已随目录清理失效，指向它的出处无法核对。
+     *
+     * 判据边界（刻意不覆盖）：`全书` **单独使用**（"先建立全书的可执行骨架"）是正常领域词，
+     * 其他 skill 里就在用，一刀切禁会把正常措辞判红；故只禁"`全书` + 计数"的样本口径。
+     *
+     * 三面覆盖：命中面（五份 skill 全查）+ 反例（保留下来的测量结论不含这些标识，
+     * 由上方 A/B 两组与本文件其余断言锁定）。
+     */
+    it("C 泛化：prompt 文本不含样本书标识（章节索引/自指/样本口径测量/维护者轮次）", () => {
+      for (const skillId of ["prose-craft", "reader-emotion", "review-gate", "story-arc-design", "fact-memory"]) {
+        const text = readFileSync(`skills/novel-v2/${skillId}.yaml`, "utf8");
+        expect(text, `${skillId}: 不得出现样本书章节索引`).not.toMatch(/ch\d+/u);
+        expect(text, `${skillId}: 不得用样本书自指`).not.toMatch(/本书/u);
+        expect(text, `${skillId}: 不得用样本口径的测量计数`).not.toMatch(/全书[^，。；\n]{0,12}\d/u);
+        expect(text, `${skillId}: 不得引用维护者轮次或临时脚本路径`).not.toMatch(/round \d+|tmp\//u);
+      }
+      // 反例：测量结论本身必须仍在（证明上面的 not 断言不是"整段被删掉"的恒真）。
+      expect(source, "反例：总结连接词的实测计数应仍在").toContain("32 处");
+      expect(source, "反例：最强带的零值结论应仍在").toContain("最强带 099-127 为 0.000");
+      // 原文引语：prose-craft 里「」此前只用于引用样本书正文，故该文件不得再有「」。
+      // 其余 skill 的「」是审核 prompt 条目名（如「最小动力闭环」），不在此禁令内。
+      expect(source, "prose-craft 不得引用样本书原文").not.toMatch(/「|」/u);
+    });
   });
   it("代价判据按机制分两种：禁叙述者宣布，允许人物自己权衡", async () => {
     const provider = createWorkspaceSkillProvider(path.resolve(process.cwd(), "skills", "novel-v2"));
@@ -685,8 +717,13 @@ describe("Skill runtime resolution", () => {
       await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint: "chapter.drafting", role: "writer" }),
       "chapter.drafting",
     );
-    expect(text, "必须带上宣告型的零值实测").toContain("全书仅 **1 处**");
+    // 泛化（AGENTS.md 泛化优先）：锁的是"零值实测"这一形状，不是样本书的范围指代。
+    expect(text, "必须带上宣告型的零值实测").toContain("仅 **1 处**");
     expect(text, "必须写明最强带为 0").toContain("最强带 0");
+    const readerEmotionSource = readFileSync("skills/novel-v2/reader-emotion.yaml", "utf8");
+    expect(readerEmotionSource, "实测不得用样本书自指").not.toMatch(/本书/u);
+    expect(readerEmotionSource, "实测不得用样本口径的测量计数").not.toMatch(/全书[^，。；\n]{0,12}\d/u);
+    expect(readerEmotionSource, "实测不得引用维护者轮次或临时脚本路径").not.toMatch(/round \d+|tmp\//u);
     // 关键防误读：代理边界必须写在同一条。
     expect(text, "必须写明该密度代理没有分辨力").toContain("没有分辨力");
     expect(text, "必须禁止读成情绪浓度低等于缺情绪推进").toContain("情绪浓度低");
@@ -863,7 +900,11 @@ describe("Skill runtime resolution", () => {
     expect(draftText, "必须带上收束机制拆分依据").toContain("短句收尾");
     // 三条硬事实：最强带最高、问句全书为零、最强带全是单拍。
     expect(draftText, "须写明短句收尾在最强带最高").toContain("最强带 0.276");
-    expect(draftText, "须写明问句收尾全书为零").toContain("问句收尾全书 0 处");
+    // 泛化：锁"问句收尾 0 处"这一测量结论本身，不再绑定样本书的范围指代。
+    expect(draftText, "须写明问句收尾为零").toContain("问句收尾 0 处");
+    expect(draftText, "不得用样本书自指").not.toMatch(/本书/u);
+    expect(draftText, "不得用样本口径的测量计数").not.toMatch(/全书[^，。；\n]{0,12}\d/u);
+    expect(draftText, "不得嵌入样本书章节索引").not.toMatch(/ch\d+/u);
     expect(draftText, "须写明最强带全是单拍落点、零宣告").toMatch(/单拍落点.{0,12}零宣告|零宣告/u);
     // 结论：禁止宣告而非禁止短。
     expect(draftText, "结论须是'禁止宣告而非禁止短'").toContain("不是**短**");

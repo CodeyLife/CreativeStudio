@@ -177,7 +177,19 @@ describe("fact-extraction retention contract", () => {
     expect(prompt, "必须要求完整字符串出现").toContain("完整字符串");
     // round 60 补：描述性短语（地点/服饰 + 人/者/老头）同样不得作 subject.id。
     expect(prompt, "必须禁描述性短语作主体").toContain("描述性短语不要当 subject.id");
-    expect(prompt, "须点名实测到的自造形态").toContain("补发房抄写人");
+    /**
+     * 反向（2026-10-16 复核轮）：判据必须用**通用构词形状**描述，不得把样本书的专名、
+     * 实测频次或内部审计章节号写进 prompt——那正是 AGENTS.md 泛化优先禁的
+     * "prompt 示例嵌入特定角色名/题材/章节索引"。
+     *
+     * 首版守卫断言的是 `toContain("补发房抄写人")`，即**把违规形状钉成了契约**：
+     * 守卫自身在要求 prompt 保留样本书专名，后来者删掉它就判红。修法是把断言翻面，
+     * 从"须点名实测到的自造形态"改为"须给通用形状 + 不得出现样本专名/频次"。
+     */
+    expect(prompt, "须给出通用构词形状").toContain("通名");
+    expect(prompt, "不得嵌入样本书专名").not.toMatch(/补发房|城南看物屋|灰衣|挑水人|抄写老头/u);
+    expect(prompt, "不得嵌入实测频次").not.toMatch(/\d+\s*次/u);
+    expect(prompt, "不得嵌入内部审计章节号").not.toContain("state-audit §");
     // 原约束仍在（本条是新增强化，不是替换）。
     expect(prompt, "原有'可指认'约束必须保留").toContain("subject.id 必须是正文中可指认的对象");
   });
