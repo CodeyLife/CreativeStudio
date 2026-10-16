@@ -109,7 +109,7 @@ describe("Skill runtime resolution", () => {
     for (const skillId of ["prose-craft", "reader-emotion", "plot-causality"]) {
       // 守卫值随 workspace yaml 版本演进（prose-craft 曾升 1.4.0 未同步本守卫，属存量断链修复）；
       // 断言的仍是"清单能解析出版本与指纹"这一契约，非具体措辞。
-      expect(byId.get(skillId)?.version).toBe(skillId === "prose-craft" ? "1.12.0" : "1.1.0");
+      expect(byId.get(skillId)?.version).toBe(skillId === "prose-craft" ? "1.13.0" : "1.1.0");
       expect(byId.get(skillId)?.contentFingerprint).toBeTruthy();
     }
 
@@ -407,6 +407,32 @@ describe("Skill runtime resolution", () => {
    *
    * 三面接线 + 反例（不得写成词表禁用——表情本身完全合法）。
    */
+  /**
+   * 群像判据的实测定性：是已守住的基线，不是区分质量的杠杆（2026-10-14 复核轮 round 35）。
+   *
+   * round 2 写入"每个具名角色都要有至少一个独立于主角观察的可观察反应"，此后从未取证。
+   * 本轮用**事实记忆层的真实主体名**（21 个）覆盖 144/168 章多人场后测得：
+   * 配角充当句子主语的占比在四个合格带 0.537、混合带 0.584、最强带 0.550——**基本持平**
+   * （最强带绝对句数更低只因它更短，不是群像更塌）。
+   * 直读最强带样本确认机制真实：ch116「来接的还是话房人。」「"存注，"繁主事开口了」。
+   *
+   * 定性结论比数值更重要：**这是已守住的基线，不是区分质量的杠杆**——
+   * 要盯的是占比掉下去（塌成主角视角回声），不是它有多高。
+   * 这把锁防的是把这条读成"占比越高越好"而去给配角加戏（那会稀释主线）。
+   */
+  it("群像判据已注明是基线而非杠杆：盯下降不盯升高", async () => {
+    const provider = createWorkspaceSkillProvider(path.resolve(process.cwd(), "skills", "novel-v2"));
+    const draftText = renderSkillInstruction(
+      await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint: "chapter.drafting", role: "writer" }),
+      "chapter.drafting",
+    );
+    expect(draftText, "必须带上实测占比与持平结论").toContain("0.550");
+    expect(draftText, "定性须是'基线而非杠杆'").toMatch(/基线.{0,6}杠杆|杠杆/u);
+    expect(draftText, "须写明盯下降不盯升高").toMatch(/占比掉下去|不要盯它有多高|盯的是.{0,12}占比掉下去/u);
+    // 判据本身（独立反应）必须仍在。
+    expect(draftText).toContain("独立于主角观察的可观察反应");
+  });
+
   /**
    * 章尾纪律的机制拆分依据（2026-10-14 复核轮 round 33）。
    *
