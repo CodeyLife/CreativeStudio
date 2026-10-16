@@ -423,6 +423,44 @@ describe("Skill runtime resolution", () => {
    */
 
   /**
+   * 复核工具的自证对照组（2026-10-14 复核轮 round 43）。
+   *
+   * round 42 判了 14 项反向同步缺口里 12 项为角色错配假阳性。round 43 复核那次判读时，
+   * 自建的复核脚本连报两轮"6 条全推翻"——包括 round 42 刚写进 review-gate 的
+   * "验收点核实纪律"。两轮各有一个独立 bug（自检词用中文"版本"而 yaml 用 `version:`；
+   * map 以带扩展名文件名为键、查询用不带扩展名 ⇒ `get()` 返回 undefined 经 `?? ""`
+   * 兜底成空串）。逐字比对证明文件与读取都对，错的全在比对脚本。
+   *
+   * 危险在于：若按那两轮输出行事，我会去给 6 条**已正确登记**的判据补写重复内容，
+   * 而"同一条判据写两遍"正是 round 37 整治过的"同一契约两处口径"隐患。
+   * **一个读起来很确定的假阴性比"0 条"更危险，因为它会驱动实际改动。**
+   *
+   * 本锁把"已知答案对照组"固化为常态：用两条**确定已登记**的纪律
+   * （round 42 补的）作对照组，任何"skill 是否登记了 X"的检查都必须先过这一关。
+   */
+  it("复核工具的自证对照组：已知已登记的两条纪律必须能被检出", async () => {
+    const provider = createWorkspaceSkillProvider(path.resolve(process.cwd(), "skills", "novel-v2"));
+    const reviewText = renderSkillInstruction(
+      await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint: "chapter.review.structure", role: "structure-reviewer" }),
+      "chapter.review.structure",
+    );
+    // 对照组一：round 42 补的验收点核实纪律。
+    expect(reviewText, "对照组①：验收点核实纪律必须可检出").toContain("验收点核实纪律");
+    // 对照组二：同轮补的跨章序列证据。
+    expect(reviewText, "对照组②：跨章序列证据必须可检出").toContain("跨章序列证据");
+
+    // 反向：源码里这两条必须真存在（否则对照组本身就失效）。
+    const prompt = readFileSync("src/novel-v2/prompts/chapter-review.ts", "utf8");
+    expect(prompt, "对照组①在 prompt 里必须真存在").toContain("验收点核实纪律");
+    expect(prompt, "对照组②在 prompt 里必须真存在").toContain("跨章序列证据");
+
+    // 警示性哨兵：把一条已登记的纪律从 skill 侧断言里**移走**，检查必须失败
+    // （证明"检出"不是恒真——即本对照组真的在比对，而不是无条件通过）。
+    const missing = "这一串在任何 skill 里都不存在_对照组哨兵";
+    expect(reviewText.includes(missing), "哨兵：未登记的串不得被检出").toBe(false);
+  });
+
+  /**
    * review-gate 必须登记 prompt 已在跑的审核纪律（2026-10-14 复核轮 round 42）。
    *
    * round 41 查出**反向同步性缺口**（实现了没写进 spec）并补齐十项。round 42 把该类别
