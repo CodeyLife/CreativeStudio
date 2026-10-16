@@ -573,8 +573,14 @@ describe("Skill runtime resolution", () => {
       for (const phrase of retracted) {
         expect(source, `撤回的措辞仍以肯定形式存在：${phrase}`).not.toContain(phrase);
       }
-      // 对照组：保留的判据必须在（证明 not.toContain 不是恒真）。
-      expect(source, "对照组：章尾纪律应仍在").toContain("不要从可感观察滑入概括议论");
+      // 对照组一：保留的判据必须在（证明 source 真被读到，not.toContain 不是恒真）。
+      expect(source, "对照组①：章尾纪律应仍在").toContain("不要从可感观察滑入概括议论");
+      // 对照组二（round 52 加固）：这三条旧措辞的**现行替身**必须都在场——
+      // 否则"旧措辞不在"可能只是因为整段表情判据被误删（round 50 我犯过这个错）。
+      // 有了这一条，"旧措辞不在"才等价于"收窄已生效"，而不是"整段不见了"。
+      expect(source, "对照组②：现行措辞（而报）应仍在").toContain("不得因\"又一个表情标记\"而报");
+      expect(source, "对照组③：机制 A/B/C 的判据应在").toContain("单一个标记不解释");
+      expect(source, "对照组④：收窄后的判据开头应在").toContain("情绪节拍的病灶是");
     });
 
     it("B 两侧并存的判据都带划清范围的限定语", () => {
