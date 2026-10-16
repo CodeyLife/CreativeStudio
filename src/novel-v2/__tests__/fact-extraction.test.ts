@@ -175,6 +175,9 @@ describe("fact-extraction retention contract", () => {
     const prompt = buildFactExtractionPrompt({ artifact, text: "她换了一件外衣，随后立誓守住城门。" });
     expect(prompt, "必须禁止拼合 subject.id").toContain("不得由多个词拼合而成");
     expect(prompt, "必须要求完整字符串出现").toContain("完整字符串");
+    // round 60 补：描述性短语（地点/服饰 + 人/者/老头）同样不得作 subject.id。
+    expect(prompt, "必须禁描述性短语作主体").toContain("描述性短语不要当 subject.id");
+    expect(prompt, "须点名实测到的自造形态").toContain("补发房抄写人");
     // 原约束仍在（本条是新增强化，不是替换）。
     expect(prompt, "原有'可指认'约束必须保留").toContain("subject.id 必须是正文中可指认的对象");
   });
