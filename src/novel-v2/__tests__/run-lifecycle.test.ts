@@ -108,8 +108,24 @@ describe("workflow_runs 生命周期词表", () => {
 
   /**
    * 消费方不得再手写「未结账」成员集——本文件 :7-11 记的根因（每处重述一遍就必然
-   * 漏掉一处）在 8 处判据里各发生过一次。守卫按**集合签名**判，不按标识符判：
-   * 同一字面量集合里同时出现 accepted 与 waiting-external，就是一份手写的未结账集。
+   * 漏掉一处）在 8 处判据里各发生过一次。
+   *
+   * 签名不能只认含 `waiting-external` 的那一种：首版判据是"`accepted` 与
+   * `waiting-external` 在 80 字符内相邻"，它只抓得住**曾经写对过**的近似集，抓不住
+   * **漏掉 `waiting-external`** 的那一种——而那正是本片要修的缺陷形态。2026-10-16
+   * 复核轮实测：`NovelPipelineBoard.tsx` 手写 `{running, manual-review-required,
+   * pending, accepted}`、`mcp/handlers.ts` 手写 `{accepted, running,
+   * manual-review-required}`，两道守卫都看不见。
+   *
+   * 泛化签名（不认任何具体状态名，只认**形状 + 词表归属**）：字面量集合（比较链或
+   * 数组成员判断）里 ≥2 个成员是 run 状态，且**全部为非终态**——"全是非终态"就是
+   * "这份集合在回答『它还开着吗』"，那正是 `OPEN_WORKFLOW_RUN_STATUSES` 的语义，
+   * 不该有第二份。非词表成员（如 `pending`）不计入判据，故漏写/误写成员不会让判据失效。
+   *
+   * 边界（为什么不把所有状态字面量集合都判红）：本仓另有共用同名成员的状态词表——
+   * `CreativeRunStatus`（completed/failed/cancelled）、故事弧 `executionStatus`
+   * （completed/abandoned）、项目卡片 `ProjectState`（failed/running）。它们的集合
+   * 必然含**终态**成员，故不命中本签名；实测这三类共 4 处集合零误报。
    *
    * `__tests__` 排除在外：测试里写死成员是正当夹具（例如 terminal-outcome.test.ts
    * 故意把幽灵状态 pending 混进非终态清单，用来证明判据是真分类而非字符串透传）。
@@ -124,10 +140,32 @@ describe("workflow_runs 生命周期词表", () => {
       .filter((file) => !file.endsWith("run-lifecycle.ts") && !file.includes("__tests__"));
     const rel = (file: string) => relative(process.cwd(), file).replace(/\\/g, "/");
 
+    const openMembers = new Set<string>(OPEN_WORKFLOW_RUN_STATUSES);
+    /** 抽出源码里的状态字面量集合：比较链与数组成员判断两种形状。 */
+    const literalSets = (text: string): string[][] => {
+      const sets: string[][] = [];
+      // 比较链：`status === "x" || … status === "y"`。刻意用 `\bstatus` 而非 `\.status`——
+      // 只认属性访问形态会漏掉裸变量（`status === "running" || status === "accepted"`），
+      // 实测该形态注入后守卫不响（2026-10-16 探针）。`\b` 同样匹配 `run?.status`。
+      const comparison = /\bstatus\s*(?:===|==|!==|!=)\s*["']([a-z][a-z-]*)["'][\s\S]{0,160}?\|\|[\s\S]{0,160}?\bstatus\s*(?:===|==|!==|!=)\s*["']([a-z][a-z-]*)["']/gu;
+      for (const match of text.matchAll(comparison)) sets.push([match[1], match[2]]);
+      const membership = /\[([^\]]{0,240})\]\s*\.\s*(?:includes|has|some)\s*\(/gu;
+      for (const match of text.matchAll(membership)) {
+        sets.push([...match[1].matchAll(/["']([a-z][a-z-]*)["']/gu)].map((item) => item[1]));
+      }
+      return sets;
+    };
+
     const handWritten = files.filter((file) => {
       const text = stripComments(readFileSync(file, "utf8"));
-      return /["']accepted["'][\s\S]{0,80}?["']waiting-external["']/.test(text)
-        || /["']waiting-external["'][\s\S]{0,80}?["']accepted["']/.test(text);
+      // 形状一：曾经的近似集（含 waiting-external 的相邻写法），任意容器形态都抓。
+      if (/["']accepted["'][\s\S]{0,80}?["']waiting-external["']/.test(text)
+        || /["']waiting-external["'][\s\S]{0,80}?["']accepted["']/.test(text)) return true;
+      // 形状二：全部成员都是非终态 run 状态的集合。
+      return literalSets(text).some((members) => {
+        const inVocab = members.filter((member) => isWorkflowRunStatus(member));
+        return inVocab.length >= 2 && inVocab.every((member) => openMembers.has(member));
+      });
     });
     expect(handWritten.map(rel), "这些文件又手写了一份未结账集").toEqual([]);
 
@@ -378,6 +416,25 @@ describe("run 状态写入面接线锁", () => {
     expect(repository).toContain("status IN (${ACTIVE_WORKFLOW_RUN_STATUSES_SQL})");
     expect(repository).toContain("status=${WAITING_EXTERNAL_WORKFLOW_RUN_STATUS_SQL}");
     expect(repository).not.toMatch(/status IN \('running','accepted'\)/);
+
+    /**
+     * 泛化：`status IN ('…')` 里出现 ≥2 个**非终态** run 状态字面量，就是一份手写的
+     * 未结账集——与 TS 侧源码签名锁同形（见上面那条用例）。
+     *
+     * 首版只锁 `('running','accepted')` 这一个字符串，于是 `findActiveChapterReview` /
+     * `findActiveProjectChapterReview` 的 `('accepted','running','manual-review-required')`
+     * 一直无人对（2026-10-16 复核轮发现）。其余状态词表（craft-rule 的
+     * proposed/evidencing/reviewing、文档的 locked/stale 等）不含 ≥2 个 run 非终态成员，
+     * 故不命中——实测本文件当前零误报。
+     */
+    const sql = repository.replace(/\/\*[\s\S]*?\*\//g, " ");
+    const offenders = [...sql.matchAll(/status IN \(([^)]*)\)/gu)]
+      .map((match) => [...match[1].matchAll(/'([a-z][a-z-]*)'/gu)].map((item) => item[1]))
+      .filter((members) => {
+        const inVocab = members.filter((member) => isWorkflowRunStatus(member));
+        return inVocab.length >= 2 && inVocab.every((member) => (OPEN_WORKFLOW_RUN_STATUSES as readonly string[]).includes(member));
+      });
+    expect(offenders, "又手写了一份 SQL 未结账集").toEqual([]);
   });
 
   it("人工门族成员确实等人，对账不得收编", () => {

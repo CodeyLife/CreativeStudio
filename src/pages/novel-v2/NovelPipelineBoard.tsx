@@ -1213,7 +1213,10 @@ export default function NovelProductionWorkspace({
 
   const runQ = useNovelRun(mainWorkflowId);
   const run = runQ.data;
-  const isActive = run?.status === "running" || run?.status === "manual-review-required" || run?.status === "pending" || run?.status === "accepted";
+  // 未结账判据用单一真源（`run-lifecycle.ts`）：此前这里手写 {running, manual-review-required,
+  // pending, accepted}——`pending` 是幽灵成员（全仓无生产者），而 `waiting-external` 与
+  // 两个人门态被漏掉，导致等待外部/等作者裁决时事件与产物轮询停摆。
+  const isActive = isOpenWorkflowRunStatus(run?.status);
   const eventsQ = useNovelRunEvents(mainWorkflowId, isActive);
   const artifactsQ = useNovelRunArtifacts(mainWorkflowId, isActive);
   const reviewsQ = useNovelRunReviews(mainWorkflowId, isActive);
@@ -1234,7 +1237,7 @@ export default function NovelProductionWorkspace({
   const effectiveDiagnosticWfId = diagnosticWfId ?? mainWorkflowId;
   const diagnosticRunQ = useNovelRun(effectiveDiagnosticWfId);
   const diagnosticRun = diagnosticRunQ.data;
-  const diagnosticActive = diagnosticRun?.status === "running" || diagnosticRun?.status === "manual-review-required" || diagnosticRun?.status === "pending" || diagnosticRun?.status === "accepted";
+  const diagnosticActive = isOpenWorkflowRunStatus(diagnosticRun?.status);
   const diagnosticEventsQ = useNovelRunEvents(effectiveDiagnosticWfId, diagnosticActive);
   const diagnosticArtifactsQ = useNovelRunArtifacts(effectiveDiagnosticWfId, diagnosticActive);
   const diagnosticReviewsQ = useNovelRunReviews(effectiveDiagnosticWfId, diagnosticActive);

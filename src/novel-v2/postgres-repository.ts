@@ -5547,7 +5547,7 @@ export class NovelPostgresRepository {
       `SELECT temporal_workflow_id FROM workflow_runs
        WHERE project_id=$1 AND workflow_type='chapter-review'
          AND (payload->>'documentId') IS DISTINCT FROM $2
-         AND status IN ('accepted','running','manual-review-required')
+         AND status IN (${OPEN_WORKFLOW_RUN_STATUSES_SQL})
        ORDER BY updated_at DESC LIMIT 1`,
       [projectId, documentId],
     );
@@ -5556,7 +5556,7 @@ export class NovelPostgresRepository {
 
   async findActiveChapterReview(projectId: string, documentId: string): Promise<string | undefined> {
     const result = await this.pool.query<{ temporal_workflow_id: string }>(
-      "SELECT temporal_workflow_id FROM workflow_runs WHERE project_id=$1 AND payload->>'documentId'=$2 AND workflow_type='chapter-review' AND status IN ('accepted','running','manual-review-required') ORDER BY updated_at DESC LIMIT 1",
+      `SELECT temporal_workflow_id FROM workflow_runs WHERE project_id=$1 AND payload->>'documentId'=$2 AND workflow_type='chapter-review' AND status IN (${OPEN_WORKFLOW_RUN_STATUSES_SQL}) ORDER BY updated_at DESC LIMIT 1`,
       [projectId, documentId],
     );
     return result.rows[0]?.temporal_workflow_id;
