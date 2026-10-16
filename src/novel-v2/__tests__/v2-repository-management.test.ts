@@ -126,6 +126,43 @@ describe("V2 repository management APIs", () => {
     expect(titleUpdate?.params).toEqual(["p1", "确认后的正式书名"]);
   });
 
+  /**
+   * 规划阶段不存在时必须拒绝批准（2026-10-14 round 49）。
+   *
+   * "规划阶段不存在"这道门在 `postgres-repository.ts` 里有**三处实现**：
+   * `prepareProjectPlanRegeneration`（L2886）、`replaceProjectPlanSection`（L2954）、
+   * `approveProjectPlanSection`（L2997）。测试对该消息**零引用**（grep 0 命中）。
+   *
+   * round 49 用反证法逐处验证（并遵守 round 48 的判据：先确认移除落在目标函数内）：
+   * 单独移除 `approveProjectPlanSection` 的门（另两处保持不动）⇒ **1375 个测试
+   * 无一变红** ⇒ 批准路径从未测过"阶段不存在"。
+   *
+   * 为什么这条最该锁：它是**权威落点**。门失效意味着可以对不存在的规划阶段
+   * 走完批准事务——后续所有依赖"已批准规划"的阶段都会拿到一个空引用，
+   * 而批准是会写 `novel_projects.title`、发 outbox 事件的持久动作。
+   */
+  it("rejects approving a plan stage that does not exist", async () => {
+    const calls: QueryCall[] = [];
+    const client = {
+      query: async (sql: string, params?: unknown[]) => {
+        calls.push({ sql, params });
+        // approve 路径先 SELECT … FOR UPDATE 取当前行：这里返回 0 行 ⇒ 阶段不存在。
+        if (sql.startsWith("SELECT project_id,task_key,work_item_id")) return { rows: [], rowCount: 0 };
+        return { rows: [], rowCount: 0 };
+      },
+      release: () => undefined,
+    };
+    const repository = Object.create(NovelPostgresRepository.prototype) as NovelPostgresRepository;
+    Object.defineProperty(repository, "pool", { value: { connect: async () => client, query: async () => ({ rows: [], rowCount: 0 }) } });
+
+    // taskKey 是联合类型，这里用合法枚举值 + 库中不存在的行来制造"阶段不存在"。
+    await expect(repository.approveProjectPlanSection("p1", "characters", "artifact-x", "web-author"))
+      .rejects.toThrow(/规划阶段不存在/);
+    // 不得继续走批准副作用（不回滚、不更新项目标题、不发 outbox）。
+    expect(calls.some((call) => call.sql.startsWith("UPDATE novel_projects SET title"))).toBe(false);
+    expect(calls.some((call) => call.sql.startsWith("INSERT INTO outbox_events"))).toBe(false);
+  });
+
   it("updates documents with explicit POV clearing and emits an outbox event", async () => {
     const { repository, calls } = createRepository([{ rows: [documentRow], rowCount: 1 }, { rows: [{ id: 1 }], rowCount: 1 }]);
     await expect(repository.updateDocument({ projectId: "p1", documentId: "doc-1", title: "新标题", povCharacterId: null, status: "review" })).resolves.toMatchObject({ id: "doc-1", title: "第一章" });
