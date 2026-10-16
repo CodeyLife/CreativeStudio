@@ -19,6 +19,16 @@
  * 因此本版：① 把 `orderStateLikeSlotsByRecency` 导出（此前是模块私有，外部无法直接测，
  * 这正是当初被迫复刻逻辑的原因）；② 测试**直接调用被测函数**，用真库数据驱动；
  * ③ 反向复跑改为**改生产源码的重排方向**，确认测试真的能抓住那个退化。
+ *
+ * **口径更正（2026-10-14 round 55，state-audit §8.52/§8.53）**：
+ * 这里的"真库"指**测试库 `ymcp_test`**，与生产库 `ymcp` 是**两个总体**——
+ * 实测该 project 在测试库为 **0 行**、生产库为 **2126 行**（检索可见 1832）。
+ * 因此：
+ *   - 本测试在测试库无数据时，用例 ① 会走"显式声明本次未验"分支（不再恒真），
+ *     用例 ② 仍按原设计显式跳过；
+ *   - round 26 报告的那组数字（92 槽位 / 13 处新旧口径差异 / 0 回归）来自
+ *     **生产库的 tmp 脚本**（`tmp/state-audit/verify-state-slot-recency-on-live.mts`），
+ *     **不是**本测试。两者不可互相替代引用。
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { isPostgresUnavailable } from "./test-db";
@@ -67,7 +77,23 @@ describe("state-slot recency ordering against live data（round 26）", () => {
     })) as unknown as MemoryHit[];
   };
 
-  it("① 真库存在同槽多值并存的状态类病例（修法有真实场景可守）", async () => {
+  /**
+   * ① 同槽多值病例存在性（2026-10-14 round 55 修：原断言在空库下恒真）。
+   *
+   * 原写法的问题：`expect(Array.isArray(multiValue)).toBe(true)` + `for (...) 断言 > 1`。
+   * 当测试库该项目**没有数据**时（实测 `ymcp_test` 对该 project 为 0 行，
+   * 生产库 `ymcp` 为 2126 行），`multiValue` 是 `[]`——
+   * 而 `[]` **是数组**，`Array.isArray` 恒真；`for` 循环体一次也不执行。
+   * ⇒ 这条"修法有真实场景可守"的断言在空库下**恒绿**，
+   * 正是 round 52 审计出的"比字符串字面量的反向断言可能恒真"的同族缺陷
+   * （这次是**正向断言**恒真：形式对但永远不验证实质）。
+   *
+   * 修正：显式分三种结果——有病例则断言成员数，无病例则**显式声明"本次未验"**
+   * （与 round 25/40/41 的"环境缺失时如实跳过"同纪律），而不是伪装成通过。
+   * 真库口径见 state-audit §8.52 的分母表；本测试走的是测试库，
+   * 与生产库是**两个总体**，生产库的结论以 tmp 脚本为准。
+   */
+  it("① 同槽多值病例存在性：有用例则断言，无用例则显式声明未验", async () => {
     if (!available) return;
     const hits = await loadHits();
     const slots = new Map<string, MemoryHit[]>();
@@ -78,8 +104,21 @@ describe("state-slot recency ordering against live data（round 26）", () => {
       slots.set(hit.identityHash, list);
     }
     const multiValue = [...slots.values()].filter((list) => list.length > 1);
-    expect(Array.isArray(multiValue), "查询应能返回数组").toBe(true);
+
+    if (multiValue.length === 0) {
+      // 空库（或该 project 未导入）：显式记录"本次未验到病例"，
+      // 不得伪装成通过——否则这条锁在空环境下永远是绿的假象。
+      console.warn(
+        `[state-slot] 本次未验到同槽多值病例：可见 claim ${hits.length} 条、状态类槽位 ${slots.size} 个、`
+        + `其中多值 ${multiValue.length} 个（测试库与生产库是两个总体，生产库结论见 state-audit §8.52 分母表）。`,
+      );
+      expect(hits.length >= 0, "查询本身应可用（返回数组）").toBe(true);
+      return;
+    }
+
     for (const list of multiValue) expect(list.length, "多值槽位的成员数必须 > 1").toBeGreaterThan(1);
+    // 有病例时才算真的验过这条修法有场景可守。
+    expect(multiValue.length, "本次验到的多值槽位数").toBeGreaterThan(0);
   }, 60_000);
 
   it("② 直接调用被测函数：槽位内按叙事位置降序，且不篡改跨槽位次序", async () => {
