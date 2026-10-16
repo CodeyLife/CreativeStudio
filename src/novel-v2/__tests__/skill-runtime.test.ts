@@ -109,7 +109,7 @@ describe("Skill runtime resolution", () => {
     for (const skillId of ["prose-craft", "reader-emotion", "plot-causality"]) {
       // 守卫值随 workspace yaml 版本演进（prose-craft 曾升 1.4.0 未同步本守卫，属存量断链修复）；
       // 断言的仍是"清单能解析出版本与指纹"这一契约，非具体措辞。
-      expect(byId.get(skillId)?.version).toBe(skillId === "prose-craft" ? "1.15.0" : skillId === "reader-emotion" ? "1.2.0" : skillId === "review-gate" ? "1.1.0" : "1.1.0");
+      expect(byId.get(skillId)?.version).toBe(skillId === "prose-craft" ? "1.15.0" : skillId === "reader-emotion" ? "1.2.0" : skillId === "review-gate" ? "1.2.0" : "1.1.0");
       expect(byId.get(skillId)?.contentFingerprint).toBeTruthy();
     }
 
@@ -421,6 +421,38 @@ describe("Skill runtime resolution", () => {
    * 不得改成可计算的密度门。这把锁钉住这个"不可计算"的结论，
    * 防止后人照那次失败的代理去立一个密度门。
    */
+
+  /**
+   * review-gate 必须登记 prompt 已在跑的审核纪律（2026-10-14 复核轮 round 42）。
+   *
+   * round 41 查出**反向同步性缺口**（实现了没写进 spec）并补齐十项。round 42 把该类别
+   * 扫到 chapter-review 的**维度纪律型**检查项（audit-reverse-sync-gaps.mts），抓到两个真缺口：
+   *   - **验收点核实纪律**：prompt 早有（chapter-review.ts 的 lines.push）、且有实证历史
+   *     （2026-09-11 修订轮评审把上一轮问题当结论复述 ⇒ 连续多轮 revise），
+   *     但 review-gate.yaml 里 0 处提及——审核执行纪律完全没进 skill；
+   *   - **跨章序列证据**：同为 review-gate 的审核判据，未登记。
+   * 其余"未登记"是角色错配的假阳性（prose 专属纪律不该进 character skill）。
+   *
+   * 首版审计只抽"- 标题："形态，读不到 DEFAULT_REVIEW_FOCUS 的维度型长句 ⇒ 报了假零；
+   * 注入探针的自检当场证明它不响，才补上第二种形态。本锁钉住"真缺口已补"与
+   * "skill 不是单方面膨胀（prompt 里真在跑）"两件事。
+   */
+  it("review-gate 登记 prompt 已在跑的验收点核实纪律与跨章序列证据", async () => {
+    const provider = createWorkspaceSkillProvider(path.resolve(process.cwd(), "skills", "novel-v2"));
+    const text = renderSkillInstruction(
+      await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint: "chapter.review.structure", role: "structure-reviewer" }),
+      "chapter.review.structure",
+    );
+    expect(text, "必须登记验收点核实纪律").toContain("验收点核实纪律");
+    expect(text, "必须写明逐条对照当前正文重新核实").toContain("逐条对照当前正文重新核实");
+    expect(text, "必须写明不得沿用历史摘录").toContain("不得沿用历史摘录");
+    expect(text, "必须登记跨章序列证据").toContain("跨章序列证据");
+    expect(text, "必须写明安静章不是缺陷").toContain("不把单个安静章");
+
+    const prompt = readFileSync("src/novel-v2/prompts/chapter-review.ts", "utf8");
+    expect(prompt, "验收点核实纪律必须真在审核 prompt 里").toContain("验收点核实纪律");
+    expect(prompt, "跨章序列证据必须真在审核 prompt 里").toContain("跨章序列证据");
+  });
 
   /**
    * review-gate 的十项必须与审核 prompt 的检查项**双向对齐**（2026-10-14 round 41）。
