@@ -109,7 +109,7 @@ describe("Skill runtime resolution", () => {
     for (const skillId of ["prose-craft", "reader-emotion", "plot-causality"]) {
       // 守卫值随 workspace yaml 版本演进（prose-craft 曾升 1.4.0 未同步本守卫，属存量断链修复）；
       // 断言的仍是"清单能解析出版本与指纹"这一契约，非具体措辞。
-      expect(byId.get(skillId)?.version).toBe(skillId === "prose-craft" ? "1.15.0" : skillId === "reader-emotion" ? "1.2.0" : "1.1.0");
+      expect(byId.get(skillId)?.version).toBe(skillId === "prose-craft" ? "1.15.0" : skillId === "reader-emotion" ? "1.2.0" : skillId === "review-gate" ? "1.1.0" : "1.1.0");
       expect(byId.get(skillId)?.contentFingerprint).toBeTruthy();
     }
 
@@ -421,6 +421,43 @@ describe("Skill runtime resolution", () => {
    * 不得改成可计算的密度门。这把锁钉住这个"不可计算"的结论，
    * 防止后人照那次失败的代理去立一个密度门。
    */
+
+  /**
+   * review-gate 的十项必须与审核 prompt 的检查项**双向对齐**（2026-10-14 round 41）。
+   *
+   * round 41 用语义对应（不是字面子串——首版字面比对得出"8 项只到 2 项"是错的：
+   * prompt 用了不同标题表达同一内容，如 skill 的"欲望-阻力-选择-代价闭环"对应 prompt 的
+   * "最小动力闭环"）核验后得到两个真实结论：
+   *   ① **承诺兑现**：skill 十项在 prompt 里逐项有对应检查项，且 foundation-contract 的
+   *      error 级门只有结构契约字段 ⇒ "是检查方向而非硬门"的承诺成立；
+   *   ② **反向缺口**：prompt 有 2 项 skill 未登记（表层大众化、揭示物分层）
+   *      ⇒ skill 清单落后于 prompt，已补齐为十项。
+   *
+   * 这把锁双向都钉：skill 必须含两项新增；且 skill 声明的十项必须真在 prompt 里
+   * （防止 skill 单方面膨胀出 prompt 没有的项）。
+   */
+  it("review-gate 十项与审核 prompt 双向对齐：补齐两项新增，且不得单方面膨胀", async () => {
+    const provider = createWorkspaceSkillProvider(path.resolve(process.cwd(), "skills", "novel-v2"));
+    const text = renderSkillInstruction(
+      await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint: "foundation.book-plan", role: "foundation-reviewer" }),
+      "foundation.book-plan",
+    );
+    // ① 两项新增必须在 skill 里。
+    expect(text, "skill 须登记 prompt 已有的'表层大众化'").toContain("表层大众化");
+    expect(text, "skill 须登记 prompt 已有的'揭示物分层'").toContain("揭示物分层");
+    // ② 十项的措辞都要在（原八项 + 两项新增）。
+    for (const item of ["承诺可兑现", "主题进入选择", "欲望-阻力-选择-代价闭环", "配角独立欲望与关系网络", "世界观规则改变人物可选集合", "感情线靠行动累积而非宣言", "重复与升级是否改变层级", "读者不确定性是否有可推断证据"]) {
+      expect(text, `skill 十项缺项：${item}`).toContain(item);
+    }
+    // ③ 口径对应（skill 措辞 ↔ prompt 标题）必须写明，否则后人又会用字面比对误判。
+    expect(text, "须写明与 prompt 的口径对应关系").toContain("最小动力闭环");
+    expect(text, "须写明口径对应已核验").toContain("口径对应已核验");
+    // ④ 反向：prompt 里必须有这些对应项（防 skill 单方面膨胀）。
+    const prompt = readFileSync("src/novel-v2/prompts/foundation-review.ts", "utf8");
+    for (const anchor of ["读者承诺可兑现", "主题进入选择", "最小动力闭环", "群像独立", "世界观压力系统", "感情线行动累积", "疲劳管理", "留白证据", "表层大众化", "揭示物分层"]) {
+      expect(prompt, `审核 prompt 缺项：${anchor}`).toContain(anchor);
+    }
+  });
 
   /**
    * reader-emotion 的实测与代理边界（2026-10-14 复核轮 round 40）。
