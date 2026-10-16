@@ -546,6 +546,57 @@ describe("Skill runtime resolution", () => {
    */
 
   /**
+   * 实测判据的**成面性**：写作面必须含全部，审核/修订面不强制（2026-10-14 round 61）。
+   *
+   * 由来：round 61 首次验"skill yaml 里有 ≠ 模型看得到"——渲染各执行面的 prompt
+   * 后检查 6 条实测判据是否真到位。结论：**写作面 6/6**，
+   * 而 round 33（章尾禁宣告）、round 50（禁宣布代价）、round 32（清点须带新信息）
+   * 三条**只进写作面**。
+   *
+   * 为什么此前不可见：我这几十轮的回归锁**全部只断言 `draftText`**——
+   * 锁的形状决定了盲区的形状。
+   *
+   * 判定（可辩护，但显式决定）：那三条都是**写作判断**（"该怎么写"），
+   * 审核面有自己的必查项列表、修订面有自己的根因顺序，不需要重复。
+   * 本条锁把这个决定落成契约：
+   *   - 写作面必须含全部实测判据（防回归）；
+   *   - 审核/修订面**不**强制（避免把默认当成契约去强制，也避免后人误以为漏了）。
+   * 后来者若认为审核面也需要某条，应有据地推翻本决定并同步改锁。
+   */
+  it("实测判据的成面性：写作面全含，审核/修订面不强制", async () => {
+    const provider = createWorkspaceSkillProvider(path.resolve(process.cwd(), "skills", "novel-v2"));
+    const draftText = renderSkillInstruction(
+      await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint: "chapter.drafting", role: "writer" }),
+      "chapter.drafting",
+    );
+
+    // ① 写作面必须含全部 6 条（含此前后 4 条只在写作面的）。
+    const required = [
+      '不得因"又是短句结尾"而报',   // round 33 章尾禁宣告非禁短句
+      "不得由叙述者宣布代价",         // round 50
+      "选择-代价闭环",                 // round 32 清点须带新信息
+      "不得\"理顺\"掉它",              // round 30 序数
+      "表情 + 一句解释它意味着什么",   // round 31 表情
+      "0.550",                        // round 35 群像
+    ];
+    for (const anchor of required) {
+      expect(draftText, `写作面缺少实测判据：${anchor}`).toContain(anchor);
+    }
+
+    // ② 审核/修订面渲染必须可用（不因投影缺失而空白）——这是"另外两面仍需接线"的底线。
+    for (const [executionPoint, role] of [
+      ["chapter.review.prose", "prose-reviewer"],
+      ["chapter.revision", "reviser"],
+    ] as Array<[SkillExecutionPoint, string]>) {
+      const text = renderSkillInstruction(
+        await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint, role }),
+        executionPoint,
+      );
+      expect(text.length, `${executionPoint} 渲染不应为空`).toBeGreaterThan(200);
+    }
+  });
+
+  /**
    * prose-craft 内部一致性：无撤回残留、无无限定的矛盾并存（2026-10-14 round 51）。
    *
    * 由来：round 50 我自己损坏过一次 spec（把表情判据开头当锚点替换掉），
