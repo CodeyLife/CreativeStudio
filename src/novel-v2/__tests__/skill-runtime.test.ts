@@ -544,6 +544,53 @@ describe("Skill runtime resolution", () => {
    * 比他预想的还要大」），合格章是**人物自己的算计**（ch21「拿了我的技术，
    * 就要付出相应的代价」）。故锁必须同时钉住两侧：禁止宣布形態、允许人物算计形態。
    */
+
+  /**
+   * prose-craft 内部一致性：无撤回残留、无无限定的矛盾并存（2026-10-14 round 51）。
+   *
+   * 由来：round 50 我自己损坏过一次 spec（把表情判据开头当锚点替换掉），
+   * 修复时意识到——**16 次版本演进里每轮都是分别加/改某段，从没做过全局互斥检查**，
+   * 于是补两类审计：
+   *   A) **残留审计**（audit-prose-craft-residue.mts）：把每轮撤回/收窄的**旧措辞**
+   *      当"禁留词"查是否仍以肯定形式出现。对照组（round 2 保留的章尾纪律）命中 1 次
+   *      证明探测器会响；结论：**0 残留**。
+   *   B) **矛盾审计**（audit-prose-craft-contradictions.mts + qualifiers）：
+   *      5 组"禁 A vs 认 B"的疑似互斥判据中 4 组两侧并存——这些**应该**并存
+   *      （都是精确形态），关键是每组都有划清范围的限定语。逐组核验后**全部齐备**。
+   *
+   * 本锁把这两类审计固化为常态：将来任何一次 spec 增改，若删掉了限定语
+   * 或把旧措辞加回来，会立刻变红。
+   */
+  describe("prose-craft 内部一致性（round 51）", () => {
+    const source = readFileSync("skills/novel-v2/prose-craft.yaml", "utf8");
+
+    it("A 无撤回残留：旧措辞不再以肯定形式出现", () => {
+      const retracted = [
+        "不得因\"又一个表情标记\"而保留",
+        "单一个表情标记草草收尾",
+        "情绪节拍也不要默认落在面部表情上",
+      ];
+      for (const phrase of retracted) {
+        expect(source, `撤回的措辞仍以肯定形式存在：${phrase}`).not.toContain(phrase);
+      }
+      // 对照组：保留的判据必须在（证明 not.toContain 不是恒真）。
+      expect(source, "对照组：章尾纪律应仍在").toContain("不要从可感观察滑入概括议论");
+    });
+
+    it("B 两侧并存的判据都带划清范围的限定语", () => {
+      const qualifiers: Record<string, string[]> = {
+        短句收尾: ["连续短句宣告同一结论", "不得因\"又是短句结尾\"而报"],
+        序数: ["只在同一处重复同一编号"],
+        表情: ["单一个表情标记不解释", "捆在肢体动作里的表情都不报"],
+        代价: ["不得由叙述者宣布代价", "人物在权衡中自己说出代价不算病灶"],
+      };
+      for (const [group, phrases] of Object.entries(qualifiers)) {
+        for (const phrase of phrases) {
+          expect(source, `${group} 判据缺限定语：${phrase}（会变成无范围界定的矛盾）`).toContain(phrase);
+        }
+      }
+    });
+  });
   it("代价判据按机制分两种：禁叙述者宣布，允许人物自己权衡", async () => {
     const provider = createWorkspaceSkillProvider(path.resolve(process.cwd(), "skills", "novel-v2"));
     const text = renderSkillInstruction(
