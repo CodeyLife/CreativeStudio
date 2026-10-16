@@ -109,7 +109,7 @@ describe("Skill runtime resolution", () => {
     for (const skillId of ["prose-craft", "reader-emotion", "plot-causality"]) {
       // 守卫值随 workspace yaml 版本演进（prose-craft 曾升 1.4.0 未同步本守卫，属存量断链修复）；
       // 断言的仍是"清单能解析出版本与指纹"这一契约，非具体措辞。
-      expect(byId.get(skillId)?.version).toBe(skillId === "prose-craft" ? "1.14.0" : "1.1.0");
+      expect(byId.get(skillId)?.version).toBe(skillId === "prose-craft" ? "1.15.0" : "1.1.0");
       expect(byId.get(skillId)?.contentFingerprint).toBeTruthy();
     }
 
@@ -421,6 +421,44 @@ describe("Skill runtime resolution", () => {
    * 不得改成可计算的密度门。这把锁钉住这个"不可计算"的结论，
    * 防止后人照那次失败的代理去立一个密度门。
    */
+
+  /**
+   * 审核面的"边界"必须集中在列表之后，不穿插在必查项里（2026-10-14 复核轮 round 37）。
+   *
+   * round 30/31/33 收窄了表情判据（只报"表情+释义"）、retract 了数数禁令、
+   * round 30 加了序数是正面声音。**但那些窄化说明原先是穿插在评测项列表内部的**，
+   * 于是审阅者按顺序读列表时，先读到的是收窄前的宽表述（"而该节拍本可由动作、
+   * 选择或对白后果承担"），窄化说明反而在其后作为括注出现——括注在注意力上输给主句。
+   *
+   * 这是同一条指令内部的"两处口径"（round 14 的跨面同族缺陷）：
+   * 宽表述在列表里（会被执行的那一份），窄表述在括注里（会被跳过的那一份）。
+   *
+   * 本锁钉住结构：列表项只保留收窄后的短形式 + 指路；三条边界集中在
+   * "**下面是上面各项的边界**"段内，且各带编号①②③。
+   */
+  it("审核面边界集中在列表后，必查项列表不携带未收窄表述", async () => {
+    const provider = createWorkspaceSkillProvider(path.resolve(process.cwd(), "skills", "novel-v2"));
+    const reviewText = renderSkillInstruction(
+      await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint: "chapter.review.prose", role: "prose-reviewer" }),
+      "chapter.review.prose",
+    );
+
+    // ① 集中的边界段必须在场，三条边界各带编号。
+    expect(reviewText, "必须有集中的边界段").toContain("下面是上面各项的边界");
+    expect(reviewText, "边界① 面部表情").toContain("① **面部表情**");
+    expect(reviewText, "边界② 数数").toContain("② **数数");
+    expect(reviewText, "边界③ 序数").toContain("③ **序数作推演编号");
+
+    // ② 必查项列表里**不得**再出现未收窄的宽表述（取列表段做反向断言）。
+    const listStart = reviewText.indexOf("是必查项：");
+    const listEnd = reviewText.indexOf("这些机制已造成");
+    expect(listStart, "必须能定位必查项列表").toBeGreaterThan(-1);
+    expect(listEnd, "必须能定位列表终点").toBeGreaterThan(listStart);
+    const list = reviewText.slice(listStart, listEnd);
+    expect(list, "列表内不得出现未收窄的'本可由动作、选择或对白后果承担'").not.toContain("本可由动作、选择或对白后果承担");
+    expect(list, "列表内不得内嵌窄化说明（round 31 窄化）").not.toContain("round 31 窄化");
+    expect(list, "列表内的表情项只保留收窄后的短形式并指路").toContain("只报这一种，见下方边界①");
+  });
   it("复原判据注明：总结连接词全书绝迹，且反向代理已证失败（不得立密度门）", async () => {
     const provider = createWorkspaceSkillProvider(path.resolve(process.cwd(), "skills", "novel-v2"));
     const draftText = renderSkillInstruction(
