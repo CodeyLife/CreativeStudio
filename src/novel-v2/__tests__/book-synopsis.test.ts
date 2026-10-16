@@ -47,6 +47,29 @@ describe("book synopsis planning contract", () => {
     expect(() => buildBookSynopsisPrompt({ projectTitle: "长夜归舟", sections })).toThrow("长程叙事战略");
   });
 
+  /**
+   * 书名候选构建的准入门同样必须被锁（2026-10-14 round 46）。
+   *
+   * 本文件里"全书规划尚未全部确认"这道门有**两处相同实现**：
+   * `buildBookSynopsisPrompt`（L124）与 `buildBookTitleCandidatesPrompt`（L87）。
+   * 但测试只覆盖了前者（上面的 "rejects incomplete planning…" 用例）——
+   * round 46 用**反证法**（临时移除 throw 看测试是否判红）逐个验证时发现：
+   * 只移除 L87 那一处，全库 1370 个测试**无一变红** ⇒ 这道门有一份没被锁的副本。
+   *
+   * 这正是 round 45"边界护栏要成对锁"的同族，但形态不同：
+   * 不是写入侧/召回侧不对称，而是**同一条门的两处实现之间**不对称。
+   * 后患是重构时删掉副本不会被告知——而书名候选若从不完整的规划生成，
+   * 产出会跨缺失阶段编造（与简介那条用例断言的理由相同）。
+   */
+  it("书名候选构建同样拒绝不完整规划，而不是跨缺失阶段编造", () => {
+    const sections = completePlan().filter((section) => section.taskKey !== "worldview");
+    expect(missingSynopsisPlanStages(sections)).toEqual(["世界观"]);
+    expect(() => buildBookTitleCandidatesPrompt(sections)).toThrow("全书规划尚未全部确认");
+    expect(() => buildBookTitleCandidatesPrompt(sections)).toThrow("世界观");
+    // 完整规划照常通过（守卫不误伤）。
+    expect(() => buildBookTitleCandidatesPrompt(completePlan())).not.toThrow();
+  });
+
   it("keeps the contract genre-neutral and changes the source fingerprint when planning changes", () => {
     const scienceFiction = completePlan("深空维修师发现殖民站正在改写居民记忆");
     const prompt = buildBookSynopsisPrompt({ projectTitle: "静默轨道", sections: scienceFiction });
