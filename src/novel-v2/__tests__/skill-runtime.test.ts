@@ -109,7 +109,7 @@ describe("Skill runtime resolution", () => {
     for (const skillId of ["prose-craft", "reader-emotion", "plot-causality"]) {
       // 守卫值随 workspace yaml 版本演进（prose-craft 曾升 1.4.0 未同步本守卫，属存量断链修复）；
       // 断言的仍是"清单能解析出版本与指纹"这一契约，非具体措辞。
-      expect(byId.get(skillId)?.version).toBe(skillId === "prose-craft" ? "1.15.0" : skillId === "reader-emotion" ? "1.2.0" : skillId === "review-gate" ? "1.2.0" : "1.1.0");
+      expect(byId.get(skillId)?.version).toBe(skillId === "prose-craft" ? "1.16.0" : skillId === "reader-emotion" ? "1.2.0" : skillId === "review-gate" ? "1.2.0" : "1.1.0");
       expect(byId.get(skillId)?.contentFingerprint).toBeTruthy();
     }
 
@@ -530,6 +530,37 @@ describe("Skill runtime resolution", () => {
   });
 
   /**
+   * "代价"按机制分两种，只有叙述者宣布那种是病灶（2026-10-14 复核轮 round 50）。
+   *
+   * 这是 prose-craft 里第一次测**赌注层**（此前四轮都是在测表达层惯用语）。
+   * 实测（measure-stakes-density.mts / sample-cost-markers.mts）：
+   *   - 代价标记 合格带 0.052 / 混合带 0.225 / **最强带 0.034**（混合带 4.3 倍）、
+   *     原始仅 33 处（基数小，只作方向）；
+   *   - 对照组阻力标记 最强带 **0.775 为最高**；
+   *   - 选择标记 最强带 0.17 为最低。
+   * ⇒ 最强章不宣布代价，而是让阻力成立、把账留给读者算。
+   *
+   * 直读样本显示同一词两种机制：弱章是**叙述者宣布**（ch3「这次强行扭转路径的代价，
+   * 比他预想的还要大」），合格章是**人物自己的算计**（ch21「拿了我的技术，
+   * 就要付出相应的代价」）。故锁必须同时钉住两侧：禁止宣布形態、允许人物算计形態。
+   */
+  it("代价判据按机制分两种：禁叙述者宣布，允许人物自己权衡", async () => {
+    const provider = createWorkspaceSkillProvider(path.resolve(process.cwd(), "skills", "novel-v2"));
+    const text = renderSkillInstruction(
+      await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint: "chapter.drafting", role: "writer" }),
+      "chapter.drafting",
+    );
+    // 实测依据与方向结论。
+    expect(text, "必须带上代价标记的分带密度实测").toContain("代价标记 合格带 0.052");
+    expect(text, "必须写明最强带最低（不许宣布代价）").toContain("最强带 0.034");
+    expect(text, "须有阻力对照组").toContain("阻力标记");
+    // 机制区分（这是 round 30/31 判据的第 N 次应用）。
+    expect(text, "须区分两种机制").toContain("按机制分两种");
+    expect(text, "禁止的是叙述者宣布").toContain("不得由叙述者宣布代价");
+    expect(text, "允许人物自己权衡").toContain("人物在权衡中自己说出代价不算病灶");
+  });
+
+  /**
    * reader-emotion 的实测与代理边界（2026-10-14 复核轮 round 40）。
    *
    * `reader-emotion.yaml` 是三面共用的 required skill，从 1.1.0 起从未单独取证
@@ -871,8 +902,8 @@ describe("Skill runtime resolution", () => {
     );
     // 可执行判据：删掉这个表情，读者是失去可观察线索还是只失去一个标签。
     expect(draftText).toContain("读者是会失去一个可观察的线索");
-    // round 31 窄化后的形态断言：只有"表情 + 一句释义"是病灶。
-    expect(draftText).toMatch(/表情 \+ 一句释义/u);
+    // round 31 窄化后的形态断言：只有"表情 + 一句解释它意味着什么"是病灶。
+    expect(draftText).toMatch(/表情 \+ 一句解释它意味着什么/u);
     const reviewText = renderSkillInstruction(
       await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint: "chapter.review.prose", role: "prose-reviewer" }),
       "chapter.review.prose",
