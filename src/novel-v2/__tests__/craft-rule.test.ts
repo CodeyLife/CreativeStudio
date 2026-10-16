@@ -22,6 +22,7 @@ import {
   createCraftRuleCandidate,
   inspectCraftRuleCandidate,
   evaluateCraftRuleOnFoundation,
+  recordCraftRuleEvidence,
   submitCraftRuleReview,
   promoteCraftRuleCandidate,
   rollbackCraftRuleCandidate,
@@ -643,6 +644,65 @@ describe("craft-rule integration", () => {
       projectId,
       candidateId: candidate.id,
     })).rejects.toThrow(/候选状态必须为 reviewing/);
+  });
+
+  /**
+   * 证据录入的候选状态门必须被锁（2026-10-14 round 48）。
+   *
+   * "候选状态必须为 proposed 或 evidencing"这道门有**四处实现**
+   * （craft-rule/index.ts 三处 + evaluation/craft-rule-experiment.ts 一处），
+   * 而测试里唯一相近的断言是 L645 的"候选状态必须为 reviewing"——**那是另一道门**
+   * （promote 前的 review 门）。round 48 用反证法（移除 throw 看测试是否判红）
+   * 测这三处：**全库 1374 个测试无一变红** ⇒ 这道门至今零覆盖。
+   *
+   * 为什么这是最该锁的一类门：它守卫的是**学习闭环的权威转移**——
+   * 只有在 proposed/evidencing 状态的候选才允许录入证据。
+   * 门失效意味着可以对已 promoted / rejected / rolled-back 的候选继续灌证据，
+   * 而证据是后续 promote/regression 判定的输入；污染的证据会改变权威决策，
+   * 且决策结果（skill 晋升）是持久生效的。
+   */
+  describe("候选状态门（证据录入前置，round 48）", () => {
+    it("记录证据时拒绝非 proposed/evidencing 状态的候选", async () => {
+      if (!postgresAvailable) return;
+      const projectId = `test-craft-state-${randomUUID().slice(0, 8)}`;
+      await repository.ensureProject(projectId, "Craft Rule State Test");
+      const skillId = "test-craft-skill";
+      await repository.pool.query(
+        `INSERT INTO skill_definitions(skill_id, version, prompt_sections)
+         VALUES($1, '1.0.0', '{"drafting":"x"}'::jsonb)
+         ON CONFLICT(skill_id) DO NOTHING`,
+        [skillId],
+      );
+
+      const candidate = await createCraftRuleCandidate(repository, {
+        projectId,
+        targetKind: "skill",
+        targetId: skillId,
+        afterText: "x".repeat(150),
+        rationale: "状态门测试",
+        scope: makeScope(),
+      });
+      // 人为把状态改成 rejected（非 proposed/evidencing）。
+      await repository.pool.query("UPDATE craft_rule_candidates SET status='rejected' WHERE id=$1", [candidate.id]);
+
+      await expect(recordCraftRuleEvidence(repository, {
+        projectId,
+        candidateId: candidate.id,
+        scenarioClass: "scene",
+        scenarioRole: "source-failure",
+        baselineWorkItemId: "w-base",
+        candidateWorkItemId: "w-cand",
+      })).rejects.toThrow(/候选状态必须为 proposed 或 evidencing/);
+
+      await expect(recordCraftRuleEvidence(repository, {
+        projectId,
+        candidateId: candidate.id,
+        scenarioClass: "scene",
+        scenarioRole: "source-failure",
+        baselineWorkItemId: "w-base",
+        candidateWorkItemId: "w-cand",
+      })).rejects.toThrow(/当前为 rejected/);
+    });
   });
 
   it("错误路径：system-prompt target 不存在抛错", async () => {
