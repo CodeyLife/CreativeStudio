@@ -109,7 +109,7 @@ describe("Skill runtime resolution", () => {
     for (const skillId of ["prose-craft", "reader-emotion", "plot-causality"]) {
       // 守卫值随 workspace yaml 版本演进（prose-craft 曾升 1.4.0 未同步本守卫，属存量断链修复）；
       // 断言的仍是"清单能解析出版本与指纹"这一契约，非具体措辞。
-      expect(byId.get(skillId)?.version).toBe(skillId === "prose-craft" ? "1.10.0" : "1.1.0");
+      expect(byId.get(skillId)?.version).toBe(skillId === "prose-craft" ? "1.11.0" : "1.1.0");
       expect(byId.get(skillId)?.contentFingerprint).toBeTruthy();
     }
 
@@ -407,6 +407,36 @@ describe("Skill runtime resolution", () => {
    *
    * 三面接线 + 反例（不得写成词表禁用——表情本身完全合法）。
    */
+  /**
+   * 清点条款的机制拆分依据（2026-10-14 复核轮 round 32）。
+   *
+   * round 30/31 用"按机制拆族"修正了"数数"、收窄了"面部表情"。本轮用它复查
+   * round 2 最早指控、也一直没被拆过的**道具盘点**族——结论是**确认而非推翻**，
+   * 而且是最硬的一种确认：把清点按机制拆开后，
+   *   A 清点即情报（点名后紧跟状态/位置变化）全书 127 处、ch73 后仍有 21 章在用
+   *   B 清点即存在感（只摸不报变化）全书 53 处、ch73 后只剩 6 章、**最强带 0.000**
+   *   C 温度判定（配一次"凉/冷"）全书 317 处、合格带 0.63 vs 混合带 1.25（1.97 倍）
+   * 而**最强带 29 章里 A 型 15 处、B 型 0 处**——最好的章只用 A、从不用 B。
+   *
+   * ⇒ "必须带来新信息/新选择/新代价"这条判据不是限制，而是**本书最好手法的定义式**。
+   * 这把锁钉住这个依据，防止后续修订把判据放宽回"可以清点"（那会放回 B）。
+   */
+  it("清点条款带着机制拆分依据：A 是定义式、B 在最强带为零、C 是本族最强信号", async () => {
+    const provider = createWorkspaceSkillProvider(path.resolve(process.cwd(), "skills", "novel-v2"));
+    const draftText = renderSkillInstruction(
+      await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint: "chapter.drafting", role: "writer" }),
+      "chapter.drafting",
+    );
+    expect(draftText, "必须带上机制拆分实测依据").toContain("清点即情报");
+    expect(draftText, "必须写明 B 型（只摸不报变化）在最强带为零").toContain("最强带 099-127 为 0.000");
+    expect(draftText, "必须写明 C（温度判定）是本族基数最大、信号最强的一族").toMatch(/C 温度判定/);
+    expect(draftText, "结论须是\"判据即最好手法的定义式\"").toMatch(/定义式/u);
+    // 判据本身三条件必须仍在（这是条款的执行核心）。
+    expect(draftText).toContain("新信息");
+    expect(draftText).toContain("新选择");
+    expect(draftText).toContain("新代价");
+  });
+
   /**
    * 序数作推演编号是正面声音，不得被"理顺"（2026-10-14 复核轮 round 30）。
    *
