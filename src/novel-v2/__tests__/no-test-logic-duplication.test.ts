@@ -134,4 +134,59 @@ describe("测试不得复刻生产逻辑（round 27）", () => {
       else rmSync(probePath, { force: true });
     }
   });
+
+  /**
+   * 存在性断言不得恒真（2026-10-14 复核轮 round 56）。
+   *
+   * round 55 在 `state-slot-recency-live.test.ts` 抓到一个：
+   * `expect(Array.isArray(multiValue)).toBe(true)` + 空数组的 `for` 断言
+   * ——测试库无数据时 `[]` 也是数组、`for` 体一次不执行，于是"某类病例存在"
+   * 这条断言**恒绿**。这是 round 52"反向断言可能恒真"的同族但**方向相反**
+   * （那次是 not.toContain 恒真，这次是**正向断言恒真**）。
+   *
+   * round 56 按该判据扫我这几十轮的测试文件（4 条恒真形态正则，
+   * 见 tmp/state-audit/audit-existence-assertions.mts 与其自检），
+   * 结论：**除注释里的历史记录外无活断言命中**。
+   *
+   * 本锁固化为常态：新增的"存在性断言"不得取这些恒真形态；
+   * 正确做法见 round 55——**空集时显式声明未验，而不是伪装成通过**。
+   */
+  it("⑤ 不得用会恒真的形态断言病例存在（round 56）", () => {
+    const audited = [
+      "state-slot-recency-live.test.ts",
+      "blind-kill-live.test.ts",
+      "qdrant-collection.test.ts",
+      "skill-runtime.test.ts",
+      "foundation-contract.test.ts",
+      "craft-rule.test.ts",
+      "book-synopsis.test.ts",
+      "v2-repository-management.test.ts",
+      "no-test-logic-duplication.test.ts",
+      "lock-bite-registry.test.ts",
+    ];
+    const patterns: Array<[string, RegExp]> = [
+      ["Array.isArray(...).toBe(true)", /expect\(\s*Array\.isArray\([^)]*\)\s*\)\.toBe\(true\)/gu],
+      [">= 0 的比较（恒真）", /toBeGreaterThanOrEqual\(0\)/gu],
+      ["空集迭代断言", /for\s*\([^)]*\)\s*\{[^}]*expect\(/gu],
+      ["孤立 toBeDefined()", /expect\([^)]*\)\.toBeDefined\(\)\s*;\s*$/gmu],
+    ];
+    const offenders: Array<{ 文件: string; 行: number; 形态: string }> = [];
+    for (const name of audited) {
+      const full = join(TESTS_DIR, name);
+      if (!existsSync(full)) continue;
+      const lines = readFileSync(full, "utf8").split("\n");
+      lines.forEach((line, index) => {
+        // 注释与文档块里的历史记录不算（round 55 的说明就在注释里）。
+        if (/^\s*(\*|\/\/|\/\*)/u.test(line)) return;
+        for (const [label, pattern] of patterns) {
+          pattern.lastIndex = 0;
+          if (pattern.test(line)) {
+            offenders.push({ 文件: name, 行: index + 1, 形态: label });
+            break;
+          }
+        }
+      });
+    }
+    expect(offenders, `以下断言用了会恒真的形态（空集下也绿），应改为 round 55 的显式未验分支：${JSON.stringify(offenders)}`).toEqual([]);
+  });
 });
