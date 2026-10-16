@@ -423,6 +423,35 @@ describe("Skill runtime resolution", () => {
    */
 
   /**
+   * fact-memory 的证据边界：spec 不得承诺数据模型交付不了的保证（2026-10-14 round 38）。
+   *
+   * 实测的错配：`fact-memory.yaml` 原写"每条事实都要有正文逐字证据、来源段落和 novelty 判断"，
+   * 而管线实际只做到：
+   *   - `prompt.ts:70` 要求 evidence ≥8 字逐字、`dedupe.ts:99` 用它**丢弃**、`:127` 用它**去重**；
+   *   - 但 `recordMemoryClaims` 落库时**不写 evidence**——`memory_claims` 无该列，
+   *     `memory_claim_sources` 只存 document/revision/artifact 链接（真库实测列清单）。
+   * ⇒ 证据是**写入前的过滤凭据**，落库后**不可回溯**。这是 round 15 的同族：
+   * "不阻塞主路径"与"不留痕迹"是两件事——过滤做了，痕迹没留。
+   */
+  it("fact-memory 证据边界：写明不持久化、不可回溯，且不得承诺成存档保证", async () => {
+    const provider = createWorkspaceSkillProvider(path.resolve(process.cwd(), "skills", "novel-v2"));
+    const text = renderSkillInstruction(
+      await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint: "chapter.fact-extraction", role: "fact-extractor" }),
+      "chapter.fact-extraction",
+    );
+    expect(text, "必须写明 evidence 不被持久化").toContain("不被持久化");
+    expect(text, "必须写明落库后不可回溯核对").toContain("无法回溯核对");
+    expect(text, "须给出可执行的自我约束").toContain("将来不可核对");
+    // 反向：不得把过滤承诺成存档保证。
+    expect(text, "不得承诺每条事实都有持久化的逐字证据").not.toContain("每条事实都要有正文逐字证据");
+    const enrichment = renderSkillInstruction(
+      await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint: "character.enrichment", role: "character-enricher" }),
+      "character.enrichment",
+    );
+    expect(enrichment, "人物增量的证据边界也要写明").toContain("将来不可核对");
+  });
+
+  /**
    * 审核面的"边界"必须集中在列表之后，不穿插在必查项里（2026-10-14 复核轮 round 37）。
    *
    * round 30/31/33 收窄了表情判据（只报"表情+释义"）、retract 了数数禁令、
