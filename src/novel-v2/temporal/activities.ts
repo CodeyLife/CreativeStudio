@@ -2276,14 +2276,20 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
             // 避免对字符串形态误判所有字段为空。
             let normalizedValue: unknown = value;
             try {
-              normalizedValue = normalizeFoundationModelOutput(value as unknown, work.taskKey ?? "");
+              // taskKey 缺失是**契约缺口**，不能按空 taskKey 放行：
+              // foundation-contract 的未知 taskKey 现在直接抛错（round 44），
+              // 空串会让"未知阶段"被当成"契约满足"——正是 PL-8 要防的静默放行。
+              if (!work.taskKey) return [`Foundation taskKey 缺失，无法执行契约校验（workItemId=${input.workItemId}）`];
+              normalizedValue = normalizeFoundationModelOutput(value as unknown, work.taskKey);
             } catch (error) {
               return [`structuredData 无法解析为对象：${error instanceof Error ? error.message : String(error)}`];
             }
-            return validateFoundationTaskContract(normalizedValue as FoundationOutput, work.taskKey ?? "");
+            return validateFoundationTaskContract(normalizedValue as FoundationOutput, work.taskKey);
           },
         });
-        const normalizedFoundation = normalizeFoundationModelOutput(generated.value, work.taskKey ?? "");
+        // taskKey 缺失同样不能按空串放行（round 44）：契约层的未知 taskKey 现在直接抛错。
+        if (!work.taskKey) throw new Error(`Foundation taskKey 缺失，无法生成规划产物（workItemId=${input.workItemId}）`);
+        const normalizedFoundation = normalizeFoundationModelOutput(generated.value, work.taskKey);
         assertFoundationTaskContract(normalizedFoundation, work.taskKey);
 
         const artifact = await makeArtifact({
@@ -2384,10 +2390,14 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
       const project = await deps.repository.getProjectDetail(run.projectId);
       const creativeBrief = parseCreativeBrief(project.metadata?.creativeBrief);
       const stubArtifact = work.artifactRefs.at(-1) ? await deps.repository.getArtifact(work.artifactRefs.at(-1)!) : undefined;
-      const taskSchema = foundationSchemaForTask(work.taskKey ?? "");
+      // taskKey 缺失不能按空串放行（round 44）：契约层的未知 taskKey 现在直接抛错，
+      // 空串会让"未知阶段"被当成"契约满足"。本条是**外部结果入口**（外部编排写入
+      // foundation 产物），静默放行的后果比生成路径更重——未校验的外部产物会直接进库。
+      if (!work.taskKey) throw new Error(`Foundation taskKey 缺失，无法校验外部结果（workItemId=${input.workItemId}）`);
+      const taskSchema = foundationSchemaForTask(work.taskKey);
       assertStructuredSchema(input.value, taskSchema, "外部 foundation 结果");
-      const normalizedFoundation = normalizeFoundationModelOutput(input.value, work.taskKey ?? "");
-      assertFoundationTaskContract(normalizedFoundation, work.taskKey ?? "");
+      const normalizedFoundation = normalizeFoundationModelOutput(input.value, work.taskKey);
+      assertFoundationTaskContract(normalizedFoundation, work.taskKey);
 
       const artifact = await makeArtifact({
         projectId: run.projectId,

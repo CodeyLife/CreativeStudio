@@ -83,6 +83,31 @@ export function foundationRequiredFields(taskKey: string): string[] {
   return contract.requiredPaths;
 }
 
+/**
+ * 未知 taskKey 必须是**响的失败**，不是静默的空结果。
+ *
+ * 根因（2026-10-14 round 44，state-audit §8.42）：本文件里三处对
+ * `FOUNDATION_TASK_CONTRACTS[taskKey]` 的查询都用 `if (!contract) return …`
+ * 兜底——`foundationRequiredFields` 返回 `[]`、
+ * `normalizeFoundationStructuredDataFlat` 原样返回 root、
+ * `validateFoundationTaskContract` 返回 `[]`（零错误）。三者合起来的效果是：
+ * **一个不存在的 taskKey 会让契约校验"全部通过"**，而调用方看不到任何异常。
+ * 这是 round 43 那类缺陷（lookup 失败被静默兜底成空值，于是"找不到"与
+ * "确实是空"在下游无法区分）的生产版本——当时是复核脚本的 `?? ""` 把
+ * 6 条正确登记判成未登记，这里是 `?? []` 把"未知阶段"判成"契约满足"。
+ *
+ * 现有两个调用点靠别处的检查兜住：`postgres-repository.ts` 批准路径先抛
+ * "规划阶段不存在"，`activities.ts` 的 `work.taskKey ?? ""` 则**没有**这层保护
+ * ——空 taskKey 会让生成重试循环里的契约校验静默通过，而这正是 PL-8 注释
+ * 要求"与来源无关都必须强制"的那道门。故在最低共享层把它变响：
+ * 未知 taskKey 直接抛错，而不是返回一个看起来"校验通过"的空数组。
+ */
+function requireFoundationContract(taskKey: string): (typeof FOUNDATION_TASK_CONTRACTS)[string] {
+  const contract = FOUNDATION_TASK_CONTRACTS[taskKey];
+  if (!contract) throw new Error(`未知的 Foundation taskKey：${JSON.stringify(taskKey)}（契约查询失败，不得按空契约放行）`);
+  return contract;
+}
+
 type JsonSchema = Record<string, unknown>;
 
 const stringSchema: JsonSchema = { type: "string", minLength: 1 };
@@ -284,8 +309,7 @@ export function foundationSchemaForTask(taskKey: string): JsonSchema {
  * - 内容确实缺失时解包后仍是空对象，由契约校验如实报告，不掩盖内容问题
  */
 export function normalizeFoundationStructuredDataFlat(root: Record<string, unknown>, taskKey: string): Record<string, unknown> {
-  const contract = FOUNDATION_TASK_CONTRACTS[taskKey];
-  if (!contract) return root;
+  const contract = requireFoundationContract(taskKey);
   if (foundationDataSchemaForTask(taskKey)?.type === "array") return root;
   let flat: Record<string, unknown> = root;
   const container = root[contract.dataRoot];
@@ -479,8 +503,7 @@ export function foundationDataSchemaForTask(taskKey: string): JsonSchema | undef
 
 /** Validate semantic fields that generic foundationSchema cannot express. */
 export function validateFoundationTaskContract(value: FoundationOutput, taskKey: string): string[] {
-  const contract = FOUNDATION_TASK_CONTRACTS[taskKey];
-  if (!contract) return [];
+  const contract = requireFoundationContract(taskKey);
   const errors: string[] = [];
   const structuredData = normalizeFoundationStructuredDataFlat(value.structuredData ?? {}, taskKey);
   const taskDataSchema = foundationDataSchemaForTask(taskKey);

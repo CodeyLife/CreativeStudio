@@ -36,6 +36,36 @@ describe("foundation task semantic contracts", () => {
     expect(validateFoundationTaskContract(value, "architecture")).toEqual([]);
   });
 
+  /**
+   * 未知 taskKey 必须**响**，不能静默返回空契约（2026-10-14 round 44，state-audit §8.42）。
+   *
+   * 根因：本模块三处 `FOUNDATION_TASK_CONTRACTS[taskKey]` 查询都用 `if (!contract) return …`
+   * 兜底——`foundationRequiredFields`→`[]`、`normalizeFoundationStructuredDataFlat`→原样 root、
+   * `validateFoundationTaskContract`→`[]`（零错误）。合起来的效果是：
+   * **一个不存在的 taskKey 会让契约校验"全部通过"**，调用方看不到任何异常。
+   *
+   * 这是 round 43 那类缺陷的生产版本：当时是复核脚本的 `?? ""` 把 6 条正确登记判成未登记，
+   * 这里是 `?? []` 把"未知阶段"判成"契约满足"。后果更重——PL-8 注释明确要求契约强制
+   * "与来源无关"，而 `activities.ts` 的 `work.taskKey ?? ""`（taskKey 在 work-item 协议里
+   * 是可选的）原本没有别处的保护。
+   *
+   * 双向覆盖：未知/空 taskKey 必须抛错；已知 taskKey 必须照常工作（不能误伤）。
+   */
+  describe("未知 taskKey 不得静默放行（round 44）", () => {
+    it("对未知 taskKey 抛错，而不是返回空契约", () => {
+      expect(() => validateFoundationTaskContract(output({}), "no-such-task"), "未知 taskKey 必须抛错").toThrow(/未知的 Foundation taskKey/);
+      expect(() => validateFoundationTaskContract(output({}), ""), "空 taskKey 必须抛错").toThrow(/未知的 Foundation taskKey/);
+      expect(() => normalizeFoundationModelOutput({ title: "t", summary: "s", structuredData: "{}" }, "no-such-task")).toThrow(/未知的 Foundation taskKey/);
+    });
+
+    it("已知 taskKey 照常校验（守卫不误伤）", () => {
+      const architecture = { structure: "三卷递进", volumes: [{ name: "寻找", theme: "查明", function: "建立问题", entryState: "未知", exitState: "开始追查", pressures: ["制度追责"], promiseWindows: [] }], povStrategy: "限知视角", timeSpan: "两年" };
+      expect(validateFoundationTaskContract(output(architecture), "architecture")).toEqual([]);
+      const normalized = normalizeFoundationModelOutput({ title: "t", summary: "s", structuredData: JSON.stringify(architecture) }, "architecture");
+      expect(validateFoundationTaskContract(normalized, "architecture")).toEqual([]);
+    });
+  });
+
   it("rejects a positioning artifact when the creation promise is only in prose", () => {
     const value = output({ bookTitle: "长夜归舟", sellingPoints: ["悬疑"], targetReader: "读者", coreConflict: "追查", activePressureSource: "追责", protagonistNeed: "真相", centralOpposition: "制度", emotionalContract: "克制", themeQuestion: "真相是否值得代价" });
     expect(validateFoundationTaskContract(value, "project-positioning")).toContain("corePromise 不能为空");

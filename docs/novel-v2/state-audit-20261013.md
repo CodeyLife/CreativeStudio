@@ -2522,6 +2522,69 @@ round 42 刚写进 review-gate.yaml L44）。两轮的原因分别是**两个独
    所有"全未命中"的结论都要先排除这一类静默兜底。
 3. **"全部推翻"本身就是警报**：与"全部通过"一样，"全推翻"意味着判据或工具
    大概率有问题（真实缺陷通常分布不均）。**极端一致的结果要先怀疑工具。**
+### 8.42 复核轮 round 44（2026-10-14）：round 43 的缺陷类别在生产代码里扫出真问题——未知 taskKey 会让契约校验静默通过
+
+Round 43 的教训是"**lookup 失败被静默兜底成空值**，于是'找不到'与'确实是空'在下游无法区分"
+（当时是复核脚本的 `?? ""`）。本轮把这个类别**扫到生产代码**。
+
+**① 扫描**（`tmp/state-audit/audit-silent-empty-fallbacks.mts`）：抓
+`.get(k) ?? "" / ?? []`、`obj[k] ?? ""` 等形态，按用途分级
+（进判据/断言 = A 高危，进提示词/日志 = B，有注释说明查无合法 = C）。
+168 个生产文件 ⇒ **37 处**，A 级 15、B 级 22。
+
+**② 逐处核到一处真问题**：`application/foundation-contract.ts` 里
+**三处**对 `FOUNDATION_TASK_CONTRACTS[taskKey]` 的查询都用静默兜底：
+- `foundationRequiredFields` → `return []`
+- `normalizeFoundationStructuredDataFlat` → `return root`
+- `validateFoundationTaskContract` → `return []`（**零错误**）
+
+三者合起来的效果：**一个不存在的 taskKey 会让契约校验"全部通过"**。
+而 `taskKey` 在 work-item 协议里是**可选字段**（`taskKey?: string`），
+`activities.ts` 原来写的是 `work.taskKey ?? ""` ⇒ 空串进校验 ⇒ `[]` ⇒
+**生成重试循环里的契约校验静默通过**。这正是 PL-8 注释要求
+"契约必须在此处强制，与来源无关"的那道门。
+
+**③ 为什么这是 round 43 的生产版本**：当时 `?? ""` 把 6 条**正确登记**判成未登记
+（假阴性），这里 `?? []` 把**未知阶段**判成契约满足（假通过）。
+两者同源、后果不同：一个会驱动错误改动，一个会**放行未校验的产物**。
+而现有保护只覆盖了一条调用路径：`postgres-repository.ts` 的批准路径
+先抛"规划阶段不存在"，但那条路径的守卫**不在契约层**，
+任何新调用方绕过它就会重新踩坑。
+
+**④ 修复（根因层）**：在最低共享层加 `requireFoundationContract(taskKey)`——
+未知 taskKey **直接抛错**，`validateFoundationTaskContract` 与
+`normalizeFoundationStructuredDataFlat` 改用它。
+调用侧同步把"taskKey 缺失"从静默放行改成显式失败。
+
+**⑤½ 修完第一处后又扫出第二处同类**（round 21"修一处要扫全类"的纪律）：
+`activities.ts` 里 `taskKey ?? ""` 共有 **3 处**，先只改了生成路径那 1 处，
+提交前重扫发现还有 2 处：
+- **L2393-2396：外部 foundation 结果入口**（外部编排写入产物后回灌校验）——
+  这条比生成路径更危险，未校验的外部产物会直接进库；已改为先判空报错。
+- L2461：`buildFoundationReviewPrompt` 的 taskKey——**提示词展示路径**，
+  该函数自身有 `contract?.qualityFocus` 兜底（"通用架构完整性与上下游一致性"），
+  属 B 级，保留。
+⇒ **同一形态要全类扫，且按用途分级处置**：判定路径全改，展示路径保留。
+
+其余调用点（`postgres-repository.ts:3459` 的陈旧契约扫描）本就有
+`foundationContractFingerprint` 前置跳过，不受影响。
+
+**⑤ 双向测试**（`foundation-contract.test.ts` 新增 describe，2 例）：
+未知 taskKey 与空 taskKey 必须抛错；已知 taskKey 照常校验（守卫不误伤）。
+**反向实测**：把抛错改回"返回假契约" ⇒ 判红
+（`未知 taskKey 必须抛错: expected [Function] to throw an error`）；还原后全绿。
+
+**本轮可复用判据**：
+1. **"兜底成空"要按用途分级，不能一律当坏味道**：进判据/断言的（A 级）
+   能把结论翻转，必须逐处核；进提示词/日志的（B 级）只是显示难看。
+   本轮 37 处里只有 A 级那批值得花时间，其余记录即可。
+2. **同一个静默兜底模式在测试脚本里是小麻烦，在生产代码里是放行漏洞**：
+   `?? ""` 把"登记了"判成"没登记"只会让你改错；`?? []` 把"未知"判成"通过"
+   会让未校验的产物流到下游。**同类缺陷的代价取决于它兜的是哪个量。**
+3. **守卫要加在最低共享层，而不是某一个调用方**：`postgres-repository.ts`
+   的批准路径本来就有保护，但那保护挡不住新调用方；改契约层后
+   所有调用方（含未来的）都自动变响。
+
 
 
 
