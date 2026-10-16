@@ -81,6 +81,24 @@ describe("MCP 工具面单一真源", () => {
     expect(offenders).toEqual([]);
   });
 
+  /**
+   * handler 文件头不得写死工具数。
+   *
+   * 根因（2026-10-16 复核轮）：`handlers.ts` 文件头写着"21 个工具"并列出已撤出的
+   * "项目生命周期（1）"分组，而 `TOOL_COUNT` 是 20——上面那条"文件头分组括号数总和
+   * 等于 TOOL_COUNT"的锁只扫 `tool-definitions.ts`，于是 handler 侧这份账无人对。
+   * 修法不是"把这处改成 20"（下次减法又会漂移），而是**取消第二份账**：计数只允许
+   * 出现在派生值 `TOOL_COUNT`，文件头只能指路。
+   */
+  it("handler 文件头不得写死工具数（第二份账必然漂移）", () => {
+    const source = readFileSync(fileURLToPath(new URL("../mcp/handlers.ts", import.meta.url)), "utf8");
+    const header = source.slice(0, source.indexOf("*/"));
+    expect(header.length, "文件头切片不得空转").toBeGreaterThan(200);
+    expect(header, "handler 文件头又写死了工具数").not.toMatch(/\d{1,3}\s*个工具/u);
+    // 反向：指路必须在场，否则"没写数字"可能只是因为整段说明被删了。
+    expect(header, "须指路到派生计数").toContain("TOOL_COUNT");
+  });
+
   it("元数据面与注册表双向覆盖", () => {
     const grouped = TOOL_GROUPS.flatMap((group) => group.tools as string[]);
     expect(grouped.filter((name) => !REGISTERED.has(name))).toEqual([]);

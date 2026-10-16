@@ -1,23 +1,20 @@
 /**
- * V2 MCP 工具处理函数（21 个工具的 handler 实现）。
+ * V2 MCP 工具处理函数（全部已注册工具的 handler 实现）。
  *
  * 设计依据：AGENTS.md 架构阶段 + Phase B-2 MCP 工具网关。
  *
  * 职责：
- * - 实现 21 个工具的具体调用逻辑
+ * - 实现全部 MCP 工具的调用逻辑（工具数不在此处写死：注册表是 `tool-definitions.ts`，
+ *   派生计数是 `tool-metadata.ts` 的 `TOOL_COUNT`，分组明细是 `TOOL_GROUPS`）
  * - 路由到 creative/ + evaluation/ + postgres-repository 模块
  * - 返回标准 JSON-serializable 结果（executeTool 包装为 McpToolResponse）
  *
- * 工具分组（与 tool-definitions.ts 对齐）：
- * - Run / Action 主体（2）
- * - 项目生命周期（1）—— project_create 撤出 MCP 面（2026-09-24 三批，能力走 REST/Web）
- * - 项目观测（1）—— project_inspect 吸收 catalog_get + context_get（view=catalog|context）
- * - 产物与工作流观测（2）—— artifact_query / workflow_query 各吸收单查与列查
- * - Craft Rule 候选演进（2）
- * - 规划与创作（8）—— story_arc_start 按 mode 三合一（auto/batch/orchestrated）；
- *   chapter_review 吸收 issue_add（issues 参数直接带意见启动 targeted 审校）
- * - Workflow 决策（1）—— workflow_decision 合并章节门与故事弧门
- * - 外部 LLM 上下文查询（4）
+ * 工具分组不在此处复制：分组账只有一份，在 `tool-definitions.ts` 文件头。两份账必然
+ * 漂移——2026-10-16 复核轮实测本文件头曾写死一个**过期的工具数**并列出已撤出的
+ * "项目生命周期（1）"分组，而实际计数比它少一个；`mcp-tool-face-single-source.test.ts`
+ * 当时只扫注册表，这份账无人对。现由该守卫的反向用例禁止本文件头再写死计数。
+ *
+ * 已撤出：`novel_project_create`（2026-09-24 三批，能力走 REST/Web），故无"项目生命周期"分组。
  *
  * 与 v1 的区别：v1 用 IndexedDB + CreativeToolEnvelope，v2 全部基于
  * NovelPostgresRepository + creative/evaluation 模块。
@@ -25,6 +22,7 @@
 import { randomUUID } from "node:crypto";
 import type { ToolHandler, ToolContext } from "./types";
 import { serialContextWithAssets } from "../application/serial-context-assets";
+import { isOpenWorkflowRunStatus } from "../run-lifecycle";
 import type {
   CreativeCommand,
   CreativeReviewInput,
@@ -1175,7 +1173,9 @@ const novel_workflow_decision: ToolHandler = async (args, ctx) => {
     if (decision !== "approve" && decision !== "revise") throw new Error("story-arc 决策 decision 必须是 approve 或 revise");
     if (!ctx.temporal) throw new Error("novel_workflow_decision 需要 ToolContext.temporal 才能发送工作流信号");
     const workflow = await ctx.repository.getStoryArcWorkflow(projectId, arcId);
-    const gateActive = Boolean(workflow && ["accepted", "running", "manual-review-required"].includes(workflow.status));
+    // 判据取自单一真源：此前手写 {accepted, running, manual-review-required}，
+    // 漏掉 waiting-external 与另外两个人门态（同 run-lifecycle.test.ts 的源码签名锁）。
+    const gateActive = Boolean(workflow && isOpenWorkflowRunStatus(workflow.status));
     const feedback = asString(args.feedback);
     if (decision === "revise") {
       if (!feedback.trim()) throw new Error("revise 必须携带 feedback 修订指令");
