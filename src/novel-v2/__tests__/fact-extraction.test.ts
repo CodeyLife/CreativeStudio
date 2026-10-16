@@ -159,6 +159,26 @@ describe("fact-extraction retention contract", () => {
     expect(prompt).toContain("承诺");
   });
 
+  /**
+   * subject.id 不得由多个词拼合而成（2026-10-14 复核轮 round 59）。
+   *
+   * 实测抓到的一例（生产库）：3 条 knowledge-scope claim 的 subject_refs 是
+   * `灰衣杂役`，而正文里"灰衣"3 次、"杂役"335 次、"灰衣杂役"**0 次**
+   * ——系统把两个分别出现的词拼成了一个小说里不存在的称呼。
+   * 后果：检索会按这个假名字返回结果，且它进入召回面后污染后续所有召回。
+   *
+   * 根因：prompt 里已有"subject.id 必须是正文中可指认的对象"，
+   * 但没说"必须是正文里作为**完整字符串**出现过的指称"。
+   * 本锁钉住新加的这条约束，防止它被后续改动删掉。
+   */
+  it("禁止 subject.id 由多个词拼合而成（round 59 实测的系统造名）", () => {
+    const prompt = buildFactExtractionPrompt({ artifact, text: "她换了一件外衣，随后立誓守住城门。" });
+    expect(prompt, "必须禁止拼合 subject.id").toContain("不得由多个词拼合而成");
+    expect(prompt, "必须要求完整字符串出现").toContain("完整字符串");
+    // 原约束仍在（本条是新增强化，不是替换）。
+    expect(prompt, "原有'可指认'约束必须保留").toContain("subject.id 必须是正文中可指认的对象");
+  });
+
   it("offers exact open-element IDs while leaving unmatched payoffs unlinked", () => {
     const prompt = buildFactExtractionPrompt({
       artifact,

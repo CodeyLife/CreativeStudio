@@ -55,6 +55,7 @@ export function buildFactExtractionPrompt(input: FactExtractionPromptInput): str
     `- subject.kind 限定为：project/character/entity/relation/outline/scene/thread/foreshadowing/timeline。`,
     `- 人物（有名有姓或有稳定指称的角色）一律用 character；地点、物件、机构、典籍等非人物可指认对象用 entity 或 scene；两者不可混用。`,
     `- subject.id 必须是正文中可指认的对象（人物名、地点名、关系名等）；不得用"主角""反派"等代词。`,
+    `- **subject.id 不得由多个词拼合而成**：只写正文里作为**完整字符串**出现过的指称。若正文分别出现过"灰衣"和"杂役"却从没有"灰衣杂役"这个合称，就不要自造"灰衣杂役"作 subject.id——改用正文实际使用的指称（"杂役""外门弟子"等），或把该主体并入其所属的群体/机构。实测过的一例：正文"灰衣"3 次、"杂役"335 次，但"灰衣杂役"0 次，系统拼出的这个名字会让后续检索按一个小说里不存在的称呼返回结果。`,
     ...(input.canonicalCharacters?.length ? [
       ``,
       `## 规范人物名册（subject.id 必须命中）`,
