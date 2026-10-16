@@ -423,6 +423,42 @@ describe("Skill runtime resolution", () => {
    */
 
   /**
+   * 全仓 skill 不得出现"承诺持久保证但数据模型交付不了"的措辞（round 38 + 39）。
+   *
+   * round 38 在 fact-memory 抓到一处：spec 说"每条事实都要有正文逐字证据、来源段落"，
+   * 而 evidence 只在写入前做过滤/去重、**落库即弃**（memory_claims 无该列）。
+   * round 39 把同一类别扫全部 12 个 skill（tmp/state-audit/audit-skill-promises.mts），
+   * 候选逐一人工核过：其余均为行为要求，或有真实落点（如 narrative-continuity 的
+   * "报告为证据越界"经审核 issue 的 rule 字段落库到 chapter_review_snapshot，可回溯）
+   * ⇒ **无新增同类缺陷**。
+   *
+   * 本锁把那次扫描结论固化为常态守卫：抓"逐字证据 + 来源段落"这类听起来像持久保证的
+   * 组合措辞，并要求一旦提到逐字证据就必须同段说明其边界。
+   */
+  it("任何 skill 不得承诺持久保证而数据模型无落点（round 39 全仓扫描结论固化）", async () => {
+    const provider = createWorkspaceSkillProvider(path.resolve(process.cwd(), "skills", "novel-v2"));
+    const points: Array<[SkillExecutionPoint, string]> = [
+      ["chapter.fact-extraction", "fact-extractor"],
+      ["character.enrichment", "character-enricher"],
+      ["chapter.drafting", "writer"],
+      ["chapter.review.prose", "prose-reviewer"],
+      ["chapter.revision", "reviser"],
+      ["foundation.book-plan", "foundation-planner"],
+      ["arc.plan", "arc-planner"],
+    ];
+    for (const [executionPoint, role] of points) {
+      const text = renderSkillInstruction(
+        await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint, role }),
+        executionPoint,
+      );
+      expect(text, `${executionPoint} 不得承诺逐字证据会被持久保存`).not.toContain("每条事实都要有正文逐字证据、来源段落");
+      if (text.includes("逐字证据")) {
+        expect(text, `${executionPoint} 提到逐字证据时必须说明其边界`).toMatch(/不被持久化|无法回溯|将来不可核对/u);
+      }
+    }
+  });
+
+  /**
    * fact-memory 的证据边界：spec 不得承诺数据模型交付不了的保证（2026-10-14 round 38）。
    *
    * 实测的错配：`fact-memory.yaml` 原写"每条事实都要有正文逐字证据、来源段落和 novelty 判断"，
