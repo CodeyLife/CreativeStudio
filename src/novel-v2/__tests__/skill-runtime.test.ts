@@ -109,7 +109,7 @@ describe("Skill runtime resolution", () => {
     for (const skillId of ["prose-craft", "reader-emotion", "plot-causality"]) {
       // 守卫值随 workspace yaml 版本演进（prose-craft 曾升 1.4.0 未同步本守卫，属存量断链修复）；
       // 断言的仍是"清单能解析出版本与指纹"这一契约，非具体措辞。
-      expect(byId.get(skillId)?.version).toBe(skillId === "prose-craft" ? "1.15.0" : "1.1.0");
+      expect(byId.get(skillId)?.version).toBe(skillId === "prose-craft" ? "1.15.0" : skillId === "reader-emotion" ? "1.2.0" : "1.1.0");
       expect(byId.get(skillId)?.contentFingerprint).toBeTruthy();
     }
 
@@ -421,6 +421,36 @@ describe("Skill runtime resolution", () => {
    * 不得改成可计算的密度门。这把锁钉住这个"不可计算"的结论，
    * 防止后人照那次失败的代理去立一个密度门。
    */
+
+  /**
+   * reader-emotion 的实测与代理边界（2026-10-14 复核轮 round 40）。
+   *
+   * `reader-emotion.yaml` 是三面共用的 required skill，从 1.1.0 起从未单独取证
+   * （12 个 skill 里此前只有 fact-memory 与 prose-craft 有实测）。本轮取证后：
+   *   - **宣告型**（情绪词后只跟抽象名词、无承载物）全书 **1 处**，
+   *     合格带 0、**最强带 0** ⇒ 与 round 33 问句收尾、round 36 总结连接词同族的
+   *     **零计数确认**：这条禁令从未被真正触发过，本书本来就不宣布情绪。
+   *   - **代理边界必须一起写**：情绪词基数只有 27 处（0.054/千字），因为情绪主要由
+   *     动作/物件/空间承担（正是本条要求的），所以以情绪词为分母的密度指标**没有分辨力**。
+   *     不写这条，后人会误读成"情绪浓度低＝缺情绪推进"。
+   *   - 章内疑问句 0.566/千字 与 round 33 的"章尾问句 0 处"是**两个口径**。
+   *
+   * 本锁钉住这三条，防止实测被简化成"情绪越少越好"这种反向误读。
+   */
+  it("reader-emotion 带着零值实测与代理边界：不得读成情绪越少越好", async () => {
+    const provider = createWorkspaceSkillProvider(path.resolve(process.cwd(), "skills", "novel-v2"));
+    const text = renderSkillInstruction(
+      await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint: "chapter.drafting", role: "writer" }),
+      "chapter.drafting",
+    );
+    expect(text, "必须带上宣告型的零值实测").toContain("全书仅 **1 处**");
+    expect(text, "必须写明最强带为 0").toContain("最强带 0");
+    // 关键防误读：代理边界必须写在同一条。
+    expect(text, "必须写明该密度代理没有分辨力").toContain("没有分辨力");
+    expect(text, "必须禁止读成情绪浓度低等于缺情绪推进").toContain("情绪浓度低");
+    // 两个口径的区分也要在（防止与 round 33 的章尾问句结论冲突）。
+    expect(text, "须区分章内疑问与章尾问句两个口径").toContain("章内疑问句");
+  });
 
   /**
    * 全仓 skill 不得出现"承诺持久保证但数据模型交付不了"的措辞（round 38 + 39）。
