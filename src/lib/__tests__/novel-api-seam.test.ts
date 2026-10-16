@@ -1,7 +1,7 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
-import { ACTIVE_RUN_POLL_MS, novelCommands, novelKeys, novelPaths, novelScopes } from "../novelApi";
+import { ACTIVE_RUN_POLL_MS, DIAGNOSTIC_POLL_MS, LEARNING_CENTER_POLL_MS, novelCommands, novelKeys, novelPaths, novelScopes } from "../novelApi";
 
 /**
  * novelApi 接口面的守卫（W1 主体：三级收到一级）。
@@ -108,9 +108,37 @@ describe("novelApi 接口面", () => {
     }
   });
 
-  it("轮询间隔是单一常量", () => {
-    expect(typeof ACTIVE_RUN_POLL_MS).toBe("number");
-    expect(ACTIVE_RUN_POLL_MS).toBeGreaterThan(0);
+  /**
+   * 轮询间隔只有一个来源：常量。
+   *
+   * 失效形态（本用例首版踩过）：只断言 `typeof ACTIVE_RUN_POLL_MS === "number"` 且 `> 0`
+   * 是**恒真**——常量在不在、10 处硬编码删没删，断言都通过，属"绿的说谎"。
+   * 本版把判据挪到**调用点**：任何 `refetchInterval` 附近出现数字字面量即红。
+   *
+   * 取三行窗口而非单行：取值可能跨行（`refetchInterval: pollWhile` 后面才是三元与箭头
+   * 函数），只看单行会漏掉原语内部的真实取值。
+   */
+  it("轮询间隔只来自常量：调用点不得再出现数字字面量", () => {
+    const code = stripComments(apiSource);
+    const lines = code.split(/\r?\n/u);
+    const offenders: string[] = [];
+    lines.forEach((line, index) => {
+      if (!/\brefetchInterval\b/u.test(line)) return;
+      const window = lines.slice(index, index + 3).join("\n");
+      // 数字字面量（含 `30_000` 形态）；标识符内部的数字不算。
+      if (/(?<![\w.])\d[\d_]*(?![\w.])/u.test(window)) offenders.push(`novelApi.ts:${index + 1}: ${line.trim()}`);
+    });
+    expect(offenders, "间隔数字不得出现在调用点，只能用常量").toEqual([]);
+
+    // 节拍语义本身也要锁：三个名字若被改成同一个数，"按数据变化速度分档"的设计就没了。
+    expect(ACTIVE_RUN_POLL_MS, "活跃 run 必须是最快的一档").toBeLessThan(LEARNING_CENTER_POLL_MS);
+    expect(LEARNING_CENTER_POLL_MS, "诊断档必须慢于学习中心档").toBeLessThan(DIAGNOSTIC_POLL_MS);
+
+    // 反向：常量必须真的被消费（声明处之外至少一处），否则"收口"只是把数字搬去没人读的地方。
+    for (const constant of ["ACTIVE_RUN_POLL_MS", "DIAGNOSTIC_POLL_MS", "LEARNING_CENTER_POLL_MS"]) {
+      const uses = (apiSource.match(new RegExp(`\\b${constant}\\b`, "gu")) ?? []).length;
+      expect(uses, `${constant} 只被声明、没有被消费`).toBeGreaterThan(1);
+    }
   });
 
   it("路径注册表覆盖读路径（页面零 /v2/ 的前提）", () => {

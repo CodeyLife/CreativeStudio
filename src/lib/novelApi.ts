@@ -537,12 +537,21 @@ export const novelScopes = {
 };
 
 /**
- * 运行中任务的轮询间隔——单一常量。
+ * 轮询间隔——每个节拍一个名字，调用点只引用常量，不写数字。
  *
- * 此前 10 处 `refetchInterval` 各自硬编码 3000（`novelApi.ts` 内 8 处 + 30_000/10_000 各一处），
- * 另有 `api.ts` 的 1500 与 `PsdTaskPanel.tsx` 的 4000 各自为政。间隔是运维决策，不该散落。
+ * 根因（`.scratch/w1-novel-api-seam/spec.md` §2.3）：间隔曾是散落的字面量——`novelApi.ts`
+ * 内 10 处 `refetchInterval` 各写各的数，另有 `api.ts` 与 `PsdTaskPanel.tsx` 各自为政。
+ * 间隔是运维决策：调一个节拍要改掉**全部**同类调用点，散落时只能靠人记住有几处。
+ *
+ * 为什么是三个名字而不是一个：三者的"数据多久可能变"不同，合并成一个数等于顺带改掉
+ * 未出问题的调用点的请求频率——那是行为变更，不是收口。名字即节拍语义。
  */
+/** 活跃 run 轮询节拍：状态随时可能推进，最短。 */
 export const ACTIVE_RUN_POLL_MS = 3000;
+/** 诊断列表（模型调用错误）轮询节拍：人工排障时才看，变化最慢。 */
+export const DIAGNOSTIC_POLL_MS = 30_000;
+/** 学习中心（评估与候选）轮询节拍：后台批量产出，居中。 */
+export const LEARNING_CENTER_POLL_MS = 10_000;
 
 export function invalidateNovelProject(queryClient: ReturnType<typeof useQueryClient>, projectId: string | undefined, documentId?: string, workflowId?: string): void {
   if (!projectId) return;
@@ -893,7 +902,7 @@ export function useNovelProject(projectId: string) {
     queryKey: novelKeys.project(projectId),
     queryFn: async () => (await novelFetch<{ project: NovelProjectDetail }>(`/v2/projects/${enc(projectId)}`)).project,
     enabled: Boolean(projectId),
-    refetchInterval: (query) => query.state.data?.latestRuns?.some((run) => isOpenWorkflowRunStatus(run.status)) ? 3000 : false,
+    refetchInterval: (query) => query.state.data?.latestRuns?.some((run) => isOpenWorkflowRunStatus(run.status)) ? ACTIVE_RUN_POLL_MS : false,
   });
 }
 
@@ -904,7 +913,7 @@ export function useNovelProjectRuns(projectId: string) {
     queryKey: novelKeys.runs(projectId),
     queryFn: async () => (await novelFetch<{ runs: NovelWorkflowRunRecord[] }>(`/v2/projects/${enc(projectId)}/runs`)).runs ?? [],
     enabled: Boolean(projectId),
-    refetchInterval: (current) => current.state.data?.some((run) => isOpenWorkflowRunStatus(run.status)) ? 3000 : false,
+    refetchInterval: (current) => current.state.data?.some((run) => isOpenWorkflowRunStatus(run.status)) ? ACTIVE_RUN_POLL_MS : false,
   });
   useEffect(() => {
     for (const run of query.data ?? []) {
@@ -925,7 +934,7 @@ export function useNovelRun(workflowId: string | undefined) {
     queryKey: novelKeys.run(workflowId ?? "none"),
     queryFn: () => novelFetch<NovelRunState>(`/v2/runs/${enc(workflowId!)}`),
     enabled: Boolean(workflowId),
-    refetchInterval: (query) => (isOpenWorkflowRunStatus(query.state.data?.status) ? 3000 : false),
+    refetchInterval: (query) => (isOpenWorkflowRunStatus(query.state.data?.status) ? ACTIVE_RUN_POLL_MS : false),
   });
   useEffect(() => {
     const state = query.data;
@@ -943,7 +952,7 @@ export function useNovelRunEvents(workflowId: string | undefined, active = false
     queryKey: novelKeys.runEvents(workflowId ?? "none"),
     queryFn: async () => (await novelFetch<{ events: NovelRunEvent[] }>(`/v2/runs/${enc(workflowId!)}/events`)).events ?? [],
     enabled: Boolean(workflowId),
-    refetchInterval: active ? 3000 : false,
+    refetchInterval: active ? ACTIVE_RUN_POLL_MS : false,
   });
 }
 
@@ -952,7 +961,7 @@ export function useNovelRunArtifacts(workflowId: string | undefined, active = fa
     queryKey: novelKeys.runArtifacts(workflowId ?? "none"),
     queryFn: async () => (await novelFetch<{ artifacts: NovelArtifactSummary[] }>(`/v2/runs/${enc(workflowId!)}/artifacts`)).artifacts ?? [],
     enabled: Boolean(workflowId),
-    refetchInterval: active ? 3000 : false,
+    refetchInterval: active ? ACTIVE_RUN_POLL_MS : false,
   });
 }
 
@@ -1003,7 +1012,7 @@ export function useNovelModelInvocationErrors(projectId: string) {
     queryKey: novelKeys.modelInvocationErrors(projectId),
     queryFn: async () => (await novelFetch<{ errors: NovelModelInvocationError[] }>(`/v2/projects/${enc(projectId)}/model-invocation-errors?limit=50`)).errors ?? [],
     enabled: Boolean(projectId),
-    refetchInterval: 30_000,
+    refetchInterval: DIAGNOSTIC_POLL_MS,
   });
 }
 
@@ -1018,7 +1027,7 @@ export function useNovelLearningCenter(projectId: string) {
       return { assessments: assessments.assessments ?? [], candidates: candidates.candidates ?? [] };
     },
     enabled: Boolean(projectId),
-    refetchInterval: 10_000,
+    refetchInterval: LEARNING_CENTER_POLL_MS,
   });
 }
 
@@ -1153,7 +1162,7 @@ export function useNovelRunReviews(workflowId: string | undefined, active = fals
     queryKey: novelKeys.runReviews(workflowId ?? "none"),
     queryFn: async () => (await novelFetch<{ reviews: NovelReviewSummary[] }>(`/v2/runs/${enc(workflowId!)}/reviews`)).reviews ?? [],
     enabled: Boolean(workflowId),
-    refetchInterval: active ? 3000 : false,
+    refetchInterval: active ? ACTIVE_RUN_POLL_MS : false,
   });
 }
 
@@ -1162,7 +1171,7 @@ export function useNovelRunPromptExecutions(workflowId: string | undefined, acti
     queryKey: novelKeys.runPromptExecutions(workflowId ?? "none"),
     queryFn: async () => (await novelFetch<{ executions: NovelPromptExecution[] }>(`/v2/runs/${enc(workflowId!)}/prompt-executions`)).executions ?? [],
     enabled: Boolean(workflowId),
-    refetchInterval: active ? 3000 : false,
+    refetchInterval: active ? ACTIVE_RUN_POLL_MS : false,
   });
 }
 
@@ -1171,7 +1180,7 @@ export function useNovelRunModelInvocations(workflowId: string | undefined, acti
     queryKey: novelKeys.runModelInvocations(workflowId ?? "none"),
     queryFn: async () => (await novelFetch<{ invocations: NovelModelInvocation[] }>(`/v2/runs/${enc(workflowId!)}/model-invocations`)).invocations ?? [],
     enabled: Boolean(workflowId),
-    refetchInterval: active ? 3000 : false,
+    refetchInterval: active ? ACTIVE_RUN_POLL_MS : false,
   });
 }
 
