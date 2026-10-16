@@ -29,11 +29,12 @@ describe("detectCoinedSubjects（round 64）", () => {
       claim("灰衣杂役"),   // 正文：灰衣 3 次、杂役 335 次、合称 0 次
       claim("盖布之物"),   // 正文：盖布（合句出现）+ 之物
       claim("岗棚生脸"),   // 正文：岗棚 + 生脸
-      claim("补发房抄写人"), // 整串幻觉型：无切分可拼 ⇒ 走⑤
+      claim("补发房抄写人"), // 前缀型："补发房抄"在正文、"写人"不在 ⇒ round 64 漏检、round 65 补上
     ], NOVEL);
     expect(found).toContain("灰衣杂役");
     expect(found).toContain("盖布之物");
     expect(found).toContain("岗棚生脸");
+    expect(found).toContain("补发房抄写人");
   });
 
   it("② 正文真实出现过的合称不报（防误伤）", () => {
@@ -56,13 +57,22 @@ describe("detectCoinedSubjects（round 64）", () => {
     expect(detectCoinedSubjects([claim("老头"), claim("岗棚")], NOVEL)).toEqual([]);
   });
 
-  it("⑤ 整串幻觉型（无任何切分可拼）不报——属更严重但需人核的另一类", () => {
+  it("⑤ 完全无出处的整串幻觉不报——属更严重但需人核的另一类", () => {
     // "城南看物屋"：所有两段切分（城南/看物屋、城南看/物屋、城南看物/屋）都不成立
     // （正文里这些片段都不出现）⇒ 检测器不报。
     // 这是有意的保守：只报"可确认是拼出来的"，不报"完全没出处"的
     // （后者在 round 60 实测里更严重，但需要人工核，不该由检测器自动判）。
     const found = detectCoinedSubjects([claim("城南看物屋")], "巷尾有一间无人认领的旧屋子，久无人至。");
     expect(found).toEqual([]);
+  });
+
+  it("⑤b 前缀型必须被抓到（round 65 的切分口径修正）", () => {
+    // "补发房抄写人"：前缀"补发房抄"在正文、尾部"写人"不在 ⇒ 仍是拼出来的称呼。
+    // round 64 只查"两段都在正文"的切分，任何切分都凑不齐 ⇒ 整条漏检。
+    const found = detectCoinedSubjects([claim("补发房抄写人")], "杂役们在补发房抄写册子。");
+    expect(found).toEqual(["补发房抄写人"]);
+    // 反向确认：正文里确实没有"补发房抄写人"这个合称。
+    expect("杂役们在补发房抄写册子。".includes("补发房抄写人")).toBe(false);
   });
 
   it("⑥ 空输入与去重", () => {

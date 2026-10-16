@@ -145,7 +145,7 @@ export function buildCraftRuleCandidateInput(assessment: RuntimeLearningAssessme
 }
 
 /**
- * 检出"系统自造的主体名"（2026-10-14 复核轮 round 59/60/64）。
+ * 检出"系统自造的主体名"（2026-10-14 复核轮 round 59/60/64/65）。
  *
  * 根因（round 59/60 实测，生产库 166 个主体里 **33 个**在正文 0 次出现）：
  * 提取模型把两个分别出现的词拼成了小说里不存在的称呼——`灰衣杂役`
@@ -154,8 +154,20 @@ export function buildCraftRuleCandidateInput(assessment: RuntimeLearningAssessme
  *
  * round 59/60 已在提取 prompt 里禁止该形态（"不得由多个词拼合而成" +
  * "描述性短语不要当 subject.id"），但 prompt 约束不保证旧数据与新模型都遵守，
- * 故这里按 round 59 的**特征信号**兜一道运行时检测：
- *   主体整串不在正文、而存在一种前后切分使两段都在正文 ⇒ 疑似自造。
+ * 故这里兜一道运行时检测。
+ *
+ * **判定（round 65 修正切分口径）**：主体整串不在本章正文、且满足任一条 ⇒ 报：
+ *   - **可拼型**：存在一种前后切分，两段都在正文（`灰衣杂役` ← 灰衣 + 杂役）；
+ *   - **前缀型**：某个真前缀在正文、而剩余部分作为整体不在正文
+ *     （`补发房抄写人` ← "补发房抄"在正文，"写人"不在 ⇒ 仍是拼出来的称呼）。
+ *     首版只查"两段切分"，漏掉了前缀型——因为"补发房抄"在正文而"写人"不在，
+ *     任何 2 段切分都凑不齐"两段都在"，于是整条被跳过。
+ *     round 65 实测：未覆盖的 5 个里有 2 个属此前漏掉的前缀型，
+ *     且它们是**更严重**的整串幻觉。
+ *
+ * **故意不报**：整串不在、且所有片段也都不在正文的（`城南看物屋`、`屋内人`、
+ * `挑水人`）——它们完全没出处，属更严重的一类，但判定需要语义（可能真是
+ * 系统该新建的实体名），不该由检测器自动判，留给人核。
  *
  * 只检测不删除：订正主体要逐条判"该人物在正文的实际称呼"，属半语义工作
  * （round 58/60 的结论：需要人核的部分不硬自动化）。调用方负责留痕。
@@ -167,12 +179,18 @@ export function detectCoinedSubjects(claims: ReadonlyArray<{ subjectRefs?: reado
   return subjects.filter((subject) => {
     // 防御：subjectRefs 里可能混入非字符串（历史数据/外部构造），不得让检测器崩。
     if (typeof subject !== "string" || subject.length < 3) return false;
-    // 机器生成的键形态（character:/foundation:/facet:）不参与——它们本就非正文指称。
+    // 机器生成的键形态（character:/foundation:/facet:…）不参与——它们本就非正文指称。
     if (/^(?:character|foundation|facet|claim|memory|graph):/u.test(subject)) return false;
     if (chapterText.includes(subject)) return false;
-    // 存在一种切分，两段都在正文 ⇒ 疑似由两段拼成。
+
+    // ① 可拼型：存在一种前后切分，两段都在正文。
     for (let cut = 2; cut <= subject.length - 2; cut += 1) {
       if (chapterText.includes(subject.slice(0, cut)) && chapterText.includes(subject.slice(cut))) return true;
+    }
+    // ② 前缀型：某个真前缀在正文，而剩余部分作为整体不在正文。
+    for (let cut = 2; cut <= subject.length - 2; cut += 1) {
+      const tail = subject.slice(cut);
+      if (chapterText.includes(subject.slice(0, cut)) && !chapterText.includes(tail)) return true;
     }
     return false;
   });
