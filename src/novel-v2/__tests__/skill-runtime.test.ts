@@ -109,7 +109,7 @@ describe("Skill runtime resolution", () => {
     for (const skillId of ["prose-craft", "reader-emotion", "plot-causality"]) {
       // 守卫值随 workspace yaml 版本演进（prose-craft 曾升 1.4.0 未同步本守卫，属存量断链修复）；
       // 断言的仍是"清单能解析出版本与指纹"这一契约，非具体措辞。
-      expect(byId.get(skillId)?.version).toBe(skillId === "prose-craft" ? "1.11.0" : "1.1.0");
+      expect(byId.get(skillId)?.version).toBe(skillId === "prose-craft" ? "1.12.0" : "1.1.0");
       expect(byId.get(skillId)?.contentFingerprint).toBeTruthy();
     }
 
@@ -407,6 +407,42 @@ describe("Skill runtime resolution", () => {
    *
    * 三面接线 + 反例（不得写成词表禁用——表情本身完全合法）。
    */
+  /**
+   * 章尾纪律的机制拆分依据（2026-10-14 复核轮 round 33）。
+   *
+   * round 30/31/32 用"按机制拆族"分别处理了"数数""面部表情""道具盘点"，
+   * 三次结论依次是推翻 / 收窄 / 确认。本轮审 round 2 写入、此后一直没被单独取过证的
+   * **章尾收束纪律**——结论又是**确认**，且带一个必须防的读窄风险：
+   *
+   * | 机制 | 原始计数 | 全书 | 合格带 | 混合带 | **最强带** | 混/合 |
+   * |---|---|---|---|---|---|---|
+   * | A 短句收尾（≤8字） | 38 | 0.226 | 0.228 | 0.176 | **0.276** | 0.77 |
+   * | B 长句收尾 | 130 | 0.774 | 0.772 | 0.824 | 0.724 | 1.07 |
+   * | C 问句收尾 | **0** | 0 | 0 | 0 | 0 | — |
+   *
+   * 短句收尾在**最强带最高（0.276，比混合带高 1.6 倍）**且越往后越多
+   * （ch72 前 10 章 → ch73 后 28 章）；而**把这 38 处按"宣告 vs 单拍"分类后，
+   * 最强带 8 处全部是单拍落点、零宣告**（ch112「他没挪。」、ch127「两个字入册。」）。
+   *
+   * ⇒ 纪律禁止的是**宣告**，不是**短**。这把锁防的是把纪律读窄成
+   * "不得短句收尾"——那会禁掉本书的标志性手法。
+   */
+  it("章尾纪律带着机制拆分依据：禁止的是宣告不是短，短句单拍是标志性手法", async () => {
+    const provider = createWorkspaceSkillProvider(path.resolve(process.cwd(), "skills", "novel-v2"));
+    const draftText = renderSkillInstruction(
+      await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint: "chapter.drafting", role: "writer" }),
+      "chapter.drafting",
+    );
+    expect(draftText, "必须带上收束机制拆分依据").toContain("短句收尾");
+    // 三条硬事实：最强带最高、问句全书为零、最强带全是单拍。
+    expect(draftText, "须写明短句收尾在最强带最高").toContain("最强带 0.276");
+    expect(draftText, "须写明问句收尾全书为零").toContain("问句收尾全书 0 处");
+    expect(draftText, "须写明最强带全是单拍落点、零宣告").toMatch(/单拍落点.{0,12}零宣告|零宣告/u);
+    // 结论：禁止宣告而非禁止短。
+    expect(draftText, "结论须是'禁止宣告而非禁止短'").toContain("不是**短**");
+    expect(draftText, "须明确不得因短句结尾而报").toContain("不得因");
+  });
+
   /**
    * 清点条款的机制拆分依据（2026-10-14 复核轮 round 32）。
    *
