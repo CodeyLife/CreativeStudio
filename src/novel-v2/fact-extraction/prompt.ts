@@ -70,6 +70,7 @@ export function buildFactExtractionPrompt(input: FactExtractionPromptInput): str
     `- truthStatus：objective=客观事实（地点、时间、物件状态）；claim=人物声明（可能不可靠）；contested=多方冲突陈述；open-question=正文留白。`,
     `- humanReadable 是事实的自然语言描述，便于人工审核。`,
     `- evidence 必须引用正文逐字证据（不少于 8 字），不得概括。`,
+    `- **evidence 只用于本次写入前的过滤与去重，落库后不会被保留**（memory_claims 表没有 evidence 列）：所以按"将来没人能核对我这条引证"的标准写它——宁可少沉淀一条，也不要沉淀一条自己都找不到原文支撑的；一次性描写不得借"证据里有"泛化成永久规则。`,
     `- confidence 0-1：直接陈述=0.9+，转述=0.7+，暗示=0.5+；低于 0.5 不提取。`,
     `- novelty=new/update/duplicate：相对于已存在记忆的新增/更新/重复。`,
     `- conflict=true：与既有冻结记忆冲突（需要后续人工审核）。`,

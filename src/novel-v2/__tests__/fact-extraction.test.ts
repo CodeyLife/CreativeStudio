@@ -182,6 +182,33 @@ describe("fact-extraction retention contract", () => {
     expect(prompt, "原有'可指认'约束必须保留").toContain("subject.id 必须是正文中可指认的对象");
   });
 
+  /**
+   * 三处已修缺陷的约束必须都在**提取 prompt** 里（2026-10-14 复核轮 round 62）。
+   *
+   * 由来（round 61 判据② 的轴间应用）："锁断言在哪个面上，盲区就在哪个面上"。
+   * round 61 发现 prose-craft 的 4 条判据只进了写作面；本轮查事实记忆轴的同性问题，
+   * 发现 round 38 的"evidence 不持久化"约束**只在 fact-memory skill 里**，
+   * 提取 prompt 完全没提——而提取模型只看 prompt，**那条约束对它不存在**。
+   *
+   * 提取 prompt 原有的一句是"evidence 必须引用正文逐字证据（不少于 8 字），不得概括"，
+   * 它要求了**写什么**，却没说**这东西不会被存**。缺了后半句，模型会按"证据已存档、
+   * 事后可查"行事，从而在不该泛化处泛化——这正是 round 38 抓到的行为。
+   *
+   * 本锁把三处约束的接线一次钉住：防的正是"修在 skill 里、模型看不见"。
+   */
+  it("三处已修缺陷的约束都在提取 prompt 里（round 62）", () => {
+    const prompt = buildFactExtractionPrompt({ artifact, text: "她换了一件外衣，随后立誓守住城门。" });
+    // ① round 38：evidence 不持久化（round 62 新补）。
+    expect(prompt, "必须写明 evidence 不被保留").toContain("落库后不会被保留");
+    expect(prompt, "必须给出自约束（将来不可核对）").toContain("将来没人能核对我这条引证");
+    // ② round 59：subject.id 不得拼合。
+    expect(prompt, "必须禁止拼合 subject.id").toContain("不得由多个词拼合而成");
+    // ③ round 60：描述性短语不得作主体。
+    expect(prompt, "必须禁描述性短语作主体").toContain("描述性短语不要当 subject.id");
+    // 原有约束仍在（新增强化，不是替换）。
+    expect(prompt, "原 evidence 约束必须保留").toContain("evidence 必须引用正文逐字证据（不少于 8 字）");
+  });
+
   it("offers exact open-element IDs while leaving unmatched payoffs unlinked", () => {
     const prompt = buildFactExtractionPrompt({
       artifact,
