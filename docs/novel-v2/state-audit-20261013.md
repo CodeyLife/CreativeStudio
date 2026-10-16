@@ -3377,6 +3377,60 @@ skill 是给**审核面/角色**投影的；`chapter.fact-extraction` 执行点�
 3. **"修过"不等于"接上线"**：round 38 当时判定为"spec 澄清"并写进 skill，
    自认完成；两个月后的跨轴核验才发现模型侧从未收到。
    **每处修复都要问"模型看得到吗"**，而不是"spec 写了吗"。
+### 8.61 复核轮 round 63（2026-10-14）：全仓 skill 接线核验——一次误删与它的纠正（同一判据用错对象的第三次）
+
+Round 62 判据③ 是"**修过不等于接上线**"，前两轮分别用在 prose-craft 与 fact-extraction。
+本轮把它**扫全部 12 个 skill**：每个 skill 声明的执行点，渲染后是否真含该 skill。
+
+**① 扫描**（`tmp/state-audit/verify-all-skill-reach.mts`）：12 个 skill、30 个执行点声明，
+**9 个组合渲染里没有该 skill**。
+
+**② 逐个判"投影未选（正常）还是死指引（缺陷）"**（`diag-reach-missing.mts`，
+判据是该 skill 的**其他**执行点是否可达）：
+- `character-ensemble → foundation.book-plan`、`plot-causality → chapter.blueprint`、
+  `story-arc-design → chapter.blueprint`：其他执行点全部可达 ⇒ **投影未选，正常**。
+- `h3-video-prompt` / `learning-loop`：首轮报"无其他可达点"，
+  但那是**我的角色表不全**（chapter.script/short.script 无角色参数、
+  learning.* 的角色是 `learning-auditor`）。补齐后 `learning-loop` 两个点都可达，
+  `h3-video-prompt` 的绑定则**早有专门锁**（`skill-runtime.test.ts` 的
+  "binds chapter.script and short.script exclusively to the H3 script skill"）。
+- `review-gate → foundation.book-plan` 与 `→ arc.review`：报"其他点可达"，看似正常。
+
+**③ 但我在③上多走了一步，且那一步是错的**：我看到 `foundation.book-plan`
+只用 role=`foundation-planner` 渲染时不含 review-gate，就判定
+"review-gate 的 foundation.book-plan 段（含 round 41 加固的十项判据）从未被投影给任何人"，
+**把 13 行内容删掉**、换成"指向真源"的说明。
+
+**④ 纠正：既有测试立刻判红，暴露出我的诊断脚本角色用错**。
+`skill-runtime.test.ts:230-232` 早就断言：
+
+    const review = await resolveStageSkillBundle({… role: "foundation-reviewer" });
+    expect(review.skills.some((skill) => skill.skillId === "review-gate")).toBe(true);
+
+即 `foundation.book-plan` 执行点有**两个角色**（planner 与 reviewer），
+review-gate 只投给 reviewer——**完全正确**。用 `foundation-planner` 去测
+就是拿不适用该 skill 的角色去判它不可达（本会话**同一判据用错对象的第三次**：
+round 16/23 是探测对象错、round 58/60 是锚串错、本轮是**角色错**）。
+
+**⑤ 处置**：`git checkout -- skills/novel-v2/review-gate.yaml` 精确还原（零 diff），
+validate 通过，全部测试恢复绿。误删期间 L235/L519-527 三个用例判红，
+正是它们把我拦住的——**锁又一次在我犯错时救场**。
+
+**⑥ 结论**：全仓 9 个"渲染缺失"**全部是投影未选或我的诊断参数错**，
+**没有死指引**。这把 round 61/62 的接线判据从两个 skill 推广到全部 12 个，
+结论是"接线完好"。
+
+**本轮可复用判据**：
+1. **执行点多角色时，可达性必须按角色分别判**：`foundation.book-plan` 同时有
+   planner 与 reviewer 两个角色，skill 按角色分流投影是设计而非缺陷。
+   **诊断脚本漏掉一个角色，就会把正确的分流判成死指引**——
+   而这类误判的危害是**你会去"修"一个没坏的东西**（本轮差点删掉 round 41 的成果）。
+2. **删内容前先跑既有测试**：本轮若先跑 `skill-runtime.test.ts`，
+   三个断言会立刻告诉我"它可达"。**改动 spec 前先确认没有锁在守它。**
+3. **"还原"要用 git 精确回滚，不要手改**：我先用手写 splice 还原，
+   结果留下 8/12 行的残余 diff；`git checkout --` 一次到位。
+   **误操作后的恢复应当是可验证的零 diff，而不是"看起来对"。**
+
 
 
 
