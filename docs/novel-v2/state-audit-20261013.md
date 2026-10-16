@@ -3519,6 +3519,58 @@ Round 64 交付了自造主体检测器，并宣称"**保守**：只报可拼型
    **切分判据至少要有"可拼"和"前缀"两种方向。**
 3. **覆盖率提升要当场量化**：28 → 31，且剩余 2 个与设计声明精确对齐——
    **边界的真实大小只有在改完之后才算得出来。**
+### 8.64 复核轮 round 66（2026-10-14）：提取审计只打日志不落盘——真库工件里 verification/stats 全为 null
+
+Round 65 判据① 是"**声明要数据证**"。本轮拿它核 round 38 的结论
+（"evidence 只用于写入前过滤、落库后不保留"）——那个结论同时暗示
+"提取的审核痕迹是有的"，但**从没有人核过痕迹落到哪**。
+
+**① 真库核验**（`tmp/state-audit/verify-evidence-filter-effect.mts`）：
+最近 5 个 fact-extraction artifact 的 payload 里，
+`stats` 与 `verification` **全为 null/false**。
+
+**② 代码侧解释了为什么**：artifact 在**提取前**就建好
+（`activities.ts` L1210：`makeArtifact({…, structuredData: { sourceArtifactId } })`），
+而矛盾核验（`result.verification`）、自造主体（`detectCoinedSubjects`）、
+丢弃统计（`result.stats`）都在提取**后**才算出。它们只被 `console.warn` 打出来，
+或挂到**返回值**（L1247 的 `{ ...factArtifact, structuredData: {...} }`）——
+**落库的那份 artifact 始终只有 sourceArtifactId**。
+
+⇒ 这是 round 15 那条（"**不阻塞主路径**"与"**不留痕迹**"是两件事）在提取侧的同族：
+`recordFactExtraction` 拿的是旧的 `factArtifact`，而不是带审计的那份。
+
+**③ 修复**（`activities.ts`，零新增 SQL、零新增表）：
+把审计并进 `factArtifact.structuredData` **之后**再落库——
+
+    const factArtifactWithAudit = { ...factArtifact, structuredData: { ...factArtifact.structuredData,
+      sourceArtifactId, verification: result.verification, stats: result.stats, coinedSubjects } };
+    await deps.repository.recordFactExtraction({ …, artifact: factArtifactWithAudit, … });
+
+字段位置与既有 `verification` 同一处（审批/审计面已有消费路径），
+`stats`/`coinedSubjects` 是新增但同名同型，不引入新概念。
+
+**④ 测试**（`fact-extraction-audit-persistence.test.ts`，2 例）：
+用例**驱动真实 extractFacts 路径**（model gateway 返回结构化 claim，不 stub 被测函数
+——round 26 的教训），断言落库的 artifact 带
+`verification`/`stats`/`coinedSubjects`/`sourceArtifactId`，以及**无问题时字段仍存在**
+（空值而非缺失，审计面可依赖字段存在性）。
+运行日志可目视确认：`[fact-extraction] 检出 1 个疑似自造主体…灰衣杂役`。
+
+**⑤ 尚未补的**：`verify-evidence-filter-effect.mts` 的结论没法"回看历史"——
+已落库的 5 个工件不带 stats，那是**修复前**的产物；本修复只对之后的提取生效。
+（这与 round 59/60 的"已落库 33 处未订正"同性质：**新机制治未来，不是过去**。）
+
+**本轮可复用判据**：
+1. **"结论 A ⇒ 痕迹 B 在"这类推理要落到"B 落在哪一行代码/哪一列"**：
+   round 38 只推理到"代码里有 `discardedShortEvidenceCount`"，没追到"它进没进 artifact"。
+   **推理链的最后一环必须是落盘点，而不是计算点。**
+2. **artifact 先建后用是痕迹丢失的高发形态**：提取前建 artifact、
+   提取后才有审计 ⇒ 想清楚"谁带着审计落库"。审计字段要么随对象派生，
+   要么在建对象时就地更新。
+3. **可观测性修复的验收标准是"事后能回答"**：本轮的验收是
+   "事后能回答这一章提取消遇了多少、为何判 candidate、有没有自造主体"——
+   而不是"代码里算了这些数"。
+
 
 
 

@@ -1223,7 +1223,6 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
           // 此处留痕 + 随 factArtifact.structuredData 上浮供审批/审计面消费。
           console.warn(`[fact-verification] ${result.verification.contradictions.length} 条新事实与冻结表同槽异值且未声明覆盖，已强制候选待裁决：${result.verification.contradictions.map((item) => item.claimId).join("、")}`);
         }
-        await deps.repository.recordFactExtraction({ projectId: input.projectId, artifact: factArtifact, claims: result.claims, lifecycleStatus: "staged", documentId: input.documentId, workflowId: input.workflowId, narrativeOrder: input.narrativeOrder });
         // 自造主体检测（2026-10-14 round 59/60/64）：prompt 已禁止"拼合/描述性短语作 subject.id"，
         // 但 prompt 约束不保证旧数据与新模型都遵守——这里按 round 59 的特征信号兜一道：
         //   主体整串不在正文、而拆开的两段都在 ⇒ 系统把两个词拼成了一个小说里不存在的称呼。
@@ -1234,6 +1233,21 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
         if (coinedSubjects.length) {
           console.warn(`[fact-extraction] 检出 ${coinedSubjects.length} 个疑似自造主体（整串不在正文但拆开可拼）：${coinedSubjects.join("、")}——请核对这些称呼是否小说实际使用，必要时订正主体（round 59/60 已在 prompt 侧禁止该形态）`);
         }
+        // 提取审计落盘（2026-10-14 round 66）：此前矛盾核验/自造主体/丢弃统计**只打 console.warn**，
+        // 而 artifact 在提取前就建好（只带 sourceArtifactId）⇒ 这些痕迹随日志一起消失，
+        // 事后无法回答"这一章提取消遇了多少条、为何判 candidate"。此处把它们并进
+        // artifact.structuredData 再落库，与既有 `verification` 字段同一处（审批/审计面可读）。
+        const factArtifactWithAudit: Artifact = {
+          ...factArtifact,
+          structuredData: {
+            ...factArtifact.structuredData,
+            sourceArtifactId: input.artifact.id,
+            verification: result.verification,
+            stats: result.stats,
+            coinedSubjects,
+          },
+        };
+        await deps.repository.recordFactExtraction({ projectId: input.projectId, artifact: factArtifactWithAudit, claims: result.claims, lifecycleStatus: "staged", documentId: input.documentId, workflowId: input.workflowId, narrativeOrder: input.narrativeOrder });
         // 名册外主体登记（§3.6）：prompt 已向模型承诺"由系统登记为待补全实体"，此处兑现。
         // 登记失败不阻塞事实落库——键一致性是后续收益，不是本章产出的前置条件。
         if (result.unregisteredSubjects.length) {
