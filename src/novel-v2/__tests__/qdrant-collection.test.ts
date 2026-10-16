@@ -148,6 +148,54 @@ describe("Qdrant collection identity", () => {
   });
 
   /**
+   * 召回侧的维度护栏（round 45 补锁——此前只锁了写入侧）。
+   *
+   * round 29 给 `upsertClaims` 补了"数量/维度不符即 throw"的锁，实测它拦住了
+   * round 28 那次退化 embedding。但**召回侧另有一道同族护栏**
+   * （`qdrant-memory.ts` 的 search：查询向量维度与集合不一致即 throw）**从未被锁**。
+   *
+   * 为什么值得锁：`model-gateway.ts` 的 `embed()` 在嵌入缺失时返回 `[]`
+   * （`parseEmbeddingVectors` 对缺行初始化为空数组，`?? []` 再兜一层），
+   * 这道护栏是它流到 Qdrant 之前的最后一道关。round 44 全类扫"静默兜底成空"时
+   * 确认两个生产调用方都设了边界检查，但只有写入侧有测试——**没锁的守卫
+   * 在别人改 search 时会悄无声息消失**，而那时召回会拿 0 维向量去比 1024 维空间。
+   */
+  describe("召回侧维度护栏（round 45）", () => {
+    const provider = (vectors: number[][]) => ({
+      embed: vi.fn(async () => ({ value: vectors, vectors, usage: undefined, provenance: {} })),
+    }) as unknown as ModelGateway;
+    const client = () => ({ getCollection: vi.fn(async () => ({ config: { params: { vectors: { size: 1024 } } } })), query: vi.fn(async () => ({ points: [] })) }) as unknown as QdrantClient;
+
+    it("查询向量为空（嵌入缺失）⇒ 拒绝检索，不外发 0 维向量", async () => {
+      await expect(
+        new QdrantMemoryProvider(client(), provider([[]]), "memory", 1024).search({
+          projectId: "project-a",
+          facets: [{ kind: "fact", query: "检索用词", required: true }],
+        }),
+      ).rejects.toThrow(/查询向量维度/u);
+    });
+
+    it("查询向量维度不符 ⇒ 拒绝检索", async () => {
+      await expect(
+        new QdrantMemoryProvider(client(), provider([[0.1, 0.2, 0.3]]), "memory", 1024).search({
+          projectId: "project-a",
+          facets: [{ kind: "fact", query: "检索用词", required: true }],
+        }),
+      ).rejects.toThrow(/查询向量维度 3 与集合维度 1024 不一致/u);
+    });
+
+    it("维度相符 ⇒ 正常外发（护栏不误伤）", async () => {
+      const stub = client();
+      const good = Array.from({ length: 1024 }, () => 0.5);
+      await new QdrantMemoryProvider(stub, provider([good]), "memory", 1024).search({
+        projectId: "project-a",
+        facets: [{ kind: "fact", query: "检索用词", required: true }],
+      });
+      expect(stub.query as unknown as ReturnType<typeof vi.fn>).toHaveBeenCalled();
+    });
+  });
+
+  /**
    * 存活判定是 A1/FM-1 在语义检索侧的唯一落点。
    *
    * 立用例的形态是实测出来的：`ymcp` 索引里有 22 个"已被可见杀手退役"的点与 5 个

@@ -2584,6 +2584,46 @@ Round 43 的教训是"**lookup 失败被静默兜底成空值**，于是'找不�
 3. **守卫要加在最低共享层，而不是某一个调用方**：`postgres-repository.ts`
    的批准路径本来就有保护，但那保护挡不住新调用方；改契约层后
    所有调用方（含未来的）都自动变响。
+### 8.43 复核轮 round 45（2026-10-14）：round 44 的 A 级清单核完——其余良性，但召回侧护栏一直没锁
+
+Round 44 用"静默兜底成空"扫出 37 处、A 级 15 处，只处置了 foundation-contract 那簇。
+本轮按 round 44 末条判据（**修一处必须重扫全类**）把**剩余 A 级全部核完**。
+
+**① 逐处核完，结论是"其余良性，但良性有原因"**：
+
+| 位置 | 判定 |
+|---|---|
+| `full-book-architecture.ts:205` `characterNames.get(ref) ?? []` | **良性且设计如此**——`candidates.length === 0` 被显式判为 unresolved 并上报，空值正是判据的输入 |
+| `structured-json.ts` 4 处 `json[index+1] ?? ""` | 良性——有界字符串解析，输入末尾追加空是正确语义 |
+| `manuscript-structure.ts` 数组越界兜底 | 良性——`paragraphs[0] ?? ""` 只是正则不匹配 |
+| **`model-gateway.ts:887`** `freshVectors[missingPosition.get(text) ?? -1] ?? []` | **真缺陷形态，但被下游边界挡住**——见下 |
+| `foundation-contract.ts:445` `requiredByTask[taskKey] ?? []` | 已被 round 44 的 `requireFoundationContract` 在函数入口挡住（行级扫不到这层） |
+
+**② model-gateway 那处的实情**：`parseEmbeddingVectors` 对缺行**初始化为空数组**
+（不报错），`?? []` 再兜一层 ⇒ 嵌入缺失时 `embed()` 返回 `[]`。
+两个生产调用方都设了边界检查：`upsertClaims` 的数量/维度 throw、
+`search` 的查询维度 throw。⇒ **缺陷没有外泄，但依赖的是两道没被完整锁住的护栏。**
+
+**③ 真正的问题：召回侧护栏从未被锁**。round 29 给 `upsertClaims` 补了锁
+（并实测它拦住了 round 28 的退化 embedding），但 **`search` 的同族护栏
+（查询向量维度不符即 throw）零测试覆盖**——grep `查询向量维度` 在测试里 0 命中。
+⇒ 写入侧有人守、召回侧没人守；而召回侧才是读者拿到事实的那条路。
+
+**④ 补锁（`qdrant-collection.test.ts` 新增 describe，3 例）**：
+查询向量为空（嵌入缺失）⇒ 拒绝检索；维度不符（3 vs 1024）⇒ 拒绝检索；
+维度相符 ⇒ 正常外发（护栏不误伤）。
+**反向实测**：移除 `search` 的 throw ⇒ **2 例判红**
+（`promise resolved "[]" instead of rejecting`）；还原后全绿。
+
+**本轮可复用判据**：
+1. **"良性"要区分"设计如此"与"被别处挡住"**：前者（full-book-architecture 的空候选）
+   不需要动；后者（model-gateway 的空向量）说明缺陷真实存在、只是没外泄——
+   **别处挡住的缺陷仍是缺陷，且那个"别处"本身需要锁**。
+2. **边界护栏要成对锁**：写入侧与召回侧是同族边界，只锁一侧会让另一侧
+   在重构时悄无声息消失。round 29 锁了写入侧却漏了召回侧，正是这种不对称。
+3. **A 级清单要核到"每处都有归属"**：15 处里 13 处良性、1 处已被修复挡住、
+   1 处暴露了锁的不对称——核完才知道剩下的工作量在哪，而不是停在"有 15 处高危"。
+
 
 
 
