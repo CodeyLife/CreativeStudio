@@ -70,6 +70,51 @@ describe("book synopsis planning contract", () => {
     expect(() => buildBookTitleCandidatesPrompt(completePlan())).not.toThrow();
   });
 
+  /**
+   * 工作流入口的准入门必须被锁（2026-10-14 round 47）。
+   *
+   * "全书规划尚未全部确认"这条门**共有四处实现**（round 46 发现两处、
+   * 本轮再发现两处）：`book-synopsis.ts` 的 `buildBookSynopsisPrompt`（L124）与
+   * `buildBookTitleCandidatesPrompt`（L87），以及 `book-synopsis-workflow.ts` 的
+   * `startBookSynopsisGeneration`（L18）与 `startBookTitleCandidateGeneration`（L55）。
+   * round 46 给前两处补了锁；本轮用反证法（临时移除 throw 看测试是否判红）
+   * 测后两处——**全库 1371 个测试无一变红** ⇒ 这两处至今零覆盖。
+   *
+   * 为什么这两处最该锁：它们是**入口**。入口不拦，不完整的规划会
+   * 启动一个持久化工作流（`putWorkflowRun` + Temporal start），
+   * 之后产出会跨缺失阶段编造——而编造的产物一旦落库就很难回溯。
+   * round 46 那条"只锁了一份"的教训在这里再放大一次：**四份实现，两份没锁。**
+   */
+  describe("工作流入口的准入门（round 47）", () => {
+    const stubRepository = (sections: ProjectPlanSection[]) => ({
+      listProjectPlanSections: vi.fn(async () => sections),
+      getProjectDetail: vi.fn(async () => ({ title: "长夜归舟" })),
+      listProjectRuns: vi.fn(async () => []),
+      putWorkflowRun: vi.fn(async () => undefined),
+      updateWorkflowRunStatus: vi.fn(async () => undefined),
+    }) as unknown as NovelPostgresRepository;
+    const stubTemporal = () => ({ workflow: { start: vi.fn(async () => ({ firstExecutionRunId: "run-1" })) } }) as unknown as Client;
+
+    it("规划不完整时不启动简介工作流", async () => {
+      const sections = completePlan().filter((section) => section.taskKey !== "characters");
+      await expect(startBookSynopsisGeneration(stubRepository(sections), stubTemporal(), { projectId: "project-1" }))
+        .rejects.toThrow("全书规划尚未全部确认");
+    });
+
+    it("规划不完整时不启动书名候选工作流", async () => {
+      const sections = completePlan().filter((section) => section.taskKey !== "characters");
+      await expect(startBookTitleCandidateGeneration(stubRepository(sections), stubTemporal(), { projectId: "project-1" }))
+        .rejects.toThrow("全书规划尚未全部确认");
+    });
+
+    it("规划完整时两个入口都正常启动（守卫不误伤）", async () => {
+      await expect(startBookSynopsisGeneration(stubRepository(completePlan()), stubTemporal(), { projectId: "project-1" }))
+        .resolves.toMatchObject({ status: "accepted", reused: false });
+      await expect(startBookTitleCandidateGeneration(stubRepository(completePlan()), stubTemporal(), { projectId: "project-1" }))
+        .resolves.toMatchObject({ reused: false });
+    });
+  });
+
   it("keeps the contract genre-neutral and changes the source fingerprint when planning changes", () => {
     const scienceFiction = completePlan("深空维修师发现殖民站正在改写居民记忆");
     const prompt = buildBookSynopsisPrompt({ projectTitle: "静默轨道", sections: scienceFiction });
