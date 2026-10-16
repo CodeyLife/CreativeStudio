@@ -210,6 +210,28 @@ export function parseChapterMemoryOutput(value: unknown, _input: Omit<CreateChap
 }
 
 /**
+ * 章节记忆投影为 claim 时 subject_refs 的**上限**（2026-10-14 round 68 实测后设定）。
+ *
+ * 根因：`subjectRefs` 直接来自 LLM 产出的 `characterStates`，无去重、无上限。
+ * 真库实测（round 68）：1832 条可见 claim 里 8 条挂了 ≥10 个键（最多 14 个），
+ * 且**全部是 chapter-memory rollup**（叙事位置 1/21/41/81/141/161）。
+ * 后果有两层：
+ *   ① **扇出放大**：一条记忆出现在 N 个主体的检索面里，其中多数组并不是本章真正的主角；
+ *   ② **主体分裂被放大**：模型自造的指称（`补发房抄写人` 等 31 个）有 18 个挂在这些
+ *      高扇出 claim 上 ⇒ 同一主体的事实按不同写法分裂，且分裂随扇出扩大。
+ *
+ * 为何取 8：实测全部 rollup 的中位数在 8 上下，且真库中 **1818/1832** 条 claim 只挂 1 个键、
+ * 5 条挂 2-4 个、1 条挂 5-9 个、8 条挂 10+。取 8 可让那 8 条全部落在上限内
+ * （其键数 7-14，取前 8 个按 `characterStates` 原始顺序，即该章状态表的前 8 个角色），
+ * 同时不触动其余 1824 条的行为。
+ *
+ * TODO(round-68): 8 是实测中位数导出的经验值，非理论最优；后续若 chapter-memory 的
+ * 检索面反馈显示"章节记忆召回过宽/过窄"，应回到 `tmp/state-audit/verify-subject-ref-fanout.mts`
+ * 重测扇出分布再调。上限只做**防御**（防模型失控），不承担语义筛选。
+ */
+const MAX_CHAPTER_MEMORY_SUBJECT_REFS = 8;
+
+/**
  * 把 ChapterMemory 投影为 MemoryClaim 形态，供 QdrantMemoryProvider.upsertClaims 索引。
  *
  * Qdrant 的 collection 是统一的（novel-memory），通过 payload.kind 区分 claim 类型。
@@ -237,7 +259,7 @@ export function chapterMemoryAsClaim(memory: ChapterMemory) {
     kind: "episodic" as const,
     title: `第${memory.narrativeRange.start}章记忆`,
     content,
-    subjectRefs: memory.characterStates.map((state) => state.characterId),
+    subjectRefs: [...new Set(memory.characterStates.map((state) => state.characterId).filter(Boolean))].slice(0, MAX_CHAPTER_MEMORY_SUBJECT_REFS),
     narrativeRange: { start: memory.narrativeRange.start, end: memory.narrativeRange.end },
     knowledgeScope: "author" as const,
     authority: "derived" as const,
