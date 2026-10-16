@@ -144,6 +144,40 @@ export function buildCraftRuleCandidateInput(assessment: RuntimeLearningAssessme
   };
 }
 
+/**
+ * 检出"系统自造的主体名"（2026-10-14 复核轮 round 59/60/64）。
+ *
+ * 根因（round 59/60 实测，生产库 166 个主体里 **33 个**在正文 0 次出现）：
+ * 提取模型把两个分别出现的词拼成了小说里不存在的称呼——`灰衣杂役`
+ * （正文"灰衣"3 次、"杂役"335 次、合称 0 次）、`补发房抄写人`、`城南看物屋` 等。
+ * 后果：检索会按假名字返回结果，且假名字进入召回面后污染后续召回。
+ *
+ * round 59/60 已在提取 prompt 里禁止该形态（"不得由多个词拼合而成" +
+ * "描述性短语不要当 subject.id"），但 prompt 约束不保证旧数据与新模型都遵守，
+ * 故这里按 round 59 的**特征信号**兜一道运行时检测：
+ *   主体整串不在正文、而存在一种前后切分使两段都在正文 ⇒ 疑似自造。
+ *
+ * 只检测不删除：订正主体要逐条判"该人物在正文的实际称呼"，属半语义工作
+ * （round 58/60 的结论：需要人核的部分不硬自动化）。调用方负责留痕。
+ *
+ * 导出以便直接单测（round 26 的教训：模块私有 ⇒ 测试只能复刻逻辑 ⇒ 锁不住真源）。
+ */
+export function detectCoinedSubjects(claims: ReadonlyArray<{ subjectRefs?: readonly string[] }>, chapterText: string): string[] {
+  const subjects = [...new Set(claims.flatMap((claim) => [...(claim.subjectRefs ?? [])]))];
+  return subjects.filter((subject) => {
+    // 防御：subjectRefs 里可能混入非字符串（历史数据/外部构造），不得让检测器崩。
+    if (typeof subject !== "string" || subject.length < 3) return false;
+    // 机器生成的键形态（character:/foundation:/facet:）不参与——它们本就非正文指称。
+    if (/^(?:character|foundation|facet|claim|memory|graph):/u.test(subject)) return false;
+    if (chapterText.includes(subject)) return false;
+    // 存在一种切分，两段都在正文 ⇒ 疑似由两段拼成。
+    for (let cut = 2; cut <= subject.length - 2; cut += 1) {
+      if (chapterText.includes(subject.slice(0, cut)) && chapterText.includes(subject.slice(cut))) return true;
+    }
+    return false;
+  });
+}
+
 export function createNovelWorkflowActivities(deps: { repository: NovelPostgresRepository; memoryProvider: MemoryProvider; skillProvider: SkillProvider; modelGateway: ModelGateway; objectStore?: ContentObjectStore; commitService?: CommitService; memoryIndex?: MemoryIndex; /** 是否启用 chapter memory 创建（默认 true，需 modelGateway 支持）。 */ enableChapterMemory?: boolean }) {
   const model = deps.modelGateway;
   const objects = deps.objectStore ?? new ContentObjectStore();
@@ -1172,6 +1206,16 @@ export function createNovelWorkflowActivities(deps: { repository: NovelPostgresR
           console.warn(`[fact-verification] ${result.verification.contradictions.length} 条新事实与冻结表同槽异值且未声明覆盖，已强制候选待裁决：${result.verification.contradictions.map((item) => item.claimId).join("、")}`);
         }
         await deps.repository.recordFactExtraction({ projectId: input.projectId, artifact: factArtifact, claims: result.claims, lifecycleStatus: "staged", documentId: input.documentId, workflowId: input.workflowId, narrativeOrder: input.narrativeOrder });
+        // 自造主体检测（2026-10-14 round 59/60/64）：prompt 已禁止"拼合/描述性短语作 subject.id"，
+        // 但 prompt 约束不保证旧数据与新模型都遵守——这里按 round 59 的特征信号兜一道：
+        //   主体整串不在正文、而拆开的两段都在 ⇒ 系统把两个词拼成了一个小说里不存在的称呼。
+        // 只报不删：删主体要逐条判"该人物在正文的实际称呼"，属半语义工作（round 58/60 结论）。
+        // 实测规模：生产库 166 个主体里 33 个正文 0 次（拼合 28 + 整串幻觉 5），
+        // 其中 `灰衣杂役`（灰衣 3 次 + 杂役 335 次、合称 0 次）涉及 3 条 claim。
+        const coinedSubjects = detectCoinedSubjects(result.claims, input.text);
+        if (coinedSubjects.length) {
+          console.warn(`[fact-extraction] 检出 ${coinedSubjects.length} 个疑似自造主体（整串不在正文但拆开可拼）：${coinedSubjects.join("、")}——请核对这些称呼是否小说实际使用，必要时订正主体（round 59/60 已在 prompt 侧禁止该形态）`);
+        }
         // 名册外主体登记（§3.6）：prompt 已向模型承诺"由系统登记为待补全实体"，此处兑现。
         // 登记失败不阻塞事实落库——键一致性是后续收益，不是本章产出的前置条件。
         if (result.unregisteredSubjects.length) {
