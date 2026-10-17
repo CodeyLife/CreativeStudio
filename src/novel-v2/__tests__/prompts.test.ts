@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { buildChapterDraftPromptPackage, buildFoundationContextMarkdown } from "../prompts/chapter-draft";
 import { dedupeNarrativeRhythmMemory } from "../prompts/chapter-planning-context";
 import { buildFoundationPrompt } from "../prompts/foundation";
@@ -779,7 +780,7 @@ describe("long-form prompt contracts", () => {
       dueLedger: { currentOrder: 10, windowElapsedCount: 1, agedOpenCount: 0, items: [{ id: "f-1", description: "断刀", horizonOrder: 8, plantedOrder: 2 }] },
       narrativeDormancy: { currentOrder: 10, running: 1, silent: [{ id: "f-2", description: "树洞蓝光", plantedOrder: 3, lastMentionOrder: 4, silentFor: 6 }], neverMentioned: [], silentBands: [], atRiskIds: ["f-2"] },
       lengthDrift: { windowSize: 6, avgChars: 1620, sparseCount: 4, minChars: 1250 },
-      dialogueDrift: { windowSize: 6, avgRatio: 0.004, hintBelowRatio: 0.01, silentOrders: [3, 5], minRatio: 0 },
+      dialogueDrift: { windowSize: 6, avgRatio: 0.004, hintBelowRatio: 0.01, silentOrders: [3, 5], minRatio: 0, decayed: false },
       ensembleSignal: { soloOnlyOrders: [4], longestSoloRun: 2, windowSize: 6 },
       payoffRhythm: [{ arcOrdinal: 7, title: null, finalChapters: 6, payoffCount: 0 }],
     } as never).map((section) => section.title);
@@ -866,6 +867,42 @@ describe("long-form prompt contracts", () => {
     // 双向反例：不得重新引入已证伪的硬性节奏公式（字数/钩子/爽点）。
     expect(instruction).not.toContain("钩子公式");
     expect(instruction).not.toContain("每章必须");
+  });
+
+  /**
+   * 独处蓝图 × 零对白正文的交集接线（2026-10-17）。
+   *
+   * 这条锁的是**接线**，不是渲染措辞。`soloSilentOrders` 由仓储侧从 `ensembleSignal`
+   * 与 `dialogueDrift` 求交（word-count.ts 的 `intersectSoloSilentOrders`）后写进
+   * `contextData`。删掉仓储那行 spread 后 **tsc 不报错**（可选字段缺省即空，字段
+   * 仍被指纹引用），信号就此静默消失——实测该形态下上面的渲染用例仍然全绿，
+   * 因为它直接把值喂给渲染函数，绕过了接线。故接线本身只能用**源码签名**锁。
+   *
+   * 判据是形状不是字面量：`...(soloSilentOrders.length ? { soloSilentOrders } : {})`
+   * 这一行必须存在于仓储，且交集变量必须由 `intersectSoloSilentOrders` 派生
+   * （不是从别处抄来的第二份交运算）。
+   */
+  it("仓储必须把交集章接进 contextData（源码签名锁，删接线即判红）", () => {
+    const source = readFileSync(fileURLToPath(new URL("../postgres-repository.ts", import.meta.url)), "utf8");
+    expect(source, "交集章必须被写进 contextData（删掉即信号静默消失，且 tsc 不报错）")
+      .toMatch(/\.\.\.\(soloSilentOrders\.length \? \{ soloSilentOrders \} : \{\}\)/u);
+    // 交集只能有一处算法：若有人在别处另写一份交运算，两处迟早漂移。
+    expect([...source.matchAll(/intersectSoloSilentOrders\(/gu)].length, "交集判据只应有一处调用").toBe(1);
+  });
+
+  it("独处与零对白的交集章进 serial-signals 段，且缺任一侧时不渲染", () => {
+    const base = { projectTitle: "测试项目", macro: [], recentChapters: [], openThreads: [] };
+    const dialogueDrift = { windowSize: 6, avgRatio: 0.05, hintBelowRatio: 0.01, silentOrders: [3, 5], minRatio: 0, decayed: false };
+    const ensembleSignal = { soloOnlyOrders: [5], longestSoloRun: 2, windowSize: 6 };
+
+    const withIntersection = buildStoryArcPlanningContextSections({ ...base, dialogueDrift, ensembleSignal, soloSilentOrders: [5] });
+    const serial = withIntersection.find((section) => section.id === "arc-context-serial-signals");
+    expect(serial?.text, "交集章必须进段（审阅者不再需要自己把两份清单在心里求交）").toContain("交集章");
+    expect(serial?.text).toContain("第5章");
+
+    // 反向：无交集（或任一侧未接线）时不渲染该段——空清单只会变成噪声。
+    const withoutIntersection = buildStoryArcPlanningContextSections({ ...base, dialogueDrift, ensembleSignal });
+    expect(withoutIntersection.find((section) => section.id === "arc-context-serial-signals")?.text).not.toContain("交集章");
   });
 
   it("篇幅信号：连续低量给出稀疏提示，健康窗口与单章不误伤（2026-09-22 2E）", () => {

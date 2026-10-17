@@ -109,7 +109,7 @@ describe("Skill runtime resolution", () => {
     for (const skillId of ["prose-craft", "reader-emotion", "plot-causality"]) {
       // 守卫值随 workspace yaml 版本演进（prose-craft 曾升 1.4.0 未同步本守卫，属存量断链修复）；
       // 断言的仍是"清单能解析出版本与指纹"这一契约，非具体措辞。
-      expect(byId.get(skillId)?.version).toBe(skillId === "prose-craft" ? "1.16.1" : skillId === "reader-emotion" ? "1.2.1" : skillId === "review-gate" ? "1.2.1" : "1.1.0");
+      expect(byId.get(skillId)?.version).toBe(skillId === "prose-craft" ? "1.16.1" : skillId === "reader-emotion" ? "1.2.2" : skillId === "review-gate" ? "1.2.1" : "1.1.0");
       expect(byId.get(skillId)?.contentFingerprint).toBeTruthy();
     }
 
@@ -729,6 +729,38 @@ describe("Skill runtime resolution", () => {
     expect(text, "必须禁止读成情绪浓度低等于缺情绪推进").toContain("情绪浓度低");
     // 两个口径的区分也要在（防止与 round 33 的章尾问句结论冲突）。
     expect(text, "须区分章内疑问与章尾问句两个口径").toContain("章内疑问句");
+  });
+
+  /**
+   * 安静章/独处章的功能声明契约（2026-10-17）。
+   *
+   * 由来：工程侧把对白密度与群像信号做成交集章后（word-count.ts 的
+   * `intersectSoloSilentOrders`），生成面仍需一条**通用契约**与之配合——否则
+   * 规划器面对"上游写成单人节目单、下游零对白"的交集章时，只知道"有人不满"，
+   * 不知道"静章要自证功能"。这条契约要求的是**声明功能**，不是**改形态**：
+   * 两人同场而安静合法、独处章也合法，说不清静做成了什么才不成立。
+   *
+   * 双向覆盖：
+   *  - 正向：功能声明须在场，且须点名"规划者看得见的那个字段"（planningRationale）；
+   *  - 反向：不得被读成"必须加人进场"——那是把合法形态判成病灶，
+   *    与 reader-emotion 自身的"允许安静章成立"直接矛盾。
+   */
+  it("安静章/独处章须声明静的功能依据，且不得被读成必须加人进场", async () => {
+    const provider = createWorkspaceSkillProvider(path.resolve(process.cwd(), "skills", "novel-v2"));
+    const text = renderSkillInstruction(
+      await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint: "chapter.drafting", role: "writer" }),
+      "chapter.drafting",
+    );
+    // 正向：功能声明在场，且落到规划者实际填写的字段上。
+    expect(text, "须要求声明静章的功能").toContain("这章的静在做成了什么");
+    expect(text, "须指明声明落在 planningRationale").toContain("planningRationale");
+    // 正向：审美式理由不算声明（否则"氛围需要"一句话就能过关，声明失去筛选力）。
+    expect(text, "须排除审美式理由").toContain("不算声明");
+    // 反向：不得把安静/独处判成病灶形态。
+    expect(text, "不得要求必须加人进场").toContain("两人同场而安静同样合法");
+    expect(text, "不得把独处章判成问题").toContain("独处章同样合法");
+    expect(text, "须明确声明的是功能而非形态").toContain("功能");
+    expect(text, "须明确声明的是功能而非形态").toContain("形态");
   });
 
   /**

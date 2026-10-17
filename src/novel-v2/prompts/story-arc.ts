@@ -204,7 +204,24 @@ export type StoryArcPromptInput = {
    * 只做描述性统计（判据边界见 word-count.ts DIALOGUE_DRIFT_POLICY）；不设绝对下限、
    * 不做逐章门，判断归审核面。
    */
-  dialogueDrift?: { windowSize: number; avgRatio: number; hintBelowRatio: number; silentOrders: number[]; minRatio: number };
+  dialogueDrift?: {
+    windowSize: number;
+    avgRatio: number;
+    hintBelowRatio: number;
+    silentOrders: number[];
+    minRatio: number;
+    decayRatio?: number;
+    decayed: boolean;
+  };
+  /**
+   * 上游独处蓝图 × 下游零对白正文的交集章（2026-10-17）。
+   *
+   * 由 `word-count.ts` 的 `intersectSoloSilentOrders` 从 `ensembleSignal` 与
+   * `dialogueDrift` 求交而得。补的是"两个信号各报各的、审阅者要自己在心里求交"这条缝：
+   * 交集非空时上游计划与下游产出**相互印证**（蓝图写成单人节目单、正文真的零对白），
+   * 而"安静型作品"的辩解在此不成立——那是另一个假设，需要额外证据。
+   */
+  soloSilentOrders?: number[];
 };
 
 /**
@@ -271,12 +288,21 @@ export function renderStoryArcLengthDrift(drift: StoryArcPromptInput["lengthDrif
  * 因此提示只针对"整窗口对白稀薄"这一**批的形态**，并显式承认安静章/余波章以低对白
  * 成立；判断（哪一章该有对手戏）留给审核面与规划者。
  */
-export function renderStoryArcDialogueDrift(drift: StoryArcPromptInput["dialogueDrift"]): string {
+export function renderStoryArcDialogueDrift(drift: StoryArcPromptInput["dialogueDrift"], soloSilentOrders?: readonly number[]): string {
   if (!drift || drift.windowSize < 3) return "";
   const avg = `${(drift.avgRatio * 100).toFixed(2)}%`;
   const min = `${(drift.minRatio * 100).toFixed(2)}%`;
   const lines = [`近 ${drift.windowSize} 章正文对白密度（确定性统计）：均对白字占比 ${avg}（引号内有效字 / 有效字），最低 ${min}${drift.silentOrders.length ? `，其中 ${drift.silentOrders.length} 章全章没有任何含引号的段落（第${drift.silentOrders.join("、")}章）` : "，每章都有对白"}。`];
-  if (drift.silentOrders.length >= 2 || drift.avgRatio < drift.hintBelowRatio) {
+  // 相对衰减读数（2026-10-17）：绝对均值会被"本来就安静"的题材形态永久压低，
+  // 跟自己首半窗比才能把"退场"与"形态"分开。缺读数（两半窗全体零对白）时不渲染。
+  if (drift.decayRatio !== undefined) {
+    lines.push(`相对首半窗，近半窗对白占比为原先的 ${(drift.decayRatio * 100).toFixed(0)}%${drift.decayed ? "——已衰减过半" : ""}（判据：低于 50% 记衰减；这是与**自身早段**的比较，不是外部基准，自始至终就低对白运行的安静型作品首半窗同样低故不会命中）。`);
+  }
+  // 上游独处 × 下游零对白的交集章：两个信号相互印证时的真形。
+  if (soloSilentOrders?.length) {
+    lines.push(`独处蓝图与零对白正文的交集章（第${soloSilentOrders.join("、")}章）：这些章的蓝图全部场景参与者≤1，而定稿正文又确实零对白——上游计划与下游产出指向同一形态。这不等于"这些章有问题"（安静章合法），但"本批再整体独处即延续已发生过的失败序列"；分配章节时保持每批≥1/3 章有两名及以上参与者互相施加代价的场景，纯独处章至多一章且跨批，独处章在该场景 planningRationale 写明这章的静在与不在场的谁对话。`);
+  }
+  if (drift.silentOrders.length >= 2 || drift.avgRatio < drift.hintBelowRatio || drift.decayed) {
     lines.push("对白密度提示：对手戏是读者追读的主引擎，而本信号的度量面是**正文实际写出来的台词**——上游群像配额只约束蓝图参与者数，写不写得出交锋仍取决于本章的编排。近窗口对白稀薄时，逐章审查通常各自达标（每章都能自证其静），只有窗口统计能看出整批正在把对手戏挤出正文。分配章节时回到'这一章谁在向谁要东西'：让有欲望、有代价的第二意志进场并把代价落到对白上。安静章、余波章、内省章以低对白成立是合法形态（本信号不是补对白指令，不为凑密度加台词）。");
   }
   return lines.join("\n");
@@ -405,7 +431,7 @@ export function buildStoryArcPlanningContextSections(input: StoryArcPromptInput)
     // 稀释优先级并让读者在五段之间跳）。指纹也按段登记（见仓储侧 sectionFingerprints
     // 与 STORY_ARC_CONTEXT_SECTION_IDS 的说明）——原实现把 payoffRhythm 单独登一个键
     // 却无读点，而共享键又挂在条件上，造成"非空段零 provenance"。
-    { id: STORY_ARC_CONTEXT_SECTION_IDS.serialSignals.id, kind: "review" as const, title: "跨章序列信号（功能游程、群像独处游程、回报节奏、篇幅与对白密度信号）", text: [serialSignals, renderStoryArcEnsembleSignal(input.ensembleSignal), renderStoryArcPayoffRhythm(input.payoffRhythm), renderStoryArcLengthDrift(input.lengthDrift), renderStoryArcDialogueDrift(input.dialogueDrift)].filter(Boolean).join("\n\n"), priority: "normal" as const, provenanceRefs: sourceRefs(receipt, STORY_ARC_CONTEXT_SECTION_IDS.serialSignals.fingerprintKey) },
+    { id: STORY_ARC_CONTEXT_SECTION_IDS.serialSignals.id, kind: "review" as const, title: "跨章序列信号（功能游程、群像独处游程、回报节奏、篇幅与对白密度信号）", text: [serialSignals, renderStoryArcEnsembleSignal(input.ensembleSignal), renderStoryArcPayoffRhythm(input.payoffRhythm), renderStoryArcLengthDrift(input.lengthDrift), renderStoryArcDialogueDrift(input.dialogueDrift, input.soloSilentOrders)].filter(Boolean).join("\n\n"), priority: "normal" as const, provenanceRefs: sourceRefs(receipt, STORY_ARC_CONTEXT_SECTION_IDS.serialSignals.fingerprintKey) },
     { id: "arc-context-receipt", kind: "background" as const, title: "上下文来源收据", text: receiptText, priority: "normal" as const, provenanceRefs: receipt ? [receipt.fingerprint] : ["legacy-context"] },
   ];
   return outlineSection ? [outlineSection, ...base] : base;
@@ -459,7 +485,7 @@ function context(input: StoryArcPromptInput): string {
     renderStoryArcNarrativeDormancy(input.narrativeDormancy),
     renderStoryArcPayoffRhythm(input.payoffRhythm),
     renderStoryArcLengthDrift(input.lengthDrift),
-    renderStoryArcDialogueDrift(input.dialogueDrift),
+    renderStoryArcDialogueDrift(input.dialogueDrift, input.soloSilentOrders),
     `全局规划引用：${input.macro.map((item) => `[${item.taskKey}] ${item.title}: ${item.summary}`).join("\n") || "无"}`,
     `最近章节位置：${input.recentChapters.map((item) => `第${item.order}章 ${item.summary}；未解=${item.unresolvedThreads.join("、") || "无"}`).join("\n") || "无"}`,
     `开放剧情线（threadRef 只能填下列 id 的精确值、不带名称；确需新建剧情线用“new:<名称>”显式表达）：\n${input.openThreads.map((item) => `- id: ${item.id}\n  名称: ${item.title}${renderThreadPayload(item.payload)}`).join("\n") || "无"}`,

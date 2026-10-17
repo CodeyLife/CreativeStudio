@@ -298,6 +298,24 @@ export const DIALOGUE_DRIFT_POLICY = {
    * TODO: 应随语料进 output-policy 配置化。
    */
   hintBelowRatio: 0.01,
+  /**
+   * "衰减"判据：近半窗均值低于首半窗的这个比例，即读作对手戏在**相对退场**。
+   *
+   * 为什么需要相对判据（state-audit-20261013.md §7 第 5 项的存量实测）：绝对均值
+   * 看不见全书最严重的病灶。该书首段均值 6.78%、061-080 段 0.67%，**崩落约 10×**；
+   * 而一个自始至终就低对白运行的安静型作品，绝对均值同样低，两者性质完全不同——
+   * 前者是把已经交付过的东西收走，后者是题材形态。绝对阈值无法区分二者，
+   * 相对衰减可以：它判的是"本书自己退了多少"，与任何外部基准无关。
+   *
+   * 取 0.5（近半窗不足首半窗一半）的理由：分段数据里 041-160 各段相对 001-020 的
+   * 比值分布在 0.10-0.57，取 0.5 恰好只圈住"衰减过半"的区段，不圈住波动。
+   *
+   * 这仍是**描述性信号**而非门：不拦停、不判 revise、不逐章执法，只让弧审核面
+   * 看见"退场"这件事。安静型作品（首半窗本就低）不会命中，因为分母同样小。
+   *
+   * TODO: 应随语料进 output-policy 配置化。
+   */
+  decayBelowRatio: 0.5,
 } as const;
 
 /** 单章对白密度信号的输入形态（结构化，避免叶子模块依赖 story-arc 类型）。 */
@@ -322,6 +340,21 @@ export interface DialogueDriftReport {
   silentOrders: number[];
   /** 窗口内最低对白字占比。 */
   minRatio: number;
+  /**
+   * 相对衰减读数：近半窗均值 / 首半窗均值。
+   *
+   * 与 `avgRatio` 互补——`avgRatio` 是绝对水平（会被安静的题材形态永久压低），
+   * `decayRatio` 是**跟自己比**的退场程度。窗口可均分时为两半窗之比；不可均分   * （奇数章）时首半窗少一章（floor），即"越早的样本代表越长的观察期"。
+   *
+   * 两半窗任一的全体成员对白字皆为 0 时记 `undefined`（0/0 无意义：那类书
+   * 从头到尾没有对白，属题材形态而非衰减），渲染侧据此不渲染该读数。
+   *
+   * 精确边界：只有**首半窗**为 0 才记 undefined（分母为 0，无从谈比值）。
+   * 后半窗为 0 是有判据意义的读数——那正是"彻底退场"，比值记 0 且判衰减。
+   */
+  decayRatio?: number;
+  /** 是否命中衰减判据（近半窗 < 首半窗 × `DIALOGUE_DRIFT_POLICY.decayBelowRatio`）。有界退化无此读数为 false。 */
+  decayed: boolean;
 }
 
 /**
@@ -336,11 +369,65 @@ export function inspectDialogueDrift(chapters: readonly DialogueDriftInput[]): D
     .sort((left, right) => left.order - right.order);
   if (measured.length < DIALOGUE_DRIFT_POLICY.minWindow) return undefined;
   const ratios = measured.map((chapter) => chapter.dialogueCharacters / chapter.characters);
+  const mean = (values: readonly number[]): number => values.reduce((sum, value) => sum + value, 0) / values.length;
+
+  /**
+   * 两半窗均值。先按章序切开再各自取均值（不是先算全书均值再切）——"首半窗均值"
+   * 要回答的是"这本书开头交付了多少对白"，按章序分组才对得上这个语义。
+   */
+  const splitAt = Math.floor(measured.length / 2);
+  const earlyRatios = ratios.slice(0, splitAt);
+  const recentRatios = ratios.slice(splitAt);
+  const earlyMean = mean(earlyRatios);
+  const recentMean = mean(recentRatios);
+  /**
+   * 只有**分母为 0**（首半窗全体零对白）时比值无意义——那类作品从头到尾没有对白，
+   * 属题材形态而非衰减，无从谈"退了多少"。
+   *
+   * 后半窗为 0 不在此列：那正是"彻底退场"，比值 0 且判衰减，是有判据意义的读数。
+   * （首版把两侧皆零都排除，实测把"前半有对白、后半归零"这一最纯粹的退场形态也一起
+   * 排除了，属误伤。）
+   */
+  const allEarlyZero = earlyRatios.every((ratio) => ratio <= 0);
+  const decayRatio = allEarlyZero ? undefined : recentMean / earlyMean;
+
   return {
     windowSize: measured.length,
-    avgRatio: ratios.reduce((sum, ratio) => sum + ratio, 0) / ratios.length,
+    avgRatio: mean(ratios),
     hintBelowRatio: DIALOGUE_DRIFT_POLICY.hintBelowRatio,
     silentOrders: measured.filter((chapter) => chapter.dialogueCharacters <= 0).map((chapter) => chapter.order),
     minRatio: ratios.reduce((min, ratio) => Math.min(min, ratio), Number.MAX_SAFE_INTEGER),
+    decayRatio,
+    decayed: decayRatio !== undefined && recentMean < earlyMean * DIALOGUE_DRIFT_POLICY.decayBelowRatio,
   };
+}
+
+/**
+ * 上游蓝图独处 × 下游正文零对白的交集章（2026-10-17，state-audit §7 第 5 项的闭环缺口）。
+ *
+ * **这是本模块里唯一把两个信号接起来的判据**，补的正是那条"没有回读"的缝：
+ * 弧审核面此前同时拿到 `ensembleSignal`（蓝图参与者数，上游）与 `dialogueDrift`
+ * （正文对白，下游），但两者各报各的——审阅者要自己把两份清单在心里求交集。
+ * 交集才是病灶的真形：**蓝图就写成单人节目单，正文又真的零对白**，即上游计划
+ * 与下游产出相互印证，而不是"安静型作品本就如此"。
+ *
+ * 判据是**可数事实的交集**，不含任何语义判定：
+ *  - 上游侧取"全部场景参与者 ≤1"的章（`soloOnlyChapterIndexes` 已是结构事实）；
+ *  - 下游侧取"正文对白字为 0"的章（`silentOrders` 同理）。
+ * 两者取交，按章序升序返回。任一侧缺信号（undefined）即返回空数组——
+ * 缺一侧时既不能断言交集存在、也不能断言不存在，**宁缺勿伪**。
+ *
+ * 刻意不覆盖：不判"是否该加对白"（那是题材/审美判断，两版语义判据已在
+ * `inspectStoryArcEnsemble` 注释里被实测推翻）；不设配额；只呈现交集章清单，
+ * 判断留给弧审核面。因此这里不引入 `soloOnly`/`silent` 之外的任何条件。
+ */
+export function intersectSoloSilentOrders(
+  ensemble: { soloOnlyChapterIndexes?: readonly number[] } | undefined,
+  dialogue: { silentOrders?: readonly number[] } | undefined,
+): number[] {
+  const solo = ensemble?.soloOnlyChapterIndexes;
+  const silent = dialogue?.silentOrders;
+  if (!solo?.length || !silent?.length) return [];
+  const silentSet = new Set(silent);
+  return [...new Set(solo)].filter((order) => silentSet.has(order)).sort((left, right) => left - right);
 }

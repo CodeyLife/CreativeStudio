@@ -68,7 +68,7 @@ import { ModelTaskSlice } from "./repository/model-task-slice";
 import { TelemetrySlice } from "./repository/telemetry-slice";
 import type { ModelRoutingConfig, ModelRoutingSnapshot, ModelTaskRecord, ModelWorkPackage } from "./model-routing";
 import type { ObjectStoreAdapter } from "./object-store";
-import { countDialogueCharacters, countNovelCharacters, effectiveTargetWordCount, inspectDialogueDrift, LENGTH_DRIFT_POLICY, normalizeTargetWordCount } from "./word-count";
+import { countDialogueCharacters, countNovelCharacters, effectiveTargetWordCount, inspectDialogueDrift, intersectSoloSilentOrders, LENGTH_DRIFT_POLICY, normalizeTargetWordCount } from "./word-count";
 import type { ObjectStoreIdentity } from "./object-store";
 import { normalizeManuscriptStructuralReview } from "./application/manuscript-structure";
 import { arcCompletionPredicateSql, auditEmotionalContractCarriage, auditNamedReferences, auditStoryArcBatchRanges, canonicalReferenceId, findEmbeddedInternalIdentifiers, normalizeThreadResponsibilityReferences, parseExplicitNewReference, planThreadForeshadowingBindings, resolveNamedReference, sanitizeReferenceToken, type NamedReferenceCandidate, type StoryArcIntegrityIssue } from "./application/story-arc-integrity";
@@ -4407,7 +4407,6 @@ export class NovelPostgresRepository {
         return [{ participants: Array.isArray(item.participants) ? item.participants.filter((name): name is string => typeof name === "string") : [] }];
       }),
     }));
-    const ensembleSignal = ensembleWindow.length >= 3 ? inspectStoryArcEnsemble(ensembleWindow) : undefined;
     // 章长漂移/内容稀疏信号（2026-09-22 商业基准对照确诊的可见性落点）：近窗口定稿
     // 章的 \p{L}\p{N} 字数统计（均长 / 低于 sparseFloor 计数 / 最短章）。**只做描述性
     // 统计**——候选逐章门被 168 章实测推翻（28/31 章全书散布命中，见
@@ -4440,6 +4439,18 @@ export class NovelPostgresRepository {
         minChars: lengthWindow.reduce((min, row) => Math.min(min, row.chars), Number.MAX_SAFE_INTEGER),
       }
       : undefined;
+    // 上游群像信号与下游对白信号取**同一个窗口**（2026-10-17，闭环 §7 第 5 项的"无回读"）。
+    //
+    // 此前 ensembleSignal 按 chapters.payload.scenes 取样、dialogueDrift 按 content_blobs
+    // 取样，两边各取各的章序——交集算出来的是"两个不同集合的交"，不等于"同一批章既是
+    // 独处蓝图又是零对白正文"。故这里先用 lengthWindow（对白字与有效字同行的那个查询）
+    // 的可测章序去过滤 ensembleWindow，保证两侧章序同源；`scenes` 由 payload 读出，
+    // 与正文是否已定稿无关，故窗口内每一章都有蓝图结构，过滤只剔除"无定稿正文"的章。
+    //
+    // 定义位置必须在 lengthWindow **之后**（`const` 不提升，放前面会 TDZ 报错）。
+    const measuredOrders = new Set(lengthWindow.map((row) => row.order));
+    const ensembleAligned = ensembleWindow.filter((chapter) => measuredOrders.has(chapter.index));
+    const ensembleSignal = ensembleAligned.length >= 3 ? inspectStoryArcEnsemble(ensembleAligned) : undefined;
     // 正文对白密度漂移信号（2026-10-13，state-audit-20261013.md §7 第 5 项，作者裁决选项 A）：
     // 与 lengthDrift 共用同一次窗口查询（同窗口、同"只做描述性统计"纪律）。
     //
@@ -4460,6 +4471,10 @@ export class NovelPostgresRepository {
         return [{ order: Number(row.narrative_order), characters, dialogueCharacters }];
       }),
     );
+    // 上游独处蓝图 × 下游零对白正文的交集章（2026-10-17）：把两个信号接成回读，
+    // 让"上游写成单人节目单、下游真的零对白"这一**相互印证**的形态可见。
+    // 任一侧缺信号即空（宁缺勿伪，见 word-count.ts intersectSoloSilentOrders）。
+    const soloSilentOrders = intersectSoloSilentOrders(ensembleSignal, dialogueDrift);
     // 窗口上界已过的账（P1，2026-09-16 起，2026-09-18 修正语义）：
     // 规划者需要看见"哪些线索的兑现窗口上界已经过去"，但**不把它叫超期债务**——
     // 实测 244 条上界已过中 238 条仍在活跃推进，对连载而言这是常态而非欠账。
@@ -4563,7 +4578,9 @@ export class NovelPostgresRepository {
       dueLedger?: { currentOrder: number; windowElapsedCount: number; agedOpenCount: number; items: Array<{ id: string; description: string; horizonOrder: number; plantedOrder: number | null }> };
       payoffRhythm?: Array<{ arcOrdinal: number; title: string | null; finalChapters: number; payoffCount: number }>;
       lengthDrift?: { windowSize: number; avgChars: number; sparseCount: number; minChars: number };
-      dialogueDrift?: { windowSize: number; avgRatio: number; hintBelowRatio: number; silentOrders: number[]; minRatio: number };
+      dialogueDrift?: { windowSize: number; avgRatio: number; hintBelowRatio: number; silentOrders: number[]; minRatio: number; decayRatio?: number; decayed: boolean };
+      /** 上游独处蓝图 × 下游零对白正文的交集章（2026-10-17，见 word-count.ts intersectSoloSilentOrders）。 */
+      soloSilentOrders?: number[];
     } = {
       projectTitle: project.rows[0].title,
       macro: macro.map((artifact) => ({ taskKey: foundationTaskKey(artifact) ?? "unknown", title: typeof artifact.structuredData?.title === "string" ? artifact.structuredData.title : "", summary: typeof artifact.structuredData?.summary === "string" ? artifact.structuredData.summary : "" })),
@@ -4581,6 +4598,7 @@ export class NovelPostgresRepository {
       ...(payoffRhythm.length ? { payoffRhythm } : {}),
       ...(lengthDrift ? { lengthDrift } : {}),
       ...(dialogueDrift ? { dialogueDrift } : {}),
+      ...(soloSilentOrders.length ? { soloSilentOrders } : {}),
     };
     // PL-8③：未揭示秘密清单投影（plot-design informationBoundaries.hidden）。别名迁移
     // 在 flat 归一层内完成（散文时代成员升为 {claim}）；plot-design 缺失或形态非法时返回
@@ -4664,7 +4682,7 @@ export class NovelPostgresRepository {
       [STORY_ARC_CONTEXT_SECTION_IDS.recent.fingerprintKey]: canonicalSha256(contextData.recentChapters),
       [STORY_ARC_CONTEXT_SECTION_IDS.openElements.fingerprintKey]: canonicalSha256({ openThreads: contextData.openThreads, openForeshadowings: contextData.openForeshadowings, openPromises: contextData.openPromises }),
       [STORY_ARC_CONTEXT_SECTION_IDS.feedbackState.fingerprintKey]: canonicalSha256({ planningFeedback: contextData.planningFeedback, narrativeState: contextData.narrativeState }),
-      [STORY_ARC_CONTEXT_SECTION_IDS.serialSignals.fingerprintKey]: canonicalSha256({ runs: contextData.serialFunctionRuns, ensembleSignal: contextData.ensembleSignal, payoffRhythm: contextData.payoffRhythm, lengthDrift: contextData.lengthDrift, dialogueDrift: contextData.dialogueDrift }),
+      [STORY_ARC_CONTEXT_SECTION_IDS.serialSignals.fingerprintKey]: canonicalSha256({ runs: contextData.serialFunctionRuns, ensembleSignal: contextData.ensembleSignal, payoffRhythm: contextData.payoffRhythm, lengthDrift: contextData.lengthDrift, dialogueDrift: contextData.dialogueDrift, soloSilentOrders: contextData.soloSilentOrders }),
       ...(contextData.cast ? { [STORY_ARC_CONTEXT_SECTION_IDS.cast.fingerprintKey]: canonicalSha256(contextData.cast) } : {}),
       ...(contextData.dueLedger ? { [STORY_ARC_CONTEXT_SECTION_IDS.dueLedger.fingerprintKey]: canonicalSha256(contextData.dueLedger) } : {}),
       ...(contextData.undisclosedSecrets?.length ? { [STORY_ARC_CONTEXT_SECTION_IDS.secrets.fingerprintKey]: canonicalSha256(contextData.undisclosedSecrets) } : {}),
