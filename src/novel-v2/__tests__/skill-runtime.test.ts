@@ -109,7 +109,7 @@ describe("Skill runtime resolution", () => {
     for (const skillId of ["prose-craft", "reader-emotion", "plot-causality"]) {
       // 守卫值随 workspace yaml 版本演进（prose-craft 曾升 1.4.0 未同步本守卫，属存量断链修复）；
       // 断言的仍是"清单能解析出版本与指纹"这一契约，非具体措辞。
-      expect(byId.get(skillId)?.version).toBe(skillId === "prose-craft" ? "1.16.1" : skillId === "reader-emotion" ? "1.2.2" : skillId === "review-gate" ? "1.2.1" : "1.1.0");
+      expect(byId.get(skillId)?.version).toBe(skillId === "prose-craft" ? "1.16.2" : skillId === "reader-emotion" ? "1.2.2" : skillId === "review-gate" ? "1.2.1" : "1.1.0");
       expect(byId.get(skillId)?.contentFingerprint).toBeTruthy();
     }
 
@@ -761,6 +761,50 @@ describe("Skill runtime resolution", () => {
     expect(text, "不得把独处章判成问题").toContain("独处章同样合法");
     expect(text, "须明确声明的是功能而非形态").toContain("功能");
     expect(text, "须明确声明的是功能而非形态").toContain("形态");
+  });
+
+  /**
+   * prose-craft 三面同步接线静章功能声明（2026-10-17，与上一条同族）。
+   *
+   * 由来（AGENTS.md 泛化优先 + 仓库自己的"判据只在单一面上 = 该面对它不存在"纪律）：
+   * §7 第 5 项的交集判据只让编排层**看见**静章缺功能；生成面还必须让写作、审核、
+   * 修订三面都拿到同一条可执行契约，否则"修在 skill 里、模型看不见"的旧形态复现
+   * （这正是本仓 round 61/62 修过的同族缺陷：4 条 prose-craft 判据只进了写作面）。
+   *
+   * 三面分工各有其职，锁的也是**不同的短语**：
+   *  - 写作面：要求事前声明（"这章的静做成了什么"）；
+   *  - 审核面：要求按"缺功能说明"报并指明挤掉了什么；
+   *  - 修订面：要求按"安上功能"修，且不得强行加人/危险/悬念问句。
+   *
+   * 反向锁一并覆盖：三面都不得把"形态"当病灶（安静章合法），这是本契约与
+   * "机械补对白"之间的界线。
+   */
+  it("prose-craft 三面都携带静章功能声明，且都不得把形态当病灶", async () => {
+    const provider = createWorkspaceSkillProvider(path.resolve(process.cwd(), "skills", "novel-v2"));
+
+    const drafting = renderSkillInstruction(
+      await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint: "chapter.drafting", role: "writer" }),
+      "chapter.drafting",
+    );
+    expect(drafting, "写作面须要求事前声明静章的功能").toContain("安静章与独处章须自证功能");
+    expect(drafting, "写作面须给出'什么不算说明'的反例").toContain("不算说明");
+    expect(drafting, "写作面须写明声明的是功能而非形态").toContain("不是\"必须加人进场\"的要求");
+
+    const review = renderSkillInstruction(
+      await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint: "chapter.review.prose", role: "prose-reviewer" }),
+      "chapter.review.prose",
+    );
+    expect(review, "审核面须把静章自证列为必查项").toContain("静章自证");
+    expect(review, "审核面须要求指明挤掉了什么").toContain("挤掉了什么");
+    // 反向：不得仅因没有对白/没有事件而报。
+    expect(review, "审核面不得仅因缺对白或缺事件而报").toContain("不得仅因");
+
+    const revision = renderSkillInstruction(
+      await resolveStageSkillBundle({ projectId: "test-project", provider, executionPoint: "chapter.revision", role: "reviser" }),
+      "chapter.revision",
+    );
+    expect(revision, "修订面须给出'安上功能'的修法").toContain("静章缺功能说明时的修法");
+    expect(revision, "修订面须禁止强行加人/危险/悬念问句").toContain("不得把安静章改写成强行加人");
   });
 
   /**
